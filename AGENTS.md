@@ -12,8 +12,9 @@ A Python CLI and library (pipx-installable, import usagebassoon) that persists `
 ## Repository Structure
 ```
 usagebassoon/
-├── pyproject.toml            # hatchling; pipx-installable; Python >= 3.11
+├── pyproject.toml            # hatchling; pipx-installable; Python >= 3.12
 ├── src/usagebassoon/
+│   ├── __init__.py
 │   ├── cli/                  # typer app; one module per CLI command
 │   ├── parsers/              # one module per payload kind
 │   │   ├── models.py         # per session×model rows → session_model_stats
@@ -21,13 +22,21 @@ usagebassoon/
 │   │   ├── graph.py          # daily contributions    → daily_stats/daily_activity/run_metrics
 │   │   └── pricing.py        # rates + resolution     → pricing_snapshots + row stamps
 │   ├── contracts/            # JSON schema contracts per payload kind
+│   │   ├── graph.json
+│   │   ├── models.json
+│   │   ├── pricing.json
+│   │   └── report.json
+│   ├── contracts.py          # contract loading, validation, and drift detection
 │   ├── backends/
 │   │   ├── base.py           # StorageBackend protocol
 │   │   ├── duckdb_local.py
 │   │   ├── motherduck.py
 │   │   └── bigquery.py
 │   ├── collector.py          # tokscale subprocess + retry
-│   ├── arrow_port.py         # normalizer: models → Arrow, derived columns
+│   ├── frames.py             # Arrow conversion to pandas or optional polars
+│   ├── ingest.py             # raw payload contract validation and parsing
+│   ├── json_types.py         # recursive types for JSON-decoded payloads
+│   ├── normalizer.py         # normalizer: models → Arrow, derived columns
 │   ├── drift.py              # schema_drift detection + reporting
 │   ├── snapshots.py          # local/GCS rotating snapshots + restore
 │   ├── merge.py              # staging + delta append + current-view logic + session_label
@@ -40,8 +49,18 @@ usagebassoon/
 │   │   ├── duckdb/{ddl.sql, views.sql}    # also serves motherduck
 │   │   └── bigquery/{ddl.sql, views.sql}
 ├── tests/
+│   ├── __init__.py
+│   ├── conftest.py           # shared golden-payload fixtures and collection bundle
 │   ├── fixtures/             # sanitized golden captures: models, report, graph, pricing
-│   └── test_*.py             # incl. fixture-derived invariants
+│   │   ├── golden-2026-09-10.graph.json
+│   │   ├── golden-2026-09-10.models.json
+│   │   ├── golden-2026-09-10.pricing.json
+│   │   └── golden-2026-09-10.report.json
+│   ├── test_backends.py      # StorageBackend integration and DDL checks
+│   ├── test_contracts.py     # schema-contract and drift validation
+│   ├── test_merge.py         # delta persistence semantics
+│   ├── test_parsers.py       # fixture-derived parser invariants
+│   └── test_reconcile.py     # cross-payload consistency checks
 └── .github/workflows/        # ci (ruff, pyrefly, pytest), dialect-parity, release to PyPI
 ```
 

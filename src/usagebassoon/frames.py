@@ -9,17 +9,18 @@ Arrow; polars is optional and raises a targeted ImportError when absent.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from importlib import import_module
+from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    from tokledger.backends.base import StorageBackend
+    from usagebassoon.backends.base import StorageBackend
 
 Engine = Literal["pandas", "polars"]
 
 
-def to_frame(table: pa.Table, engine: Engine = "pandas") -> Any:
+def to_frame(table: pa.Table, engine: Engine = "pandas") -> object:
     """Convert an Arrow table to a pandas or polars DataFrame.
 
     Args:
@@ -38,13 +39,13 @@ def to_frame(table: pa.Table, engine: Engine = "pandas") -> Any:
         return table.to_pandas() if hasattr(table, "to_pandas") else table
     if engine == "polars":
         try:
-            import polars as pl
+            polars = import_module("polars")
         except ModuleNotFoundError as exc:
             raise ImportError(
                 "polars backend requested but polars is not installed; "
-                "pip install 'tokledger[polars]'"
+                "pip install 'usagebassoon[polars]'"
             ) from exc
-        return pl.from_arrow(table)
+        return polars.from_arrow(table)
     raise ValueError(f"unsupported engine {engine!r}")
 
 
@@ -53,7 +54,7 @@ def query_frame(
     sql: str,
     *,
     engine: Engine = "pandas",
-) -> Any:
+) -> object:
     """Execute SQL on a backend and return the result as a DataFrame.
 
     Args:

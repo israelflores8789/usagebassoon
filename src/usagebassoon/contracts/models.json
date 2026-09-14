@@ -1,0 +1,196 @@
+{
+  "format_version": 1,
+  "payload_kind": "models",
+  "tokscale_version": "4.15.1",
+  "entries": [
+    {
+      "path": "entries",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].cacheRead",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].cacheWrite",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].client",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].cost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].input",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].mergedClients",
+      "types": [
+        "null"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].messageCount",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].model",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].output",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance.msPer1KTokens",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance.sampleCount",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance.timedTokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance.tokenCoverage",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].performance.totalDurationMs",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].provider",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].reasoning",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "entries[].sessionId",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "groupBy",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "processingTimeMs",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalCacheRead",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalCacheWrite",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalCost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalInput",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalMessages",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "totalOutput",
+      "types": [
+        "int"
+      ],
+      "required": true
+    }
+  ]
+}

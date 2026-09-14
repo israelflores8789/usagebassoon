@@ -1,0 +1,153 @@
+{
+  "format_version": 1,
+  "payload_kind": "report",
+  "tokscale_version": "4.15.1",
+  "entries": [
+    {
+      "path": "[].client",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].complexity",
+      "types": [
+        "null",
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].created_at",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].description",
+      "types": [
+        "null",
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].duration_minutes",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].fm_version",
+      "types": [
+        "null"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].last_active",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].message_count",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].models_used",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].session_id",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].summarized_at",
+      "types": [
+        "int",
+        "null"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].task_category",
+      "types": [
+        "null",
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].task_group",
+      "types": [
+        "null",
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].title",
+      "types": [
+        "null",
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].total_cache_read",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].total_cost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].total_input_tokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].total_output_tokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].workspace",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "[].workspace_label",
+      "types": [
+        "str"
+      ],
+      "required": true
+    }
+  ]
+}

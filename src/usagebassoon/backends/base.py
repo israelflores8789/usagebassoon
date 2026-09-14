@@ -1,60 +1,79 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""base.py — StorageBackend protocol.
-
-Arrow contract shared by all backends. Implementations own their
-dialect SQL and callers never see engine handles.
-"""
+"""base.py — StorageBackend protocol for canonical Arrow tables."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from typing import Protocol
 
 import pyarrow as pa
 
 
+@dataclass(frozen=True, slots=True)
+class UpsertResult:
+    """Counts produced while applying a current-state Arrow batch.
+
+    Attributes:
+        inserted: Rows whose natural key was not yet present.
+        updated: Existing rows whose logical values changed.
+    """
+
+    inserted: int = 0
+    updated: int = 0
+
+    @property
+    def affected(self) -> int:
+        """Return the total number of rows inserted or updated."""
+        return self.inserted + self.updated
+
+
 class StorageBackend(Protocol):
-    """A warehouse backend that exchanges data as Arrow tables."""
+    """A dialect-specific warehouse exchanging normalized Arrow tables."""
 
     def apply_ddl(self) -> None:
-        """Create (idempotently) the backend's dialect-native schema."""
+        """Create the backend's dialect-native schema and views idempotently."""
         ...
 
-    def merge(
+    def upsert(
         self,
         table: str,
         data: pa.Table,
         natural_keys: Sequence[str],
-        measure_fields: Sequence[str],
-    ) -> int:
-        """Append rows whose key is new or whose measures changed.
+        change_fields: Sequence[str],
+    ) -> UpsertResult:
+        """Insert new current-state rows and update materially changed ones.
 
         Args:
-            table: Target fact table.
-            data: Staged batch carrying derived columns and collected_at.
-            natural_keys: Natural identity columns of a logical row.
-            measure_fields: Columns compared null-safe to detect change.
+            table: Current-state table named by the active dialect DDL.
+            data: Normalized Arrow batch with columns matching that table.
+            natural_keys: Columns that uniquely identify a current row.
+            change_fields: Logical fields used for null-safe change detection.
 
         Returns:
-            Rows appended (additions plus superseding updates).
+            Separate inserted and updated row counts.
         """
         ...
 
     def append(self, table: str, data: pa.Table) -> None:
-        """Append rows to a non-delta append-only table."""
+        """Append rows to a DDL-defined append-only table.
+
+        Callers must not use this for a current-state table unless restoring
+        into a known-empty database.
+        """
         ...
 
     def query(self, sql: str) -> pa.Table:
-        """Execute SQL in the configured dialect and return Arrow."""
+        """Execute SQL in the configured dialect and return an Arrow table."""
         ...
 
     def transaction(self) -> AbstractContextManager[None]:
-        """Best-effort multi-statement transaction context."""
+        """Return a best-effort multi-statement transaction context."""
         ...
 
     def close(self) -> None:
-        """Release the backend connection."""
+        """Release backend resources."""
         ...

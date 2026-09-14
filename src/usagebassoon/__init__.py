@@ -3,4 +3,5 @@
 
 
 def main() -> None:
+    """Print the package placeholder entrypoint."""
     print("Hello from UsageBassoon!")

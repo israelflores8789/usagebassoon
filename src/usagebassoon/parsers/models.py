@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from usagebassoon.json_types import JsonObject, JsonValue
+
 
 class ModelStatsRow(BaseModel):
     """Normalized cumulative usage for one (client, session, model)."""
@@ -55,7 +57,7 @@ class ModelStatsRow(BaseModel):
         return tuple(value)
 
     @classmethod
-    def from_entry(cls, entry: dict[str, Any]) -> ModelStatsRow:
+    def from_entry(cls, entry: JsonObject) -> ModelStatsRow:
         """Build a row from one raw models entry, flattening performance.
 
         Args:
@@ -64,7 +66,8 @@ class ModelStatsRow(BaseModel):
         Returns:
             The validated row with nested performance fields promoted.
         """
-        perf = entry.get("performance") or {}
+        performance = entry.get("performance")
+        perf = performance if isinstance(performance, dict) else {}
         row = cls.model_validate(entry)
         return row.model_copy(
             update={
@@ -91,7 +94,7 @@ class ModelsPayload(BaseModel):
     processing_time_ms: int | None = Field(default=None, alias="processingTimeMs")
 
 
-def parse_models(payload: dict[str, Any]) -> ModelsPayload:
+def parse_models(payload: JsonValue) -> ModelsPayload:
     """Parse the models JSON object into validated rows.
 
     Args:
@@ -106,6 +109,13 @@ def parse_models(payload: dict[str, Any]) -> ModelsPayload:
     """
     if not isinstance(payload, dict):
         raise ValueError("models payload must be a JSON object")
-    entries = [ModelStatsRow.from_entry(e) for e in payload.get("entries", [])]
+    entries_value = payload.get("entries", [])
+    if not isinstance(entries_value, list):
+        raise ValueError("models entries must be a JSON array")
+    entries: list[ModelStatsRow] = []
+    for entry in entries_value:
+        if not isinstance(entry, dict):
+            raise ValueError("models entries must contain JSON objects")
+        entries.append(ModelStatsRow.from_entry(entry))
     body = {k: v for k, v in payload.items() if k != "entries"}
-    return ModelsPayload(entries=entries, **body)
+    return ModelsPayload.model_validate({**body, "entries": entries})

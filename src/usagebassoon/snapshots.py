@@ -15,11 +15,12 @@ import io
 import json
 import pickle
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 import pyarrow.parquet as pq
 from fsspec.core import url_to_fs
-from tokledger.backends.base import StorageBackend
+
+from usagebassoon.backends.base import StorageBackend
 
 SNAPSHOT_TABLES: tuple[str, ...] = (
     "sessions",
@@ -34,6 +35,18 @@ SNAPSHOT_TABLES: tuple[str, ...] = (
     "tags",
     "notes",
 )
+
+
+class SnapshotFilesystem(Protocol):
+    """Minimal fsspec interface used for listing and rotating snapshots."""
+
+    def ls(self, path: str) -> list[str | dict[str, str]]:
+        """List paths under a snapshot root."""
+        ...
+
+    def rm(self, path: str, *, recursive: bool) -> None:
+        """Remove one snapshot path."""
+        ...
 
 
 class SnapshotStore:
@@ -62,7 +75,7 @@ class SnapshotStore:
         """
         return url_to_fs(self.uri)
 
-    def _stamps(self, fs: Any, root: str) -> list[str]:
+    def _stamps(self, fs: SnapshotFilesystem, root: str) -> list[str]:
         """List snapshot directory names, oldest first.
 
         Args:
@@ -76,7 +89,9 @@ class SnapshotStore:
             entries = fs.ls(root)
         except FileNotFoundError:
             return []
-        names = [e["name"] if isinstance(e, dict) else e for e in entries]
+        names: list[str] = [
+            entry["name"] if isinstance(entry, dict) else entry for entry in entries
+        ]
         return sorted(p.rsplit("/", 1)[-1].rstrip("/") for p in names)
 
     def write(self, backend: StorageBackend, *, run_id: str) -> str:
@@ -121,7 +136,7 @@ class SnapshotStore:
         self._rotate(fs, root)
         return f"{self.uri}/{stamp}"
 
-    def _rotate(self, fs: Any, root: str) -> None:
+    def _rotate(self, fs: SnapshotFilesystem, root: str) -> None:
         """Delete oldest snapshots beyond retention.
 
         Args:

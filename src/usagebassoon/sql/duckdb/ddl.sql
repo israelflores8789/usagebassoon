@@ -9,7 +9,8 @@
 --
 -- Fact tables use current-state upserts: an existing natural key is updated
 -- in place, a new natural key is inserted, and absent input rows are never
--- deleted. last_collected_at is a freshness marker, not version keys.
+-- deleted. last_updated_at records the last material change, not collection
+-- freshness or a version key.
 -- Normalized table snapshots provide restore capability; raw tokscale
 -- JSON is intentionally not stored on every ingest.
 
@@ -58,7 +59,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_label   TEXT,
     first_seen_at   TIMESTAMPTZ NOT NULL,
     last_seen_at    TIMESTAMPTZ NOT NULL,
-    last_collected_at    TIMESTAMPTZ NOT NULL,
+    last_updated_at      TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (client, session_id)
 );
 
@@ -94,7 +95,7 @@ CREATE TABLE IF NOT EXISTS session_model_stats (
     price_captured_at   TIMESTAMPTZ,
     first_seen_at       TIMESTAMPTZ NOT NULL,
     last_seen_at        TIMESTAMPTZ NOT NULL,
-    last_collected_at   TIMESTAMPTZ NOT NULL,
+    last_updated_at     TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (client, session_id, model)
 );
 
@@ -112,7 +113,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     reasoning         BIGINT,
     message_count     BIGINT,
     cost_usd          DOUBLE,
-    last_collected_at TIMESTAMPTZ NOT NULL,
+    last_updated_at   TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (day, client, model)
 );
 
@@ -121,7 +122,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
     day               DATE PRIMARY KEY,
     intensity         INTEGER,
     active_time_ms    BIGINT,
-    last_collected_at TIMESTAMPTZ NOT NULL
+    last_updated_at   TIMESTAMPTZ NOT NULL
 );
 
 -- Historical point-in-time rates resolved by tokscale. Unlike current-state

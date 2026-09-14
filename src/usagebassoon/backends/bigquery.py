@@ -3,12 +3,12 @@
 
 """bigquery.py — BigQuery backend.
 
-STRUCTURAL ONLY (v4 bundle): google-cloud-bigquery and GCP credentials
+TODO!!
+STRUCTURAL ONLY: google-cloud-bigquery and GCP credentials
 were unavailable in the offline conformance sandbox, so this module is
 syntax-compiled and design-reviewed but not execution-verified. The merge
-SQL is the same logical statement as the DuckDB merge (both dialects
-support IS DISTINCT FROM and window QUALIFY); CI must run this module
-against a real free-tier BigQuery dataset before release.
+SQL follows the same current-state upsert contract as DuckDB. CI must run
+this module against a real free-tier BigQuery dataset before release.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from importlib import resources
 
 import pyarrow as pa
 from google.cloud import bigquery
+
+from usagebassoon.backends.base import UpsertResult
 
 
 class BigQueryBackend:
@@ -51,52 +53,39 @@ class BigQueryBackend:
         """Ensure dataset, then run ddl.sql and views.sql statements."""
         ds = bigquery.Dataset(self.dataset_ref)
         self.client.create_dataset(ds, exists_ok=True)
-        pkg = resources.files(f"tokledger.sql.{self.dialect}")
+        pkg = resources.files(f"usagebassoon.sql.{self.dialect}")
         for name in ("ddl.sql", "views.sql"):
             r = pkg.joinpath(name)
             if r.is_file():
                 for stmt in r.read_text().split(";"):
                     if stmt.strip():
-                        self.client.query(stmt).result()
+                        self.client.query(
+                            stmt,
+                            job_config=bigquery.QueryJobConfig(
+                                default_dataset=self.dataset_ref
+                            ),
+                        ).result()
 
-    @staticmethod
-    def _latest_sql(table: str, natural_keys: Sequence[str]) -> str:
-        """Inline a fresh latest-per-key scan via QUALIFY.
-
-        Args:
-            table: Project.dataset-qualified table name.
-            natural_keys: Natural key columns.
-
-        Returns:
-            SQL fragment selecting the newest row per key.
-        """
-        nk = ", ".join(natural_keys)
-        return (
-            f"SELECT * FROM {table} QUALIFY row_number() "
-            f"OVER (PARTITION BY {nk} "
-            f"ORDER BY collected_at DESC) = 1"
-        )
-
-    def merge(
+    def upsert(
         self,
         table: str,
         data: pa.Table,
         natural_keys: Sequence[str],
-        measure_fields: Sequence[str],
-    ) -> int:
-        """Single-statement delta merge; atomic by construction.
+        change_fields: Sequence[str],
+    ) -> UpsertResult:
+        """Insert new rows and update changed current-state rows.
 
         Args:
             table: Target fact table.
             data: Staged Arrow batch.
             natural_keys: Natural key columns.
-            measure_fields: Columns compared null-safe (IS DISTINCT FROM).
+            change_fields: Columns compared null-safe (IS DISTINCT FROM).
 
         Returns:
-            Rows appended (job.num_dml_affected_rows).
+            Separate inserted and updated row counts.
         """
         if data.num_rows == 0:
-            return 0
+            return UpsertResult()
         stage = f"{self.dataset_ref}._stage_{table}"
         self.client.load_table_from_arrow(
             data,
@@ -107,21 +96,40 @@ class BigQueryBackend:
         ).result()
         nk = list(natural_keys)
         cols = data.schema.names
-        measures = " OR ".join(f"l.{m} IS DISTINCT FROM s.{m}" for m in measure_fields)
-        change = f" OR ({measures})" if measures else ""
-        latest = self._latest_sql(f"{self.dataset_ref}.{table}", nk)
-        select_cols = ", ".join(
-            f"COALESCE(l.{c}, s.{c})" if c == "first_seen_at" else f"s.{c}"
-            for c in cols
+        join = " AND ".join(f"target.{key} = source.{key}" for key in nk)
+        changes = " OR ".join(
+            f"target.{field} IS DISTINCT FROM source.{field}" for field in change_fields
         )
+        change = changes or "FALSE"
+        assignments: list[str] = []
+        for column in cols:
+            value = f"source.{column}"
+            if column == "first_seen_at":
+                value = f"COALESCE(target.{column}, {value})"
+            assignments.append(f"{column} = {value}")
+        source_values = ", ".join(f"source.{column}" for column in cols)
+        counted = self.client.query(
+            f"SELECT "
+            f"countif(target.{nk[0]} IS NULL) AS inserted, "
+            f"countif(target.{nk[0]} IS NOT NULL AND ({change})) AS updated "
+            f"FROM `{stage}` source "
+            f"LEFT JOIN `{self.dataset_ref}.{table}` target ON {join}"
+        ).result()
+        count_row = next(iter(counted), None)
+        if count_row is None:
+            return UpsertResult()
         job = self.client.query(
-            f"INSERT INTO {self.dataset_ref}.{table} ({', '.join(cols)}) "
-            f"SELECT {select_cols} FROM `{stage}` s "
-            f"LEFT JOIN ({latest}) l USING ({', '.join(nk)}) "
-            f"WHERE l.{nk[0]} IS NULL{change}"
+            f"MERGE `{self.dataset_ref}.{table}` target "
+            f"USING `{stage}` source ON {join} "
+            f"WHEN MATCHED AND ({change}) THEN UPDATE SET {', '.join(assignments)} "
+            f"WHEN NOT MATCHED THEN INSERT ({', '.join(cols)}) "
+            f"VALUES ({source_values})"
         )
         job.result()
-        return int(job.num_dml_affected_rows or 0)
+        return UpsertResult(
+            inserted=int(count_row["inserted"]),
+            updated=int(count_row["updated"]),
+        )
 
     def append(self, table: str, data: pa.Table) -> None:
         """Append a batch via a WRITE_APPEND load job.
@@ -149,10 +157,13 @@ class BigQueryBackend:
         Returns:
             Result set as an Arrow table.
         """
-        return self.client.query(sql).to_arrow()
+        return self.client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(default_dataset=self.dataset_ref),
+        ).to_arrow()
 
     def transaction(self) -> AbstractContextManager[None]:
-        """No-op context: merges are single atomic INSERT statements."""
+        """Return a no-op context because each BigQuery DML job is atomic."""
         return nullcontext()
 
     def close(self) -> None:

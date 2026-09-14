@@ -16,6 +16,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from usagebassoon.json_types import JsonValue
+
 
 class SessionRow(BaseModel):
     """Stable session metadata; LLM-summary fields intentionally excluded."""
@@ -75,7 +77,7 @@ class SessionRow(BaseModel):
         return tuple(value or ())
 
 
-def parse_report(payload: list[dict[str, Any]]) -> list[SessionRow]:
+def parse_report(payload: JsonValue) -> list[SessionRow]:
     """Parse the report JSON array into validated session rows.
 
     Args:
@@ -91,7 +93,8 @@ def parse_report(payload: list[dict[str, Any]]) -> list[SessionRow]:
     """
     if not isinstance(payload, list):
         raise ValueError("report payload must be a JSON array")
-    rows, seen = [], set()
+    rows: list[SessionRow] = []
+    seen: set[tuple[str, str]] = set()
     for row in payload:
         session = SessionRow.model_validate(row)
         key = (session.client, session.session_id)
@@ -120,7 +123,6 @@ def make_session_label(row: SessionRow) -> str:
     day = row.created_at.date().isoformat() if row.created_at else "unknown-date"
     sid = row.session_id
     # parts: rollout, YYYY, MM, DDTHH, MI, SS, then uuid groups
-    short = (
-        sid.split("-")[6] if sid.startswith("rollout-") and len(sid.split("-")) > 6 else sid[:12]
-    )
+    parts = sid.split("-")
+    short = parts[6] if sid.startswith("rollout-") and len(parts) > 6 else sid[:12]
     return f"{label} · {day} · {short}"

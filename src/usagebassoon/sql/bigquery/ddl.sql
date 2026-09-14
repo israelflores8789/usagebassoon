@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     models_used     ARRAY<STRING>,
     session_label   STRING,
     first_seen_at   TIMESTAMP NOT NULL,
-    last_seen_at    TIMESTAMP NOT NULL
+    last_seen_at    TIMESTAMP NOT NULL,
+    last_updated_at TIMESTAMP NOT NULL
 );
 
 -- Fact table from `tokscale models --json --group-by client,session,model`.
@@ -91,7 +92,8 @@ CREATE TABLE IF NOT EXISTS session_model_stats (
     price_source        STRING,
     price_captured_at   TIMESTAMP,
     first_seen_at       TIMESTAMP NOT NULL,
-    last_seen_at        TIMESTAMP NOT NULL
+    last_seen_at        TIMESTAMP NOT NULL,
+    last_updated_at     TIMESTAMP NOT NULL
 );
 
 -- Daily fact from `tokscale graph` contributions[]. One current row exists
@@ -108,7 +110,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     reasoning       INT64,
     message_count   INT64,
     cost_usd          FLOAT64,
-    last_collected_at TIMESTAMP NOT NULL
+    last_updated_at   TIMESTAMP NOT NULL
 );
 
 -- Day-level activity from contributions[].
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
     day               DATE NOT NULL,
     intensity         INT64,
     active_time_ms    INT64,
-    last_collected_at TIMESTAMP NOT NULL
+    last_updated_at   TIMESTAMP NOT NULL
 );
 
 -- Historical point-in-time rates resolved by tokscale. Unlike current-state

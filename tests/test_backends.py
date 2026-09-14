@@ -1,75 +1,133 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_backends.py — Backend tests: local DuckDB round-trips; MotherDuck validation only.
-
-MotherDuck connectivity is intentionally not tested here — it requires a
-token and a live service. Behaviour under missing/invalid config is.
-"""
+"""Backend tests for local DuckDB and offline MotherDuck validation."""
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
-from usagebassoon.backends.base import DatabaseBackend
-from usagebassoon.backends.duckdb_local import LocalDuckDBBackend
+
+from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
 
 
-def test_local_backend_creates_parents(tmp_path: Path) -> None:
-    """Assert parent directories are created on write."""
-    target = tmp_path / "deep" / "nested" / "stats.duckdb"
-    backend = LocalDuckDBBackend(target)
-    with backend.connect() as con:
-        con.execute("CREATE TABLE probe (i INTEGER)")
-        con.execute("INSERT INTO probe VALUES (42)")
-    assert target.exists()
+def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
+    """Assert the local backend applies the DDL currently shipped for DuckDB."""
+    backend = DuckDBBackend(tmp_path / "deep" / "stats.duckdb")
+    try:
+        backend.apply_ddl()
+        tables = (
+            backend.query(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main' ORDER BY table_name"
+            )
+            .column("table_name")
+            .to_pylist()
+        )
+        assert tables == [
+            "daily_activity",
+            "daily_activity_current",
+            "daily_stats",
+            "daily_stats_current",
+            "ingest_runs",
+            "notes",
+            "pricing_snapshots",
+            "reconciliation_issues",
+            "run_metrics",
+            "schema_drift",
+            "session_model_stats",
+            "session_model_stats_current",
+            "sessions",
+            "sessions_current",
+            "tags",
+        ]
+        columns = backend.query("DESCRIBE sessions").column("column_name").to_pylist()
+        assert columns[-3:] == ["first_seen_at", "last_seen_at", "last_updated_at"]
+    finally:
+        backend.close()
 
 
-def test_local_backend_read_only_round_trip(tmp_path: Path) -> None:
-    """Assert data written then re-opened read-only reads back."""
-    target = tmp_path / "stats.duckdb"
-    backend = LocalDuckDBBackend(target)
-    with backend.connect() as con:
-        con.execute("CREATE TABLE probe (i INTEGER)")
-        con.execute("INSERT INTO probe VALUES (42)")
-    with backend.connect(read_only=True) as con:
-        assert con.execute("SELECT i FROM probe").fetchone() == (42,)
+def test_local_backend_merges_current_state_in_place() -> None:
+    """Assert a changed fact updates its DDL primary-key row rather than appending."""
+    backend = DuckDBBackend(":memory:")
+    first_updated_at = datetime(2026, 9, 14, tzinfo=UTC)
+    second_updated_at = datetime(2026, 9, 15, tzinfo=UTC)
+    try:
+        backend.apply_ddl()
+        first = pa.table(
+            {
+                "day": [date(2026, 9, 14)],
+                "intensity": [1],
+                "active_time_ms": [100],
+                "last_updated_at": [first_updated_at],
+            }
+        )
+        changed = first.set_column(1, "intensity", pa.array([2])).set_column(
+            3,
+            "last_updated_at",
+            pa.array([second_updated_at]),
+        )
+        first_result = backend.upsert(
+            "daily_activity",
+            first,
+            ("day",),
+            ("intensity",),
+        )
+        assert first_result.affected == 1
+        unchanged_result = backend.upsert(
+            "daily_activity",
+            first,
+            ("day",),
+            ("intensity",),
+        )
+        assert unchanged_result.affected == 0
+        assert (
+            backend.upsert(
+                "daily_activity",
+                changed,
+                ("day",),
+                ("intensity",),
+            ).updated
+            == 1
+        )
+        assert backend.query(
+            "SELECT intensity, last_updated_at FROM daily_activity"
+        ).to_pylist() == [{"intensity": 2, "last_updated_at": second_updated_at}]
+    finally:
+        backend.close()
 
 
-def test_local_backend_expands_user() -> None:
-    """Assert tilde expansion on the database path."""
-    backend = LocalDuckDBBackend("~/usagebassoon-test.duckdb")
-    assert "~" not in str(backend.database)
-
-
-def test_motherduck_rejects_prefixed_name() -> None:
-    """Assert md:-prefixed database names are rejected."""
+def test_motherduck_rejects_invalid_database_name() -> None:
+    """Assert MotherDuck rejects empty and already-prefixed database names."""
+    with pytest.raises(ValueError, match="database name"):
+        MotherDuckBackend("")
     with pytest.raises(ValueError, match="database name"):
         MotherDuckBackend("md:usagebassoon")
 
 
-def test_motherduck_rejects_empty_name() -> None:
-    """Assert empty database names are rejected."""
-    with pytest.raises(ValueError, match="database name"):
-        MotherDuckBackend("")
-
-
-def test_motherduck_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Assert a missing token raises before any connection attempt."""
+def test_motherduck_requires_token_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assert a missing MotherDuck token fails without contacting the service."""
     monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="MOTHERDUCK_TOKEN"):
-        with MotherDuckBackend("usagebassoon").connect():
-            pass
+        MotherDuckBackend("usagebassoon")
 
 
-def test_backends_satisfy_protocol(tmp_path: Path) -> None:
-    """Assert both concrete backends structurally fit DatabaseBackend."""
+def test_local_backend_satisfies_storage_protocol() -> None:
+    """Assert the local implementation exposes the Arrow StorageBackend API."""
 
-    def accept(backend: DatabaseBackend) -> None:
-        """Accept any structurally conforming backend."""
-        assert callable(backend.connect)
+    def accept(backend: StorageBackend) -> None:
+        """Accept a structurally conforming storage backend."""
+        assert callable(backend.apply_ddl)
 
-    accept(LocalDuckDBBackend(tmp_path / "protocol-check.duckdb"))
-    accept(MotherDuckBackend("usagebassoon", token="placeholder"))
+    backend = DuckDBBackend(":memory:")
+    try:
+        accept(backend)
+    finally:
+        backend.close()

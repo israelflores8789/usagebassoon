@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from usagebassoon.json_types import JsonValue
+
 
 class TokenBreakdown(BaseModel):
     """The five token buckets for one contribution client entry."""
@@ -104,7 +106,7 @@ class GraphPayload(BaseModel):
     contributions: list[Contribution]
 
 
-def parse_graph(payload: dict[str, Any]) -> GraphPayload:
+def parse_graph(payload: JsonValue) -> GraphPayload:
     """Parse graph JSON into validated daily facts and telemetry.
 
     Args:

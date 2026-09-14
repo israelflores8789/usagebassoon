@@ -74,7 +74,13 @@ def reconcile_models_report(
     for row in models.entries:
         agg = totals.setdefault(
             (row.client, row.session_id),
-            {"input": 0.0, "output": 0.0, "cache_read": 0.0, "messages": 0.0, "cost": 0.0},
+            {
+                "input": 0.0,
+                "output": 0.0,
+                "cache_read": 0.0,
+                "messages": 0.0,
+                "cost": 0.0,
+            },
         )
         agg["input"] += row.input_tokens
         agg["output"] += row.output_tokens
@@ -188,7 +194,9 @@ def reconcile_models_graph(
     if abs(graph_cost - Decimal(str(models.total_cost))) > Decimal("0.000000001"):
         issues.append(
             ReconciliationIssue(
-                "models_graph_cost_total", "cost", f"graph={graph_cost}, models={models.total_cost}"
+                "models_graph_cost_total",
+                "cost",
+                f"graph={graph_cost}, models={models.total_cost}",
             )
         )
     token_sum = sum(expected.values())

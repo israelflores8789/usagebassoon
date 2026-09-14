@@ -1,0 +1,119 @@
+{
+  "format_version": 1,
+  "payload_kind": "pricing",
+  "tokscale_version": "4.15.1",
+  "entries": [
+    {
+      "path": "matchedKey",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "modelId",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "pricing",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "pricing.cacheReadInputTokenCost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "pricing.inputCostPerToken",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "pricing.outputCostPerToken",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.aliasApplied",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.candidateCount",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.exactModelIdentity",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.kind",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.normalized",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.priceConsensus",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.stripped",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "resolution.submissionSafe",
+      "types": [
+        "bool"
+      ],
+      "required": true
+    },
+    {
+      "path": "source",
+      "types": [
+        "str"
+      ],
+      "required": true
+    }
+  ]
+}

@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict, Field
+
+from usagebassoon.json_types import JsonValue
 
 
 class PricingResolution(BaseModel):
@@ -31,8 +31,14 @@ class PricingRates(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     input_cost_per_token: float | None = Field(default=None, alias="inputCostPerToken")
-    output_cost_per_token: float | None = Field(default=None, alias="outputCostPerToken")
-    cache_read_input_token_cost: float | None = Field(default=None, alias="cacheReadInputTokenCost")
+    output_cost_per_token: float | None = Field(
+        default=None,
+        alias="outputCostPerToken",
+    )
+    cache_read_input_token_cost: float | None = Field(
+        default=None,
+        alias="cacheReadInputTokenCost",
+    )
     cache_write_input_token_cost: float | None = Field(
         default=None, alias="cacheWriteInputTokenCost"
     )
@@ -50,7 +56,7 @@ class PricingRow(BaseModel):
     pricing: PricingRates
 
 
-def parse_pricing(payload: dict[str, Any]) -> PricingRow:
+def parse_pricing(payload: JsonValue) -> PricingRow:
     """Parse pricing JSON into a validated rate card.
 
     Args:

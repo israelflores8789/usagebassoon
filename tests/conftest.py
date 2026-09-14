@@ -11,15 +11,15 @@ across this suite.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import cast
 from uuid import uuid4
 
-import duckdb
 import pytest
-from usagebassoon.merge import CollectionBundle
+
+from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
+from usagebassoon.normalizer import CollectionBundle
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.models import ModelsPayload, parse_models
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
@@ -42,7 +42,7 @@ EXPECTED_TOTAL_COST = 109.48238866000003
 EXPECTED_TOKSCALE_VERSION = "4.15.1"
 
 
-def _load(name: str) -> Any:
+def _load(name: str) -> JsonValue:
     """Load a golden fixture by stem name.
 
     Args:
@@ -51,53 +51,92 @@ def _load(name: str) -> Any:
     Returns:
         The decoded JSON payload.
     """
-    return json.loads((FIXTURES / f"golden-2026-09-10.{name}.json").read_text())
+    return cast(
+        JsonValue,
+        json.loads((FIXTURES / f"golden-2026-09-10.{name}.json").read_text()),
+    )
+
+
+def _load_object(name: str) -> JsonObject:
+    """Load a golden fixture known to have an object top-level shape.
+
+    Args:
+        name: Fixture stem, e.g. "models".
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        TypeError: If the fixture's top-level shape is not an object.
+    """
+    payload = _load(name)
+    if not isinstance(payload, dict):
+        raise TypeError(f"fixture {name} must be a JSON object")
+    return payload
+
+
+def _load_array(name: str) -> JsonArray:
+    """Load a golden fixture known to have an array top-level shape.
+
+    Args:
+        name: Fixture stem, e.g. "report".
+
+    Returns:
+        The decoded JSON array.
+
+    Raises:
+        TypeError: If the fixture's top-level shape is not an array.
+    """
+    payload = _load(name)
+    if not isinstance(payload, list):
+        raise TypeError(f"fixture {name} must be a JSON array")
+    return payload
 
 
 @pytest.fixture(scope="session")
-def models_raw() -> dict[str, Any]:
+def models_raw() -> JsonObject:
     """Return the raw models payload as decoded JSON."""
-    return _load("models")
+    return _load_object("models")
 
 
 @pytest.fixture(scope="session")
-def report_raw() -> list[dict[str, Any]]:
+def report_raw() -> JsonArray:
     """Return the raw report payload as decoded JSON."""
-    return _load("report")
+    return _load_array("report")
 
 
 @pytest.fixture(scope="session")
-def graph_raw() -> dict[str, Any]:
+def graph_raw() -> JsonObject:
     """Return the raw graph payload as decoded JSON."""
-    return _load("graph")
+    return _load_object("graph")
 
 
 @pytest.fixture(scope="session")
-def pricing_raw() -> dict[str, Any]:
+def pricing_raw() -> JsonObject:
     """Return the raw pricing payload as decoded JSON."""
-    return _load("pricing")
+    return _load_object("pricing")
 
 
 @pytest.fixture(scope="session")
-def models_payload(models_raw: dict[str, Any]) -> ModelsPayload:
+def models_payload(models_raw: JsonObject) -> ModelsPayload:
     """Return the validated models payload."""
     return parse_models(models_raw)
 
 
 @pytest.fixture(scope="session")
-def report_rows(report_raw: list[dict[str, Any]]) -> list[SessionRow]:
+def report_rows(report_raw: JsonArray) -> list[SessionRow]:
     """Return the validated report rows."""
     return parse_report(report_raw)
 
 
 @pytest.fixture(scope="session")
-def graph_payload(graph_raw: dict[str, Any]) -> GraphPayload:
+def graph_payload(graph_raw: JsonObject) -> GraphPayload:
     """Return the validated graph payload."""
     return parse_graph(graph_raw)
 
 
 @pytest.fixture(scope="session")
-def pricing_row(pricing_raw: dict[str, Any]) -> PricingRow:
+def pricing_row(pricing_raw: JsonObject) -> PricingRow:
     """Return the validated pricing row."""
     return parse_pricing(pricing_raw)
 
@@ -113,30 +152,20 @@ def recon_result(
 
 
 @pytest.fixture
-def connection() -> Iterator[duckdb.DuckDBPyConnection]:
-    """Yield an in-memory DuckDB connection with the full DDL applied."""
-    ddl = Path(__file__).parents[1] / "src" / "usagebassoon" / "sql" / "ddl.sql"
-    con = duckdb.connect(":memory:")
-    con.execute(ddl.read_text())
-    yield con
-    con.close()
-
-
-@pytest.fixture
 def collection_bundle(
     models_payload: ModelsPayload,
     report_rows: list[SessionRow],
     graph_payload: GraphPayload,
     pricing_row: PricingRow,
-    models_raw: dict[str, Any],
-    report_raw: list[dict[str, Any]],
-    graph_raw: dict[str, Any],
-    pricing_raw: dict[str, Any],
+    models_raw: JsonObject,
+    report_raw: JsonArray,
+    graph_raw: JsonObject,
+    pricing_raw: JsonObject,
     recon_result: ReconciliationResult,
 ) -> CollectionBundle:
     """Build a complete, validated CollectionBundle from the fixtures."""
     return CollectionBundle(
-        run_id=uuid4(),
+        run_id=str(uuid4()),
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC) + timedelta(seconds=2),
         host="pytest",
@@ -144,11 +173,5 @@ def collection_bundle(
         report_rows=report_rows,
         graph=graph_payload,
         pricing_by_model={"gemini-3.8-flash": pricing_row},
-        raw_exports={
-            "models": models_raw,
-            "report": report_raw,
-            "graph": graph_raw,
-            "pricing": pricing_raw,
-        },
         reconciliation=recon_result,
     )

@@ -1,65 +1,43 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""motherduck.py — MotherDuck backend using DuckDB's MotherDuck connection URI."""
+"""motherduck.py — MotherDuck StorageBackend connection and authentication."""
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
 from urllib.parse import quote
 
 import duckdb
 
+from usagebassoon.backends.duckdb_local import _DuckDBStorage
 
-class MotherDuckBackend:
-    """Open a MotherDuck database through DuckDB's `md:` URI.
 
-    Attributes:
-        database: MotherDuck database name, without the `md:` prefix.
+class MotherDuckBackend(_DuckDBStorage):
+    """StorageBackend backed by a MotherDuck database.
+
+    MotherDuck uses the DuckDB SQL schema but has distinct credential and URI
+    handling, which is kept here rather than in the local DuckDB module.
     """
 
     def __init__(self, database: str, *, token: str | None = None) -> None:
-        """Initialize the backend with a database name and optional token.
+        """Connect to a MotherDuck database.
 
         Args:
-            database: MotherDuck database name (no `md:` prefix).
-            token: Service-account or user token. If omitted, the backend
-                reads `MOTHERDUCK_TOKEN` when opening a connection.
+            database: MotherDuck database name without the ``md:`` prefix.
+            token: Service token, or ``MOTHERDUCK_TOKEN`` when omitted.
 
         Raises:
-            ValueError: If the database name is empty or already prefixed.
+            ValueError: If the database name is invalid.
+            RuntimeError: If no token is configured.
         """
         if not database or database.startswith("md:"):
             raise ValueError("database must be a non-empty MotherDuck database name")
+        resolved_token = token or os.environ.get("MOTHERDUCK_TOKEN")
+        if not resolved_token:
+            raise RuntimeError(
+                "MOTHERDUCK_TOKEN is required for MotherDuck connections"
+            )
         self.database = database
-        self._token = token
-
-    @contextmanager
-    def connect(
-        self,
-        *,
-        read_only: bool = False,
-    ) -> Iterator[duckdb.DuckDBPyConnection]:
-        """Open and close a MotherDuck connection.
-
-        Args:
-            read_only: Requested read-only mode; MotherDuck enforces
-                permissions server-side, so this is advisory.
-
-        Yields:
-            An active DuckDB Python connection.
-
-        Raises:
-            RuntimeError: If no MotherDuck token is available.
-        """
-        token = self._token or os.environ.get("MOTHERDUCK_TOKEN")
-        if not token:
-            raise RuntimeError("MOTHERDUCK_TOKEN is required for MotherDuck connections")
-        uri = f"md:{self.database}?motherduck_token={quote(token, safe='')}"
-        connection = duckdb.connect(uri, read_only=read_only)
-        try:
-            yield connection
-        finally:
-            connection.close()
+        uri = f"md:{database}?motherduck_token={quote(resolved_token, safe='')}"
+        super().__init__(duckdb.connect(uri))

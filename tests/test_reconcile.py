@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_reconcile.py — Reconciliation tests over a fixture set known to be partially stale.
+"""Reconciliation tests over a fixture set known to be partially stale.
 
 Appendix A invariant: models-vs-report has 10 drift issues (8 metric + 2
 cost, from two sessions served by report's cached assembly); models-vs-graph
@@ -12,10 +12,6 @@ from __future__ import annotations
 
 from collections import Counter
 
-from usagebassoon.parsers.graph import GraphPayload
-from usagebassoon.parsers.models import ModelsPayload
-from usagebassoon.reconcile import ReconciliationResult, reconcile_models_graph
-
 from tests.conftest import (
     EXPECTED_TOTAL_CACHE_READ,
     EXPECTED_TOTAL_CACHE_WRITE,
@@ -24,6 +20,9 @@ from tests.conftest import (
     EXPECTED_TOTAL_MESSAGES,
     EXPECTED_TOTAL_OUTPUT,
 )
+from usagebassoon.parsers.graph import GraphPayload
+from usagebassoon.parsers.models import ModelsPayload
+from usagebassoon.reconcile import ReconciliationResult, reconcile_models_graph
 
 
 def test_reconcile_report_drift_is_exactly_ten(
@@ -38,7 +37,9 @@ def test_reconcile_report_drift_is_exactly_ten(
 def test_reconcile_graph_is_clean(recon_result: ReconciliationResult) -> None:
     """Assert graph reconciles with models with zero issues."""
     graph_checks = [
-        i for i in recon_result.issues if i.check.startswith(("models_graph", "graph_summary"))
+        i
+        for i in recon_result.issues
+        if i.check.startswith(("models_graph", "graph_summary"))
     ]
     assert graph_checks == []
 

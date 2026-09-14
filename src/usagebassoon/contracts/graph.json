@@ -1,0 +1,378 @@
+{
+  "format_version": 1,
+  "payload_kind": "graph",
+  "tokscale_version": "4.15.1",
+  "entries": [
+    {
+      "path": "contributions",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].activeTimeMs",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].client",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].cost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].messages",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].modelId",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].providerId",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens.cacheRead",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens.cacheWrite",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens.input",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens.output",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].clients[].tokens.reasoning",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].date",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].intensity",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown.cacheRead",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown.cacheWrite",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown.input",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown.output",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].tokenBreakdown.reasoning",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].totals",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].totals.cost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].totals.messages",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "contributions[].totals.tokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta.dateRange",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta.dateRange.end",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta.dateRange.start",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta.generatedAt",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "meta.version",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.activeDays",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.averagePerDay",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.clients",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.maxCostInSingleDay",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.models",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.totalCost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.totalDays",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "summary.totalTokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "timeMetrics",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "timeMetrics.longestContinuousMs",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "timeMetrics.maxConcurrentSessions",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "timeMetrics.sessionCount",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "timeMetrics.totalActiveTimeMs",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "years",
+      "types": [
+        "array"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].range",
+      "types": [
+        "object"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].range.end",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].range.start",
+      "types": [
+        "str"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].totalCost",
+      "types": [
+        "float"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].totalTokens",
+      "types": [
+        "int"
+      ],
+      "required": true
+    },
+    {
+      "path": "years[].year",
+      "types": [
+        "str"
+      ],
+      "required": true
+    }
+  ]
+}

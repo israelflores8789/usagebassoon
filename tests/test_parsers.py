@@ -6,13 +6,8 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from typing import Any
 
 import pytest
-from usagebassoon.parsers.graph import GraphPayload, parse_graph
-from usagebassoon.parsers.models import ModelsPayload, parse_models
-from usagebassoon.parsers.pricing import PricingRow
-from usagebassoon.parsers.report import SessionRow, make_session_label, parse_report
 
 from tests.conftest import (
     EXPECTED_DAILY_ROWS,
@@ -21,6 +16,11 @@ from tests.conftest import (
     EXPECTED_REPORT_ROWS,
     EXPECTED_TOKSCALE_VERSION,
 )
+from usagebassoon.json_types import JsonArray, JsonObject
+from usagebassoon.parsers.graph import GraphPayload, parse_graph
+from usagebassoon.parsers.models import ModelsPayload, parse_models
+from usagebassoon.parsers.pricing import PricingRow
+from usagebassoon.parsers.report import SessionRow, make_session_label, parse_report
 
 
 def test_models_shape(models_payload: ModelsPayload) -> None:
@@ -77,10 +77,10 @@ def test_report_no_llm_summary_fields(report_rows: list[SessionRow]) -> None:
         assert excluded.isdisjoint(row.model_fields_set | set(row.model_dump()))
 
 
-def test_report_duplicate_session_rejected(report_raw: list[dict[str, Any]]) -> None:
+def test_report_duplicate_session_rejected(report_raw: JsonArray) -> None:
     """Assert duplicate session keys are rejected."""
     with pytest.raises(ValueError, match="duplicate report session key"):
-        parse_report(report_raw + [report_raw[0]])
+        parse_report([*report_raw, report_raw[0]])
 
 
 def test_session_label_unique(report_rows: list[SessionRow]) -> None:
@@ -92,15 +92,19 @@ def test_session_label_unique(report_rows: list[SessionRow]) -> None:
 def test_graph_shape(graph_payload: GraphPayload) -> None:
     """Assert the graph payload carries the expected fixture shape."""
     assert len(graph_payload.contributions) == EXPECTED_DAYS
-    assert sum(len(c.clients) for c in graph_payload.contributions) == EXPECTED_DAILY_ROWS
+    assert (
+        sum(len(c.clients) for c in graph_payload.contributions) == EXPECTED_DAILY_ROWS
+    )
     assert graph_payload.meta.version == EXPECTED_TOKSCALE_VERSION
     assert graph_payload.contributions[0].date == date(2026, 8, 22)
 
 
-def test_graph_duplicate_dates_rejected(graph_raw: dict[str, Any]) -> None:
+def test_graph_duplicate_dates_rejected(graph_raw: JsonObject) -> None:
     """Assert duplicate contribution dates are rejected."""
     dup = dict(graph_raw)
-    dup["contributions"] = graph_raw["contributions"] + [graph_raw["contributions"][0]]
+    contributions = graph_raw["contributions"]
+    assert isinstance(contributions, list)
+    dup["contributions"] = [*contributions, contributions[0]]
     with pytest.raises(ValueError, match="duplicate contribution date"):
         parse_graph(dup)
 
