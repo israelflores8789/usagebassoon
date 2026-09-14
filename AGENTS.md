@@ -98,6 +98,10 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 
 ## Rules
 
+- ALL Python code should target Python 3.12+ syntax only.
+- ALL generated/edited Python source code MUST pass Ruff and Pyrefly checks through `just lint` and `just typecheck`, respecitively. You MUST run Ruff and Pyrefly as a matter of routine after generating or editing any Python source code.
+- Do NOT suppress diagnostics to make checks pass. Do NOT introduce implicit `Any` or use bare generic types.
+- PREFER PEP 695 syntax for **all** new generic declarations and type aliases. USE modern built-in generic and union syntax.
 - USE Google-style docstrings for **all** source code.
 - KEEP comments concise yet clear. Do NOT use numbered headers (e.g. "1." or "(1)" etc).
 - NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).

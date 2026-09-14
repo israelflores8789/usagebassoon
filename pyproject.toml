@@ -11,7 +11,7 @@ name = "usagebassoon"
 dynamic = ["version"]
 description = "Persistent analytics over tokscale's stateless JSON exports"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 dependencies = [
     "duckdb>=1.0",
@@ -21,10 +21,14 @@ dependencies = [
     "rich>=13.0",
     "plotext>=5.2",
     "pyarrow>=25.0.1",
+    "fsspec>=2026.7.0",
 ]
 
 [project.optional-dependencies]
 polars = ["polars>=1.0"]
+bigquery = ["google-cloud-bigquery>=3.17"]
+gcs = ["gcsfs>=2023.6"]
+full = ["polars>=1.0", "google-cloud-bigquery>=3.17", "gcsfs>=2023.6"]
 
 [project.scripts]
 usagebassoon = "usagebassoon.cli:app"
@@ -36,6 +40,7 @@ dev = [
     "ruff>=0.8",
     "pyrefly>=0.20",
     "twine>=7.0.0",
+    "sqlglot>=30.18.0",
 ]
 
 [tool.hatch.version]
@@ -47,24 +52,31 @@ fallback-version = "0.1.0"
 packages = ["src/usagebassoon"]
 
 [tool.ruff]
-line-length = 100
-target-version = "py311"
+target-version = "py312"
+line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "ANN"]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "ANN", "PGH"]
 ignore = [
     "D100",    # missing docstring in public module (SQL-only modules)
     "D104",    # missing docstring in public package (__init__.py)
     "D203",    # one-blank-line-before-class (conflicts with D211)
     "D212",    # multi-line-summary-first-line (conflicts with D213)
-    "ANN401",  # Any allowed for raw JSON payloads
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"src/usagebassoon/parsers/**/*.py" = ["ANN401"]
+"src/usagebassoon/merge.py" = ["ANN401"]
+"tests/conftest.py" = ["ANN401"]
+"tests/test_parsers.py" = ["ANN401"]
+"tests/**/*.py" = ["D", "S101"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.pyrefly]
 preset = "strict"
+python-version = "3.12"
 project-includes = ["src", "tests"]
 search-path = ["."]
 min-severity = "warn"
