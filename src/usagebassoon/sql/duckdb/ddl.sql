@@ -9,8 +9,8 @@
 --
 -- Fact tables use current-state upserts: an existing natural key is updated
 -- in place, a new natural key is inserted, and absent input rows are never
--- deleted. last_collected_at/last_seen_at are freshness markers, not version
--- keys. Normalized table snapshots provide restore capability; raw tokscale
+-- deleted. last_collected_at is a freshness marker, not version keys.
+-- Normalized table snapshots provide restore capability; raw tokscale
 -- JSON is intentionally not stored on every ingest.
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_label   TEXT,
     first_seen_at   TIMESTAMPTZ NOT NULL,
     last_seen_at    TIMESTAMPTZ NOT NULL,
+    last_collected_at    TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (client, session_id)
 );
 
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS session_model_stats (
     price_captured_at   TIMESTAMPTZ,
     first_seen_at       TIMESTAMPTZ NOT NULL,
     last_seen_at        TIMESTAMPTZ NOT NULL,
+    last_collected_at   TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (client, session_id, model)
 );
 

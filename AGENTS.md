@@ -30,7 +30,7 @@ usagebassoon/
 │   ├── arrow_port.py         # normalizer: models → Arrow, derived columns
 │   ├── drift.py              # schema_drift detection + reporting
 │   ├── snapshots.py          # local/GCS rotating snapshots + restore
-│   ├── merge.py              # staging + delta append + current-view logic + rebuild + session_label
+│   ├── merge.py              # staging + delta append + current-view logic + session_label
 │   ├── reconcile.py          # cross-payload consistency checks
 │   ├── curation.py           # tags + notes
 │   ├── obfuscate.py          # export-time pseudonymization
@@ -152,13 +152,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Library + CLI:** Everything the CLI does is importable Python.
 
-- **Raw tokscale data storage:** Raw tokscale JSON output will be persisted and updated by addition only. tokscale only outputs full JSON token usage history. The initial output for a given user environment will be persisted uniquely while subsequent JSON outputs will be updated based only on their additions. Data absent from tokscale's subsequent output (e.g. due to a deleted agent session) will *remain* in the usagebassoon database. Only data additions will be ingested.
-
-- **Append-mostly delta semantics of raw tokscale data:** Raw tokscale JSON output from every `bassoon collect` compares tokscale's cumulative state against the raw data warehouse's current state and appends only what changed. Curated fact tables carry a `collected_at` version column. A collect run stages the incoming Arrow batch, anti-joins it against the *current* state (a view selecting the latest row per natural key), and appends only:
-  - **Additions** — natural keys not present in the warehouse, and
-  - **In-line updates** — natural keys present, but one or more measured fields changed (higher cost, more tokens, longer duration, etc.).
-
-  A re-sent identical snapshot appends nothing. History is therefore preserved per key; dashboards use the `current_*` views, while `history` is queryable directly. **Absence is never propagated**. If tokscale stops reporting a session (e.g. pruning, compaction, user deletion of the agent session file), the warehouse retains the last observed state. **Exemption**: Users may delete or overwrite their own tags/notes; the append-mostly rule applies to tokscale-derived data only.
+- **Raw tokscale data semantics:** Raw tokscale JSON output from every `bassoon collect` is a *cumulative* state and will be used to compare against the database's current state. A collect run stages the incoming Arrow batch and upserts the data; **never** deletes.
 
 - **Data ingest pipeline:** `bassoon collect` (target runtime < 10s):
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
@@ -166,9 +160,8 @@ The following are out-of-scope and/or antithetical to the design goals:
   3. Validate against the schema contract with pydantic strict mode. Required-field absence **fails the run** with a clear error; *unknown* fields or changed cardinalities are **drift events** — recorded in `schema_drift`, surfaced in output, surfaced again on the next `bassoon doctor`, and the run continues (tolerant reader) so collection is never blocked by additive changes. (Be careful! this can cause migration issues if a hotfix is released!)
   4. Reconcile models ↔ report session overlap and cost drift; graph totals ↔ models grand totals per token type. Mismatches go to `ingest_runs` and are surfaced by `bassoon doctor`.
   5. Normalize to Arrow tables; compute derived columns. Stage each fact table in one batch.
-  6. **Delta merge**: anti-join staged rows against the `current_*` view on natural key + measured-field tuple; append additions and superseding updates in one transaction (BigQuery: `MERGE` DML; DuckDB/MotherDuck: transactional delete-free `INSERT`). Tags/notes untouched.
+  6. Stage the Arrow batch, match rows by natural key, update changed existing rows, insert new rows, and leave absent rows untouched. Use a transactional upsert/MERGE; **never** delete.
   7. Optionally: if `snapshots.interval` has elapsed, run `bassoon snapshot`.
-  - Concurrent collectors are safe: delta appends are keyed by `(natural_key, collected_at)` (uuid/stamped), merges are per-key idempotent, and last-writer-wins is correct for cumulative snapshots at the view level.
 
 - **Database management:** Locally, data will be managed and stored by DuckDB. Remotely, data will be managed and stored by either MotherDuck or GCP BigQuery. DDL and SQL views will be written natively to their respective dialect (e.g. `sql/duckdb/{ddl,views}.sql` and `sql/bigquery/{ddl,views}.sql`). `SQLGlot` will be used during CI to prevent structural drift. Dedicated pytests will be used during CI to prevent semantic drift against the golden fixtures.
 
@@ -177,13 +170,13 @@ The following are out-of-scope and/or antithetical to the design goals:
   2. Transpiles `bigquery/*` → duckdb dialect, asserts AST-equivalence against the duckdb tree (and vice-versa for the view sets).
   3. A **replay test** runs the same golden-fixture dataset through both dialects in DuckDB (translated BigQuery SQL) and asserts identical result sets. Transpiler parity is *structural*, not semantic.
 
-- **Ingest semantics:** tokscale reports *cumulative* totals per session in `models`; dedupe keeps the latest snapshot per key and values are never summed across rows. `graph` contributions are per-day facts (additive by nature) and merge by their natural key `(day, client, model)`. Tags and notes are owned by the user and are never touched by merge — they persist across `collect` runs and are exported by `bassoon export` like any other table.
+- **Ingest semantics:** tokscale reports *cumulative* totals per session in `models`; dedupe keeps the latest snapshot per key and values are never summed across rows. `graph` contributions are authoritative daily totals at `(day, client, model)` and are upserted; repeated cumulative observations are never summed. Tags and notes are owned by the user and are never touched by merge — they persist across `collect` runs and are exported by `bassoon export` like any other table.
 
-- **Snapshot semantics:** Optional layer providing portability, restore, and seed:
-  - `bassoon snapshot` writes every table to Parquet locally at `~/.usagebassoon/snapshots/` or remotely in GCS `gs://<uri>/<UTC-date>-<short-sha>/`, plus a `manifest.json` (table list, row counts, tokscale contract version, DuckDB/BigQuery schema hashes).
+- **Snapshot semantics:** Snapshots are an optional layer that contain normalized tables that provide portability, restore, and seed of the current database state. They are not raw-payload replay points:
+  - `bassoon snapshot` writes every table to Parquet locally at `~/.usagebassoon/snapshots/` (UTC timestamp in the filename) or remotely in GCS `gs://<uri>/<UTC-date>-<short-sha>/`, plus a `manifest.json` (table list, row counts, tokscale contract version, DuckDB/BigQuery schema hashes).
   - Rotation: after each snapshot, delete the oldest if more than `max_snapshots` exist.
   - `bassoon restore --from-snapshot [latest|date|run]` hydrates a fresh environment (new container, new VM, local↔cloud migration) — reads Parquet → Arrow → backend append path unchanged.
-  - Snapshots are the substrate for `bassoon export` portability too; the export path is the same code with `--sanitize` applied.
+  - Snapshots are the substrate for `bassoon export` portability too.
 
 - **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift` rows and a user-facing warning and asks for a bug report:
 
@@ -210,6 +203,13 @@ $ bassoon collect
               → pandas/polars/Arrow on the way back via `to_arrow()`
   ```
 
+- **Notable SQL semantics:**
+  - `run_id` is generated and UUID-validated by Arrow, then stored as canonical text in SQL backends for dialect portability.
+  - `last_seen_at` is metadata from tokscale's `last_active` or similar.
+  - `last_collected_at` is a freshness marker internal to usagebassoon.
+
+- **General storage model:** Usage facts use current-state upserts. Existing natural keys are overwritten in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Only audit, pricing-history, drift, reconciliation, and snapshot artifacts are append-only. Current-state tables do not retain prior versions of session facts.
+
 ### Canonical Ingest Commands
 
 These are the `tokscale` commands used to generate ingest data. Each command is authoritative for their given data domain. Cross-payload reconciliation runs at ingest. Mismatches are surfaced to request bug reporting, never silently resolved:
@@ -227,7 +227,6 @@ These are the `tokscale` commands used to generate ingest data. Each command is 
 - `cache_efficiency` — cache_read hit ratios per model
 - `burn_rate` — trailing 7/30-day daily averages
 - `session_leaderboard` — top sessions by cost
-- `session_deltas` — derived from version history directly
   (`lag()` over `collected_at`), no longer depending on detection
 - `price_drift` — rate changes per model over time
 - `throughput` — ms_per_1k_tokens distributions per model
@@ -243,7 +242,7 @@ These are the `tokscale` commands used to generate ingest data. Each command is 
 | `bassoon report` | terminal summary; `--sanitize` |
 | `bassoon report --save out.txt` | render incl. charts to text |
 | `bassoon tag` / `note` | user curation |
-| `bassoon rebuild` | full replay: restore latest snapshot + re-ingest since (was raw_exports replay in v1 — raw_exports no longer exists) |
+| `bassoon restore` | recreate normalized state/views from a snapshot and optionally re-collect current tokscale state |
 | `bassoon snapshot` / `bassoon restore` | write/read rotating GCS Parquet snapshots |
 | `bassoon export` | dump any table/view to parquet/csv; `--sanitize` |
 | `bassoon runs` | ingest audit log incl. run_metrics |
@@ -258,7 +257,7 @@ import usagebassoon
 
 df  = usagebassoon.query("SELECT * FROM cost_by_model")                   # pandas
 df  = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")     # polars
-tbl = usagebassoon.query_arrow("SELECT * FROM current_sessions")          # raw Arrow
+tbl = usagebassoon.query_arrow("SELECT * FROM sessions_current")          # raw Arrow
 con = usagebassoon.connect()          # duckdb conn, or ibis-style BigQuery session
 ```
 
