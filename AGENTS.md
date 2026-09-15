@@ -283,7 +283,7 @@ The installed command is `bassoon`. The commands below are implemented; report v
 | `bassoon restore` | recreate normalized state/views from a snapshot and optionally re-collect current tokscale state |
 | `bassoon snapshot` / `bassoon restore` | write/read rotating GCS Parquet snapshots |
 | `bassoon export` | dump a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for intentional raw backup/data management |
-| `bassoon runs` | ingest audit log incl. run_metrics |
+| `bassoon audit` | ingest audit log incl. run_metrics |
 | `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
 
 ### Privacy and sharing policy

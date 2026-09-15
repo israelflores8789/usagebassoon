@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""runs.py — Typer command for recent collection audit history."""
+"""audit.py — Typer command for recent collection audit history."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ from rich.table import Table
 from usagebassoon.cli._utils import configured_backend
 
 
-def runs(
+def audit(
     config: Annotated[
         Path | None,
         typer.Option("--config", help="Use this configuration file."),
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, help="Maximum runs to show."),
+        typer.Option("--limit", min=1, help="Maximum audit records to show."),
     ] = 20,
 ) -> None:
     """Show recent ingestion audit records."""
@@ -35,7 +35,7 @@ def runs(
         )
     finally:
         backend.close()
-    table = Table(title="Recent ingest runs")
+    table = Table(title="Recent ingest audit records")
     for column in data.column_names:
         table.add_column(column)
     for row in data.to_pylist():

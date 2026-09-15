@@ -5,6 +5,7 @@
 
 import typer
 
+from usagebassoon.cli.audit import audit
 from usagebassoon.cli.collect import collect
 from usagebassoon.cli.curation import note, tag
 from usagebassoon.cli.doctor import doctor
@@ -13,7 +14,6 @@ from usagebassoon.cli.init import init
 from usagebassoon.cli.query import query
 from usagebassoon.cli.report import report
 from usagebassoon.cli.restore import restore
-from usagebassoon.cli.runs import runs
 from usagebassoon.cli.snapshot import snapshot
 
 app = typer.Typer(
@@ -37,5 +37,5 @@ app.command(name="note")(note)
 app.command(name="query")(query)
 app.command(name="report")(report)
 app.command(name="restore")(restore)
-app.command(name="runs")(runs)
+app.command(name="audit")(audit)
 app.command(name="snapshot")(snapshot)
