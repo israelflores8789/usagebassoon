@@ -27,6 +27,10 @@ from usagebassoon.reconcile import ReconciliationResult, reconcile_all
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+# Explicit expectations are independent test oracles that catch semantic
+# regressions in parsing and normalization instead of merely rechecking the fixture.
+# If tests were based on the fixture alone, a parser could silently produce a bug
+# because the expected value would be compute from the same transformed fixture data.
 EXPECTED_MODELS_ENTRIES = 88
 EXPECTED_REPORT_ROWS = 81
 EXPECTED_DAILY_ROWS = 23
@@ -38,7 +42,9 @@ EXPECTED_TOTAL_CACHE_WRITE = 0
 EXPECTED_TOTAL_REASONING = 1_686_926
 EXPECTED_TOTAL_MESSAGES = 4_988
 EXPECTED_TOTAL_COST = 109.48238866000003
+EXPECTED_GOLDEN_DATE = "2026-09-10"
 EXPECTED_TOKSCALE_VERSION = "4.15.1"
+FIXTURE_PREFIX = f"golden-{EXPECTED_GOLDEN_DATE}-tokscale-{EXPECTED_TOKSCALE_VERSION}"
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
@@ -53,7 +59,7 @@ def _load(name: str) -> JsonValue:
     """
     return cast(
         JsonValue,
-        json.loads((FIXTURES / f"golden-2026-09-10.{name}.json").read_text()),
+        json.loads((FIXTURES / f"{FIXTURE_PREFIX}.{name}.json").read_text()),
     )
 
 

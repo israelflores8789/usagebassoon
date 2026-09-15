@@ -55,10 +55,10 @@ usagebassoon/
 │   ├── __init__.py
 │   ├── conftest.py           # shared golden-payload fixtures and collection bundle
 │   ├── fixtures/             # sanitized golden captures: models, report, graph, pricing
-│   │   ├── golden-2026-09-10.graph.json
-│   │   ├── golden-2026-09-10.models.json
-│   │   ├── golden-2026-09-10.pricing.json
-│   │   └── golden-2026-09-10.report.json
+│   │   ├── golden-2026-09-10-tokscale-4.15.1.graph.json
+│   │   ├── golden-2026-09-10-tokscale-4.15.1.models.json
+│   │   ├── golden-2026-09-10-tokscale-4.15.1.pricing.json
+│   │   └── golden-2026-09-10-tokscale-4.15.1.report.json
 │   ├── test_backends.py      # StorageBackend integration and DDL checks
 │   ├── test_cli_curation.py  # tag/note command integration
 │   ├── test_cli_init.py      # config and schema initialization
@@ -68,6 +68,8 @@ usagebassoon/
 │   └── test_reconcile.py     # cross-payload consistency checks
 └── .github/workflows/        # ci (ruff, pyrefly, pytest), dialect-parity, release to PyPI
 ```
+
+Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-10-tokscale-4.15.1.models.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
 
 ## Architecture
 
