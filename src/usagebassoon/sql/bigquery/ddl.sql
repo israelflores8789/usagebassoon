@@ -18,9 +18,17 @@
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id          STRING NOT NULL,
+    source_id       STRING NOT NULL,
     started_at      TIMESTAMP NOT NULL,
     finished_at     TIMESTAMP,
     host            STRING,
+    os_name         STRING,
+    os_version      STRING,
+    architecture    STRING,
+    cpu_model       STRING,
+    cpu_count       INT64,
+    memory_bytes    INT64,
+    shell           STRING,
     tokscale_ver    STRING,
     status          STRING,             -- ok | partial | schema_drift | failed
     rows_in         INT64,
@@ -32,6 +40,7 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
 CREATE TABLE IF NOT EXISTS schema_drift (
     drift_id        STRING NOT NULL,
     run_id          STRING NOT NULL,
+    source_id       STRING NOT NULL,
     detected_at     TIMESTAMP NOT NULL,
     payload_kind    STRING,
     drift_kind      STRING,             -- unknown_field | missing_field | type_change
@@ -42,10 +51,11 @@ CREATE TABLE IF NOT EXISTS schema_drift (
 );
 
 -- Session dimension from `tokscale report --json --no-summarize`.
--- One current row exists per (client, session_id). Stable fields are kept;
+-- One current row exists per (source_id, client, session_id). Stable fields are kept;
 -- tokscale-generated summary fields are intentionally excluded. session_label
 -- is derived deterministically in Arrow for backend portability.
 CREATE TABLE IF NOT EXISTS sessions (
+    source_id       STRING NOT NULL,
     client          STRING NOT NULL,
     session_id      STRING NOT NULL,
     workspace       STRING,
@@ -67,6 +77,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- observation. Point-in-time pricing is embedded so each current row remains
 -- self-contained. total_tokens is computed in Arrow for backend portability.
 CREATE TABLE IF NOT EXISTS session_model_stats (
+    source_id       STRING NOT NULL,
     client          STRING NOT NULL,
     session_id      STRING NOT NULL,
     model           STRING NOT NULL,
@@ -97,8 +108,9 @@ CREATE TABLE IF NOT EXISTS session_model_stats (
 );
 
 -- Daily fact from `tokscale graph` contributions[]. One current row exists
--- per (day, client, model); newer observations overwrite that natural key.
+-- per (source_id, day, client, model); newer observations overwrite that key.
 CREATE TABLE IF NOT EXISTS daily_stats (
+    source_id       STRING NOT NULL,
     day             DATE NOT NULL,
     client          STRING NOT NULL,
     model           STRING NOT NULL,
@@ -115,6 +127,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 
 -- Day-level activity from contributions[].
 CREATE TABLE IF NOT EXISTS daily_activity (
+    source_id         STRING NOT NULL,
     day               DATE NOT NULL,
     intensity         INT64,
     active_time_ms    INT64,
@@ -124,6 +137,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
 -- Historical point-in-time rates resolved by tokscale. Unlike current-state
 -- usage facts, pricing history is intentionally append-mostly.
 CREATE TABLE IF NOT EXISTS pricing_snapshots (
+    source_id       STRING NOT NULL,
     captured_at     TIMESTAMP NOT NULL,
     model           STRING NOT NULL,
     source          STRING NOT NULL,
@@ -139,6 +153,7 @@ CREATE TABLE IF NOT EXISTS pricing_snapshots (
 -- One row is retained for each collection run.
 CREATE TABLE IF NOT EXISTS run_metrics (
     run_id                  STRING NOT NULL,
+    source_id               STRING NOT NULL,
     captured_at             TIMESTAMP NOT NULL,
     total_tokens            INT64,
     total_cost              FLOAT64,
@@ -152,16 +167,19 @@ CREATE TABLE IF NOT EXISTS run_metrics (
 -- Non-fatal cross-payload reconciliation observations per run.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id          STRING NOT NULL,
+    source_id       STRING NOT NULL,
     check_name      STRING,
     issue_key       STRING,
     message         STRING
 );
 
--- User curation: a client-scoped tag uses an empty session_id; a session-
--- scoped tag names one session. Tags are plaintext by definition.
+-- User curation: BigQuery cannot enforce these scope checks. curation.py
+-- validates the three supported scopes before it writes a row.
 CREATE TABLE IF NOT EXISTS tags (
     scope           STRING NOT NULL,
-    client          STRING NOT NULL,
+    source_id       STRING NOT NULL,
+    client          STRING NOT NULL DEFAULT '',
+    workspace       STRING NOT NULL DEFAULT '',
     session_id      STRING NOT NULL DEFAULT '',
     tag             STRING NOT NULL,
     created_at      TIMESTAMP NOT NULL
@@ -169,6 +187,7 @@ CREATE TABLE IF NOT EXISTS tags (
 
 -- User curation: one editable free-text note per session.
 CREATE TABLE IF NOT EXISTS notes (
+    source_id       STRING NOT NULL,
     client          STRING NOT NULL,
     session_id      STRING NOT NULL,
     note            STRING NOT NULL,

@@ -23,6 +23,7 @@ from usagebassoon.parsers.models import parse_models
 from usagebassoon.parsers.pricing import parse_pricing
 from usagebassoon.parsers.report import parse_report
 from usagebassoon.reconcile import reconcile_all
+from usagebassoon.system_metadata import SystemMetadata, capture_system_metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,9 +47,11 @@ def build_collection_bundle(
     raw: RawCollection,
     *,
     run_id: str,
+    source_id: str,
     started_at: datetime,
     finished_at: datetime,
     host: str | None,
+    system_metadata: SystemMetadata | None = None,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
 ) -> CollectionBundle:
     """Validate raw payload contracts, then parse one collection bundle.
@@ -56,9 +59,11 @@ def build_collection_bundle(
     Args:
         raw: Decoded tokscale command outputs.
         run_id: Owning collection run id.
+        source_id: Stable namespace of the collector that observed this data.
         started_at: Collection start timestamp.
         finished_at: Collection completion timestamp.
         host: Hostname or container identifier when available.
+        system_metadata: Collector-host metadata, captured when omitted.
         contracts: Explicit contracts for tests or custom deployments.
 
     Returns:
@@ -90,6 +95,7 @@ def build_collection_bundle(
     pricing_by_model = {row.model_id: row for row in pricing_rows}
     return CollectionBundle(
         run_id=run_id,
+        source_id=source_id,
         started_at=started_at,
         finished_at=finished_at,
         host=host,
@@ -104,4 +110,5 @@ def build_collection_bundle(
             + len(report_rows)
             + sum(len(contribution.clients) for contribution in graph.contributions)
         },
+        system_metadata=system_metadata or capture_system_metadata(),
     )

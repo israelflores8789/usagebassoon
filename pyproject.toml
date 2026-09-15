@@ -31,6 +31,7 @@ gcs = ["gcsfs>=2023.6"]
 full = ["polars>=1.0", "google-cloud-bigquery>=3.17", "gcsfs>=2023.6"]
 
 [project.scripts]
+bassoon = "usagebassoon.cli:app"
 usagebassoon = "usagebassoon.cli:app"
 
 [dependency-groups]

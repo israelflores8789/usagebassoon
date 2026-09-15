@@ -22,6 +22,7 @@ from usagebassoon.parsers.models import ModelsPayload, ModelStatsRow
 from usagebassoon.parsers.pricing import PricingRow
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.reconcile import ReconciliationResult
+from usagebassoon.system_metadata import SystemMetadata
 
 type ColumnarData = dict[str, list[object | None]]
 
@@ -32,6 +33,7 @@ class CollectionBundle:
 
     Attributes:
         run_id: Identifier for this collection run.
+        source_id: Stable namespace of the collector that observed this data.
         started_at: When the collector began invoking tokscale.
         finished_at: When parsing finished; merged-data timestamp.
         host: Hostname or container id, if known.
@@ -46,6 +48,7 @@ class CollectionBundle:
     """
 
     run_id: str
+    source_id: str
     started_at: datetime
     finished_at: datetime
     host: str | None
@@ -57,6 +60,7 @@ class CollectionBundle:
     contract_drift: tuple[ContractDrift, ...] = ()
     fetch_summary: dict[str, int] | None = None
     drift_fatal: bool = False
+    system_metadata: SystemMetadata | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,18 +87,24 @@ def _col_major[T](recs: list[dict[str, T]]) -> ColumnarData:
     return columns
 
 
-def _session_rows(rows: list[SessionRow], at: datetime) -> ColumnarData:
+def _session_rows(
+    rows: list[SessionRow],
+    at: datetime,
+    source_id: str,
+) -> ColumnarData:
     """Build the session dimension (with derived labels) for one run.
 
     Args:
         rows: Validated report rows (metadata authority).
         at: This run's collection timestamp.
+        source_id: Stable collector namespace.
 
     Returns:
         Column-major dict.
     """
     recs = [
         {
+            "source_id": source_id,
             "client": r.client,
             "session_id": r.session_id,
             "workspace": r.workspace,
@@ -120,6 +130,7 @@ def _stats_rows(
     pricing_by_model: dict[str, PricingRow],
     session_last_seen: dict[tuple[str, str], datetime],
     at: datetime,
+    source_id: str,
 ) -> ColumnarData:
     """Build per-(client,session,model) rows with pricing stamps.
 
@@ -131,6 +142,7 @@ def _stats_rows(
         pricing_by_model: Rate cards captured this run.
         session_last_seen: Latest report activity timestamp per session.
         at: Collection timestamp.
+        source_id: Stable collector namespace.
 
     Returns:
         Column-major dict including embedded point-in-time pricing.
@@ -140,6 +152,7 @@ def _stats_rows(
         p = pricing_by_model.get(r.model)
         recs.append(
             {
+                "source_id": source_id,
                 "client": r.client,
                 "session_id": r.session_id,
                 "model": r.model,
@@ -185,12 +198,13 @@ def _stats_rows(
     return _col_major(recs) if recs else {}
 
 
-def _daily_rows(graph: GraphPayload, at: datetime) -> ColumnarData:
+def _daily_rows(graph: GraphPayload, at: datetime, source_id: str) -> ColumnarData:
     """Build day x client x model rows from graph contributions.
 
     Args:
         graph: Validated graph payload.
         at: Collection timestamp.
+        source_id: Stable collector namespace.
 
     Returns:
         Column-major dict.
@@ -201,6 +215,7 @@ def _daily_rows(graph: GraphPayload, at: datetime) -> ColumnarData:
             t = cl.tokens
             recs.append(
                 {
+                    "source_id": source_id,
                     "day": c.date,
                     "client": cl.client,
                     "model": cl.model_id,
@@ -218,18 +233,24 @@ def _daily_rows(graph: GraphPayload, at: datetime) -> ColumnarData:
     return _col_major(recs) if recs else {}
 
 
-def _activity_rows(graph: GraphPayload, at: datetime) -> ColumnarData:
+def _activity_rows(
+    graph: GraphPayload,
+    at: datetime,
+    source_id: str,
+) -> ColumnarData:
     """Build day-level intensity and active-time rows.
 
     Args:
         graph: Validated graph payload.
         at: Collection timestamp.
+        source_id: Stable collector namespace.
 
     Returns:
         Column-major dict.
     """
     recs = [
         {
+            "source_id": source_id,
             "day": c.date,
             "intensity": c.intensity,
             "active_time_ms": c.active_time_ms,
@@ -257,6 +278,7 @@ def _append_only(
     if bundle.pricing_by_model:
         recs = [
             {
+                "source_id": bundle.source_id,
                 "captured_at": at,
                 "model": p.model_id,
                 "source": p.source,
@@ -274,6 +296,7 @@ def _append_only(
     tm, summary = bundle.graph.time_metrics, bundle.graph.summary
     out["run_metrics"] = {
         "run_id": [bundle.run_id],
+        "source_id": [bundle.source_id],
         "captured_at": [bundle.graph.meta.generated_at],
         "total_tokens": [summary.total_tokens],
         "total_cost": [summary.total_cost],
@@ -291,9 +314,27 @@ def _append_only(
         st = "ok" if bundle.reconciliation.ok else "partial"
     out["ingest_runs"] = {
         "run_id": [bundle.run_id],
+        "source_id": [bundle.source_id],
         "started_at": [bundle.started_at],
         "finished_at": [bundle.finished_at],
         "host": [bundle.host],
+        "os_name": [bundle.system_metadata.os_name if bundle.system_metadata else None],
+        "os_version": [
+            bundle.system_metadata.os_version if bundle.system_metadata else None
+        ],
+        "architecture": [
+            bundle.system_metadata.architecture if bundle.system_metadata else None
+        ],
+        "cpu_model": [
+            bundle.system_metadata.cpu_model if bundle.system_metadata else None
+        ],
+        "cpu_count": [
+            bundle.system_metadata.cpu_count if bundle.system_metadata else None
+        ],
+        "memory_bytes": [
+            bundle.system_metadata.memory_bytes if bundle.system_metadata else None
+        ],
+        "shell": [bundle.system_metadata.shell if bundle.system_metadata else None],
         "tokscale_ver": [bundle.graph.meta.version],
         "status": [st],
         "rows_in": [
@@ -310,6 +351,7 @@ def _append_only(
         recs = [
             {
                 "run_id": bundle.run_id,
+                "source_id": bundle.source_id,
                 "check_name": i.check,
                 "issue_key": i.key or "",
                 "message": i.message,
@@ -322,6 +364,7 @@ def _append_only(
             {
                 "drift_id": d.drift_id,
                 "run_id": d.run_id,
+                "source_id": bundle.source_id,
                 "detected_at": d.detected_at,
                 "payload_kind": d.payload_kind,
                 "drift_kind": d.drift_kind,
@@ -352,7 +395,7 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
         for row in bundle.report_rows
     }
     for name, cols in (
-        ("sessions", _session_rows(bundle.report_rows, at)),
+        ("sessions", _session_rows(bundle.report_rows, at, bundle.source_id)),
         (
             "session_model_stats",
             _stats_rows(
@@ -360,10 +403,11 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
                 bundle.pricing_by_model,
                 session_last_seen,
                 at,
+                bundle.source_id,
             ),
         ),
-        ("daily_stats", _daily_rows(bundle.graph, at)),
-        ("daily_activity", _activity_rows(bundle.graph, at)),
+        ("daily_stats", _daily_rows(bundle.graph, at, bundle.source_id)),
+        ("daily_activity", _activity_rows(bundle.graph, at, bundle.source_id)),
     ):
         if cols:
             tables[name] = pa.Table.from_pydict(cols)

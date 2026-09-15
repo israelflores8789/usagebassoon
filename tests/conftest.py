@@ -40,6 +40,7 @@ EXPECTED_TOTAL_REASONING = 1_686_926
 EXPECTED_TOTAL_MESSAGES = 4_988
 EXPECTED_TOTAL_COST = 109.48238866000003
 EXPECTED_TOKSCALE_VERSION = "4.15.1"
+SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _load(name: str) -> JsonValue:
@@ -166,6 +167,7 @@ def collection_bundle(
     """Build a complete, validated CollectionBundle from the fixtures."""
     return CollectionBundle(
         run_id=str(uuid4()),
+        source_id=SOURCE_ID,
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC) + timedelta(seconds=2),
         host="pytest",

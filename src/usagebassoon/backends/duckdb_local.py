@@ -117,7 +117,7 @@ class _DuckDBStorage:
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if column == "first_seen_at":
+            if column in {"created_at", "first_seen_at"}:
                 value = f"COALESCE(target.{quoted_column}, {value})"
             assignments.append(f"{quoted_column} = {value}")
         source_values = ", ".join(f"source.{_identifier(column)}" for column in columns)

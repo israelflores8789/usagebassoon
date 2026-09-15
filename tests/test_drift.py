@@ -31,6 +31,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
                 {
                     "drift_id": ["older", "newer"],
                     "run_id": [str(uuid4()), str(uuid4())],
+                    "source_id": ["source", "source"],
                     "detected_at": [now, now],
                     "payload_kind": ["models", "pricing"],
                     "drift_kind": ["unknown_field", "type_change"],
@@ -62,6 +63,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                 {
                     "drift_id": ["drift-1"],
                     "run_id": [run_id],
+                    "source_id": ["source"],
                     "detected_at": [now],
                     "payload_kind": ["models"],
                     "drift_kind": ["unknown_field"],
@@ -77,6 +79,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
             pa.table(
                 {
                     "run_id": [run_id],
+                    "source_id": ["source"],
                     "started_at": [now],
                     "finished_at": [now],
                     "host": ["pytest"],

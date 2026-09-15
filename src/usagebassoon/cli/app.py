@@ -5,7 +5,9 @@
 
 import typer
 
+from usagebassoon.cli.curation import note, tag
 from usagebassoon.cli.doctor import doctor
+from usagebassoon.cli.init import init
 
 app = typer.Typer(
     name="usagebassoon",
@@ -20,3 +22,6 @@ def main() -> None:
 
 
 app.command(name="doctor")(doctor)
+app.command(name="init")(init)
+app.command(name="tag")(tag)
+app.command(name="note")(note)

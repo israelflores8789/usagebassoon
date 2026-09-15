@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+from uuid import UUID, uuid4
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -18,12 +19,39 @@ from usagebassoon.backends.motherduck import MotherDuckBackend
 
 BackendName = Literal["duckdb", "motherduck", "bigquery"]
 DEFAULT_CONFIG_PATH = Path("~/.config/usagebassoon/config.toml")
+DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
 
 
 class ConfigurationError(ValueError):
     """Raised when the UsageBassoon configuration is absent or invalid."""
+
+
+def write_initial_config(path: Path) -> bool:
+    """Create a default local-DuckDB configuration without overwriting one.
+
+    Args:
+        path: Fully resolved target configuration path.
+
+    Returns:
+        True when a new configuration was created; otherwise False.
+
+    Raises:
+        OSError: If the configuration directory cannot be created or written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f'source_id = "{uuid4()}"\n'
+        'backend = "duckdb"\n'
+        f'database = "{DEFAULT_DUCKDB_DATABASE}"\n'
+    )
+    try:
+        with path.open("x") as handle:
+            handle.write(content)
+    except FileExistsError:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +88,7 @@ class UsageBassoonConfig:
 
     Attributes:
         path: Configuration file from which these values were loaded.
+        source_id: Stable UUID namespace for one intentional collection source.
         backend: Selected storage backend.
         database: Backend database, dataset, or local file path.
         tokscale_bin: Optional tokscale executable override.
@@ -68,6 +97,7 @@ class UsageBassoonConfig:
     """
 
     path: Path
+    source_id: str
     backend: BackendName
     database: str
     tokscale_bin: str | None = None
@@ -132,14 +162,19 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
 
 def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConfig:
     """Validate decoded TOML and create the typed configuration object."""
+    source_id = _string(payload.get("source_id"), "source_id", required=True)
     backend_value = _string(payload.get("backend"), "backend", required=True)
     database = _string(payload.get("database"), "database", required=True)
     if backend_value not in SUPPORTED_BACKENDS:
         raise ConfigurationError(
             f"backend must be one of: {', '.join(sorted(SUPPORTED_BACKENDS))}"
         )
-    if database is None:
-        raise ConfigurationError("database is required")
+    if source_id is None or database is None:
+        raise ConfigurationError("source_id and database are required")
+    try:
+        canonical_source_id = str(UUID(source_id))
+    except ValueError as error:
+        raise ConfigurationError("source_id must be a UUID") from error
     tokscale = _table(payload.get("tokscale"), "tokscale")
     tokscale_bin = _string(tokscale.get("bin"), "tokscale.bin")
     bigquery = _bigquery_config(payload.get("bigquery"))
@@ -147,6 +182,7 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         raise ConfigurationError("[bigquery] is required for the BigQuery backend")
     return UsageBassoonConfig(
         path=path,
+        source_id=canonical_source_id,
         backend=cast(BackendName, backend_value),
         database=database,
         tokscale_bin=tokscale_bin,
@@ -187,7 +223,7 @@ class ConfigurationManager:
 
     Explicit ``--config`` paths take precedence over ``USAGEBASSOON_CONFIG``;
     otherwise the manager uses ``~/.config/usagebassoon/config.toml``. No
-    backend or database setting can be overridden independently.
+    No source, backend, or database setting can be overridden independently.
     """
 
     def __init__(

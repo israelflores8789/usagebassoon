@@ -17,7 +17,7 @@ from usagebassoon.normalizer import NormalizedBundle
 
 CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "sessions": (
-        ("client", "session_id"),
+        ("source_id", "client", "session_id"),
         (
             "workspace",
             "workspace_label",
@@ -32,7 +32,7 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
     ),
     "session_model_stats": (
-        ("client", "session_id", "model"),
+        ("source_id", "client", "session_id", "model"),
         (
             "provider",
             "input_tokens",
@@ -57,7 +57,7 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
     ),
     "daily_stats": (
-        ("day", "client", "model"),
+        ("source_id", "day", "client", "model"),
         (
             "provider",
             "input_tokens",
@@ -69,7 +69,7 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "cost_usd",
         ),
     ),
-    "daily_activity": (("day",), ("intensity", "active_time_ms")),
+    "daily_activity": (("source_id", "day"), ("intensity", "active_time_ms")),
 }
 
 APPEND_ONLY_TABLES = frozenset(

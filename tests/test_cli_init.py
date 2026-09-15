@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""test_cli_init.py — Typer integration tests for initialization."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+from typer.testing import CliRunner
+
+from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.cli.app import app
+from usagebassoon.config import CONFIG_PATH_ENV_VAR, ConfigurationManager
+
+
+def test_init_creates_source_config_and_local_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create a stable source namespace and the default DuckDB schema."""
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
+
+    result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    configuration = ConfigurationManager(config_path).load()
+    assert UUID(configuration.source_id)
+    assert configuration.backend == "duckdb"
+    backend = DuckDBBackend(configuration.database)
+    try:
+        assert backend.query("SELECT count(*) AS n FROM sessions").to_pylist() == [
+            {"n": 0}
+        ]
+    finally:
+        backend.close()
+
+
+def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
+    """Reuse a configured source and database without overwriting either one."""
+    config_path = tmp_path / "config.toml"
+    database = tmp_path / "custom.duckdb"
+    source_id = "11111111-1111-4111-8111-111111111111"
+    config_path.write_text(
+        f'source_id = "{source_id}"\nbackend = "duckdb"\ndatabase = "{database}"\n'
+    )
+
+    result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert ConfigurationManager(config_path).load().source_id == source_id
+    assert "Using existing configuration" in result.output
+    backend = DuckDBBackend(database)
+    try:
+        assert backend.query("SELECT count(*) AS n FROM tags").to_pylist() == [{"n": 0}]
+    finally:
+        backend.close()

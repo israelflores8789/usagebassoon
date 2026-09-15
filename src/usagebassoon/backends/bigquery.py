@@ -18,6 +18,7 @@ from contextlib import AbstractContextManager, nullcontext
 from importlib import resources
 
 import pyarrow as pa
+from google.auth.credentials import Credentials
 from google.cloud import bigquery
 
 from usagebassoon.backends.base import UpsertResult
@@ -34,7 +35,7 @@ class BigQueryBackend:
         dataset: str,
         *,
         location: str = "US",
-        credentials: object | None = None,
+        credentials: Credentials | None = None,
     ) -> None:
         """Create a backend bound to a BigQuery dataset.
 
@@ -87,8 +88,8 @@ class BigQueryBackend:
         if data.num_rows == 0:
             return UpsertResult()
         stage = f"{self.dataset_ref}._stage_{table}"
-        self.client.load_table_from_arrow(
-            data,
+        self.client.load_table_from_dataframe(
+            data.to_pandas(),
             stage,
             job_config=bigquery.LoadJobConfig(
                 write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
@@ -104,7 +105,7 @@ class BigQueryBackend:
         assignments: list[str] = []
         for column in cols:
             value = f"source.{column}"
-            if column == "first_seen_at":
+            if column in {"created_at", "first_seen_at"}:
                 value = f"COALESCE(target.{column}, {value})"
             assignments.append(f"{column} = {value}")
         source_values = ", ".join(f"source.{column}" for column in cols)
@@ -140,8 +141,8 @@ class BigQueryBackend:
         """
         if data.num_rows == 0:
             return
-        self.client.load_table_from_arrow(
-            data,
+        self.client.load_table_from_dataframe(
+            data.to_pandas(),
             f"{self.dataset_ref}.{table}",
             job_config=bigquery.LoadJobConfig(
                 write_disposition=bigquery.WriteDisposition.WRITE_APPEND

@@ -23,6 +23,8 @@ from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.merge import persist_run
 from usagebassoon.normalizer import normalize
 
+SOURCE_ID = "11111111-1111-4111-8111-111111111111"
+
 
 def _payloads(
     models_raw: JsonObject,
@@ -70,6 +72,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
             pricing={"gemini-3.8-flash": pricing_raw},
         ),
         run_id=str(uuid4()),
+        source_id=SOURCE_ID,
         started_at=when,
         finished_at=when,
         host="pytest",
@@ -115,6 +118,7 @@ def test_required_missing_field_blocks_parsing(
                 pricing={"gemini-3.8-flash": pricing_raw},
             ),
             run_id=str(uuid4()),
+            source_id=SOURCE_ID,
             started_at=when,
             finished_at=when,
             host="pytest",

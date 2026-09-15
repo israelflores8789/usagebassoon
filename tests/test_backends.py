@@ -35,6 +35,7 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             "daily_stats",
             "daily_stats_current",
             "ingest_runs",
+            "noted_sessions",
             "notes",
             "pricing_snapshots",
             "reconciliation_issues",
@@ -42,12 +43,26 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             "schema_drift",
             "session_model_stats",
             "session_model_stats_current",
+            "session_tags",
             "sessions",
             "sessions_current",
+            "tagged_sessions",
             "tags",
         ]
         columns = backend.query("DESCRIBE sessions").column("column_name").to_pylist()
         assert columns[-3:] == ["first_seen_at", "last_seen_at", "last_updated_at"]
+        run_columns = (
+            backend.query("DESCRIBE ingest_runs").column("column_name").to_pylist()
+        )
+        assert run_columns[4:11] == [
+            "host",
+            "os_name",
+            "os_version",
+            "architecture",
+            "cpu_model",
+            "cpu_count",
+            "memory_bytes",
+        ]
     finally:
         backend.close()
 
@@ -61,28 +76,29 @@ def test_local_backend_merges_current_state_in_place() -> None:
         backend.apply_ddl()
         first = pa.table(
             {
+                "source_id": ["source"],
                 "day": [date(2026, 9, 14)],
                 "intensity": [1],
                 "active_time_ms": [100],
                 "last_updated_at": [first_updated_at],
             }
         )
-        changed = first.set_column(1, "intensity", pa.array([2])).set_column(
-            3,
+        changed = first.set_column(2, "intensity", pa.array([2])).set_column(
+            4,
             "last_updated_at",
             pa.array([second_updated_at]),
         )
         first_result = backend.upsert(
             "daily_activity",
             first,
-            ("day",),
+            ("source_id", "day"),
             ("intensity",),
         )
         assert first_result.affected == 1
         unchanged_result = backend.upsert(
             "daily_activity",
             first,
-            ("day",),
+            ("source_id", "day"),
             ("intensity",),
         )
         assert unchanged_result.affected == 0
@@ -90,7 +106,7 @@ def test_local_backend_merges_current_state_in_place() -> None:
             backend.upsert(
                 "daily_activity",
                 changed,
-                ("day",),
+                ("source_id", "day"),
                 ("intensity",),
             ).updated
             == 1

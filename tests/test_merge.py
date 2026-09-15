@@ -19,6 +19,7 @@ from tests.conftest import (
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.merge import persist_run
 from usagebassoon.normalizer import CollectionBundle, normalize
+from usagebassoon.system_metadata import SystemMetadata
 
 
 def test_normalize_emits_the_current_state_ddl_columns(
@@ -99,6 +100,42 @@ def test_persist_run_populates_ddl_tables(
         backend.close()
 
 
+def test_persist_run_records_collector_system_metadata(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Assert normalized ingest audit rows carry collector-host metadata."""
+    backend = DuckDBBackend(":memory:")
+    metadata = SystemMetadata(
+        os_name="Linux",
+        os_version="6.16",
+        architecture="x86_64",
+        cpu_model="Example CPU",
+        cpu_count=16,
+        memory_bytes=68_719_476_736,
+        shell="/bin/bash",
+    )
+    try:
+        backend.apply_ddl()
+        persist_run(
+            backend,
+            normalize(replace(collection_bundle, system_metadata=metadata)),
+        )
+        assert backend.query(
+            "SELECT os_name, architecture, cpu_count, memory_bytes, shell "
+            "FROM ingest_runs"
+        ).to_pylist() == [
+            {
+                "os_name": "Linux",
+                "architecture": "x86_64",
+                "cpu_count": 16,
+                "memory_bytes": 68_719_476_736,
+                "shell": "/bin/bash",
+            }
+        ]
+    finally:
+        backend.close()
+
+
 def test_unchanged_rows_keep_their_last_updated_at(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -126,6 +163,43 @@ def test_unchanged_rows_keep_their_last_updated_at(
         backend.close()
 
 
+def test_distinct_sources_do_not_share_current_state_keys(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Assert identical tokscale keys remain distinct across source namespaces."""
+    backend = DuckDBBackend(":memory:")
+    alternate_source = "22222222-2222-4222-8222-222222222222"
+    try:
+        backend.apply_ddl()
+        first = persist_run(backend, normalize(collection_bundle))
+        second = persist_run(
+            backend,
+            normalize(
+                replace(
+                    collection_bundle,
+                    run_id=str(uuid4()),
+                    source_id=alternate_source,
+                )
+            ),
+        )
+        assert (first.inserted, second.inserted) == (
+            EXPECTED_REPORT_ROWS
+            + EXPECTED_MODELS_ENTRIES
+            + EXPECTED_DAILY_ROWS
+            + EXPECTED_DAYS,
+            EXPECTED_REPORT_ROWS
+            + EXPECTED_MODELS_ENTRIES
+            + EXPECTED_DAILY_ROWS
+            + EXPECTED_DAYS,
+        )
+        assert backend.query(
+            "SELECT count(DISTINCT source_id) AS sources, count(*) AS sessions "
+            "FROM sessions"
+        ).to_pylist() == [{"sources": 2, "sessions": EXPECTED_REPORT_ROWS * 2}]
+    finally:
+        backend.close()
+
+
 def test_persistence_never_touches_user_curation(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -135,10 +209,11 @@ def test_persistence_never_touches_user_curation(
         backend.apply_ddl()
         backend.connection.execute(
             "INSERT INTO tags VALUES "
-            "('session', 'codex', 'ses_1', 'investigate', now())"
+            "('session', 'source', 'codex', '', 'ses_1', 'investigate', now())"
         )
         backend.connection.execute(
-            "INSERT INTO notes VALUES ('codex', 'ses_1', 'spike here', now(), now())"
+            "INSERT INTO notes VALUES "
+            "('source', 'codex', 'ses_1', 'spike here', now(), now())"
         )
         persist_run(backend, normalize(collection_bundle))
         assert backend.query("SELECT count(*) AS n FROM tags").to_pylist() == [{"n": 1}]

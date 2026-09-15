@@ -20,8 +20,14 @@ def test_explicit_config_path_has_highest_precedence(tmp_path: Path) -> None:
     """Use --config's path even when the environment points elsewhere."""
     explicit = tmp_path / "explicit.toml"
     environment = tmp_path / "environment.toml"
-    explicit.write_text('backend = "duckdb"\ndatabase = ":memory:"\n')
-    environment.write_text('backend = "duckdb"\ndatabase = "other.duckdb"\n')
+    explicit.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+    )
+    environment.write_text(
+        'source_id = "22222222-2222-4222-8222-222222222222"\n'
+        'backend = "duckdb"\ndatabase = "other.duckdb"\n'
+    )
     manager = ConfigurationManager(
         explicit,
         environ={CONFIG_PATH_ENV_VAR: str(environment)},
@@ -36,7 +42,10 @@ def test_environment_path_precedes_default(
 ) -> None:
     """Use the environment-selected file when no explicit path is supplied."""
     configured = tmp_path / "config.toml"
-    configured.write_text('backend = "duckdb"\ndatabase = ":memory:"\n')
+    configured.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+    )
     monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(configured))
     manager = ConfigurationManager()
     assert manager.path == configured
@@ -46,6 +55,19 @@ def test_environment_path_precedes_default(
 def test_bigquery_requires_its_connection_settings(tmp_path: Path) -> None:
     """Reject a partial configuration before any backend is opened."""
     path = tmp_path / "config.toml"
-    path.write_text('backend = "bigquery"\ndatabase = "usagebassoon"\n')
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "bigquery"\ndatabase = "usagebassoon"\n'
+    )
     with pytest.raises(ConfigurationError, match=r"\[bigquery\]"):
+        ConfigurationManager(path).load()
+
+
+def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
+    """Reject an unparsable source namespace before opening a backend."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "not-a-uuid"\nbackend = "duckdb"\ndatabase = ":memory:"\n'
+    )
+    with pytest.raises(ConfigurationError, match="source_id must be a UUID"):
         ConfigurationManager(path).load()

@@ -16,9 +16,17 @@
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id          TEXT PRIMARY KEY,
+    source_id       TEXT NOT NULL,
     started_at      TIMESTAMPTZ NOT NULL,
     finished_at     TIMESTAMPTZ,
     host            TEXT,
+    os_name         TEXT,
+    os_version      TEXT,
+    architecture    TEXT,
+    cpu_model       TEXT,
+    cpu_count       INTEGER,
+    memory_bytes    BIGINT,
+    shell           TEXT,
     tokscale_ver    TEXT,
     status          TEXT,             -- ok | partial | schema_drift | failed
     rows_in         INTEGER,
@@ -32,6 +40,7 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
 CREATE TABLE IF NOT EXISTS schema_drift (
     drift_id        TEXT PRIMARY KEY,
     run_id          TEXT NOT NULL,
+    source_id       TEXT NOT NULL,
     detected_at     TIMESTAMPTZ NOT NULL,
     payload_kind    TEXT,
     drift_kind      TEXT,             -- unknown_field | missing_field | type_change
@@ -42,10 +51,11 @@ CREATE TABLE IF NOT EXISTS schema_drift (
 );
 
 -- Session dimension from `tokscale report --json --no-summarize`.
--- One current row exists per (client, session_id). Stable fields are kept;
+-- One current row exists per (source_id, client, session_id). Stable fields are kept;
 -- tokscale-generated summary fields are intentionally excluded. session_label
 -- is derived deterministically in Arrow for backend portability.
 CREATE TABLE IF NOT EXISTS sessions (
+    source_id       TEXT NOT NULL,
     client          TEXT NOT NULL,
     session_id      TEXT NOT NULL,
     workspace       TEXT,
@@ -60,7 +70,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     first_seen_at   TIMESTAMPTZ NOT NULL,
     last_seen_at    TIMESTAMPTZ NOT NULL,
     last_updated_at      TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (client, session_id)
+    PRIMARY KEY (source_id, client, session_id)
 );
 
 -- Fact table from `tokscale models --json --group-by client,session,model`.
@@ -69,6 +79,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- self-contained. total_tokens is computed in Arrow, not by DuckDB, so both
 -- SQL dialects receive the same normalized value.
 CREATE TABLE IF NOT EXISTS session_model_stats (
+    source_id       TEXT NOT NULL,
     client          TEXT NOT NULL,
     session_id      TEXT NOT NULL,
     model           TEXT NOT NULL,
@@ -96,12 +107,13 @@ CREATE TABLE IF NOT EXISTS session_model_stats (
     first_seen_at       TIMESTAMPTZ NOT NULL,
     last_seen_at        TIMESTAMPTZ NOT NULL,
     last_updated_at     TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (client, session_id, model)
+    PRIMARY KEY (source_id, client, session_id, model)
 );
 
 -- Daily fact from `tokscale graph` contributions[]. One current row exists
--- per (day, client, model); newer observations overwrite that natural key.
+-- per (source_id, day, client, model); newer observations overwrite that key.
 CREATE TABLE IF NOT EXISTS daily_stats (
+    source_id         TEXT NOT NULL,
     day               DATE NOT NULL,
     client            TEXT NOT NULL,
     model             TEXT NOT NULL,
@@ -114,20 +126,23 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     message_count     BIGINT,
     cost_usd          DOUBLE,
     last_updated_at   TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (day, client, model)
+    PRIMARY KEY (source_id, day, client, model)
 );
 
 -- Day-level activity from contributions[].
 CREATE TABLE IF NOT EXISTS daily_activity (
-    day               DATE PRIMARY KEY,
+    source_id         TEXT NOT NULL,
+    day               DATE NOT NULL,
     intensity         INTEGER,
     active_time_ms    BIGINT,
-    last_updated_at   TIMESTAMPTZ NOT NULL
+    last_updated_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_id, day)
 );
 
 -- Historical point-in-time rates resolved by tokscale. Unlike current-state
 -- usage facts, pricing history is intentionally append-mostly.
 CREATE TABLE IF NOT EXISTS pricing_snapshots (
+    source_id       TEXT NOT NULL,
     captured_at     TIMESTAMPTZ NOT NULL,
     model           TEXT NOT NULL,
     source          TEXT NOT NULL,
@@ -137,13 +152,14 @@ CREATE TABLE IF NOT EXISTS pricing_snapshots (
     price_output_per_token      DOUBLE,
     price_cache_read_per_token  DOUBLE,
     price_cache_write_per_token DOUBLE,
-    PRIMARY KEY (captured_at, model)
+    PRIMARY KEY (source_id, captured_at, model)
 );
 
 -- Run-level aggregate telemetry from graph summary and timeMetrics.
 -- One row is retained for each collection run.
 CREATE TABLE IF NOT EXISTS run_metrics (
     run_id                 TEXT PRIMARY KEY,
+    source_id              TEXT NOT NULL,
     captured_at            TIMESTAMPTZ NOT NULL,
     total_tokens           BIGINT,
     total_cost             DOUBLE,
@@ -157,28 +173,37 @@ CREATE TABLE IF NOT EXISTS run_metrics (
 -- Non-fatal cross-payload reconciliation observations per run.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id          TEXT NOT NULL,
+    source_id       TEXT NOT NULL,
     check_name      TEXT,
     issue_key       TEXT,
     message         TEXT
 );
 
--- User curation: a client-scoped tag uses an empty session_id; a session-
--- scoped tag names one session. Tags are plaintext by definition.
+-- User curation: tags have only three scopes. Client and workspace tags are
+-- resolved onto matching sessions by session_tags; session tags are direct.
 CREATE TABLE IF NOT EXISTS tags (
-    scope           TEXT NOT NULL CHECK (scope IN ('client', 'session')),
-    client          TEXT NOT NULL,
+    scope           TEXT NOT NULL CHECK (scope IN ('client', 'workspace', 'session')),
+    source_id       TEXT NOT NULL,
+    client          TEXT NOT NULL DEFAULT '',
+    workspace       TEXT NOT NULL DEFAULT '',
     session_id      TEXT NOT NULL DEFAULT '',
     tag             TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (scope, client, session_id, tag)
+    PRIMARY KEY (source_id, scope, client, workspace, session_id, tag),
+    CHECK (
+        (scope = 'client' AND client <> '' AND workspace = '' AND session_id = '')
+        OR (scope = 'workspace' AND client = '' AND workspace <> '' AND session_id = '')
+        OR (scope = 'session' AND client <> '' AND workspace = '' AND session_id <> '')
+    )
 );
 
 -- User curation: one editable free-text note per session.
 CREATE TABLE IF NOT EXISTS notes (
+    source_id       TEXT NOT NULL,
     client          TEXT NOT NULL,
     session_id      TEXT NOT NULL,
     note            TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (client, session_id)
+    PRIMARY KEY (source_id, client, session_id)
 );
