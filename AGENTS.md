@@ -17,21 +17,24 @@ usagebassoon/
 │   ├── __init__.py
 │   ├── cli/                  # typer app; one module per CLI command
 │   ├── parsers/              # one module per payload kind
+│   │   ├── __init__.py
 │   │   ├── models.py         # per session×model rows → session_model_stats
 │   │   ├── report.py         # session metadata       → sessions (no LLM summary fields)
 │   │   ├── graph.py          # daily contributions    → daily_stats/daily_activity/run_metrics
 │   │   └── pricing.py        # rates + resolution     → pricing_snapshots + row stamps
 │   ├── contracts/            # JSON schema contracts per payload kind
-│   │   ├── graph.json
 │   │   ├── models.json
-│   │   ├── pricing.json
-│   │   └── report.json
+│   │   ├── report.json
+│   │   ├── graph.json
+│   │   └── pricing.json
 │   ├── contracts.py          # contract loading, validation, and drift detection
 │   ├── backends/
+│   │   ├── __init__.py
 │   │   ├── base.py           # StorageBackend protocol
 │   │   ├── duckdb_local.py
 │   │   ├── motherduck.py
 │   │   └── bigquery.py
+│   ├── reports/              # terminal rich tables + plotext charts; one module per report type
 │   ├── collector.py          # tokscale subprocess + retry
 │   ├── frames.py             # Arrow conversion to pandas or optional polars
 │   ├── ingest.py             # raw payload contract validation and parsing
@@ -43,7 +46,6 @@ usagebassoon/
 │   ├── reconcile.py          # cross-payload consistency checks
 │   ├── curation.py           # tags + notes
 │   ├── obfuscate.py          # export-time pseudonymization
-│   ├── report_term.py        # rich tables + plotext charts
 │   ├── api.py                # usagebassoon.query/connect (pandas default, polars opt-in)
 │   ├── sql/                  # ddl + views, loaded as package data
 │   │   ├── duckdb/{ddl.sql, views.sql}    # also serves motherduck
