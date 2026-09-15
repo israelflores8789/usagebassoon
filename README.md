@@ -27,6 +27,14 @@ bassoon tag important --client codex --session ses_123
 bassoon note "Investigate cache miss" --client codex --session ses_123
 ```
 
+## Privacy and sharing
+
+Reports are raw by default for personal terminal use; run `bassoon report --sanitize` before sharing one. `bassoon doctor` is the shareable diagnostics command and sanitizes configuration locations and credentials by default. Its `--raw` mode prints a warning not to paste raw output into public GitHub issues.
+
+`bassoon query` intentionally returns raw values, accepts only one read-only SELECT or WITH query, and always warns on stderr not to share its output publicly. Use `bassoon doctor` for issue-ready diagnostics instead.
+
+`bassoon export` obfuscates potentially identifying fields and redacts notes by default. It announces this behavior on stderr; use `--raw` only for intentional personal backup or data-management exports. Snapshots are raw restoration artifacts and should be kept private.
+
 ## License & Disclaimers
 
 UsageBassoon is copyright © 2026 Israel Flores-Arbolay and licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See LICENSE for the full text.

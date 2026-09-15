@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""snapshot.py — Typer command for private raw warehouse snapshots."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Annotated
+
+import typer
+
+from usagebassoon.cli._utils import configured_backend, snapshot_store
+
+
+def snapshot(
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Use this configuration file."),
+    ] = None,
+) -> None:
+    """Write a raw private restoration snapshot of the configured warehouse."""
+    configuration, backend = configured_backend(config)
+    try:
+        latest = backend.query(
+            "SELECT run_id FROM ingest_runs ORDER BY finished_at DESC LIMIT 1"
+        ).to_pylist()
+        uri = snapshot_store(configuration).write(
+            backend,
+            run_id=str(latest[0]["run_id"]) if latest else "manual",
+        )
+    finally:
+        backend.close()
+    typer.echo(f"Created private raw snapshot at {uri}.")

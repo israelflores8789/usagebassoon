@@ -270,21 +270,31 @@ These are the `tokscale` commands used to generate ingest data. Each command is 
 
 ### CLI
 
-The installed command is `bassoon`. `init`, `tag`, `note`, and `doctor` are implemented; the remaining commands below are planned.
+The installed command is `bassoon`. The commands below are implemented; report views and diagnostics continue to grow incrementally.
 
 | Command | Purpose |
 |---|---|
 | `bassoon init` | create config + configured DDL + views |
 | `bassoon collect` | one delta-ingest cycle (designed for cron) |
-| `bassoon query "<sql>"` | ad-hoc SQL → rich table; `--format csv\|json\|parquet`; `--sanitize` |
-| `bassoon report` | terminal summary; `--sanitize` |
+| `bassoon query "<sql>"` | one read-only SELECT/WITH query → raw output; `--format csv\|json\|parquet`; unavoidable sharing warning |
+| `bassoon report` | terminal summary; raw personal-use output by default; `--sanitize/--obfuscate` for sharing |
 | `bassoon report --save out.txt` | render incl. charts to text |
 | `bassoon tag` / `note` | source-aware user curation |
 | `bassoon restore` | recreate normalized state/views from a snapshot and optionally re-collect current tokscale state |
 | `bassoon snapshot` / `bassoon restore` | write/read rotating GCS Parquet snapshots |
-| `bassoon export` | dump any table/view to parquet/csv; `--sanitize` |
+| `bassoon export` | dump a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for intentional raw backup/data management |
 | `bassoon runs` | ingest audit log incl. run_metrics |
 | `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
+
+### Privacy and sharing policy
+
+- UsageBassoon stores raw operational data so collection, merge, curation, restore, and personal reports retain full fidelity.
+- `bassoon report` is raw by default because it is a user-facing terminal experience. Its interactive terminal rendering reminds users to run `--sanitize` before sharing; saved reports omit that reminder.
+- `bassoon doctor` is the shareable diagnostic path and sanitizes configuration paths, database locations, and connection credentials by default. `bassoon doctor --raw` always warns that raw output must not be pasted into public GitHub issues.
+- `bassoon query` returns raw results and accepts exactly one read-only SELECT or WITH query. It always prints an unsuppressible sharing warning to stderr and directs issue reporters to `bassoon doctor`.
+- `bassoon export` obfuscates `session_id`, workspace fields, host names, free-form tags, and session-bearing reconciliation keys by default; notes are redacted. It prints a stderr reminder that `--raw` is available for intentional personal backup or data-management output.
+- Schema-drift identifiers, paths, detail, versions, exact timestamps, and reconciliation messages remain unchanged in sanitized doctor/export output because they are generated structural diagnostics required for actionable bug reports. `client` values (for example `codex` and `opencode`) remain unchanged.
+- Snapshots are raw restoration artifacts, not shareable exports. Treat snapshot storage as private.
 
 ### Proposed Python API
 

@@ -12,6 +12,7 @@ import pyarrow as pa
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.config import ConfigurationManager, open_backend
 from usagebassoon.frames import Engine, query_frame
+from usagebassoon.sql_safety import dialect_for_backend, validate_read_only_sql
 
 __all__ = ["connect", "query", "query_arrow"]
 
@@ -47,19 +48,22 @@ def query_arrow(
     *,
     config: str | Path | None = None,
 ) -> pa.Table:
-    """Execute SQL and return the result as an Arrow table.
+    """Execute read-only SQL and return the result as an Arrow table.
 
     This function opens and closes a backend for one query. Use ``connect``
     when multiple queries should share one connection.
 
     Args:
-        sql: SQL written for the configured backend dialect.
+        sql: One read-only SELECT or WITH query in the configured dialect.
         config: Optional configuration file path.
 
     Returns:
         The query result as a ``pyarrow.Table``.
     """
-    backend = connect(config)
+    config_path = Path(config) if config is not None else None
+    configuration = ConfigurationManager(config_path).load()
+    validate_read_only_sql(sql, dialect=dialect_for_backend(configuration.backend))
+    backend = open_backend(configuration)
     try:
         return backend.query(sql)
     finally:
@@ -72,10 +76,10 @@ def query(
     engine: Engine = "pandas",
     config: str | Path | None = None,
 ) -> object:
-    """Execute SQL and return a pandas or Polars DataFrame.
+    """Execute read-only SQL and return a pandas or Polars DataFrame.
 
     Args:
-        sql: SQL written for the configured backend dialect.
+        sql: One read-only SELECT or WITH query in the configured dialect.
         engine: Result frame library, either ``"pandas"`` (the default) or
             ``"polars"``.
         config: Optional configuration file path.
@@ -87,7 +91,10 @@ def query(
         ImportError: If Polars is requested but is not installed.
         ValueError: If ``engine`` is unsupported.
     """
-    backend = connect(config)
+    config_path = Path(config) if config is not None else None
+    configuration = ConfigurationManager(config_path).load()
+    validate_read_only_sql(sql, dialect=dialect_for_backend(configuration.backend))
+    backend = open_backend(configuration)
     try:
         return query_frame(backend, sql, engine=engine)
     finally:

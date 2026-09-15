@@ -14,18 +14,43 @@ from rich.text import Text
 
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.drift import DoctorReport, run_doctor
+from usagebassoon.privacy import sanitize_doctor_text
 
 
-def _print_report(report: DoctorReport) -> None:
+def _print_report(
+    report: DoctorReport,
+    *,
+    raw: bool,
+    config_path: str | None,
+    database: str | None,
+) -> None:
     """Render a structured doctor report with Rich."""
     console = Console()
     styles = {"ok": "green", "warning": "yellow", "error": "red"}
     for check in report.checks:
         line = Text(f"{check.status.upper()} ", style=styles[check.status])
-        line.append(f"{check.name}: {check.message}")
+        message = (
+            check.message
+            if raw
+            else sanitize_doctor_text(
+                check.message,
+                config_path=config_path,
+                database=database,
+            )
+        )
+        line.append(f"{check.name}: {message}")
         console.print(line)
         for detail in check.details:
-            console.print(f"  - {detail}", markup=False)
+            text = (
+                detail
+                if raw
+                else sanitize_doctor_text(
+                    detail,
+                    config_path=config_path,
+                    database=database,
+                )
+            )
+            console.print(f"  - {text}", markup=False)
     console.print(f"\nOverall status: {report.status}")
 
 
@@ -49,6 +74,13 @@ def doctor(
             help="Maximum unresolved drift and recent run records to display.",
         ),
     ] = 20,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help="Show original diagnostic locations and connection details.",
+        ),
+    ] = False,
 ) -> None:
     """Check the configured backend, schema, drift, and ingest health."""
     manager = ConfigurationManager(config)
@@ -78,7 +110,20 @@ def doctor(
         limit=limit,
     )
     try:
-        _print_report(report)
+        if raw:
+            Console(stderr=True).print(
+                "WARNING: raw doctor output may contain identifiers, paths, host "
+                "metadata, and other private information. Do not paste it into a "
+                "public GitHub issue. Use bassoon doctor without --raw for shareable "
+                "diagnostics.",
+                style="yellow",
+            )
+        _print_report(
+            report,
+            raw=raw,
+            config_path=str(manager.path),
+            database=configuration.database if configuration else None,
+        )
     finally:
         if opened is not None:
             opened.close()

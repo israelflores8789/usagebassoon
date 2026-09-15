@@ -22,6 +22,7 @@ dependencies = [
     "plotext>=5.2",
     "pyarrow>=25.0.1",
     "fsspec>=2026.7.0",
+    "sqlglot>=30.18.0",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +42,6 @@ dev = [
     "ruff>=0.8",
     "pyrefly>=0.20",
     "twine>=7.0.0",
-    "sqlglot>=30.18.0",
 ]
 
 [tool.hatch.version]

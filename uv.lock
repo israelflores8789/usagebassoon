@@ -2018,6 +2018,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "rich" },
+    { name = "sqlglot" },
     { name = "typer" },
 ]
 
@@ -2043,7 +2044,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "sqlglot" },
     { name = "twine" },
 ]
 
@@ -2062,6 +2062,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pydantic", specifier = ">=2.5" },
     { name = "rich", specifier = ">=13.0" },
+    { name = "sqlglot", specifier = ">=30.18.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["bigquery", "full", "gcs", "polars"]
@@ -2072,7 +2073,6 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
     { name = "ruff", specifier = ">=0.8" },
-    { name = "sqlglot", specifier = ">=30.18.0" },
     { name = "twine", specifier = ">=7.0.0" },
 ]
 
