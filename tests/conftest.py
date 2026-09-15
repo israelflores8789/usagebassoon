@@ -4,8 +4,7 @@
 """conftest.py — Shared fixtures for the usagebassoon test suite.
 
 Golden payloads were captured from tokscale 4.15.1 on 2026-09-10 and
-sanitized. See Appendix A of the design doc for the invariants asserted
-across this suite.
+sanitized.
 """
 
 from __future__ import annotations

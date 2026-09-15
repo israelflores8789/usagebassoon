@@ -59,3 +59,20 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
         assert backend.query("SELECT count(*) AS n FROM tags").to_pylist() == [{"n": 0}]
     finally:
         backend.close()
+
+
+def test_init_formats_invalid_existing_configuration_as_a_cli_error(
+    tmp_path: Path,
+) -> None:
+    """Report an invalid preserved config without exposing a traceback."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "unsupported"\n'
+        'database = "usagebassoon"\n'
+    )
+
+    result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
+
+    assert result.exit_code != 0
+    assert "backend must be one of" in result.output

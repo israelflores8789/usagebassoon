@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Normalization and persistence tests over the shipped DuckDB DDL."""
+"""test_merge.py — Normalization and persistence tests over the shipped DuckDB DDL."""
 
 from __future__ import annotations
 

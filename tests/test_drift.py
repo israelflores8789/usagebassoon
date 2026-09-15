@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Tests for persisted drift queries and read-only health diagnostics."""
+"""test_drift.py — Tests persisted drift queries and read-only health diagnostics."""
 
 from __future__ import annotations
 

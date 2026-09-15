@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Tests for configuration path resolution and validation."""
+"""test_config.py — Tests for configuration path resolution and validation."""
 
 from __future__ import annotations
 

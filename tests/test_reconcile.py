@@ -1,12 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Reconciliation tests over a fixture set known to be partially stale.
-
-Appendix A invariant: models-vs-report has 10 drift issues (8 metric + 2
-cost, from two sessions served by report's cached assembly); models-vs-graph
-has zero issues. These counts are the regression net.
-"""
+"""test_reconcile.py — Reconciliation over a fixture set known to be partially stale."""
 
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Contract validation tests over shipped contracts and synthetic drift."""
+"""test_contracts.py — Tests validation over shipped contracts and synthetic drift."""
 
 from __future__ import annotations
 

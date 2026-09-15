@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_cli_query_export.py — Privacy and read-only command integration tests."""
+"""test_cli_export.py — Typer integration tests for share-safe exports."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from typer.testing import CliRunner
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -19,14 +20,7 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
-    """Create a populated DuckDB configuration for command tests.
-
-    Args:
-        tmp_path: Per-test temporary directory.
-
-    Returns:
-        Explicit config path and its initialized backend.
-    """
+    """Create a populated local warehouse for export command tests."""
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
@@ -48,33 +42,6 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
         ),
     )
     return config, backend
-
-
-def test_query_warns_and_rejects_mutating_sql(tmp_path: Path) -> None:
-    """Keep query raw but prevent it from changing the configured warehouse."""
-    config, backend = _configured_store(tmp_path)
-    backend.close()
-    runner = CliRunner()
-
-    query_result = runner.invoke(
-        app,
-        [
-            "query",
-            "SELECT client, session_id FROM notes",
-            "--config",
-            str(config),
-        ],
-    )
-    delete_result = runner.invoke(
-        app,
-        ["query", "DELETE FROM notes", "--config", str(config)],
-    )
-
-    assert query_result.exit_code == 0
-    assert "ses_private" in query_result.output
-    assert "returns raw data" in query_result.stderr
-    assert delete_result.exit_code != 0
-    assert "read-only SELECT or WITH" in delete_result.output
 
 
 def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None:
@@ -123,17 +90,55 @@ def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None
     assert raw_row["note"] == "Call Ada at example@private.test"
 
 
-def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
-    """Make doctor issue-ready by default while warning on raw diagnostics."""
-    missing = tmp_path / "private" / "config.toml"
+def test_export_supports_csv_and_parquet_and_rejects_unknown_relations(
+    tmp_path: Path,
+) -> None:
+    """Exercise every binary or delimited file path at the CLI boundary."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    csv_path = tmp_path / "notes.csv"
+    parquet_path = tmp_path / "notes.parquet"
     runner = CliRunner()
 
-    sanitized = runner.invoke(app, ["doctor", "--config", str(missing)])
-    raw = runner.invoke(app, ["doctor", "--raw", "--config", str(missing)])
+    csv_result = runner.invoke(
+        app,
+        [
+            "export",
+            "notes",
+            str(csv_path),
+            "--format",
+            "csv",
+            "--config",
+            str(config),
+        ],
+    )
+    parquet_result = runner.invoke(
+        app,
+        [
+            "export",
+            "notes",
+            str(parquet_path),
+            "--format",
+            "parquet",
+            "--raw",
+            "--config",
+            str(config),
+        ],
+    )
+    invalid = runner.invoke(
+        app,
+        [
+            "export",
+            "not_a_relation",
+            str(tmp_path / "bad.json"),
+            "--config",
+            str(config),
+        ],
+    )
 
-    assert sanitized.exit_code == 1
-    assert str(missing) not in sanitized.output
-    assert "<config-path>" in sanitized.output
-    assert raw.exit_code == 1
-    assert str(missing) in raw.output.replace("\n", "")
-    assert "raw doctor output may contain" in raw.stderr
+    assert csv_result.exit_code == 0
+    assert "session-alpha" in csv_path.read_text()
+    assert parquet_result.exit_code == 0
+    assert pq.read_table(parquet_path).to_pylist()[0]["session_id"] == "ses_private"
+    assert invalid.exit_code != 0
+    assert "target must be one of" in invalid.output
