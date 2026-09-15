@@ -5,6 +5,8 @@
 
 import typer
 
+from usagebassoon.cli.doctor import doctor
+
 app = typer.Typer(
     name="usagebassoon",
     help="Persistent analytics over tokscale's stateless JSON exports.",
@@ -15,3 +17,6 @@ app = typer.Typer(
 @app.callback()
 def main() -> None:
     """Run the UsageBassoon command-line interface."""
+
+
+app.command(name="doctor")(doctor)

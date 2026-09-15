@@ -125,6 +125,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - PREFER PEP 695 syntax for **all** new generic declarations and type aliases. USE modern built-in generic and union syntax.
 - USE Google-style docstrings for **all** source code.
 - KEEP comments concise yet clear. Do NOT use numbered headers (e.g. "1." or "(1)" etc).
+- FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
 - NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).
 
 ### Prohibitions
