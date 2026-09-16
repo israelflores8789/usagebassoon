@@ -54,6 +54,7 @@ class _BatchClient:
     ) -> _Job:
         """Record one explicit-schema staging load."""
         assert location == "US"
+        assert "`" not in destination
         self.loads.append((destination, job_config))
         return _Job()
 
@@ -81,7 +82,18 @@ class _BatchClient:
     def delete_table(self, table: str, *, not_found_ok: bool) -> None:
         """Record best-effort staging cleanup."""
         assert not_found_ok
+        assert "`" not in table
         self.deleted.append(table)
+
+    def get_table(self, _: str) -> bigquery.Table:
+        """Return a table with required fields for direct-append testing."""
+        return bigquery.Table(
+            "usagebassoon-test.usagebassoon_emulated.run_metrics",
+            schema=[
+                bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("source_id", "STRING", mode="REQUIRED"),
+            ],
+        )
 
     def close(self) -> None:
         """Satisfy the BigQuery client close surface."""
@@ -91,7 +103,7 @@ def _backend() -> BigQueryBackend:
     """Build a BigQuery backend without credentials or network access."""
     return BigQueryBackend(
         "usagebassoon-test",
-        "usagebassoon",
+        "usagebassoon_emulated",
         client=cast(bigquery.Client, _OfflineClient()),
     )
 
@@ -162,7 +174,22 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
     assert "IF NOT already_committed THEN" in script
     assert "WHERE `run_id` = @run_id" in script
     assert run_id.replace("-", "") in stages["daily_activity"]
-    assert "MERGE `usagebassoon-test.usagebassoon.daily_activity`" in script
+    assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
+
+
+def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
+    """Qualify view definitions while retaining portable shipped SQL files."""
+    backend = _backend()
+
+    qualified = backend._qualify_view_sql(
+        "CREATE OR REPLACE VIEW sessions_current AS "
+        "SELECT * FROM sessions JOIN tags ON TRUE"
+    )
+
+    table_prefix = "usagebassoon-test.usagebassoon_emulated"
+    assert f"CREATE OR REPLACE VIEW `{table_prefix}.sessions_current`" in qualified
+    assert f"FROM `{table_prefix}.sessions` AS sessions" in qualified
+    assert f"JOIN `{table_prefix}.tags` AS tags" in qualified
 
 
 def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
@@ -170,7 +197,7 @@ def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
     client = _BatchClient()
     backend = BigQueryBackend(
         "usagebassoon-test",
-        "usagebassoon",
+        "usagebassoon_emulated",
         client=cast(bigquery.Client, client),
     )
     run_id = str(uuid4())
@@ -208,3 +235,22 @@ def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
     assert schema is not None
     assert schema[1].field_type == "DATE"
     assert client.queries[0].count("BEGIN TRANSACTION;") == 1
+
+
+def test_direct_append_uses_the_existing_required_schema() -> None:
+    """Preserve destination field modes when restoring or importing data."""
+    client = _BatchClient()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+
+    backend.append(
+        "run_metrics",
+        pa.table({"run_id": ["run"], "source_id": ["source"]}),
+    )
+
+    schema = client.loads[0][1].schema
+    assert schema is not None
+    assert [field.mode for field in schema] == ["REQUIRED", "REQUIRED"]

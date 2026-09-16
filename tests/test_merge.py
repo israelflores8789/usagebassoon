@@ -9,6 +9,8 @@ from dataclasses import replace
 from datetime import timedelta
 from uuid import uuid4
 
+import pyarrow as pa
+
 from tests.conftest import (
     EXPECTED_DAILY_ROWS,
     EXPECTED_DAYS,
@@ -18,7 +20,7 @@ from tests.conftest import (
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.merge import persist_run
-from usagebassoon.normalizer import CollectionBundle, normalize
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, CollectionBundle, normalize
 from usagebassoon.system_metadata import SystemMetadata
 
 
@@ -44,6 +46,25 @@ def test_normalize_emits_the_current_state_ddl_columns(
         "rows_updated",
         "drift_events",
     ]
+
+
+def test_normalize_preserves_types_for_null_only_columns(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Keep absent tokscale values nullable without degrading to Arrow null type."""
+    normalized = normalize(collection_bundle)
+
+    assert {name: table.schema for name, table in normalized.tables.items()} == {
+        name: CANONICAL_TABLE_SCHEMAS[name] for name in normalized.tables
+    }
+    assert all(
+        not pa.types.is_null(field.type)
+        for table in normalized.tables.values()
+        for field in table.schema
+    )
+    assert normalized.tables["pricing_snapshots"].column(
+        "price_cache_write_per_token"
+    ).to_pylist() == [0.0]
 
 
 def test_persist_run_populates_ddl_tables(

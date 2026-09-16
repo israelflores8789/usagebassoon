@@ -26,6 +26,162 @@ from usagebassoon.system_metadata import SystemMetadata
 
 type ColumnarData = dict[str, list[object | None]]
 
+_TIMESTAMP = pa.timestamp("us", tz="UTC")
+
+CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
+    "sessions": pa.schema(
+        [
+            pa.field("source_id", pa.string()),
+            pa.field("client", pa.string()),
+            pa.field("session_id", pa.string()),
+            pa.field("workspace", pa.string()),
+            pa.field("workspace_label", pa.string()),
+            pa.field("created_at", _TIMESTAMP),
+            pa.field("last_active", _TIMESTAMP),
+            pa.field("duration_minutes", pa.int64()),
+            pa.field("message_count", pa.int64()),
+            pa.field("cost_usd", pa.float64()),
+            pa.field("models_used", pa.list_(pa.string())),
+            pa.field("session_label", pa.string()),
+            pa.field("first_seen_at", _TIMESTAMP),
+            pa.field("last_seen_at", _TIMESTAMP),
+            pa.field("last_updated_at", _TIMESTAMP),
+        ]
+    ),
+    "session_model_stats": pa.schema(
+        [
+            pa.field("source_id", pa.string()),
+            pa.field("client", pa.string()),
+            pa.field("session_id", pa.string()),
+            pa.field("model", pa.string()),
+            pa.field("provider", pa.string()),
+            pa.field("input_tokens", pa.int64()),
+            pa.field("output_tokens", pa.int64()),
+            pa.field("cache_read", pa.int64()),
+            pa.field("cache_write", pa.int64()),
+            pa.field("reasoning", pa.int64()),
+            pa.field("total_tokens", pa.int64()),
+            pa.field("message_count", pa.int64()),
+            pa.field("cost_usd", pa.float64()),
+            pa.field("ms_per_1k_tokens", pa.float64()),
+            pa.field("perf_duration_ms", pa.int64()),
+            pa.field("perf_token_coverage", pa.float64()),
+            pa.field("price_input_per_token", pa.float64()),
+            pa.field("price_output_per_token", pa.float64()),
+            pa.field("price_cache_read_per_token", pa.float64()),
+            pa.field("price_cache_write_per_token", pa.float64()),
+            pa.field("price_matched_key", pa.string()),
+            pa.field("price_match_kind", pa.string()),
+            pa.field("price_alias_applied", pa.bool_()),
+            pa.field("price_source", pa.string()),
+            pa.field("price_captured_at", _TIMESTAMP),
+            pa.field("first_seen_at", _TIMESTAMP),
+            pa.field("last_seen_at", _TIMESTAMP),
+            pa.field("last_updated_at", _TIMESTAMP),
+        ]
+    ),
+    "daily_stats": pa.schema(
+        [
+            pa.field("source_id", pa.string()),
+            pa.field("day", pa.date32()),
+            pa.field("client", pa.string()),
+            pa.field("model", pa.string()),
+            pa.field("provider", pa.string()),
+            pa.field("input_tokens", pa.int64()),
+            pa.field("output_tokens", pa.int64()),
+            pa.field("cache_read", pa.int64()),
+            pa.field("cache_write", pa.int64()),
+            pa.field("reasoning", pa.int64()),
+            pa.field("message_count", pa.int64()),
+            pa.field("cost_usd", pa.float64()),
+            pa.field("last_updated_at", _TIMESTAMP),
+        ]
+    ),
+    "daily_activity": pa.schema(
+        [
+            pa.field("source_id", pa.string()),
+            pa.field("day", pa.date32()),
+            pa.field("intensity", pa.int64()),
+            pa.field("active_time_ms", pa.int64()),
+            pa.field("last_updated_at", _TIMESTAMP),
+        ]
+    ),
+    "pricing_snapshots": pa.schema(
+        [
+            pa.field("run_id", pa.string()),
+            pa.field("source_id", pa.string()),
+            pa.field("captured_at", _TIMESTAMP),
+            pa.field("model", pa.string()),
+            pa.field("source", pa.string()),
+            pa.field("matched_key", pa.string()),
+            pa.field("match_kind", pa.string()),
+            pa.field("price_input_per_token", pa.float64()),
+            pa.field("price_output_per_token", pa.float64()),
+            pa.field("price_cache_read_per_token", pa.float64()),
+            pa.field("price_cache_write_per_token", pa.float64()),
+        ]
+    ),
+    "run_metrics": pa.schema(
+        [
+            pa.field("run_id", pa.string()),
+            pa.field("source_id", pa.string()),
+            pa.field("captured_at", _TIMESTAMP),
+            pa.field("total_tokens", pa.int64()),
+            pa.field("total_cost", pa.float64()),
+            pa.field("active_days", pa.int64()),
+            pa.field("total_active_time_ms", pa.int64()),
+            pa.field("longest_continuous_ms", pa.int64()),
+            pa.field("max_concurrent_sessions", pa.int64()),
+            pa.field("graph_session_count", pa.int64()),
+        ]
+    ),
+    "ingest_runs": pa.schema(
+        [
+            pa.field("run_id", pa.string()),
+            pa.field("source_id", pa.string()),
+            pa.field("started_at", _TIMESTAMP),
+            pa.field("finished_at", _TIMESTAMP),
+            pa.field("host", pa.string()),
+            pa.field("os_name", pa.string()),
+            pa.field("os_version", pa.string()),
+            pa.field("architecture", pa.string()),
+            pa.field("cpu_model", pa.string()),
+            pa.field("cpu_count", pa.int64()),
+            pa.field("memory_bytes", pa.int64()),
+            pa.field("shell", pa.string()),
+            pa.field("tokscale_ver", pa.string()),
+            pa.field("status", pa.string()),
+            pa.field("rows_in", pa.int64()),
+            pa.field("rows_inserted", pa.int64()),
+            pa.field("rows_updated", pa.int64()),
+            pa.field("drift_events", pa.int64()),
+        ]
+    ),
+    "reconciliation_issues": pa.schema(
+        [
+            pa.field("run_id", pa.string()),
+            pa.field("source_id", pa.string()),
+            pa.field("check_name", pa.string()),
+            pa.field("issue_key", pa.string()),
+            pa.field("message", pa.string()),
+        ]
+    ),
+    "schema_drift": pa.schema(
+        [
+            pa.field("drift_id", pa.string()),
+            pa.field("run_id", pa.string()),
+            pa.field("source_id", pa.string()),
+            pa.field("detected_at", _TIMESTAMP),
+            pa.field("payload_kind", pa.string()),
+            pa.field("drift_kind", pa.string()),
+            pa.field("path", pa.string()),
+            pa.field("detail", pa.string()),
+            pa.field("tokscale_ver", pa.string()),
+            pa.field("resolved", pa.bool_()),
+        ]
+    ),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class CollectionBundle:
@@ -87,6 +243,26 @@ def _col_major[T](recs: list[dict[str, T]]) -> ColumnarData:
     return columns
 
 
+def _table(name: str, columns: ColumnarData) -> pa.Table:
+    """Create one normalized table with its canonical nullable Arrow schema.
+
+    Args:
+        name: DDL-defined normalized table name.
+        columns: Column-major normalized values.
+
+    Returns:
+        A typed Arrow table whose null-only columns retain their logical type.
+
+    Raises:
+        ValueError: If a normalizer table does not have a canonical schema.
+    """
+    try:
+        schema = CANONICAL_TABLE_SCHEMAS[name]
+    except KeyError as error:
+        raise ValueError(f"missing canonical Arrow schema for {name!r}") from error
+    return pa.Table.from_pydict(columns, schema=schema)
+
+
 def _session_rows(
     rows: list[SessionRow],
     at: datetime,
@@ -134,9 +310,6 @@ def _stats_rows(
 ) -> ColumnarData:
     """Build per-(client,session,model) rows with pricing stamps.
 
-    total_tokens is computed here (was a GENERATED column in v3): BigQuery
-    has no generated columns and both backends must receive identical data.
-
     Args:
         entries: Validated cumulative entries.
         pricing_by_model: Rate cards captured this run.
@@ -182,9 +355,13 @@ def _stats_rows(
                 "price_cache_read_per_token": p.pricing.cache_read_input_token_cost
                 if p
                 else None,
-                "price_cache_write_per_token": p.pricing.cache_write_input_token_cost
-                if p
-                else None,
+                "price_cache_write_per_token": (
+                    None
+                    if p is None
+                    else p.pricing.cache_write_input_token_cost
+                    if p.pricing.cache_write_input_token_cost is not None
+                    else 0.0
+                ),
                 "price_matched_key": p.matched_key if p else None,
                 "price_match_kind": p.resolution.kind if p else None,
                 "price_alias_applied": p.resolution.alias_applied if p else None,
@@ -288,7 +465,11 @@ def _append_only(
                 "price_input_per_token": p.pricing.input_cost_per_token,
                 "price_output_per_token": p.pricing.output_cost_per_token,
                 "price_cache_read_per_token": p.pricing.cache_read_input_token_cost,
-                "price_cache_write_per_token": p.pricing.cache_write_input_token_cost,
+                "price_cache_write_per_token": (
+                    p.pricing.cache_write_input_token_cost
+                    if p.pricing.cache_write_input_token_cost is not None
+                    else 0.0
+                ),
             }
             for model_id in sorted(bundle.pricing_by_model)
             for p in [bundle.pricing_by_model[model_id]]
@@ -411,8 +592,8 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
         ("daily_activity", _activity_rows(bundle.graph, at, bundle.source_id)),
     ):
         if cols:
-            tables[name] = pa.Table.from_pydict(cols)
+            tables[name] = _table(name, cols)
     for name, cols in _append_only(bundle, at).items():
         if cols:
-            tables[name] = pa.Table.from_pydict(cols)
+            tables[name] = _table(name, cols)
     return NormalizedBundle(bundle.run_id, tables)

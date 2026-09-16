@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_updated_at TIMESTAMP NOT NULL
 );
 
--- Fact table from `tokscale models --json --group-by client,session,model`.
+-- Fact table from `    `.
 -- Values are cumulative for each natural key and are overwritten by a newer
 -- observation. Point-in-time pricing is embedded so each current row remains
 -- self-contained. total_tokens is computed in Arrow for backend portability.
@@ -179,9 +179,9 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
 CREATE TABLE IF NOT EXISTS tags (
     scope           STRING NOT NULL,
     source_id       STRING NOT NULL,
-    client          STRING NOT NULL DEFAULT '',
-    workspace       STRING NOT NULL DEFAULT '',
-    session_id      STRING NOT NULL DEFAULT '',
+    client          STRING DEFAULT '' NOT NULL,
+    workspace       STRING DEFAULT '' NOT NULL,
+    session_id      STRING DEFAULT '' NOT NULL,
     tag             STRING NOT NULL,
     created_at      TIMESTAMP NOT NULL
 );

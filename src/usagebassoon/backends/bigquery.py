@@ -15,7 +15,9 @@ from typing import cast, override
 from uuid import uuid4
 
 import pyarrow as pa
+from google.api_core.exceptions import GoogleAPICallError, NotFound
 from google.auth.credentials import Credentials
+from google.auth.exceptions import GoogleAuthError
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -31,6 +33,21 @@ from usagebassoon.backends.base import (
 _PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
 _LOG = logging.getLogger("usagebassoon")
+_VIEW_RELATIONS = (
+    "session_model_stats_current",
+    "daily_activity_current",
+    "daily_stats_current",
+    "tagged_sessions",
+    "noted_sessions",
+    "sessions_current",
+    "session_tags",
+    "session_model_stats",
+    "daily_activity",
+    "daily_stats",
+    "sessions",
+    "notes",
+    "tags",
+)
 
 
 def _validate_project(project: str) -> None:
@@ -126,26 +143,40 @@ class BigQueryBackend(AbstractStorageBackend):
             raise ValueError("credentials and credentials_file cannot be combined")
         resolved_credentials = credentials
         if credentials_file is not None:
-            resolved_credentials = (
-                service_account.Credentials.from_service_account_file(
-                    str(credentials_file)
+            try:
+                resolved_credentials = (
+                    service_account.Credentials.from_service_account_file(
+                        str(credentials_file)
+                    )
                 )
-            )
+            except (GoogleAuthError, OSError, ValueError) as error:
+                raise RuntimeError(
+                    "BigQuery credentials file could not be loaded"
+                ) from error
         self.project = project
         self.dataset = dataset
         self.location = location
         self.dataset_ref = f"{project}.{dataset}"
-        self.client = client or bigquery.Client(
-            project=project,
-            credentials=resolved_credentials,
-            location=location,
-        )
+        try:
+            self.client = client or bigquery.Client(
+                project=project,
+                credentials=resolved_credentials,
+                location=location,
+            )
+        except GoogleAuthError as error:
+            raise RuntimeError(
+                "BigQuery authentication failed; configure ADC or credentials_file"
+            ) from error
 
-    def _table_ref(self, table: str) -> str:
-        """Return a safely quoted fully qualified internal table reference."""
+    def _table_id(self, table: str) -> str:
+        """Return an unquoted fully qualified table ID for BigQuery APIs."""
         if not is_simple_identifier(table):
             raise ValueError(f"invalid BigQuery table identifier: {table!r}")
-        return f"`{self.dataset_ref}.{table}`"
+        return f"{self.dataset_ref}.{table}"
+
+    def _table_ref(self, table: str) -> str:
+        """Return a safely quoted fully qualified table reference for SQL."""
+        return f"`{self._table_id(table)}`"
 
     def _query_config(
         self,
@@ -158,6 +189,25 @@ class BigQueryBackend(AbstractStorageBackend):
             query_parameters=parameters or [],
         )
 
+    def _qualify_view_sql(self, sql: str) -> str:
+        """Fully qualify view relations required by BigQuery view definitions."""
+        relations = "|".join(re.escape(relation) for relation in _VIEW_RELATIONS)
+        pattern = re.compile(
+            rf"\b(CREATE\s+OR\s+REPLACE\s+VIEW|FROM|JOIN)\s+({relations})\b",
+            flags=re.IGNORECASE,
+        )
+
+        def qualify(match: re.Match[str]) -> str:
+            """Return one view SQL clause with a fully qualified relation."""
+            clause = match.group(1)
+            relation = match.group(2)
+            qualified = f"{clause} {self._table_ref(relation)}"
+            if clause.casefold() == "create or replace view":
+                return qualified
+            return f"{qualified} AS {relation}"
+
+        return pattern.sub(qualify, sql)
+
     @override
     def apply_ddl(self) -> None:
         """Create or validate the configured dataset, then apply packaged SQL.
@@ -165,10 +215,12 @@ class BigQueryBackend(AbstractStorageBackend):
         Raises:
             ValueError: If an existing dataset has another location.
         """
-        dataset = bigquery.Dataset(self.dataset_ref)
-        dataset.location = self.location
-        self.client.create_dataset(dataset, exists_ok=True)
-        actual = self.client.get_dataset(self.dataset_ref)
+        try:
+            actual = self.client.get_dataset(self.dataset_ref)
+        except NotFound:
+            dataset = bigquery.Dataset(self.dataset_ref)
+            dataset.location = self.location
+            actual = self.client.create_dataset(dataset)
         actual_location = actual.location
         if not isinstance(actual_location, str):
             raise ValueError("BigQuery dataset did not report a string location")
@@ -179,12 +231,18 @@ class BigQueryBackend(AbstractStorageBackend):
                 f"{actual_location!r}"
             )
         package = resources.files("usagebassoon.sql.bigquery")
-        for filename in ("ddl.sql", "migrations.sql", "views.sql"):
-            self.client.query(
-                package.joinpath(filename).read_text(),
-                job_config=self._query_config(),
-                location=self.location,
-            ).result()
+        try:
+            for filename in ("ddl.sql", "migrations.sql", "views.sql"):
+                sql = package.joinpath(filename).read_text()
+                if filename == "views.sql":
+                    sql = self._qualify_view_sql(sql)
+                self.client.query(
+                    sql,
+                    job_config=self._query_config(),
+                    location=self.location,
+                ).result()
+        except GoogleAPICallError as error:
+            raise RuntimeError("BigQuery schema initialization failed") from error
 
     def _load(
         self,
@@ -192,28 +250,34 @@ class BigQueryBackend(AbstractStorageBackend):
         destination: str,
         *,
         disposition: str,
+        schema: Sequence[bigquery.SchemaField] | None = None,
     ) -> None:
         """Load canonical Arrow data through pandas with an explicit schema."""
         self.client.load_table_from_dataframe(
             data.to_pandas(),
             destination,
             job_config=bigquery.LoadJobConfig(
-                schema=_schema_from_arrow(data),
+                schema=list(schema) if schema is not None else _schema_from_arrow(data),
                 write_disposition=disposition,
             ),
             location=self.location,
         ).result()
 
-    def _stage_ref(self, table: str, run_id: str) -> str:
-        """Return one collision-resistant, run-scoped staging table reference."""
+    def _stage_id(self, table: str, run_id: str) -> str:
+        """Return one collision-resistant staging table ID for BigQuery APIs."""
         compact_run_id = run_id.replace("-", "")
-        return self._table_ref(f"_stage_{table}_{compact_run_id}")
+        return self._table_id(f"_stage_{table}_{compact_run_id}")
+
+    def _stage_ref(self, table: str, run_id: str) -> str:
+        """Return one collision-resistant staging table reference for SQL."""
+        return f"`{self._stage_id(table, run_id)}`"
 
     def _delete_stages(self, stages: Sequence[str]) -> None:
         """Best-effort remove staging tables after a batch reaches a terminal state."""
         for stage in stages:
             try:
                 self.client.delete_table(stage, not_found_ok=True)
+                _LOG.info("removed BigQuery staging table %s", stage)
             except Exception:
                 _LOG.exception("could not remove BigQuery staging table %s", stage)
 
@@ -246,10 +310,11 @@ class BigQueryBackend(AbstractStorageBackend):
         if data.num_rows == 0:
             return UpsertResult()
         self._validate_upsert(table, data, natural_keys, change_fields)
-        stage = self._table_ref(f"_stage_{table}_{uuid4().hex}")
+        stage_id = self._stage_id(table, uuid4().hex)
+        stage = f"`{stage_id}`"
         try:
             self._load(
-                data, stage, disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+                data, stage_id, disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
             )
             inserted, updated = self._count_changes(
                 table,
@@ -264,7 +329,7 @@ class BigQueryBackend(AbstractStorageBackend):
             ).result()
             return UpsertResult(inserted=inserted, updated=updated)
         finally:
-            self._delete_stages((stage,))
+            self._delete_stages((stage_id,))
 
     def _count_changes(
         self,
@@ -275,7 +340,11 @@ class BigQueryBackend(AbstractStorageBackend):
     ) -> tuple[int, int]:
         """Count inserts and material changes against a staged source."""
         join = self._join_sql(natural_keys)
-        changes = self._change_sql(change_fields)
+        table_schema = self.client.get_table(self._table_id(table)).schema
+        repeated_fields = frozenset(
+            field.name for field in table_schema if field.mode == "REPEATED"
+        )
+        changes = self._change_sql(change_fields, repeated_fields)
         key = self._column(natural_keys[0])
         row = next(
             iter(
@@ -309,12 +378,21 @@ class BigQueryBackend(AbstractStorageBackend):
             for key in natural_keys
         )
 
-    def _change_sql(self, change_fields: Sequence[str]) -> str:
+    def _change_sql(
+        self,
+        change_fields: Sequence[str],
+        repeated_fields: frozenset[str] = frozenset(),
+    ) -> str:
         """Build a null-safe material-change predicate."""
         return (
             " OR ".join(
-                f"target.{self._column(field)} IS DISTINCT FROM "
-                f"source.{self._column(field)}"
+                (
+                    f"TO_JSON_STRING(target.{self._column(field)}) IS DISTINCT FROM "
+                    f"TO_JSON_STRING(source.{self._column(field)})"
+                    if field in repeated_fields
+                    else f"target.{self._column(field)} IS DISTINCT FROM "
+                    f"source.{self._column(field)}"
+                )
                 for field in change_fields
             )
             or "FALSE"
@@ -328,8 +406,10 @@ class BigQueryBackend(AbstractStorageBackend):
         change_fields: Sequence[str],
     ) -> str:
         """Build a MERGE statement from trusted canonical table metadata."""
-        columns = tuple(
-            field.name for field in self.client.get_table(self._table_ref(table)).schema
+        table_schema = self.client.get_table(self._table_id(table)).schema
+        columns = tuple(field.name for field in table_schema)
+        repeated_fields = frozenset(
+            field.name for field in table_schema if field.mode == "REPEATED"
         )
         assignments: list[str] = []
         for column in columns:
@@ -345,7 +425,8 @@ class BigQueryBackend(AbstractStorageBackend):
         return (
             f"MERGE {self._table_ref(table)} AS target USING {stage} AS source "
             f"ON {self._join_sql(natural_keys)} "
-            f"WHEN MATCHED AND ({self._change_sql(change_fields)}) THEN UPDATE SET "
+            f"WHEN MATCHED AND ({self._change_sql(change_fields, repeated_fields)}) "
+            "THEN UPDATE SET "
             f"{', '.join(assignments)} "
             f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values})"
         )
@@ -357,10 +438,12 @@ class BigQueryBackend(AbstractStorageBackend):
             return
         if not is_simple_identifier(table):
             raise ValueError(f"invalid BigQuery table identifier: {table!r}")
+        table_id = self._table_id(table)
         self._load(
             data,
-            self._table_ref(table),
+            table_id,
             disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            schema=self.client.get_table(table_id).schema,
         )
 
     @override
@@ -372,12 +455,13 @@ class BigQueryBackend(AbstractStorageBackend):
         }
         tables.update(batch.append_only)
         tables["ingest_runs"] = batch.ingest_runs
-        stages = {table: self._stage_ref(table, batch.run_id) for table in tables}
+        stage_ids = {table: self._stage_id(table, batch.run_id) for table in tables}
+        stages = {table: f"`{stage_id}`" for table, stage_id in stage_ids.items()}
         try:
             for table, data in tables.items():
                 self._load(
                     data,
-                    stages[table],
+                    stage_ids[table],
                     disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
                 )
             result = self.client.query(
@@ -402,7 +486,7 @@ class BigQueryBackend(AbstractStorageBackend):
             }
             return BatchPersistResult(per_table, already_committed=already_committed)
         finally:
-            self._delete_stages(tuple(stages.values()))
+            self._delete_stages(tuple(stage_ids.values()))
 
     def _batch_script(
         self,
@@ -435,7 +519,12 @@ class BigQueryBackend(AbstractStorageBackend):
         ]
         for write in batch.current_state:
             join = self._join_sql(write.natural_keys)
-            changes = self._change_sql(write.change_fields)
+            repeated_fields = frozenset(
+                field.name
+                for field in write.data.schema
+                if pa.types.is_list(field.type)
+            )
+            changes = self._change_sql(write.change_fields, repeated_fields)
             key = self._column(write.natural_keys[0])
             target = self._table_ref(write.table)
             stage = stages[write.table]
@@ -494,6 +583,9 @@ class BigQueryBackend(AbstractStorageBackend):
     def _merge_from_data(self, write: CurrentStateWrite, stage: str) -> str:
         """Build a batch MERGE using Arrow data columns instead of API lookup."""
         columns = tuple(write.data.column_names)
+        repeated_fields = frozenset(
+            field.name for field in write.data.schema if pa.types.is_list(field.type)
+        )
         assignments: list[str] = []
         for column in columns:
             quoted = self._column(column)
@@ -508,7 +600,8 @@ class BigQueryBackend(AbstractStorageBackend):
         return (
             f"MERGE {self._table_ref(write.table)} AS target USING {stage} AS source "
             f"ON {self._join_sql(write.natural_keys)} "
-            f"WHEN MATCHED AND ({self._change_sql(write.change_fields)}) "
+            f"WHEN MATCHED AND ("
+            f"{self._change_sql(write.change_fields, repeated_fields)}) "
             f"THEN UPDATE SET {', '.join(assignments)} "
             f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values});"
         )

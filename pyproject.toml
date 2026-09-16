@@ -86,6 +86,9 @@ min-severity = "warn"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+markers = [
+    "bigquery_live: runs against the dedicated usagebassoon_it BigQuery dataset.",
+]
 
 [tool.coverage.run]
 source = ["src/usagebassoon"]
