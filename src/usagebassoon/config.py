@@ -20,6 +20,7 @@ from usagebassoon.backends.motherduck import MotherDuckBackend
 BackendName = Literal["duckdb", "motherduck", "bigquery"]
 DEFAULT_CONFIG_PATH = Path("~/.config/usagebassoon/config.toml")
 DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
+DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
 
@@ -61,10 +62,40 @@ class BigQueryConfig:
     Attributes:
         project: GCP project identifier.
         location: BigQuery dataset and job location.
+        credentials_file: Optional service-account credential file path.
     """
 
     project: str
     location: str = "US"
+    credentials_file: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionConfig:
+    """Retry settings for one scheduled collection cycle.
+
+    Attributes:
+        max_retries: Additional persistence attempts after the first failure.
+        retry_initial_seconds: Initial exponential-backoff delay.
+    """
+
+    max_retries: int = 3
+    retry_initial_seconds: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    """Local operational log settings for scheduled collection failures.
+
+    Attributes:
+        directory: Directory containing the active and rotated log files.
+        max_files: Number of retained log files including the active file.
+        max_bytes: Maximum size of the active file before rotation.
+    """
+
+    directory: Path = DEFAULT_LOG_DIRECTORY
+    max_files: int = 10
+    max_bytes: int = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +124,8 @@ class UsageBassoonConfig:
         database: Backend database, dataset, or local file path.
         tokscale_bin: Optional tokscale executable override.
         bigquery: BigQuery settings when that backend is selected.
+        collection: Collection retry settings.
+        logging: Local operational logging settings.
         snapshots: Optional snapshot settings.
     """
 
@@ -102,6 +135,8 @@ class UsageBassoonConfig:
     database: str
     tokscale_bin: str | None = None
     bigquery: BigQueryConfig | None = None
+    collection: CollectionConfig = CollectionConfig()
+    logging: LoggingConfig = LoggingConfig()
     snapshots: SnapshotConfig | None = None
 
 
@@ -144,6 +179,65 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     )
 
 
+def _positive_int(value: object, name: str) -> int:
+    """Return a strictly positive TOML integer.
+
+    Args:
+        value: Decoded TOML value.
+        name: Fully qualified configuration field name.
+
+    Raises:
+        ConfigurationError: If the value is not a positive integer.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigurationError(f"{name} must be a positive integer")
+    return value
+
+
+def _collection_config(value: object | None) -> CollectionConfig:
+    """Parse optional collection retry settings."""
+    table = _table(value, "collection")
+    max_retries = table.get("max_retries", 3)
+    retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
+        raise ConfigurationError(
+            "collection.max_retries must be a non-negative integer"
+        )
+    if (
+        not isinstance(retry_initial_seconds, (int, float))
+        or isinstance(retry_initial_seconds, bool)
+        or retry_initial_seconds <= 0
+    ):
+        raise ConfigurationError(
+            "collection.retry_initial_seconds must be a positive number"
+        )
+    return CollectionConfig(
+        max_retries=max_retries,
+        retry_initial_seconds=float(retry_initial_seconds),
+    )
+
+
+def _logging_config(value: object | None) -> LoggingConfig:
+    """Parse optional local rotating-log settings."""
+    table = _table(value, "logging")
+    directory = _string(table.get("directory"), "logging.directory")
+    max_files = _positive_int(table.get("max_files", 10), "logging.max_files")
+    max_bytes = _positive_int(
+        table.get("max_bytes", 10 * 1024 * 1024), "logging.max_bytes"
+    )
+    return LoggingConfig(
+        directory=Path(directory).expanduser()
+        if directory
+        else DEFAULT_LOG_DIRECTORY.expanduser(),
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+
+
 def _bigquery_config(value: object | None) -> BigQueryConfig | None:
     """Parse optional BigQuery settings."""
     if value is None:
@@ -155,9 +249,19 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         "bigquery.location",
         required=True,
     )
+    credentials_file = _string(
+        table.get("credentials_file"),
+        "bigquery.credentials_file",
+    )
     if project is None or location is None:
         raise ConfigurationError("bigquery.project and bigquery.location are required")
-    return BigQueryConfig(project=project, location=location)
+    return BigQueryConfig(
+        project=project,
+        location=location,
+        credentials_file=Path(credentials_file).expanduser()
+        if credentials_file
+        else None,
+    )
 
 
 def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConfig:
@@ -187,6 +291,8 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         database=database,
         tokscale_bin=tokscale_bin,
         bigquery=bigquery,
+        collection=_collection_config(payload.get("collection")),
+        logging=_logging_config(payload.get("logging")),
         snapshots=_snapshot_config(payload.get("snapshots")),
     )
 
@@ -215,6 +321,7 @@ def open_backend(config: UsageBassoonConfig) -> StorageBackend:
         config.bigquery.project,
         config.database,
         location=config.bigquery.location,
+        credentials_file=config.bigquery.credentials_file,
     )
 
 

@@ -2040,6 +2040,7 @@ polars = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "google-cloud-bigquery" },
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -2069,6 +2070,7 @@ provides-extras = ["bigquery", "full", "gcs", "polars"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "google-cloud-bigquery", specifier = ">=3.17" },
     { name = "pyrefly", specifier = ">=0.20" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },

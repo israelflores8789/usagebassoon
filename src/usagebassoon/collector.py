@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import shutil
 import subprocess
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from socket import gethostname
@@ -19,8 +21,9 @@ from uuid import uuid4
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.ingest import RawCollection, build_collection_bundle
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
+from usagebassoon.logger import configure as configure_logging
 from usagebassoon.merge import PersistSummary, persist_run
-from usagebassoon.normalizer import normalize
+from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.parsers.models import parse_models
 
 
@@ -107,6 +110,56 @@ def _array(payload: JsonValue, command: str) -> JsonArray:
     return payload
 
 
+def _persist_with_retries(
+    config: UsageBassoonConfig,
+    bundle: NormalizedBundle,
+    logger: logging.Logger,
+) -> PersistSummary:
+    """Persist one normalized cycle with bounded transient-failure retries.
+
+    Args:
+        config: Active collection retry settings and backend configuration.
+        bundle: One immutable normalized run reused across every retry.
+        logger: Local operational logger for failures safe to diagnose later.
+
+    Returns:
+        The successful atomic persistence outcome.
+
+    Raises:
+        Exception: The final backend exception after retry exhaustion.
+    """
+    from usagebassoon.config import open_backend
+
+    attempts = config.collection.max_retries + 1
+    for attempt in range(1, attempts + 1):
+        backend = None
+        try:
+            backend = open_backend(config)
+            backend.apply_ddl()
+            return persist_run(backend, bundle)
+        except Exception:
+            if attempt == attempts:
+                logger.exception(
+                    "collection run %s failed after %s attempts",
+                    bundle.run_id,
+                    attempts,
+                )
+                raise
+            delay = config.collection.retry_initial_seconds * (2 ** (attempt - 1))
+            logger.exception(
+                "collection run %s failed on attempt %s of %s; retrying in %.1fs",
+                bundle.run_id,
+                attempt,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+        finally:
+            if backend is not None:
+                backend.close()
+    raise RuntimeError("collection persistence exhausted without an exception")
+
+
 def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     """Collect, validate, normalize, and persist one cumulative tokscale state.
 
@@ -116,48 +169,49 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     Returns:
         Generated ingest run id and persistence outcome.
     """
-    from usagebassoon.config import open_backend
-
+    logger = configure_logging(config.logging)
     started_at = datetime.now(UTC)
-    prefix = _prefix(config)
-    models_raw = _object(
-        _json_command(
-            prefix,
-            "models",
-            "--json",
-            "--group-by",
-            "client,session,model",
-            "--merge-worktrees",
-        ),
-        "models",
-    )
-    models = parse_models(models_raw)
-    pricing: dict[str, JsonObject] = {
-        model: _object(_json_command(prefix, "pricing", model, "--json"), "pricing")
-        for model in sorted({entry.model for entry in models.entries})
-    }
-    raw = RawCollection(
-        models=models_raw,
-        report=_array(
-            _json_command(prefix, "report", "--json", "--no-summarize"),
-            "report",
-        ),
-        graph=_object(_json_command(prefix, "graph"), "graph"),
-        pricing=pricing,
-    )
-    run_id = str(uuid4())
-    bundle = build_collection_bundle(
-        raw,
-        run_id=run_id,
-        source_id=config.source_id,
-        started_at=started_at,
-        finished_at=datetime.now(UTC),
-        host=gethostname(),
-    )
-    backend = open_backend(config)
     try:
-        backend.apply_ddl()
-        summary = persist_run(backend, normalize(bundle))
-    finally:
-        backend.close()
+        prefix = _prefix(config)
+        models_raw = _object(
+            _json_command(
+                prefix,
+                "models",
+                "--json",
+                "--group-by",
+                "client,session,model",
+                "--merge-worktrees",
+            ),
+            "models",
+        )
+        models = parse_models(models_raw)
+        pricing: dict[str, JsonObject] = {
+            model: _object(
+                _json_command(prefix, "pricing", model, "--json"),
+                "pricing",
+            )
+            for model in sorted({entry.model for entry in models.entries})
+        }
+        raw = RawCollection(
+            models=models_raw,
+            report=_array(
+                _json_command(prefix, "report", "--json", "--no-summarize"),
+                "report",
+            ),
+            graph=_object(_json_command(prefix, "graph"), "graph"),
+            pricing=pricing,
+        )
+        run_id = str(uuid4())
+        bundle = build_collection_bundle(
+            raw,
+            run_id=run_id,
+            source_id=config.source_id,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+            host=gethostname(),
+        )
+        summary = _persist_with_retries(config, normalize(bundle), logger)
+    except Exception:
+        logger.exception("collection cycle failed before completion")
+        raise
     return run_id, summary

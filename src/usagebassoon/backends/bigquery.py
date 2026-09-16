@@ -1,31 +1,97 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""bigquery.py — BigQuery backend.
-
-TODO!!
-STRUCTURAL ONLY: google-cloud-bigquery and GCP credentials
-were unavailable in the offline conformance sandbox, so this module is
-syntax-compiled and design-reviewed but not execution-verified. The merge
-SQL follows the same current-state upsert contract as DuckDB. CI must run
-this module against a real free-tier BigQuery dataset before release.
-"""
+"""bigquery.py — Atomic BigQuery storage over canonical Arrow tables."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import AbstractContextManager, nullcontext
+import logging
+import re
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from importlib import resources
+from pathlib import Path
+from typing import cast, override
+from uuid import uuid4
 
 import pyarrow as pa
 from google.auth.credentials import Credentials
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
-from usagebassoon.backends.base import UpsertResult
+from usagebassoon.backends.base import (
+    AbstractStorageBackend,
+    BatchPersistResult,
+    CurrentStateWrite,
+    PersistenceBatch,
+    UpsertResult,
+    is_simple_identifier,
+)
+
+_PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
+_DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
+_LOG = logging.getLogger("usagebassoon")
 
 
-class BigQueryBackend:
-    """StorageBackend implementation over a GCP BigQuery dataset."""
+def _validate_project(project: str) -> None:
+    """Require a canonical GCP project identifier."""
+    if not _PROJECT_ID.fullmatch(project):
+        raise ValueError(f"invalid BigQuery project identifier: {project!r}")
+
+
+def _validate_dataset(dataset: str) -> None:
+    """Require a canonical BigQuery dataset identifier."""
+    if not _DATASET_ID.fullmatch(dataset):
+        raise ValueError(f"invalid BigQuery dataset identifier: {dataset!r}")
+
+
+def _schema_from_arrow(data: pa.Table) -> list[bigquery.SchemaField]:
+    """Map the canonical Arrow table schema to an explicit BigQuery schema.
+
+    Args:
+        data: Normalized Arrow table to load.
+
+    Returns:
+        BigQuery schema fields preserving Arrow's supported logical types.
+
+    Raises:
+        ValueError: If a normalized table has an unsupported Arrow type.
+    """
+    fields: list[bigquery.SchemaField] = []
+    for field in data.schema:
+        if not is_simple_identifier(field.name):
+            raise ValueError(f"invalid Arrow field name {field.name!r}")
+        arrow_type = field.type
+        mode = "NULLABLE"
+        if pa.types.is_list(arrow_type):
+            if not pa.types.is_string(arrow_type.value_type):
+                raise ValueError(
+                    f"unsupported repeated Arrow type for {field.name!r}: {arrow_type}"
+                )
+            kind = "STRING"
+            mode = "REPEATED"
+        elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+            kind = "STRING"
+        elif pa.types.is_boolean(arrow_type):
+            kind = "BOOL"
+        elif pa.types.is_integer(arrow_type) or pa.types.is_unsigned_integer(
+            arrow_type
+        ):
+            kind = "INT64"
+        elif pa.types.is_floating(arrow_type):
+            kind = "FLOAT64"
+        elif pa.types.is_date(arrow_type):
+            kind = "DATE"
+        elif pa.types.is_timestamp(arrow_type):
+            kind = "TIMESTAMP"
+        else:
+            raise ValueError(f"unsupported Arrow type for {field.name!r}: {arrow_type}")
+        fields.append(bigquery.SchemaField(field.name, kind, mode=mode))
+    return fields
+
+
+class BigQueryBackend(AbstractStorageBackend):
+    """StorageBackend implementation using run-scoped remote staging tables."""
 
     dialect = "bigquery"
 
@@ -36,37 +102,135 @@ class BigQueryBackend:
         *,
         location: str = "US",
         credentials: Credentials | None = None,
+        credentials_file: Path | None = None,
+        client: bigquery.Client | None = None,
     ) -> None:
-        """Create a backend bound to a BigQuery dataset.
+        """Create a backend bound to a validated BigQuery dataset.
 
         Args:
-            project: GCP project id.
+            project: GCP project identifier.
             dataset: BigQuery dataset name.
-            location: BigQuery location for dataset and jobs.
-            credentials: google-auth credentials; ADC used when omitted.
+            location: Required dataset and job location.
+            credentials: Explicit Google credentials, normally for tests.
+            credentials_file: Service-account JSON file, preferred over ADC.
+            client: Injected client for offline unit tests.
+
+        Raises:
+            ValueError: If identifiers or credential sources conflict.
         """
-        self.client = bigquery.Client(
-            project=project, credentials=credentials, location=location
-        )
+        _validate_project(project)
+        _validate_dataset(dataset)
+        if not location.strip():
+            raise ValueError("BigQuery location must not be empty")
+        if credentials is not None and credentials_file is not None:
+            raise ValueError("credentials and credentials_file cannot be combined")
+        resolved_credentials = credentials
+        if credentials_file is not None:
+            resolved_credentials = (
+                service_account.Credentials.from_service_account_file(
+                    str(credentials_file)
+                )
+            )
+        self.project = project
+        self.dataset = dataset
+        self.location = location
         self.dataset_ref = f"{project}.{dataset}"
+        self.client = client or bigquery.Client(
+            project=project,
+            credentials=resolved_credentials,
+            location=location,
+        )
 
+    def _table_ref(self, table: str) -> str:
+        """Return a safely quoted fully qualified internal table reference."""
+        if not is_simple_identifier(table):
+            raise ValueError(f"invalid BigQuery table identifier: {table!r}")
+        return f"`{self.dataset_ref}.{table}`"
+
+    def _query_config(
+        self,
+        *,
+        parameters: list[bigquery.ScalarQueryParameter] | None = None,
+    ) -> bigquery.QueryJobConfig:
+        """Build the fixed Standard SQL configuration for backend jobs."""
+        return bigquery.QueryJobConfig(
+            default_dataset=self.dataset_ref,
+            query_parameters=parameters or [],
+        )
+
+    @override
     def apply_ddl(self) -> None:
-        """Ensure dataset, then run ddl.sql and views.sql statements."""
-        ds = bigquery.Dataset(self.dataset_ref)
-        self.client.create_dataset(ds, exists_ok=True)
-        pkg = resources.files(f"usagebassoon.sql.{self.dialect}")
-        for name in ("ddl.sql", "views.sql"):
-            r = pkg.joinpath(name)
-            if r.is_file():
-                for stmt in r.read_text().split(";"):
-                    if stmt.strip():
-                        self.client.query(
-                            stmt,
-                            job_config=bigquery.QueryJobConfig(
-                                default_dataset=self.dataset_ref
-                            ),
-                        ).result()
+        """Create or validate the configured dataset, then apply packaged SQL.
 
+        Raises:
+            ValueError: If an existing dataset has another location.
+        """
+        dataset = bigquery.Dataset(self.dataset_ref)
+        dataset.location = self.location
+        self.client.create_dataset(dataset, exists_ok=True)
+        actual = self.client.get_dataset(self.dataset_ref)
+        actual_location = actual.location
+        if not isinstance(actual_location, str):
+            raise ValueError("BigQuery dataset did not report a string location")
+        if actual_location.casefold() != self.location.casefold():
+            raise ValueError(
+                "configured BigQuery location "
+                f"{self.location!r} does not match existing dataset location "
+                f"{actual_location!r}"
+            )
+        package = resources.files("usagebassoon.sql.bigquery")
+        for filename in ("ddl.sql", "migrations.sql", "views.sql"):
+            self.client.query(
+                package.joinpath(filename).read_text(),
+                job_config=self._query_config(),
+                location=self.location,
+            ).result()
+
+    def _load(
+        self,
+        data: pa.Table,
+        destination: str,
+        *,
+        disposition: str,
+    ) -> None:
+        """Load canonical Arrow data through pandas with an explicit schema."""
+        self.client.load_table_from_dataframe(
+            data.to_pandas(),
+            destination,
+            job_config=bigquery.LoadJobConfig(
+                schema=_schema_from_arrow(data),
+                write_disposition=disposition,
+            ),
+            location=self.location,
+        ).result()
+
+    def _stage_ref(self, table: str, run_id: str) -> str:
+        """Return one collision-resistant, run-scoped staging table reference."""
+        compact_run_id = run_id.replace("-", "")
+        return self._table_ref(f"_stage_{table}_{compact_run_id}")
+
+    def _delete_stages(self, stages: Sequence[str]) -> None:
+        """Best-effort remove staging tables after a batch reaches a terminal state."""
+        for stage in stages:
+            try:
+                self.client.delete_table(stage, not_found_ok=True)
+            except Exception:
+                _LOG.exception("could not remove BigQuery staging table %s", stage)
+
+    @override
+    def has_committed_run(self, run_id: str) -> bool:
+        """Return whether the ingest ledger contains a completed cycle."""
+        result = self.client.query(
+            f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
+            "WHERE `run_id` = @run_id LIMIT 1",
+            job_config=self._query_config(
+                parameters=[bigquery.ScalarQueryParameter("run_id", "STRING", run_id)]
+            ),
+            location=self.location,
+        ).result()
+        return next(iter(result), None) is not None
+
+    @override
     def upsert(
         self,
         table: str,
@@ -74,99 +238,303 @@ class BigQueryBackend:
         natural_keys: Sequence[str],
         change_fields: Sequence[str],
     ) -> UpsertResult:
-        """Insert new rows and update changed current-state rows.
+        """Apply one standalone mutation for curation or empty-store restore.
 
-        Args:
-            table: Target fact table.
-            data: Staged Arrow batch.
-            natural_keys: Natural key columns.
-            change_fields: Columns compared null-safe (IS DISTINCT FROM).
-
-        Returns:
-            Separate inserted and updated row counts.
+        Collection ingestion uses :meth:`persist_batch` so every fact and
+        audit write belongs to one BigQuery multi-statement transaction.
         """
         if data.num_rows == 0:
             return UpsertResult()
-        stage = f"{self.dataset_ref}._stage_{table}"
-        self.client.load_table_from_dataframe(
-            data.to_pandas(),
-            stage,
-            job_config=bigquery.LoadJobConfig(
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        self._validate_upsert(table, data, natural_keys, change_fields)
+        stage = self._table_ref(f"_stage_{table}_{uuid4().hex}")
+        try:
+            self._load(
+                data, stage, disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+            )
+            inserted, updated = self._count_changes(
+                table,
+                stage,
+                natural_keys,
+                change_fields,
+            )
+            self.client.query(
+                self._merge_sql(table, stage, natural_keys, change_fields),
+                job_config=self._query_config(),
+                location=self.location,
+            ).result()
+            return UpsertResult(inserted=inserted, updated=updated)
+        finally:
+            self._delete_stages((stage,))
+
+    def _count_changes(
+        self,
+        table: str,
+        stage: str,
+        natural_keys: Sequence[str],
+        change_fields: Sequence[str],
+    ) -> tuple[int, int]:
+        """Count inserts and material changes against a staged source."""
+        join = self._join_sql(natural_keys)
+        changes = self._change_sql(change_fields)
+        key = self._column(natural_keys[0])
+        row = next(
+            iter(
+                self.client.query(
+                    "SELECT "
+                    f"COUNTIF(target.{key} IS NULL) AS inserted, "
+                    f"COUNTIF(target.{key} IS NOT NULL AND ({changes})) AS updated "
+                    f"FROM {stage} AS source "
+                    f"LEFT JOIN {self._table_ref(table)} AS target ON {join}",
+                    job_config=self._query_config(),
+                    location=self.location,
+                ).result()
             ),
-        ).result()
-        nk = list(natural_keys)
-        cols = data.schema.names
-        join = " AND ".join(f"target.{key} = source.{key}" for key in nk)
-        changes = " OR ".join(
-            f"target.{field} IS DISTINCT FROM source.{field}" for field in change_fields
+            None,
         )
-        change = changes or "FALSE"
+        if row is None:
+            return (0, 0)
+        return (int(row["inserted"]), int(row["updated"]))
+
+    @staticmethod
+    def _column(column: str) -> str:
+        """Return a validated, quoted internal column reference fragment."""
+        if not is_simple_identifier(column):
+            raise ValueError(f"invalid BigQuery column identifier: {column!r}")
+        return f"`{column}`"
+
+    def _join_sql(self, natural_keys: Sequence[str]) -> str:
+        """Build a null-safe-false natural-key equality predicate."""
+        return " AND ".join(
+            f"target.{self._column(key)} = source.{self._column(key)}"
+            for key in natural_keys
+        )
+
+    def _change_sql(self, change_fields: Sequence[str]) -> str:
+        """Build a null-safe material-change predicate."""
+        return (
+            " OR ".join(
+                f"target.{self._column(field)} IS DISTINCT FROM "
+                f"source.{self._column(field)}"
+                for field in change_fields
+            )
+            or "FALSE"
+        )
+
+    def _merge_sql(
+        self,
+        table: str,
+        stage: str,
+        natural_keys: Sequence[str],
+        change_fields: Sequence[str],
+    ) -> str:
+        """Build a MERGE statement from trusted canonical table metadata."""
+        columns = tuple(
+            field.name for field in self.client.get_table(self._table_ref(table)).schema
+        )
         assignments: list[str] = []
-        for column in cols:
-            value = f"source.{column}"
+        for column in columns:
+            quoted = self._column(column)
+            value = f"source.{quoted}"
             if column in {"created_at", "first_seen_at"}:
-                value = f"COALESCE(target.{column}, {value})"
-            assignments.append(f"{column} = {value}")
-        source_values = ", ".join(f"source.{column}" for column in cols)
-        counted = self.client.query(
-            f"SELECT "
-            f"countif(target.{nk[0]} IS NULL) AS inserted, "
-            f"countif(target.{nk[0]} IS NOT NULL AND ({change})) AS updated "
-            f"FROM `{stage}` source "
-            f"LEFT JOIN `{self.dataset_ref}.{table}` target ON {join}"
-        ).result()
-        count_row = next(iter(counted), None)
-        if count_row is None:
-            return UpsertResult()
-        job = self.client.query(
-            f"MERGE `{self.dataset_ref}.{table}` target "
-            f"USING `{stage}` source ON {join} "
-            f"WHEN MATCHED AND ({change}) THEN UPDATE SET {', '.join(assignments)} "
-            f"WHEN NOT MATCHED THEN INSERT ({', '.join(cols)}) "
-            f"VALUES ({source_values})"
+                value = f"COALESCE(target.{quoted}, {value})"
+            assignments.append(f"{quoted} = {value}")
+        quoted_columns = ", ".join(self._column(column) for column in columns)
+        source_values = ", ".join(
+            f"source.{self._column(column)}" for column in columns
         )
-        job.result()
-        return UpsertResult(
-            inserted=int(count_row["inserted"]),
-            updated=int(count_row["updated"]),
+        return (
+            f"MERGE {self._table_ref(table)} AS target USING {stage} AS source "
+            f"ON {self._join_sql(natural_keys)} "
+            f"WHEN MATCHED AND ({self._change_sql(change_fields)}) THEN UPDATE SET "
+            f"{', '.join(assignments)} "
+            f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values})"
         )
 
+    @override
     def append(self, table: str, data: pa.Table) -> None:
-        """Append a batch via a WRITE_APPEND load job.
-
-        Args:
-            table: Target table.
-            data: Arrow batch.
-        """
+        """Append one Arrow table outside collection-cycle batch persistence."""
         if data.num_rows == 0:
             return
-        self.client.load_table_from_dataframe(
-            data.to_pandas(),
-            f"{self.dataset_ref}.{table}",
-            job_config=bigquery.LoadJobConfig(
-                write_disposition=bigquery.WriteDisposition.WRITE_APPEND
-            ),
-        ).result()
+        if not is_simple_identifier(table):
+            raise ValueError(f"invalid BigQuery table identifier: {table!r}")
+        self._load(
+            data,
+            self._table_ref(table),
+            disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
 
-    def query(self, sql: str) -> pa.Table:
-        """Run BigQuery Standard SQL and return Arrow.
+    @override
+    def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
+        """Stage Arrow tables then atomically apply one BigQuery cycle script."""
+        self._validate_batch(batch)
+        tables: dict[str, pa.Table] = {
+            write.table: write.data for write in batch.current_state
+        }
+        tables.update(batch.append_only)
+        tables["ingest_runs"] = batch.ingest_runs
+        stages = {table: self._stage_ref(table, batch.run_id) for table in tables}
+        try:
+            for table, data in tables.items():
+                self._load(
+                    data,
+                    stages[table],
+                    disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                )
+            result = self.client.query(
+                self._batch_script(batch, stages),
+                job_config=self._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter("run_id", "STRING", batch.run_id)
+                    ]
+                ),
+                location=self.location,
+            ).result()
+            row = next(iter(result), None)
+            if row is None:
+                raise RuntimeError("BigQuery persistence batch returned no summary row")
+            already_committed = bool(row["already_committed"])
+            per_table = {
+                write.table: UpsertResult(
+                    inserted=int(row[f"inserted_{write.table}"]),
+                    updated=int(row[f"updated_{write.table}"]),
+                )
+                for write in batch.current_state
+            }
+            return BatchPersistResult(per_table, already_committed=already_committed)
+        finally:
+            self._delete_stages(tuple(stages.values()))
 
-        Args:
-            sql: BigQuery-dialect SQL.
+    def _batch_script(
+        self,
+        batch: PersistenceBatch,
+        stages: Mapping[str, str],
+    ) -> str:
+        """Build the remote staging and atomic persistence script.
 
-        Returns:
-            Result set as an Arrow table.
+        The temporary stage tables are loaded before the script. All user
+        tables are then mutated only inside the transaction. ``ingest_runs``
+        is inserted last, providing the idempotency ledger for retrying the
+        same UUID after an ambiguous client-side outcome.
         """
-        return self.client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(default_dataset=self.dataset_ref),
-        ).to_arrow()
+        declarations = [
+            "DECLARE already_committed BOOL DEFAULT EXISTS("
+            f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
+            "WHERE `run_id` = @run_id);"
+        ]
+        for write in batch.current_state:
+            declarations.extend(
+                [
+                    f"DECLARE inserted_{write.table} INT64 DEFAULT 0;",
+                    f"DECLARE updated_{write.table} INT64 DEFAULT 0;",
+                ]
+            )
+        statements = [
+            *declarations,
+            "IF NOT already_committed THEN",
+            "BEGIN TRANSACTION;",
+        ]
+        for write in batch.current_state:
+            join = self._join_sql(write.natural_keys)
+            changes = self._change_sql(write.change_fields)
+            key = self._column(write.natural_keys[0])
+            target = self._table_ref(write.table)
+            stage = stages[write.table]
+            statements.extend(
+                [
+                    f"SET inserted_{write.table} = ("
+                    f"SELECT COUNTIF(target.{key} IS NULL) FROM {stage} AS source "
+                    f"LEFT JOIN {target} AS target ON {join});",
+                    f"SET updated_{write.table} = ("
+                    f"SELECT COUNTIF(target.{key} IS NOT NULL AND ({changes})) "
+                    f"FROM {stage} AS source LEFT JOIN {target} AS target ON {join});",
+                    self._merge_from_data(write, stage),
+                ]
+            )
+        for table, data in batch.append_only.items():
+            columns = ", ".join(self._column(name) for name in data.column_names)
+            statements.append(
+                f"INSERT INTO {self._table_ref(table)} ({columns}) "
+                f"SELECT {columns} FROM {stages[table]};"
+            )
+        ingest_columns = tuple(batch.ingest_runs.column_names)
+        target_columns = ", ".join(self._column(name) for name in ingest_columns)
+        inserted_total = (
+            " + ".join(f"inserted_{write.table}" for write in batch.current_state)
+            or "0"
+        )
+        updated_total = (
+            " + ".join(f"updated_{write.table}" for write in batch.current_state) or "0"
+        )
 
-    def transaction(self) -> AbstractContextManager[None]:
-        """Return a no-op context because each BigQuery DML job is atomic."""
-        return nullcontext()
+        def source_column(name: str) -> str:
+            """Return the staged expression for one ingest-run field."""
+            if name == "rows_inserted":
+                return f"({inserted_total})"
+            if name == "rows_updated":
+                return f"({updated_total})"
+            return f"source.{self._column(name)}"
 
+        source_columns = ", ".join(source_column(name) for name in ingest_columns)
+        statements.extend(
+            [
+                f"INSERT INTO {self._table_ref('ingest_runs')} ({target_columns}) "
+                f"SELECT {source_columns} FROM {stages['ingest_runs']} AS source;",
+                "COMMIT TRANSACTION;",
+                "END IF;",
+            ]
+        )
+        select_columns = ["already_committed"]
+        for write in batch.current_state:
+            select_columns.extend(
+                [f"inserted_{write.table}", f"updated_{write.table}"],
+            )
+        statements.append(f"SELECT {', '.join(select_columns)};")
+        return "\n".join(statements)
+
+    def _merge_from_data(self, write: CurrentStateWrite, stage: str) -> str:
+        """Build a batch MERGE using Arrow data columns instead of API lookup."""
+        columns = tuple(write.data.column_names)
+        assignments: list[str] = []
+        for column in columns:
+            quoted = self._column(column)
+            value = f"source.{quoted}"
+            if column in {"created_at", "first_seen_at"}:
+                value = f"COALESCE(target.{quoted}, {value})"
+            assignments.append(f"{quoted} = {value}")
+        quoted_columns = ", ".join(self._column(column) for column in columns)
+        source_values = ", ".join(
+            f"source.{self._column(column)}" for column in columns
+        )
+        return (
+            f"MERGE {self._table_ref(write.table)} AS target USING {stage} AS source "
+            f"ON {self._join_sql(write.natural_keys)} "
+            f"WHEN MATCHED AND ({self._change_sql(write.change_fields)}) "
+            f"THEN UPDATE SET {', '.join(assignments)} "
+            f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values});"
+        )
+
+    @override
+    def query(self, sql: str) -> pa.Table:
+        """Run BigQuery Standard SQL and return Arrow without Storage API use."""
+        return cast(
+            pa.Table,
+            self.client.query(
+                sql,
+                job_config=self._query_config(),
+                location=self.location,
+            )
+            .result()
+            .to_arrow(create_bqstorage_client=False),
+        )
+
+    @contextmanager
+    @override
+    def transaction(self) -> Generator[None]:
+        """Reject generic transaction use that cannot span BigQuery jobs."""
+        raise RuntimeError("BigQuery requires persist_batch for atomic persistence")
+        yield
+
+    @override
     def close(self) -> None:
-        """Close the client."""
+        """Close the owned BigQuery client."""
         self.client.close()

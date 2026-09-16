@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_backends.py — Tests for local DuckDB and offline MotherDuck validation."""
+"""test_backend_duckdb.py — Tests for local DuckDB and offline MotherDuck validation."""
 
 from __future__ import annotations
 

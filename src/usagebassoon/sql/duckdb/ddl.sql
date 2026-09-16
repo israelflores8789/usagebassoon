@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
 -- Historical point-in-time rates resolved by tokscale. Unlike current-state
 -- usage facts, pricing history is intentionally append-mostly.
 CREATE TABLE IF NOT EXISTS pricing_snapshots (
+    run_id          TEXT NOT NULL,
     source_id       TEXT NOT NULL,
     captured_at     TIMESTAMPTZ NOT NULL,
     model           TEXT NOT NULL,

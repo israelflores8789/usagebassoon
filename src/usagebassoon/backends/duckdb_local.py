@@ -9,11 +9,16 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
+from typing import override
 
 import duckdb
 import pyarrow as pa
 
-from usagebassoon.backends.base import UpsertResult
+from usagebassoon.backends.base import (
+    AbstractStorageBackend,
+    UpsertResult,
+    is_simple_identifier,
+)
 
 
 def _identifier(value: str) -> str:
@@ -28,12 +33,12 @@ def _identifier(value: str) -> str:
     Raises:
         ValueError: If the value is not a simple identifier.
     """
-    if not value.isidentifier():
+    if not is_simple_identifier(value):
         raise ValueError(f"expected a simple SQL identifier, got {value!r}")
     return f'"{value}"'
 
 
-class _DuckDBStorage:
+class _DuckDBStorage(AbstractStorageBackend):
     """DuckDB SQL operations shared with the separate MotherDuck backend."""
 
     dialect = "duckdb"
@@ -46,37 +51,14 @@ class _DuckDBStorage:
         """
         self.connection = connection
 
+    @override
     def apply_ddl(self) -> None:
         """Apply the shared DuckDB and MotherDuck DDL plus views."""
         package = resources.files("usagebassoon.sql.duckdb")
-        for filename in ("ddl.sql", "views.sql"):
+        for filename in ("ddl.sql", "migrations.sql", "views.sql"):
             self.connection.execute(package.joinpath(filename).read_text())
 
-    @staticmethod
-    def _validate_upsert(
-        data: pa.Table,
-        natural_keys: Sequence[str],
-        change_fields: Sequence[str],
-    ) -> None:
-        """Validate the staged batch before building an upsert statement.
-
-        Args:
-            data: Staged Arrow batch.
-            natural_keys: Current-state identity columns.
-            change_fields: Logical columns used for change detection.
-
-        Raises:
-            ValueError: If the batch is malformed for a current-state upsert.
-        """
-        if not natural_keys:
-            raise ValueError("at least one natural key is required")
-        columns = set(data.column_names)
-        required = set(natural_keys) | set(change_fields)
-        if missing := required - columns:
-            raise ValueError(f"staged data is missing columns: {sorted(missing)}")
-        for column in (*natural_keys, *change_fields):
-            _identifier(column)
-
+    @override
     def upsert(
         self,
         table: str,
@@ -98,7 +80,7 @@ class _DuckDBStorage:
         if data.num_rows == 0:
             return UpsertResult()
         quoted_table = _identifier(table)
-        self._validate_upsert(data, natural_keys, change_fields)
+        self._validate_upsert(table, data, natural_keys, change_fields)
         columns = tuple(data.column_names)
         quoted_columns = ", ".join(map(_identifier, columns))
         join = " AND ".join(
@@ -124,13 +106,6 @@ class _DuckDBStorage:
 
         self.connection.register("_usagebassoon_upsert_batch", data)
         try:
-            key_columns = ", ".join(map(_identifier, natural_keys))
-            distinct_count = self.connection.execute(
-                f"SELECT count(DISTINCT ({key_columns})) "
-                f"FROM _usagebassoon_upsert_batch"
-            ).fetchone()
-            if distinct_count is None or int(distinct_count[0]) != data.num_rows:
-                raise ValueError("staged data contains duplicate natural keys")
             counted = self.connection.execute(
                 f"SELECT "
                 f"count(*) FILTER (WHERE "
@@ -156,6 +131,7 @@ class _DuckDBStorage:
             self.connection.unregister("_usagebassoon_upsert_batch")
         return UpsertResult(inserted=int(inserted), updated=int(updated))
 
+    @override
     def append(self, table: str, data: pa.Table) -> None:
         """Append an Arrow batch to an append-only table.
 
@@ -175,6 +151,16 @@ class _DuckDBStorage:
         finally:
             self.connection.unregister("_usagebassoon_append_batch")
 
+    @override
+    def has_committed_run(self, run_id: str) -> bool:
+        """Return whether an ingest audit row already owns a run identifier."""
+        result = self.connection.execute(
+            "SELECT 1 FROM ingest_runs WHERE run_id = ? LIMIT 1",
+            [run_id],
+        ).fetchone()
+        return result is not None
+
+    @override
     def query(self, sql: str) -> pa.Table:
         """Execute DuckDB SQL and materialize the result as an Arrow table.
 
@@ -187,6 +173,7 @@ class _DuckDBStorage:
         return self.connection.execute(sql).arrow().read_all()
 
     @contextmanager
+    @override
     def transaction(self) -> Generator[None]:
         """Yield a DuckDB transaction that commits only if its body succeeds.
 
@@ -202,6 +189,7 @@ class _DuckDBStorage:
         else:
             self.connection.execute("COMMIT")
 
+    @override
     def close(self) -> None:
         """Close the owned connection."""
         self.connection.close()

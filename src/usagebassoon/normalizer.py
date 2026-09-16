@@ -278,6 +278,7 @@ def _append_only(
     if bundle.pricing_by_model:
         recs = [
             {
+                "run_id": bundle.run_id,
                 "source_id": bundle.source_id,
                 "captured_at": at,
                 "model": p.model_id,
