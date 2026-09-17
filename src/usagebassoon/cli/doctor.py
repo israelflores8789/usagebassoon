@@ -12,7 +12,13 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
+from usagebassoon.cli._utils import snapshot_store
+from usagebassoon.config import (
+    ConfigurationError,
+    ConfigurationManager,
+    UsageBassoonConfig,
+    open_backend,
+)
 from usagebassoon.drift import DoctorReport, run_doctor
 from usagebassoon.privacy import sanitize_doctor_text
 
@@ -107,6 +113,13 @@ def doctor(
         snapshot_enabled=(configuration.snapshots is not None)
         if configuration
         else None,
+        snapshot_warnings=(
+            _snapshot_warnings(configuration)
+            if configuration
+            and configuration.snapshots
+            and configuration.snapshots.gcs_uri
+            else ()
+        ),
         limit=limit,
     )
     try:
@@ -129,3 +142,11 @@ def doctor(
             opened.close()
     if report.exit_code(strict=strict):
         raise typer.Exit(code=1)
+
+
+def _snapshot_warnings(configuration: UsageBassoonConfig) -> tuple[str, ...]:
+    """Inspect configured GCS lifecycle rules without failing doctor outright."""
+    try:
+        return snapshot_store(configuration).lifecycle_warnings()
+    except Exception as error:
+        return (f"GCS lifecycle inspection unavailable: {error}",)

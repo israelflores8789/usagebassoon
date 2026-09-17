@@ -96,3 +96,22 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
     assert config.collection.retry_initial_seconds == 0.5
     assert config.logging.directory == DEFAULT_LOG_DIRECTORY.expanduser()
     assert (config.logging.max_files, config.logging.max_bytes) == (5, 4096)
+
+
+def test_snapshot_defaults_and_interval_validation_are_consistent(
+    tmp_path: Path,
+) -> None:
+    """Use the documented default retention and reject invalid cadence values."""
+    valid = tmp_path / "valid.toml"
+    valid.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[snapshots]\ninterval = "12h"\n'
+    )
+    snapshots = ConfigurationManager(valid).load().snapshots
+    assert snapshots is not None
+    assert snapshots.max_snapshots == 3
+    invalid = tmp_path / "invalid.toml"
+    invalid.write_text(valid.read_text().replace('"12h"', '"zero"'))
+    with pytest.raises(ConfigurationError, match=r"snapshots\.interval"):
+        ConfigurationManager(invalid).load()

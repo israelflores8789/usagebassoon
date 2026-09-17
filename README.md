@@ -35,6 +35,10 @@ Reports are raw by default for personal terminal use; run `bassoon report --sani
 
 `bassoon export` obfuscates potentially identifying fields and redacts notes by default. It announces this behavior on stderr; use `--raw` only for intentional personal backup or data-management exports. Snapshots are raw restoration artifacts and should be kept private.
 
+## Snapshots
+
+`bassoon snapshot` writes a catalog-published Parquet restoration archive and `bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Local archives rotate under `~/.usagebassoon/snapshots/` by default. Configure `[snapshots] max_snapshots = 3` and an optional positive interval such as `12h`; an interval also enables due-only automatic snapshots after collection. Set `gcs_uri = "gs://bucket/private/usagebassoon-snapshots"` to use Google Cloud Storage (install `usagebassoon[gcs]`); the archive uses generation-conditional catalog publication and stores raw private data.
+
 ## License & Disclaimers
 
 UsageBassoon is copyright © 2026 Israel Flores-Arbolay and licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See LICENSE for the full text.

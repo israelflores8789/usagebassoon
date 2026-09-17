@@ -15,6 +15,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from pathlib import Path
 from socket import gethostname
 from typing import cast
 from uuid import uuid4
@@ -27,10 +28,34 @@ from usagebassoon.merge import PersistSummary, persist_run
 from usagebassoon.normalizer import NormalizedBundle, ProcessingTarget, normalize
 from usagebassoon.parsers.daily import parse_daily
 from usagebassoon.parsers.graph import parse_graph
+from usagebassoon.snapshots import SnapshotStore
 
 _DAILY_STATS_TARGET = "daily_stats"
 _PRICE_VERSIONS_TARGET = "price_versions"
 _MAX_TRANSACTION_RETRY_SECONDS = 30.0
+
+
+def _snapshot_after_collect(
+    config: UsageBassoonConfig,
+    run_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Attempt a due optional snapshot without invalidating persisted usage data."""
+    settings = config.snapshots
+    if settings is None or settings.interval is None:
+        return
+    uri = settings.gcs_uri or f"file://{Path('~/.usagebassoon/snapshots').expanduser()}"
+    backend = open_backend(config)
+    try:
+        SnapshotStore(
+            uri,
+            max_snapshots=settings.max_snapshots,
+            interval=settings.interval,
+        ).write(backend, run_id=run_id)
+    except Exception:
+        logger.exception("snapshot after collection run %s failed", run_id)
+    finally:
+        backend.close()
 
 
 def _prefix(config: UsageBassoonConfig) -> list[str]:
@@ -292,6 +317,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
             host=gethostname(),
         )
         summary = _persist_with_retries(config, normalize(bundle), logger)
+        _snapshot_after_collect(config, run_id, logger)
     except Exception:
         logger.exception("collection cycle failed before completion")
         raise

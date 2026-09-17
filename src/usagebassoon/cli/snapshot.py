@@ -31,4 +31,9 @@ def snapshot(
         )
     finally:
         backend.close()
-    typer.echo(f"Created private raw snapshot at {uri}.")
+    if uri is None:
+        typer.echo(
+            "Snapshot skipped: the configured interval is not due or is reserved."
+        )
+    else:
+        typer.echo(f"Created private raw snapshot at {uri}.")

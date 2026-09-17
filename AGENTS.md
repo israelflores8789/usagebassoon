@@ -34,7 +34,8 @@ usagebassoon/
 │   │   ├── base.py           # StorageBackend protocol
 │   │   ├── duckdb_local.py
 │   │   ├── motherduck.py
-│   │   └── bigquery.py
+│   │   ├── bigquery.py
+│   │   └── gcs.py            # generation-safe GCS archive adapter
 │   ├── reports/              # terminal rich tables + plotext charts; one module per report type
 │   ├── collector.py          # tokscale subprocess + retry
 │   ├── frames.py             # Arrow conversion to pandas or optional polars
@@ -42,7 +43,7 @@ usagebassoon/
 │   ├── json_types.py         # recursive types for JSON-decoded payloads
 │   ├── normalizer.py         # daily facts and price versions → Arrow
 │   ├── drift.py              # schema_drift detection + reporting
-│   ├── snapshots.py          # local/GCS rotating snapshots + restore
+│   ├── snapshots.py          # catalog-published local/GCS snapshots + restore
 │   ├── merge.py              # staging + daily current-state upserts
 │   ├── reconcile.py          # report/session consistency checks
 │   ├── curation.py           # tags + notes
@@ -63,11 +64,14 @@ usagebassoon/
 │   ├── test_backends.py      # StorageBackend integration and DDL checks
 │   ├── test_cli_curation.py  # tag/note command integration
 │   ├── test_cli_init.py      # config and schema initialization
+│   ├── test_cli_restore.py   # snapshot restore command integration
+│   ├── test_cli_snapshot.py  # snapshot command integration
 │   ├── test_collector_daily.py # daily candidate selection and retries
 │   ├── test_contracts.py     # schema-contract and drift validation
 │   ├── test_merge.py         # delta persistence semantics
 │   ├── test_parsers.py       # fixture-derived parser invariants
-│   └── test_reconcile.py     # cross-payload consistency checks
+│   ├── test_reconcile.py     # cross-payload consistency checks
+│   └── test_snapshots.py     # catalog, retention, cadence, and GCS behavior
 └── .github/workflows/        # ci (ruff, pyrefly, pytest), dialect-parity, release to PyPI
 ```
 
@@ -212,11 +216,11 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Ingest semantics:** Date-filtered `models` rows are upserted at daily session/model grain. `graph` contributions are authoritative only for `daily_activity` and candidate dates. `session_model_stats` is an all-time calculated view over `daily_stats`. Tags and notes are owned by the user and are never touched by merge.
 
-- **Snapshot semantics:** Snapshots are an optional layer that contain normalized tables that provide portability, restore, and seed of the current database state. They are not raw-payload replay points:
-  - `bassoon snapshot` writes every table to Parquet locally at `~/.usagebassoon/snapshots/` (UTC timestamp in the filename) or remotely in GCS `gs://<uri>/<UTC-date>-<short-sha>/`, plus a `manifest.json` (table list, row counts, tokscale contract version, DuckDB/BigQuery schema hashes).
-  - Rotation: after each snapshot, delete the oldest if more than `max_snapshots` exist.
-  - `bassoon restore --from-snapshot [latest|date|run]` hydrates a fresh environment (new container, new VM, local↔cloud migration) — reads Parquet → Arrow → backend append path unchanged.
-  - Snapshots are the substrate for `bassoon export` portability too.
+- **Snapshot semantics:** Snapshots are portable normalized-table archives, not raw-payload replay points. Every backend—including BigQuery—reads canonical Arrow tables and writes deterministic Parquet through UsageBassoon; never use a server-side BigQuery-to-GCS export.
+  - A snapshot is restorable only after every expected table succeeds, its complete manifest is written, and the manifest is published in the archive catalog. Uncataloged prefixes are staging/orphans, never restore candidates.
+  - The catalog defines `latest`, cadence, and FIFO retention. GCS catalog publication uses generation compare-and-swap plus a short fenced reservation; cleanup is generation-conditional and must never delete the latest published snapshot. Local archives use the same catalog semantics.
+  - Restore validates catalog membership, complete table coverage, and destination schema compatibility before appending any data. The destination must be initialized and empty; a failed restore can leave partial data and must be retried from a fresh/emptied destination.
+  - `interval` is an optional positive minimum publication cadence. It gates both manual and automatic snapshots; only a configured interval enables collection-triggered snapshots. The retention default is 3.
 
 - **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift` rows and a user-facing warning and asks for a bug report:
 

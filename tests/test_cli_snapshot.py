@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
-from usagebassoon.snapshots import SnapshotStore
+from usagebassoon.snapshots import SNAPSHOT_TABLES, SnapshotStore
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -43,10 +43,12 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
 
     store = SnapshotStore(f"file://{tmp_path}/.usagebassoon/snapshots")
     stamps = store.list_snapshots()
-    fs, root = store._fs_root()
-    with fs.open(f"{root}/{stamps[0]}/manifest.json") as handle:
+    with (
+        tmp_path / ".usagebassoon" / "snapshots" / stamps[0] / "manifest.json"
+    ).open() as handle:
         manifest = json.load(handle)
     assert result.exit_code == 0
     assert "Created private raw snapshot at" in result.output
     assert manifest["run_id"] == "manual"
-    assert manifest["tables"] == {"sessions": 1}
+    assert manifest["tables"]["sessions"]["rows"] == 1
+    assert set(manifest["tables"]) == set(SNAPSHOT_TABLES)

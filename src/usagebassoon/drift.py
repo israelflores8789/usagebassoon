@@ -287,6 +287,7 @@ def run_doctor(
     config_error: str | None = None,
     connection_error: str | None = None,
     snapshot_enabled: bool | None = None,
+    snapshot_warnings: tuple[str, ...] = (),
     limit: int = 20,
 ) -> DoctorReport:
     """Run read-only diagnostics against a configured backend.
@@ -299,6 +300,7 @@ def run_doctor(
         config_error: Configuration parsing or validation error, if any.
         connection_error: Backend construction error, if any.
         snapshot_enabled: Whether optional snapshots are configured.
+        snapshot_warnings: Advisories from configured snapshot storage.
         limit: Maximum number of drift and ingest records to display.
 
     Returns:
@@ -495,7 +497,12 @@ def run_doctor(
         )
     elif snapshot_enabled:
         checks.append(
-            DoctorCheck("snapshots", "ok", "snapshot configuration is enabled")
+            DoctorCheck(
+                "snapshots",
+                "warning" if snapshot_warnings else "ok",
+                "snapshot configuration is enabled",
+                snapshot_warnings,
+            )
         )
     else:
         checks.append(

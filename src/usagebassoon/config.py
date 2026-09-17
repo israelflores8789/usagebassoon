@@ -109,7 +109,7 @@ class SnapshotConfig:
     """
 
     gcs_uri: str | None = None
-    max_snapshots: int = 10
+    max_snapshots: int = 3
     interval: str | None = None
 
 
@@ -167,11 +167,18 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     table = _table(value, "snapshots")
     gcs_uri = _string(table.get("gcs_uri"), "snapshots.gcs_uri")
     interval = _string(table.get("interval"), "snapshots.interval")
-    max_snapshots = table.get("max_snapshots", 10)
+    max_snapshots = table.get("max_snapshots", 3)
     if not isinstance(max_snapshots, int) or isinstance(max_snapshots, bool):
         raise ConfigurationError("snapshots.max_snapshots must be an integer")
     if max_snapshots < 1:
         raise ConfigurationError("snapshots.max_snapshots must be positive")
+    if interval is not None:
+        from usagebassoon.snapshots import parse_interval
+
+        try:
+            parse_interval(interval)
+        except ValueError as error:
+            raise ConfigurationError(str(error)) from error
     return SnapshotConfig(
         gcs_uri=gcs_uri,
         max_snapshots=max_snapshots,
