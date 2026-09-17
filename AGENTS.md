@@ -141,6 +141,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - Do NOT wrap lines when generating markdown text.
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
 - ALWAYS use the `gs://usagebassoon-test-snapshots-gen-lang-client-0670612427` Google Cloud Storage bucket for GCS testing. NEVER perform tests on any other GCS bucket.
+- ALL CLI commands MUST use a dialect-specific SQL view; NEVER hardcode SQL queries that are not dialect agnostic.
 
 ### Prohibitions
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:
