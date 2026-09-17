@@ -28,21 +28,21 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
         "INSERT INTO sessions "
         "(source_id, client, session_id, tokscale_cost_usd, first_seen_at, "
         "last_seen_at, "
-        "last_updated_at) "
+        "updated_at) "
         "VALUES (?, ?, ?, ?, NOW(), NOW(), NOW())",
         [SOURCE_ID, "codex", "ses_1", 1.25],
     )
     backend.connection.execute(
         "INSERT INTO daily_stats "
         "(source_id, day, client, session_id, model, input_tokens, output_tokens, "
-        "cache_read, cache_write, reasoning, total_tokens, last_updated_at) "
+        "cache_read, cache_write, reasoning, total_tokens, updated_at) "
         "VALUES (?, DATE '2026-09-10', ?, ?, ?, 42, 0, 0, 0, 0, 42, NOW())",
         [SOURCE_ID, "codex", "ses_1", "gpt-test"],
     )
     backend.connection.execute(
         "INSERT INTO price_versions "
         "(source_id, day, model, source, price_input_per_token, observed_at, "
-        "last_updated_at) "
+        "updated_at) "
         "VALUES (?, DATE '2026-09-10', ?, 'fixture', ?, NOW(), NOW())",
         [SOURCE_ID, "gpt-test", 1.25 / 42],
     )

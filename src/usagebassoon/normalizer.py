@@ -40,7 +40,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("session_label", pa.string()),
             pa.field("first_seen_at", _TIMESTAMP),
             pa.field("last_seen_at", _TIMESTAMP),
-            pa.field("last_updated_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
         ]
     ),
     "daily_stats": pa.schema(
@@ -59,7 +59,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("total_tokens", pa.int64()),
             pa.field("message_count", pa.int64()),
             pa.field("tokscale_cost_usd", pa.float64()),
-            pa.field("last_updated_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
         ]
     ),
     "daily_activity": pa.schema(
@@ -68,7 +68,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("day", pa.date32()),
             pa.field("intensity", pa.int64()),
             pa.field("active_time_ms", pa.int64()),
-            pa.field("last_updated_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
         ]
     ),
     "price_versions": pa.schema(
@@ -84,7 +84,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("price_cache_read_per_token", pa.float64()),
             pa.field("price_cache_write_per_token", pa.float64()),
             pa.field("observed_at", _TIMESTAMP),
-            pa.field("last_updated_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
         ]
     ),
     "daily_processed_state": pa.schema(
@@ -241,7 +241,7 @@ def _session_rows(rows: list[SessionRow], at: datetime, source_id: str) -> Colum
             "session_label": make_session_label(row),
             "first_seen_at": at,
             "last_seen_at": row.last_active or at,
-            "last_updated_at": at,
+            "updated_at": at,
         }
         for row in rows
     ]
@@ -278,7 +278,7 @@ def _daily_stats_rows(
                     ),
                     "message_count": row.message_count,
                     "tokscale_cost_usd": row.tokscale_cost_usd,
-                    "last_updated_at": at,
+                    "updated_at": at,
                 }
             )
     return _col_major(records) if records else {}
@@ -292,7 +292,7 @@ def _activity_rows(graph: GraphPayload, at: datetime, source_id: str) -> Columna
             "day": contribution.date,
             "intensity": contribution.intensity,
             "active_time_ms": contribution.active_time_ms,
-            "last_updated_at": at,
+            "updated_at": at,
         }
         for contribution in graph.contributions
     ]
@@ -326,7 +326,7 @@ def _price_version_rows(
                         else 0.0
                     ),
                     "observed_at": at,
-                    "last_updated_at": at,
+                    "updated_at": at,
                 }
             )
     return _col_major(records) if records else {}

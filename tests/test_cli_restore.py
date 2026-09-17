@@ -29,7 +29,7 @@ def _seed_session(database: Path, session_id: str) -> None:
     backend.apply_ddl()
     backend.connection.execute(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, first_seen_at, last_seen_at, last_updated_at) "
+        "(source_id, client, session_id, first_seen_at, last_seen_at, updated_at) "
         "VALUES (?, ?, ?, NOW(), NOW(), NOW())",
         [SOURCE_ID, "codex", session_id],
     )

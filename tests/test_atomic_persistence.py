@@ -56,7 +56,7 @@ def test_batch_rolls_back_every_write_when_a_later_append_fails() -> None:
             "day": [date(2026, 9, 16)],
             "intensity": [1],
             "active_time_ms": [100],
-            "last_updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
         }
     )
     batch = PersistenceBatch(

@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_label TEXT,
     first_seen_at TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
-    last_updated_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, client, session_id)
 );
 
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     total_tokens BIGINT NOT NULL,
     message_count BIGINT,
     tokscale_cost_usd DOUBLE,
-    last_updated_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day, client, session_id, model)
 );
 
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
     day DATE NOT NULL,
     intensity INTEGER,
     active_time_ms BIGINT,
-    last_updated_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day)
 );
 
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS price_versions (
     price_cache_read_per_token DOUBLE,
     price_cache_write_per_token DOUBLE,
     observed_at TIMESTAMPTZ NOT NULL,
-    last_updated_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day, model)
 );
 

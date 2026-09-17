@@ -51,7 +51,7 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             "tags",
         ]
         columns = backend.query("DESCRIBE sessions").column("column_name").to_pylist()
-        assert columns[-3:] == ["first_seen_at", "last_seen_at", "last_updated_at"]
+        assert columns[-3:] == ["first_seen_at", "last_seen_at", "updated_at"]
         run_columns = (
             backend.query("DESCRIBE ingest_runs").column("column_name").to_pylist()
         )
@@ -81,12 +81,12 @@ def test_local_backend_merges_current_state_in_place() -> None:
                 "day": [date(2026, 9, 14)],
                 "intensity": [1],
                 "active_time_ms": [100],
-                "last_updated_at": [first_updated_at],
+                "updated_at": [first_updated_at],
             }
         )
         changed = first.set_column(2, "intensity", pa.array([2])).set_column(
             4,
-            "last_updated_at",
+            "updated_at",
             pa.array([second_updated_at]),
         )
         first_result = backend.upsert(
@@ -113,8 +113,8 @@ def test_local_backend_merges_current_state_in_place() -> None:
             == 1
         )
         assert backend.query(
-            "SELECT intensity, last_updated_at FROM daily_activity"
-        ).to_pylist() == [{"intensity": 2, "last_updated_at": second_updated_at}]
+            "SELECT intensity, updated_at FROM daily_activity"
+        ).to_pylist() == [{"intensity": 2, "updated_at": second_updated_at}]
     finally:
         backend.close()
 

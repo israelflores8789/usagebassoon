@@ -41,7 +41,7 @@ SELECT
     SUM(message_count) AS message_count,
     SUM(tokscale_cost_usd) AS tokscale_cost_usd,
     CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS cost_usd,
-    MAX(last_updated_at) AS last_updated_at
+    MAX(updated_at) AS updated_at
 FROM daily_cost
 GROUP BY source_id, client, session_id, model;
 

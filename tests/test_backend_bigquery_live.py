@@ -290,7 +290,7 @@ def test_live_batch_rolls_back_after_staging_and_logs_cleanup(
             "day": [date(2026, 9, 16)],
             "intensity": [1],
             "active_time_ms": [100],
-            "last_updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
         }
     )
     batch = PersistenceBatch(

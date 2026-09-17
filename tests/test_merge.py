@@ -31,11 +31,11 @@ def test_normalize_emits_daily_tables_and_processing_state(
     assert "session_model_stats" not in normalized.tables
     assert normalized.tables["daily_stats"].column_names[-2:] == [
         "tokscale_cost_usd",
-        "last_updated_at",
+        "updated_at",
     ]
     assert normalized.tables["price_versions"].column_names[-2:] == [
         "observed_at",
-        "last_updated_at",
+        "updated_at",
     ]
     assert normalized.tables["daily_processed_state"].column_names[-1] == "processed_at"
     assert normalized.tables["ingest_runs"].column_names[-3:] == [

@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_label STRING,
     first_seen_at TIMESTAMP NOT NULL,
     last_seen_at TIMESTAMP NOT NULL,
-    last_updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daily_stats (
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     total_tokens INT64 NOT NULL,
     message_count INT64,
     tokscale_cost_usd FLOAT64,
-    last_updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daily_activity (
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS daily_activity (
     day DATE NOT NULL,
     intensity INT64,
     active_time_ms INT64,
-    last_updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS price_versions (
@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS price_versions (
     price_cache_read_per_token FLOAT64,
     price_cache_write_per_token FLOAT64,
     observed_at TIMESTAMP NOT NULL,
-    last_updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daily_processed_state (

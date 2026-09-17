@@ -168,7 +168,7 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
             "day": [date(2026, 9, 16)],
             "intensity": [1],
             "active_time_ms": [100],
-            "last_updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
         }
     )
     batch = PersistenceBatch(
@@ -265,7 +265,7 @@ def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
             "day": [date(2026, 9, 16)],
             "intensity": [1],
             "active_time_ms": [100],
-            "last_updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
         }
     )
     batch = PersistenceBatch(
