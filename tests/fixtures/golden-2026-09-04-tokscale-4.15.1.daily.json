@@ -1,0 +1,138 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_962bd33dcf1b87bfaf4387fc0d",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 1063586,
+      "output": 74425,
+      "cacheRead": 12777770,
+      "cacheWrite": 0,
+      "reasoning": 49974,
+      "messageCount": 110,
+      "cost": 2.2225185000000005,
+      "performance": {
+        "msPer1KTokens": 90.07898248250811,
+        "totalDurationMs": 1258021,
+        "timedTokens": 13965755,
+        "sampleCount": 110,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_8435778d45a119e63ec0f88017",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 1100898,
+      "output": 16007,
+      "cacheRead": 4106496,
+      "cacheWrite": 0,
+      "reasoning": 25068,
+      "messageCount": 77,
+      "cost": 1.2876919500000006,
+      "performance": {
+        "msPer1KTokens": 95.70943450366192,
+        "totalDurationMs": 502328,
+        "timedTokens": 5248469,
+        "sampleCount": 76,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_3bfc19c79a0059d8d419721f14",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 413976,
+      "output": 5318,
+      "cacheRead": 1767197,
+      "cacheWrite": 0,
+      "reasoning": 10386,
+      "messageCount": 36,
+      "cost": 0.5019117750000001,
+      "performance": {
+        "msPer1KTokens": 94.74722526568397,
+        "totalDurationMs": 208148,
+        "timedTokens": 2196877,
+        "sampleCount": 36,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_2bf155700b261fee658db15b30",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 194821,
+      "output": 3980,
+      "cacheRead": 1731429,
+      "cacheWrite": 0,
+      "reasoning": 18097,
+      "messageCount": 43,
+      "cost": 0.35876167500000006,
+      "performance": {
+        "msPer1KTokens": 138.26734423944237,
+        "totalDurationMs": 269390,
+        "timedTokens": 1948327,
+        "sampleCount": 43,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_b89fd922988459acb5ef5fd8ed",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 184346,
+      "output": 4240,
+      "cacheRead": 1559746,
+      "cacheWrite": 0,
+      "reasoning": 12601,
+      "messageCount": 39,
+      "cost": 0.3183942,
+      "performance": {
+        "msPer1KTokens": 140.3170932681709,
+        "totalDurationMs": 247089,
+        "timedTokens": 1760933,
+        "sampleCount": 39,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_42d734ae9a8caafddc3dafae8d",
+      "model": "gemini-3.8-flash",
+      "provider": "google_vertex",
+      "input": 135263,
+      "output": 1583,
+      "cacheRead": 510935,
+      "cacheWrite": 0,
+      "reasoning": 5020,
+      "messageCount": 25,
+      "cost": 0.16452862499999998,
+      "performance": {
+        "msPer1KTokens": 208.07412978840412,
+        "totalDurationMs": 135831,
+        "timedTokens": 652801,
+        "sampleCount": 25,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 3092890,
+  "totalOutput": 105553,
+  "totalCacheRead": 22453573,
+  "totalCacheWrite": 0,
+  "totalMessages": 330,
+  "totalCost": 4.853806725000002,
+  "processingTimeMs": 68
+}

@@ -1,0 +1,75 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-09T01-26-58-e2cb2e36-c4c7-06d4-40a5-3170b0b650cb",
+      "model": "gpt-5.6-terra",
+      "provider": "openai",
+      "input": 269095,
+      "output": 23522,
+      "cacheRead": 6450176,
+      "cacheWrite": 0,
+      "reasoning": 42516,
+      "messageCount": 80,
+      "cost": 2.6206812000000004,
+      "performance": {
+        "msPer1KTokens": 367.24930286888923,
+        "totalDurationMs": 2491900,
+        "timedTokens": 6785309,
+        "sampleCount": 80,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-09T21-58-05-4473ba33-dbdd-956c-c978-a81e5f9960fa",
+      "model": "gpt-5.6-luna",
+      "provider": "openai",
+      "input": 54180,
+      "output": 2910,
+      "cacheRead": 364544,
+      "cacheWrite": 0,
+      "reasoning": 1526,
+      "messageCount": 12,
+      "cost": 0.023450079999999998,
+      "performance": {
+        "msPer1KTokens": 242.03138292844315,
+        "totalDurationMs": 102418,
+        "timedTokens": 423160,
+        "sampleCount": 12,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-09T01-26-58-e2cb2e36-c4c7-06d4-40a5-3170b0b650cb",
+      "model": "gpt-5.6-luna",
+      "provider": "openai",
+      "input": 30658,
+      "output": 1077,
+      "cacheRead": 81664,
+      "cacheWrite": 0,
+      "reasoning": 620,
+      "messageCount": 5,
+      "cost": 0.009801279999999999,
+      "performance": {
+        "msPer1KTokens": 336.75089239512715,
+        "totalDurationMs": 38396,
+        "timedTokens": 114019,
+        "sampleCount": 5,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 353933,
+  "totalOutput": 27509,
+  "totalCacheRead": 6896384,
+  "totalCacheWrite": 0,
+  "totalMessages": 97,
+  "totalCost": 2.6539325600000003,
+  "processingTimeMs": 68
+}

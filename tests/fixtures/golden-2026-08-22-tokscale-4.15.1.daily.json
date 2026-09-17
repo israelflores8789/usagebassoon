@@ -1,0 +1,33 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_b6e88d468bb705cbb5e14d4c1a",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 1638845,
+      "output": 39218,
+      "cacheRead": 7004228,
+      "cacheWrite": 0,
+      "reasoning": 28113,
+      "messageCount": 87,
+      "cost": 2.0069420999999994,
+      "performance": {
+        "msPer1KTokens": 210.008399151176,
+        "totalDurationMs": 1829258,
+        "timedTokens": 8710404,
+        "sampleCount": 87,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 1638845,
+  "totalOutput": 39218,
+  "totalCacheRead": 7004228,
+  "totalCacheWrite": 0,
+  "totalMessages": 87,
+  "totalCost": 2.0069420999999994,
+  "processingTimeMs": 69
+}

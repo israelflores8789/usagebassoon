@@ -133,6 +133,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
 - NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).
 - Do NOT wrap lines when generating markdown text.
+- ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
 
 ### Prohibitions
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:
@@ -185,6 +186,10 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Session and curation identity:** A session key is `(source_id, client, session_id)`; workspace remains metadata. Client and workspace are peer scopes, not a hierarchy. Effective session tags combine direct session tags with tags on its source-scoped client and workspace.
 
 - **Raw tokscale data semantics:** Raw tokscale JSON output from every `bassoon collect` is a *cumulative* state and will be used to compare against the database's current state. A collect run stages the incoming Arrow batch and upserts the data; **never** deletes.
+
+- **Token calculation invariants:**
+  - "reasoning" tokens are a component of the total token count such that total_tokens = input + cache_read + cache_write + reasoning + output tokens (fixture-verified against tokscale 4.15.1).
+  - "reasoning" tokens are considered output tokens for pricing purposes (fixture-verified against tokscale 4.15.1).
 
 - **Data ingest pipeline:** `bassoon collect` (target runtime < 10s):
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
@@ -247,8 +252,9 @@ $ bassoon collect
 These are the `tokscale` commands used to generate ingest data. Each command is authoritative for their given data domain. Cross-payload reconciliation runs at ingest. Mismatches are surfaced to request bug reporting, never silently resolved:
 
 - `tokscale models --json --group-by client,session,model --merge-worktrees` — authoritative for token/cost metrics.
+- `tokscale models --json --group-by client,session,model --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for daily statistics with session-level granularity.
 - `tokscale report --json --no-summarize` — authoritative for session metadata.
-- `tokscale graph` — authoritative for daily statistics granularity.
+- `tokscale graph` — authoritative for daily activity statistics.
 - `tokscale pricing <model-id> --json` — authoritative for current point-in-time rates.
 
 ### Shipped views (per-dialect: `sql/{duckdb,bigquery}/views.sql`)
