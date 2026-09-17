@@ -136,6 +136,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).
 - Do NOT wrap lines when generating markdown text.
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
+- ALWAYS use the `gs://usagebassoon-test-snapshots-gen-lang-client-0670612427` Google Cloud Storage bucket for GCS testing. NEVER perform tests on any other GCS bucket.
 
 ### Prohibitions
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:
