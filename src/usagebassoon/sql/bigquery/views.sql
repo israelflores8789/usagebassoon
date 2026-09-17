@@ -103,3 +103,8 @@ JOIN notes
     ON notes.source_id = sessions.source_id
     AND notes.client = sessions.client
     AND notes.session_id = sessions.session_id;
+
+-- Curation commands read notes through this stable, dialect-paired view.
+CREATE OR REPLACE VIEW session_notes AS
+SELECT source_id, client, session_id, note, created_at, updated_at
+FROM notes;

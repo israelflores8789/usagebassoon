@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+import re
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
 from typing import override
@@ -16,6 +18,9 @@ import pyarrow as pa
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
+    CuratedIdentity,
+    CuratedRenameError,
+    CuratedRenameResult,
     UpsertResult,
     is_simple_identifier,
 )
@@ -161,16 +166,91 @@ class _DuckDBStorage(AbstractStorageBackend):
         return result is not None
 
     @override
-    def query(self, sql: str) -> pa.Table:
+    def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
         """Execute DuckDB SQL and materialize the result as an Arrow table.
 
         Args:
             sql: DuckDB-dialect query.
+            parameters: Named string values bound without SQL interpolation.
 
         Returns:
             Materialized Arrow result table.
         """
-        return self.connection.execute(sql).arrow().read_all()
+        bindings = parameters or {}
+        statement = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"$\1", sql)
+        return self.connection.execute(statement, bindings).arrow().read_all()
+
+    @override
+    def delete_curated(self, identity: CuratedIdentity) -> int:
+        """Delete one completely identified notes or tags row."""
+        predicates = " AND ".join(
+            f"{_identifier(name)} = ${name}" for name, _ in identity.values
+        )
+        result = self.connection.execute(
+            f"DELETE FROM {_identifier(identity.table)} WHERE {predicates} RETURNING 1",
+            identity.parameters(),
+        ).fetchall()
+        return len(result)
+
+    @override
+    def rename_curated(
+        self,
+        source: CuratedIdentity,
+        destination: CuratedIdentity,
+        *,
+        updated_at: datetime,
+    ) -> CuratedRenameResult:
+        """Rename one tag assignment in a transaction without duplication."""
+        if source.table != "tags" or destination.table != "tags":
+            raise ValueError("only tag assignments can be renamed")
+        source_parameters = source.parameters(prefix="source_")
+        destination_parameters = destination.parameters(prefix="destination_")
+        insert_parameters = {
+            **source_parameters,
+            "destination_tag": destination_parameters["destination_tag"],
+            "updated_at": updated_at,
+        }
+        source_predicate = " AND ".join(
+            f"{_identifier(name)} = $source_{name}" for name, _ in source.values
+        )
+        destination_predicate = " AND ".join(
+            f"{_identifier(name)} = $destination_{name}"
+            for name, _ in destination.values
+        )
+        with self.transaction():
+            source_exists = self.connection.execute(
+                f'SELECT EXISTS(SELECT 1 FROM "tags" WHERE {source_predicate})',
+                source_parameters,
+            ).fetchone()
+            if source_exists is None or not source_exists[0]:
+                return CuratedRenameResult(renamed=False)
+            destination_exists = self.connection.execute(
+                f'SELECT EXISTS(SELECT 1 FROM "tags" WHERE {destination_predicate})',
+                destination_parameters,
+            ).fetchone()
+            if destination_exists is not None and destination_exists[0]:
+                return CuratedRenameResult(renamed=False, destination_exists=True)
+            insert_sql = (
+                'INSERT INTO "tags" '
+                "(source_id, scope, client, workspace, session_id, "
+                "tag, created_at, updated_at) "
+                "SELECT source_id, scope, client, workspace, session_id, "
+                ' $destination_tag, created_at, $updated_at FROM "tags" WHERE '
+                f"{source_predicate}"
+            )
+            self.connection.execute(
+                insert_sql,
+                insert_parameters,
+            )
+            deleted = self.connection.execute(
+                f'DELETE FROM "tags" WHERE {source_predicate} RETURNING 1',
+                source_parameters,
+            ).fetchall()
+            if len(deleted) != 1:
+                raise CuratedRenameError(
+                    "tag rename deletion did not remove exactly one row"
+                )
+        return CuratedRenameResult(renamed=True)
 
     @contextmanager
     @override

@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS tags (
     session_id TEXT NOT NULL DEFAULT '',
     tag TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, scope, client, workspace, session_id, tag),
     CHECK (
         (scope = 'client' AND client <> '' AND workspace = '' AND session_id = '')

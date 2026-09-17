@@ -5,15 +5,21 @@
 
 from __future__ import annotations
 
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime
 from typing import cast
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from google.api_core.exceptions import BadRequest
 from google.cloud import bigquery
 
-from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
+from usagebassoon.backends.base import (
+    CuratedIdentity,
+    CurrentStateWrite,
+    PersistenceBatch,
+)
 from usagebassoon.backends.bigquery import BigQueryBackend, _schema_from_arrow
 
 
@@ -27,13 +33,47 @@ class _OfflineClient:
 class _Job:
     """Minimal completed BigQuery job with a deterministic row result."""
 
-    def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, object]] | None = None,
+        *,
+        affected_rows: int = 0,
+    ) -> None:
         """Store rows returned when the fake job is awaited."""
         self._rows = rows or []
+        self.num_dml_affected_rows = affected_rows
 
-    def result(self) -> list[dict[str, object]]:
+    def result(self, *, timeout: float | None = None) -> list[dict[str, object]]:
         """Return the completed job's query result rows."""
+        assert timeout == 120.0
         return self._rows
+
+    def cancel(self) -> None:
+        """Satisfy the timeout-cancellation surface."""
+
+    def to_arrow(self, *, create_bqstorage_client: bool) -> pa.Table:
+        """Return an empty Arrow table for bound-query transport tests."""
+        assert not create_bqstorage_client
+        return pa.table({})
+
+
+class _TimeoutJob:
+    """Minimal job that times out until the backend cancels it."""
+
+    job_id = "stuck-job"
+
+    def __init__(self) -> None:
+        """Track whether timeout handling canceled the remote job."""
+        self.cancelled = False
+
+    def result(self, *, timeout: float | None = None) -> None:
+        """Raise the same timeout exposed by the BigQuery client."""
+        assert timeout == 120.0
+        raise FutureTimeoutError
+
+    def cancel(self) -> None:
+        """Record the backend's best-effort cancellation."""
+        self.cancelled = True
 
 
 class _BatchClient:
@@ -45,17 +85,19 @@ class _BatchClient:
         self.deleted: list[str] = []
         self.queries: list[str] = []
 
-    def load_table_from_dataframe(
+    def load_table_from_file(
         self,
-        _: object,
+        payload: object,
         destination: str,
         *,
         job_config: bigquery.LoadJobConfig,
         location: str,
     ) -> _Job:
-        """Record one explicit-schema staging load."""
+        """Record one explicit-schema Parquet staging load."""
         assert location == "US"
         assert "`" not in destination
+        assert hasattr(payload, "read")
+        assert job_config.source_format == bigquery.SourceFormat.PARQUET
         self.loads.append((destination, job_config))
         return _Job()
 
@@ -124,6 +166,43 @@ class _TransactionClient:
         """Satisfy the BigQuery client close surface."""
 
 
+class _CurationClient:
+    """Offline client recording curation queries and their named parameters."""
+
+    def __init__(self) -> None:
+        """Initialize recorded curation transport calls."""
+        self.queries: list[str] = []
+        self.configurations: list[bigquery.QueryJobConfig] = []
+
+    def query(
+        self,
+        sql: str,
+        *,
+        job_config: bigquery.QueryJobConfig,
+        location: str,
+    ) -> _Job:
+        """Record one curation query and return its intended atomic outcome."""
+        assert location == "US"
+        self.queries.append(sql)
+        self.configurations.append(job_config)
+        if sql.startswith("DELETE"):
+            return _Job(affected_rows=1)
+        if "BEGIN TRANSACTION" in sql:
+            return _Job(
+                [
+                    {
+                        "source_exists": True,
+                        "destination_exists": False,
+                        "deleted_rows": 1,
+                    }
+                ]
+            )
+        return _Job()
+
+    def close(self) -> None:
+        """Satisfy the BigQuery client close surface."""
+
+
 def _backend() -> BigQueryBackend:
     """Build a BigQuery backend without credentials or network access."""
     return BigQueryBackend(
@@ -131,6 +210,16 @@ def _backend() -> BigQueryBackend:
         "usagebassoon_emulated",
         client=cast(bigquery.Client, _OfflineClient()),
     )
+
+
+def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
+    """Cancel a stuck remote job and expose its identity in the exception."""
+    job = _TimeoutJob()
+
+    with pytest.raises(RuntimeError, match="stuck-job exceeded 120 seconds"):
+        _backend()._wait_for_job(cast(bigquery.job.QueryJob, job))
+
+    assert job.cancelled
 
 
 def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:
@@ -202,6 +291,28 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
     assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
 
 
+def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
+    """Keep a column called source distinct from the MERGE source table alias."""
+    backend = _backend()
+    write = CurrentStateWrite(
+        "price_versions",
+        pa.table(
+            {
+                "source_id": ["source-id"],
+                "day": [date(2026, 9, 17)],
+                "model": ["model"],
+                "source": ["tokscale"],
+            }
+        ),
+        ("source_id", "day", "model"),
+        ("source",),
+    )
+
+    statement = backend._merge_from_data(write, "`staged`")
+
+    assert "target.`source` = source.`source`" in statement
+
+
 def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     """Qualify view definitions while retaining portable shipped SQL files."""
     backend = _backend()
@@ -248,6 +359,59 @@ def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
         "query LIKE '%`usagebassoon-test.usagebassoon_emulated.%'" in client.statement
     )
     assert client.statement.endswith("LIMIT 2")
+
+
+def test_bigquery_curation_operations_use_complete_bound_identities() -> None:
+    """Build typed delete and transactional rename SQL without interpolating values."""
+    client = _CurationClient()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+    source = CuratedIdentity(
+        "tags",
+        (
+            ("source_id", "source"),
+            ("scope", "client"),
+            ("client", "codex"),
+            ("workspace", ""),
+            ("session_id", ""),
+            ("tag", "old"),
+        ),
+    )
+    destination = CuratedIdentity(
+        "tags",
+        (
+            ("source_id", "source"),
+            ("scope", "client"),
+            ("client", "codex"),
+            ("workspace", ""),
+            ("session_id", ""),
+            ("tag", "new"),
+        ),
+    )
+
+    assert backend.delete_curated(source) == 1
+    result = backend.rename_curated(
+        source,
+        destination,
+        updated_at=datetime(2026, 9, 17, tzinfo=UTC),
+    )
+
+    assert result.renamed
+    assert "BEGIN TRANSACTION;" in client.queries[1]
+    assert "ASSERT deleted_rows = 1" in client.queries[1]
+    assert "= 'source'" not in client.queries[0]
+    parameters = client.configurations[0].query_parameters
+    assert [parameter.name for parameter in parameters] == [
+        "source_id",
+        "scope",
+        "client",
+        "workspace",
+        "session_id",
+        "tag",
+    ]
 
 
 def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:

@@ -7,14 +7,15 @@ import typer
 
 from usagebassoon.cli.audit import audit
 from usagebassoon.cli.collect import collect
-from usagebassoon.cli.curation import note, tag
 from usagebassoon.cli.doctor import doctor
 from usagebassoon.cli.export import export
 from usagebassoon.cli.init import init
+from usagebassoon.cli.note import note_app
 from usagebassoon.cli.query import query
 from usagebassoon.cli.report import report
 from usagebassoon.cli.restore import restore
 from usagebassoon.cli.snapshot import snapshot
+from usagebassoon.cli.tag import tag_app
 
 app = typer.Typer(
     name="usagebassoon",
@@ -32,8 +33,8 @@ app.command(name="doctor")(doctor)
 app.command(name="collect")(collect)
 app.command(name="export")(export)
 app.command(name="init")(init)
-app.command(name="tag")(tag)
-app.command(name="note")(note)
+app.add_typer(tag_app, name="tag")
+app.add_typer(note_app, name="note")
 app.command(name="query")(query)
 app.command(name="report")(report)
 app.command(name="restore")(restore)

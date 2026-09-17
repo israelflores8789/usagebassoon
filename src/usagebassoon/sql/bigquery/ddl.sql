@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS tags (
     workspace STRING DEFAULT '' NOT NULL,
     session_id STRING DEFAULT '' NOT NULL,
     tag STRING NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS notes (

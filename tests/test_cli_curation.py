@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,22 +19,21 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _write_config(path: Path, database: Path) -> None:
-    """Write a local-DuckDB configuration for CLI integration tests.
-
-    Args:
-        path: Config path to create.
-        database: DuckDB file selected by that config.
-    """
+    """Write a local-DuckDB configuration for CLI integration tests."""
     path.write_text(
         f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\ndatabase = "{database}"\n'
     )
 
 
+def _command(config: Path, *parts: str) -> list[str]:
+    """Return one curation command with its explicit configuration path."""
+    return [*parts, "--config", str(config)]
+
+
 def test_curation_commands_use_only_the_explicit_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Assert --config wins and no command-level backend override exists."""
+    """Assert every curation subcommand honors its explicit configuration."""
     selected_config = tmp_path / "selected.toml"
     selected_database = tmp_path / "selected.duckdb"
     environment_config = tmp_path / "environment.toml"
@@ -42,64 +42,30 @@ def test_curation_commands_use_only_the_explicit_config(
     monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(environment_config))
     runner = CliRunner()
 
-    client_result = runner.invoke(
+    tag_result = runner.invoke(
         app,
-        [
-            "tag",
-            "project-alpha",
-            "--client",
-            "codex",
-            "--config",
-            str(selected_config),
-        ],
-    )
-    workspace_result = runner.invoke(
-        app,
-        [
-            "tag",
-            "shared-workspace",
-            "--workspace",
-            "/repo",
-            "--config",
-            str(selected_config),
-        ],
+        _command(selected_config, "tag", "add", "project-alpha", "--client", "codex"),
     )
     note_result = runner.invoke(
         app,
-        [
+        _command(
+            selected_config,
             "note",
+            "set",
             "Track this session",
             "--client",
             "codex",
             "--session",
             "ses_123",
-            "--config",
-            str(selected_config),
-        ],
+        ),
     )
 
-    assert client_result.exit_code == 0
-    assert workspace_result.exit_code == 0
+    assert tag_result.exit_code == 0
     assert note_result.exit_code == 0
     backend = DuckDBBackend(selected_database)
     try:
-        assert backend.query(
-            "SELECT source_id, scope, client, workspace, tag FROM tags ORDER BY tag"
-        ).to_pylist() == [
-            {
-                "source_id": SOURCE_ID,
-                "scope": "client",
-                "client": "codex",
-                "workspace": "",
-                "tag": "project-alpha",
-            },
-            {
-                "source_id": SOURCE_ID,
-                "scope": "workspace",
-                "client": "",
-                "workspace": "/repo",
-                "tag": "shared-workspace",
-            },
+        assert backend.query("SELECT tag FROM tags").to_pylist() == [
+            {"tag": "project-alpha"}
         ]
         assert backend.query("SELECT note FROM notes").to_pylist() == [
             {"note": "Track this session"}
@@ -108,133 +74,127 @@ def test_curation_commands_use_only_the_explicit_config(
         backend.close()
 
 
-def test_tag_command_rejects_non_peer_scope_mix(tmp_path: Path) -> None:
-    """Assert a workspace tag cannot also name a client or session."""
+def test_only_the_new_curation_command_forms_are_available(tmp_path: Path) -> None:
+    """Assert old note and tag positional forms are not compatibility aliases."""
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usage.duckdb")
-    result = CliRunner().invoke(
-        app,
-        [
-            "tag",
-            "project-alpha",
-            "--client",
-            "codex",
-            "--workspace",
-            "/repo",
-            "--session",
-            "ses_123",
-            "--config",
-            str(config),
-        ],
+    runner = CliRunner()
+    old_note = runner.invoke(app, _command(config, "note", "first"))
+    old_tag = runner.invoke(
+        app, _command(config, "tag", "important", "--client", "codex")
     )
-    assert result.exit_code != 0
-    assert "--workspace cannot be combined" in result.output
+    assert old_note.exit_code != 0
+    assert old_tag.exit_code != 0
 
 
-def test_tag_command_supports_session_scope_and_is_idempotent(tmp_path: Path) -> None:
-    """Keep direct session tags source-scoped and repeatable."""
+def test_tag_commands_support_each_scope_rename_and_remove(tmp_path: Path) -> None:
+    """Assert tags mutate only at their declared complete target scope."""
     config = tmp_path / "config.toml"
     database = tmp_path / "usage.duckdb"
     _write_config(config, database)
     runner = CliRunner()
-    command = [
+    client = _command(config, "tag", "add", "client-tag", "--client", "codex")
+    workspace = _command(config, "tag", "add", "workspace-tag", "--workspace", "/repo")
+    session = _command(
+        config,
         "tag",
-        "investigate",
+        "add",
+        "session-tag",
         "--client",
         "codex",
         "--session",
         "ses_123",
-        "--config",
-        str(config),
-    ]
-
-    added = runner.invoke(app, command)
-    repeated = runner.invoke(app, command)
-
-    assert added.exit_code == 0
-    assert "Added tag" in added.output
-    assert repeated.exit_code == 0
-    assert "Already present" in repeated.output
+    )
+    assert runner.invoke(app, client).exit_code == 0
+    assert runner.invoke(app, workspace).exit_code == 0
+    assert runner.invoke(app, session).exit_code == 0
+    renamed = runner.invoke(
+        app,
+        _command(
+            config,
+            "tag",
+            "rename",
+            "session-tag",
+            "renamed",
+            "--client",
+            "codex",
+            "--session",
+            "ses_123",
+        ),
+    )
+    removed = runner.invoke(
+        app, _command(config, "tag", "remove", "workspace-tag", "--workspace", "/repo")
+    )
+    assert renamed.exit_code == 0
+    assert removed.exit_code == 0
     backend = DuckDBBackend(database)
     try:
-        assert backend.query(
-            "SELECT scope, client, session_id, tag FROM tags"
-        ).to_pylist() == [
-            {
-                "scope": "session",
-                "client": "codex",
-                "session_id": "ses_123",
-                "tag": "investigate",
-            }
+        assert backend.query("SELECT tag FROM tags ORDER BY tag").to_pylist() == [
+            {"tag": "client-tag"},
+            {"tag": "renamed"},
         ]
     finally:
         backend.close()
 
 
-def test_tag_command_requires_a_complete_target_scope(tmp_path: Path) -> None:
-    """Reject missing scopes and incomplete session identities."""
-    config = tmp_path / "config.toml"
-    _write_config(config, tmp_path / "usage.duckdb")
-    runner = CliRunner()
-
-    missing_scope = runner.invoke(app, ["tag", "investigate", "--config", str(config)])
-    missing_client = runner.invoke(
-        app,
-        ["tag", "investigate", "--session", "ses_123", "--config", str(config)],
-    )
-
-    assert missing_scope.exit_code != 0
-    assert "supply --workspace or --client" in missing_scope.output
-    assert missing_client.exit_code != 0
-    assert "--session requires --client" in missing_client.output
-
-
-def test_note_command_updates_and_recognizes_an_unchanged_note(tmp_path: Path) -> None:
-    """Preserve user curation semantics through the command-line interface."""
+def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assert editor success, blank content, and failures preserve note safety."""
     config = tmp_path / "config.toml"
     database = tmp_path / "usage.duckdb"
     _write_config(config, database)
     runner = CliRunner()
-    command = ["note", "first", "--client", "codex", "--session", "ses_123"]
-
-    added = runner.invoke(app, [*command, "--config", str(config)])
-    updated = runner.invoke(
-        app,
-        [
-            "note",
-            "second",
-            "--client",
-            "codex",
-            "--session",
-            "ses_123",
-            "--config",
-            str(config),
-        ],
+    target = ["--client", "codex", "--session", "ses_123"]
+    assert (
+        runner.invoke(app, _command(config, "note", "set", "first", *target)).exit_code
+        == 0
     )
-    unchanged = runner.invoke(
-        app,
-        [
-            "note",
-            "second",
-            "--client",
-            "codex",
-            "--session",
-            "ses_123",
-            "--config",
-            str(config),
-        ],
-    )
-
-    assert added.exit_code == 0
-    assert "Added note" in added.output
-    assert updated.exit_code == 0
-    assert "Updated note" in updated.output
-    assert unchanged.exit_code == 0
-    assert "Unchanged note" in unchanged.output
     backend = DuckDBBackend(database)
     try:
-        assert backend.query("SELECT note FROM notes").to_pylist() == [
-            {"note": "second"}
-        ]
+        original = backend.query(
+            "SELECT created_at, updated_at FROM notes"
+        ).to_pylist()[0]
     finally:
         backend.close()
+
+    editor = tmp_path / "editor.py"
+    editor.write_text(
+        "from pathlib import Path\nimport sys\n"
+        "Path(sys.argv[-1]).write_text(sys.argv[1])\n"
+    )
+    monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} edited")
+    edited = runner.invoke(app, _command(config, "note", "edit", *target))
+    assert edited.exit_code == 0
+    assert "Updated note" in edited.output
+
+    monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '   '")
+    blank = runner.invoke(app, _command(config, "note", "edit", *target))
+    assert blank.exit_code != 0
+    assert "note remove" in blank.output
+    backend = DuckDBBackend(database)
+    try:
+        revised = backend.query(
+            "SELECT note, created_at, updated_at FROM notes"
+        ).to_pylist()[0]
+        assert revised["note"] == "edited"
+        assert revised["created_at"] == original["created_at"]
+        assert revised["updated_at"] > original["updated_at"]
+    finally:
+        backend.close()
+
+
+def test_note_edit_requires_a_configured_editor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assert edit directs users to set when no editor has been configured."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "usage.duckdb")
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    result = CliRunner().invoke(
+        app,
+        _command(config, "note", "edit", "--client", "codex", "--session", "ses_123"),
+    )
+    assert result.exit_code != 0
+    assert "note set" in result.output

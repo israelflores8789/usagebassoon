@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -45,6 +46,30 @@ pytestmark = pytest.mark.bigquery_live
 
 _DATASET = "usagebassoon_it"
 _LOCATION = "US"
+_LIVE_TEST_TIMEOUT_SECONDS = 300
+
+
+@pytest.fixture(autouse=True)
+def _bound_live_test_duration() -> Iterator[None]:
+    """Fail a live test instead of leaving a CI worker blocked indefinitely."""
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def fail_timeout(_: int, __: object) -> None:
+        """Raise a visible failure from the main pytest thread."""
+        raise TimeoutError(
+            "live BigQuery test exceeded "
+            f"{_LIVE_TEST_TIMEOUT_SECONDS} seconds; inspect BigQuery jobs and retries"
+        )
+
+    previous_handler = signal.signal(signal.SIGALRM, fail_timeout)
+    signal.setitimer(signal.ITIMER_REAL, _LIVE_TEST_TIMEOUT_SECONDS)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +217,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
     normalized = _normalized_bundle(live_settings, collection_bundle)
     duckdb_backend = DuckDBBackend(":memory:")
     bigquery_backend = _backend(live_settings)
+    configuration = ConfigurationManager(live_settings.config_path).load()
     expected_inserted = (
         EXPECTED_REPORT_ROWS
         + EXPECTED_DAILY_STATS_ROWS
@@ -203,7 +229,11 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         duckdb_backend.apply_ddl()
         bigquery_backend.apply_ddl()
         expected = persist_run(duckdb_backend, normalized)
-        actual = persist_run(bigquery_backend, normalized)
+        actual = _persist_with_retries(
+            configuration,
+            normalized,
+            logging.getLogger("usagebassoon-bigquery-live"),
+        )
 
         assert (actual.inserted, actual.updated) == (
             expected_inserted,
@@ -241,7 +271,11 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             f"WHERE source_id = '{live_settings.source_id}'"
         ).to_pylist() == [{"n": price_count}]
 
-        retried = persist_run(bigquery_backend, normalized)
+        retried = _persist_with_retries(
+            configuration,
+            normalized,
+            logging.getLogger("usagebassoon-bigquery-live"),
+        )
         assert (retried.inserted, retried.updated) == (0, 0)
         assert all(
             result.inserted == 0 and result.updated == 0
@@ -407,12 +441,12 @@ def test_live_cli_commands_except_report(
 ) -> None:
     """Exercise configured BigQuery CLI commands other than out-of-scope report."""
     normalized = _normalized_bundle(live_settings, collection_bundle)
-    backend = _backend(live_settings)
-    try:
-        backend.apply_ddl()
-        persist_run(backend, normalized)
-    finally:
-        backend.close()
+    configuration = ConfigurationManager(live_settings.config_path).load()
+    _persist_with_retries(
+        configuration,
+        normalized,
+        logging.getLogger("usagebassoon-bigquery-live"),
+    )
 
     session = collection_bundle.report_rows[0]
     runner = CliRunner()
@@ -437,6 +471,7 @@ def test_live_cli_commands_except_report(
         ],
         [
             "tag",
+            "add",
             "live-test",
             "--client",
             session.client,
@@ -445,6 +480,7 @@ def test_live_cli_commands_except_report(
         ],
         [
             "note",
+            "set",
             "live integration note",
             "--client",
             session.client,
@@ -460,6 +496,47 @@ def test_live_cli_commands_except_report(
     results = [runner.invoke(app, command) for command in commands]
 
     assert all(result.exit_code == 0 for result in results)
+    renamed = runner.invoke(
+        app,
+        [
+            "tag",
+            "rename",
+            "live-test",
+            "live-test-renamed",
+            "--client",
+            session.client,
+            "--config",
+            str(live_settings.config_path),
+        ],
+    )
+    removed_tag = runner.invoke(
+        app,
+        [
+            "tag",
+            "remove",
+            "live-test-renamed",
+            "--client",
+            session.client,
+            "--config",
+            str(live_settings.config_path),
+        ],
+    )
+    removed_note = runner.invoke(
+        app,
+        [
+            "note",
+            "remove",
+            "--client",
+            session.client,
+            "--session",
+            session.session_id,
+            "--config",
+            str(live_settings.config_path),
+        ],
+    )
+    assert renamed.exit_code == 0
+    assert removed_tag.exit_code == 0
+    assert removed_note.exit_code == 0
     assert export_path.is_file()
     snapshots = SnapshotStore(f"file://{tmp_path}/.usagebassoon/snapshots")
     assert snapshots.list_snapshots()

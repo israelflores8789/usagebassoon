@@ -12,7 +12,15 @@ from uuid import uuid4
 import pytest
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.curation import TagAssignment, add_tag, set_note
+from usagebassoon.curation import (
+    NoteAssignment,
+    TagAssignment,
+    add_tag,
+    remove_note,
+    remove_tag,
+    rename_tag,
+    set_note,
+)
 from usagebassoon.merge import persist_run
 from usagebassoon.normalizer import CollectionBundle, normalize
 
@@ -97,10 +105,12 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
         assert (
             set_note(
                 backend,
-                source_id=collection_bundle.source_id,
-                client=target.client,
-                session_id=target.session_id,
-                note="First annotation",
+                NoteAssignment(
+                    source_id=collection_bundle.source_id,
+                    client=target.client,
+                    session_id=target.session_id,
+                    note="First annotation",
+                ),
                 at=created,
             ).inserted
             == 1
@@ -108,10 +118,12 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
         assert (
             set_note(
                 backend,
-                source_id=collection_bundle.source_id,
-                client=target.client,
-                session_id=target.session_id,
-                note="Revised annotation",
+                NoteAssignment(
+                    source_id=collection_bundle.source_id,
+                    client=target.client,
+                    session_id=target.session_id,
+                    note="Revised annotation",
+                ),
                 at=updated,
             ).updated
             == 1
@@ -178,3 +190,77 @@ def test_tag_assignment_rejects_invalid_scope_targets() -> None:
         )
     with pytest.raises(ValueError, match="session tags require"):
         TagAssignment(scope="session", source_id="source", tag="project-alpha")
+
+
+def test_tag_rename_preserves_creation_time_and_updates_timestamp() -> None:
+    """Assert a rename changes only a complete assignment's label and freshness."""
+    backend = DuckDBBackend(":memory:")
+    created = datetime(2026, 9, 14, tzinfo=UTC)
+    renamed = created + timedelta(days=1)
+    assignment = TagAssignment(
+        scope="client",
+        source_id="11111111-1111-4111-8111-111111111111",
+        client="codex",
+        tag="old",
+    )
+    try:
+        backend.apply_ddl()
+        add_tag(backend, assignment, at=created)
+        result = rename_tag(backend, assignment, "new", at=renamed)
+        assert result.renamed
+        assert backend.query(
+            "SELECT tag, created_at, updated_at FROM tags"
+        ).to_pylist() == [{"tag": "new", "created_at": created, "updated_at": renamed}]
+    finally:
+        backend.close()
+
+
+def test_tag_rename_leaves_source_when_destination_exists() -> None:
+    """Assert an existing destination prevents any rename mutation."""
+    backend = DuckDBBackend(":memory:")
+    source = TagAssignment(
+        scope="client", source_id="source", client="codex", tag="old"
+    )
+    destination = TagAssignment(
+        scope="client", source_id="source", client="codex", tag="new"
+    )
+    try:
+        backend.apply_ddl()
+        add_tag(backend, source)
+        add_tag(backend, destination)
+        result = rename_tag(backend, source, "new")
+        assert not result.renamed
+        assert result.destination_exists
+        assert backend.query("SELECT tag FROM tags ORDER BY tag").to_pylist() == [
+            {"tag": "new"},
+            {"tag": "old"},
+        ]
+    finally:
+        backend.close()
+
+
+def test_curated_remove_requires_the_complete_identity() -> None:
+    """Assert curation deletions leave unrelated tags and notes intact."""
+    backend = DuckDBBackend(":memory:")
+    first_note = NoteAssignment("source", "codex", "first", "first note")
+    second_note = NoteAssignment("source", "codex", "second", "second note")
+    first_tag = TagAssignment(
+        scope="client", source_id="source", client="codex", tag="first"
+    )
+    second_tag = TagAssignment(
+        scope="client", source_id="source", client="codex", tag="second"
+    )
+    try:
+        backend.apply_ddl()
+        set_note(backend, first_note)
+        set_note(backend, second_note)
+        add_tag(backend, first_tag)
+        add_tag(backend, second_tag)
+        assert remove_note(backend, first_note) == 1
+        assert remove_tag(backend, first_tag) == 1
+        assert backend.query("SELECT session_id FROM notes").to_pylist() == [
+            {"session_id": "second"}
+        ]
+        assert backend.query("SELECT tag FROM tags").to_pylist() == [{"tag": "second"}]
+    finally:
+        backend.close()

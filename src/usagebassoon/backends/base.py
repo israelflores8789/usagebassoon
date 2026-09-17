@@ -9,7 +9,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Protocol
+from datetime import datetime
+from typing import Literal, Protocol
 from uuid import UUID
 
 import pyarrow as pa
@@ -103,6 +104,65 @@ class ActiveTransaction:
     transaction_id: str
 
 
+type CuratedTable = Literal["notes", "tags"]
+
+
+@dataclass(frozen=True, slots=True)
+class CuratedIdentity:
+    """Complete identity for one user-curated row.
+
+    Attributes:
+        table: Curation table containing the row.
+        values: Ordered identity fields and their values.
+    """
+
+    table: CuratedTable
+    values: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        """Require the exact identity columns for the declared curation table."""
+        expected = {
+            "notes": ("source_id", "client", "session_id"),
+            "tags": ("source_id", "scope", "client", "workspace", "session_id", "tag"),
+        }[self.table]
+        names = tuple(name for name, _ in self.values)
+        if names != expected:
+            raise ValueError(f"{self.table} identity must contain {expected!r}")
+        required = (
+            ("source_id", "client", "session_id")
+            if self.table == "notes"
+            else (
+                "source_id",
+                "scope",
+                "tag",
+            )
+        )
+        values = dict(self.values)
+        if any(not values[name].strip() for name in required):
+            raise ValueError("curated identity has an empty required value")
+
+    def parameters(self, *, prefix: str = "") -> dict[str, str]:
+        """Return uniquely named query parameters for the identity values."""
+        return {f"{prefix}{name}": value for name, value in self.values}
+
+
+@dataclass(frozen=True, slots=True)
+class CuratedRenameResult:
+    """Outcome of an atomic curation rename.
+
+    Attributes:
+        renamed: Whether the source assignment changed its label.
+        destination_exists: Whether an existing destination prevented the rename.
+    """
+
+    renamed: bool
+    destination_exists: bool = False
+
+
+class CuratedRenameError(RuntimeError):
+    """Raised when an atomic curated rename could not remove its source row."""
+
+
 def is_simple_identifier(value: str) -> bool:
     """Return whether a value is a portable unquoted internal identifier."""
     return value.isascii() and value.isidentifier()
@@ -178,8 +238,22 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def query(self, sql: str) -> pa.Table:
-        """Execute SQL in the configured dialect and return an Arrow table."""
+    def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
+        """Execute SQL with named string parameters and return an Arrow table."""
+        ...
+
+    def delete_curated(self, identity: CuratedIdentity) -> int:
+        """Delete one fully identified user-curated row and return its count."""
+        ...
+
+    def rename_curated(
+        self,
+        source: CuratedIdentity,
+        destination: CuratedIdentity,
+        *,
+        updated_at: datetime,
+    ) -> CuratedRenameResult:
+        """Atomically rename a curated assignment while preserving its creation time."""
         ...
 
     def transaction(self) -> AbstractContextManager[None]:
@@ -242,8 +316,22 @@ class AbstractStorageBackend(ABC):
         """Append a single DDL-defined Arrow table."""
 
     @abstractmethod
-    def query(self, sql: str) -> pa.Table:
+    def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
         """Execute dialect-native SQL and materialize Arrow results."""
+
+    @abstractmethod
+    def delete_curated(self, identity: CuratedIdentity) -> int:
+        """Delete one fully identified user-curated row."""
+
+    @abstractmethod
+    def rename_curated(
+        self,
+        source: CuratedIdentity,
+        destination: CuratedIdentity,
+        *,
+        updated_at: datetime,
+    ) -> CuratedRenameResult:
+        """Atomically rename a curated assignment while retaining its creation time."""
 
     @abstractmethod
     def transaction(self) -> AbstractContextManager[None]:

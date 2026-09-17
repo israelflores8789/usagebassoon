@@ -7,24 +7,33 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import cast, override
 from uuid import uuid4
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from google.api_core.exceptions import GoogleAPICallError, NotFound
 from google.auth.credentials import Credentials
 from google.auth.exceptions import GoogleAuthError
-from google.cloud import bigquery
+from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud.bigquery_storage_v1 import reader as bigquery_storage_reader
+from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from google.oauth2 import service_account
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
     ActiveTransaction,
     BatchPersistResult,
+    CuratedIdentity,
+    CuratedRenameError,
+    CuratedRenameResult,
     CurrentStateWrite,
     PersistenceBatch,
     UpsertResult,
@@ -35,6 +44,7 @@ _PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
 _LOG = logging.getLogger("usagebassoon")
 _CONCURRENT_TRANSACTION_MESSAGE = "transaction is aborted due to concurrent update"
+_JOB_WAIT_SECONDS = 120.0
 _VIEW_RELATIONS = (
     "report_summary",
     "report_models",
@@ -43,6 +53,7 @@ _VIEW_RELATIONS = (
     "tagged_sessions",
     "noted_sessions",
     "session_tags",
+    "session_notes",
     "session_model_stats",
     "daily_activity",
     "daily_stats",
@@ -161,6 +172,7 @@ class BigQueryBackend(AbstractStorageBackend):
         self.dataset = dataset
         self.location = location
         self.dataset_ref = f"{project}.{dataset}"
+        self._credentials = resolved_credentials
         try:
             self.client = client or bigquery.Client(
                 project=project,
@@ -170,6 +182,36 @@ class BigQueryBackend(AbstractStorageBackend):
         except GoogleAuthError as error:
             raise RuntimeError(
                 "BigQuery authentication failed; configure ADC or credentials_file"
+            ) from error
+
+    def _wait_for_job(
+        self, job: bigquery.job.QueryJob | bigquery.job.LoadJob
+    ) -> Iterable[Mapping[str, object]]:
+        """Await one remote job for a bounded period and cancel a timeout.
+
+        Args:
+            job: Submitted BigQuery query or load job.
+
+        Returns:
+            The completed BigQuery result iterator.
+
+        Raises:
+            RuntimeError: If the job does not finish within the configured bound.
+        """
+        try:
+            return cast(
+                Iterable[Mapping[str, object]],
+                job.result(timeout=_JOB_WAIT_SECONDS),
+            )
+        except FutureTimeoutError as error:
+            job_id = job.job_id or "unknown"
+            try:
+                job.cancel()
+            except GoogleAPICallError:
+                _LOG.exception("could not cancel timed-out BigQuery job %s", job_id)
+            raise RuntimeError(
+                f"BigQuery job {job_id} exceeded {_JOB_WAIT_SECONDS:.0f} seconds "
+                "and was cancelled"
             ) from error
 
     def _table_id(self, table: str) -> str:
@@ -237,11 +279,13 @@ class BigQueryBackend(AbstractStorageBackend):
             f"LIMIT {limit}"
         )
         try:
-            rows = self.client.query(
-                statement,
-                job_config=self._query_config(),
-                location=self.location,
-            ).result()
+            rows = self._wait_for_job(
+                self.client.query(
+                    statement,
+                    job_config=self._query_config(),
+                    location=self.location,
+                )
+            )
         except GoogleAPICallError as error:
             raise RuntimeError(
                 "BigQuery active-transaction inspection failed"
@@ -299,11 +343,13 @@ class BigQueryBackend(AbstractStorageBackend):
                 sql = package.joinpath(filename).read_text()
                 if filename == "views.sql":
                     sql = self._qualify_view_sql(sql)
-                self.client.query(
-                    sql,
-                    job_config=self._query_config(),
-                    location=self.location,
-                ).result()
+                self._wait_for_job(
+                    self.client.query(
+                        sql,
+                        job_config=self._query_config(),
+                        location=self.location,
+                    )
+                )
         except GoogleAPICallError as error:
             raise RuntimeError("BigQuery schema initialization failed") from error
 
@@ -315,16 +361,26 @@ class BigQueryBackend(AbstractStorageBackend):
         disposition: str,
         schema: Sequence[bigquery.SchemaField] | None = None,
     ) -> None:
-        """Load canonical Arrow data through pandas with an explicit schema."""
-        self.client.load_table_from_dataframe(
-            data.to_pandas(),
-            destination,
-            job_config=bigquery.LoadJobConfig(
-                schema=list(schema) if schema is not None else _schema_from_arrow(data),
-                write_disposition=disposition,
-            ),
-            location=self.location,
-        ).result()
+        """Load canonical Arrow data through an explicit Parquet payload."""
+        with TemporaryFile(mode="w+b") as payload:
+            pq.write_table(data, payload)
+            payload.seek(0)
+            self._wait_for_job(
+                self.client.load_table_from_file(
+                    payload,
+                    destination,
+                    job_config=bigquery.LoadJobConfig(
+                        source_format=bigquery.SourceFormat.PARQUET,
+                        schema=(
+                            list(schema)
+                            if schema is not None
+                            else _schema_from_arrow(data)
+                        ),
+                        write_disposition=disposition,
+                    ),
+                    location=self.location,
+                )
+            )
 
     def _stage_id(self, table: str, run_id: str) -> str:
         """Return one collision-resistant staging table ID for BigQuery APIs."""
@@ -347,14 +403,18 @@ class BigQueryBackend(AbstractStorageBackend):
     @override
     def has_committed_run(self, run_id: str) -> bool:
         """Return whether the ingest ledger contains a completed cycle."""
-        result = self.client.query(
-            f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
-            "WHERE `run_id` = @run_id LIMIT 1",
-            job_config=self._query_config(
-                parameters=[bigquery.ScalarQueryParameter("run_id", "STRING", run_id)]
-            ),
-            location=self.location,
-        ).result()
+        result = self._wait_for_job(
+            self.client.query(
+                f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
+                "WHERE `run_id` = @run_id LIMIT 1",
+                job_config=self._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter("run_id", "STRING", run_id)
+                    ]
+                ),
+                location=self.location,
+            )
+        )
         return next(iter(result), None) is not None
 
     @override
@@ -385,11 +445,13 @@ class BigQueryBackend(AbstractStorageBackend):
                 natural_keys,
                 change_fields,
             )
-            self.client.query(
-                self._merge_sql(table, stage, natural_keys, change_fields),
-                job_config=self._query_config(),
-                location=self.location,
-            ).result()
+            self._wait_for_job(
+                self.client.query(
+                    self._merge_sql(table, stage, natural_keys, change_fields),
+                    job_config=self._query_config(),
+                    location=self.location,
+                )
+            )
             return UpsertResult(inserted=inserted, updated=updated)
         finally:
             self._delete_stages((stage_id,))
@@ -411,21 +473,23 @@ class BigQueryBackend(AbstractStorageBackend):
         key = self._column(natural_keys[0])
         row = next(
             iter(
-                self.client.query(
-                    "SELECT "
-                    f"COUNTIF(target.{key} IS NULL) AS inserted, "
-                    f"COUNTIF(target.{key} IS NOT NULL AND ({changes})) AS updated "
-                    f"FROM {stage} AS source "
-                    f"LEFT JOIN {self._table_ref(table)} AS target ON {join}",
-                    job_config=self._query_config(),
-                    location=self.location,
-                ).result()
+                self._wait_for_job(
+                    self.client.query(
+                        "SELECT "
+                        f"COUNTIF(target.{key} IS NULL) AS inserted, "
+                        f"COUNTIF(target.{key} IS NOT NULL AND ({changes})) AS updated "
+                        f"FROM {stage} AS source "
+                        f"LEFT JOIN {self._table_ref(table)} AS target ON {join}",
+                        job_config=self._query_config(),
+                        location=self.location,
+                    )
+                )
             ),
             None,
         )
         if row is None:
             return (0, 0)
-        return (int(row["inserted"]), int(row["updated"]))
+        return (cast(int, row["inserted"]), cast(int, row["updated"]))
 
     @staticmethod
     def _column(column: str) -> str:
@@ -480,7 +544,7 @@ class BigQueryBackend(AbstractStorageBackend):
             value = f"source.{quoted}"
             if column in {"created_at", "first_seen_at"}:
                 value = f"COALESCE(target.{quoted}, {value})"
-            assignments.append(f"{quoted} = {value}")
+            assignments.append(f"target.{quoted} = {value}")
         quoted_columns = ", ".join(self._column(column) for column in columns)
         source_values = ", ".join(
             f"source.{self._column(column)}" for column in columns
@@ -527,23 +591,27 @@ class BigQueryBackend(AbstractStorageBackend):
                     stage_ids[table],
                     disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
                 )
-            result = self.client.query(
-                self._batch_script(batch, stages),
-                job_config=self._query_config(
-                    parameters=[
-                        bigquery.ScalarQueryParameter("run_id", "STRING", batch.run_id)
-                    ]
-                ),
-                location=self.location,
-            ).result()
+            result = self._wait_for_job(
+                self.client.query(
+                    self._batch_script(batch, stages),
+                    job_config=self._query_config(
+                        parameters=[
+                            bigquery.ScalarQueryParameter(
+                                "run_id", "STRING", batch.run_id
+                            )
+                        ]
+                    ),
+                    location=self.location,
+                )
+            )
             row = next(iter(result), None)
             if row is None:
                 raise RuntimeError("BigQuery persistence batch returned no summary row")
             already_committed = bool(row["already_committed"])
             per_table = {
                 write.table: UpsertResult(
-                    inserted=int(row[f"inserted_{write.table}"]),
-                    updated=int(row[f"updated_{write.table}"]),
+                    inserted=cast(int, row[f"inserted_{write.table}"]),
+                    updated=cast(int, row[f"updated_{write.table}"]),
                 )
                 for write in batch.current_state
             }
@@ -655,7 +723,7 @@ class BigQueryBackend(AbstractStorageBackend):
             value = f"source.{quoted}"
             if column in {"created_at", "first_seen_at"}:
                 value = f"COALESCE(target.{quoted}, {value})"
-            assignments.append(f"{quoted} = {value}")
+            assignments.append(f"target.{quoted} = {value}")
         quoted_columns = ", ".join(self._column(column) for column in columns)
         source_values = ", ".join(
             f"source.{self._column(column)}" for column in columns
@@ -670,17 +738,169 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
-    def query(self, sql: str) -> pa.Table:
-        """Run BigQuery Standard SQL and return Arrow without Storage API use."""
-        return cast(
-            pa.Table,
-            self.client.query(
-                sql,
-                job_config=self._query_config(),
-                location=self.location,
+    def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
+        """Run BigQuery Standard SQL with named string parameters as Arrow."""
+        bindings = parameters or {}
+        invalid = [name for name in bindings if not is_simple_identifier(name)]
+        if invalid:
+            raise ValueError(f"invalid BigQuery parameter names: {invalid!r}")
+        statement = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"@\1", sql)
+        job = self.client.query(
+            statement,
+            job_config=self._query_config(
+                parameters=[
+                    bigquery.ScalarQueryParameter(name, "STRING", value)
+                    for name, value in bindings.items()
+                ]
+            ),
+            location=self.location,
+        )
+        self._wait_for_job(job)
+        return self._read_query_arrow(job)
+
+    def _read_query_arrow(self, job: bigquery.job.QueryJob) -> pa.Table:
+        """Read one completed query destination through the Storage Read API.
+
+        Args:
+            job: Completed query job with a result destination table.
+
+        Returns:
+            Query rows as one canonical Arrow table.
+
+        Raises:
+            RuntimeError: If the completed job has no readable destination.
+        """
+        destination = job.destination
+        if destination is None:
+            raise RuntimeError("BigQuery query completed without a result destination")
+        table = (
+            f"projects/{destination.project}/datasets/{destination.dataset_id}/"
+            f"tables/{destination.table_id}"
+        )
+        with bigquery_storage_v1.BigQueryReadClient(
+            credentials=self._credentials
+        ) as reader:
+            session = reader.create_read_session(
+                parent=f"projects/{self.project}",
+                read_session=bigquery_storage_types.ReadSession(
+                    table=table,
+                    data_format=bigquery_storage_types.DataFormat.ARROW,
+                ),
+                max_stream_count=1,
+                timeout=_JOB_WAIT_SECONDS,
             )
-            .result()
-            .to_arrow(create_bqstorage_client=False),
+            tables = [
+                cast(
+                    bigquery_storage_reader.ReadRowsStream,
+                    reader.read_rows(
+                        bigquery_storage_types.ReadRowsRequest(read_stream=stream.name),
+                        timeout=_JOB_WAIT_SECONDS,
+                    ),
+                ).to_arrow(read_session=session)
+                for stream in session.streams
+            ]
+        if not tables:
+            return pa.table({})
+        return pa.concat_tables(tables)
+
+    @override
+    def delete_curated(self, identity: CuratedIdentity) -> int:
+        """Delete one fully identified user-curated row."""
+        predicates = " AND ".join(
+            f"{self._column(name)} = @{name}" for name, _ in identity.values
+        )
+        job = self.client.query(
+            f"DELETE FROM {self._table_ref(identity.table)} WHERE {predicates}",
+            job_config=self._query_config(
+                parameters=[
+                    bigquery.ScalarQueryParameter(name, "STRING", value)
+                    for name, value in identity.values
+                ]
+            ),
+            location=self.location,
+        )
+        self._wait_for_job(job)
+        return job.num_dml_affected_rows or 0
+
+    @override
+    def rename_curated(
+        self,
+        source: CuratedIdentity,
+        destination: CuratedIdentity,
+        *,
+        updated_at: datetime,
+    ) -> CuratedRenameResult:
+        """Rename one tag assignment in a single BigQuery transaction script."""
+        if source.table != "tags" or destination.table != "tags":
+            raise ValueError("only tag assignments can be renamed")
+        source_predicate = " AND ".join(
+            f"{self._column(name)} = @source_{name}" for name, _ in source.values
+        )
+        destination_predicate = " AND ".join(
+            f"{self._column(name)} = @destination_{name}"
+            for name, _ in destination.values
+        )
+        parameters = [
+            *[
+                bigquery.ScalarQueryParameter(f"source_{name}", "STRING", value)
+                for name, value in source.values
+            ],
+            *[
+                bigquery.ScalarQueryParameter(f"destination_{name}", "STRING", value)
+                for name, value in destination.values
+            ],
+            bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", updated_at),
+        ]
+        target = self._table_ref("tags")
+        insert_columns = (
+            "source_id, scope, client, workspace, session_id, "
+            "tag, created_at, updated_at"
+        )
+        insert_values = (
+            "source_id, scope, client, workspace, session_id, @destination_tag, "
+            "created_at, @updated_at"
+        )
+        script = "\n".join(
+            (
+                "DECLARE source_exists BOOL DEFAULT EXISTS("
+                f"SELECT 1 FROM {target} WHERE {source_predicate});",
+                "DECLARE destination_exists BOOL DEFAULT EXISTS("
+                f"SELECT 1 FROM {target} WHERE {destination_predicate});",
+                "DECLARE deleted_rows INT64 DEFAULT 0;",
+                "BEGIN TRANSACTION;",
+                "IF source_exists AND NOT destination_exists THEN",
+                f"INSERT INTO {target} ({insert_columns}) SELECT {insert_values} "
+                f"FROM {target} WHERE {source_predicate};",
+                f"DELETE FROM {target} WHERE {source_predicate};",
+                "SET deleted_rows = @@row_count;",
+                "ASSERT deleted_rows = 1 AS "
+                "'tag rename deletion did not remove exactly one row';",
+                "END IF;",
+                "COMMIT TRANSACTION;",
+                "SELECT source_exists, destination_exists, deleted_rows;",
+            )
+        )
+        try:
+            row = next(
+                iter(
+                    self._wait_for_job(
+                        self.client.query(
+                            script,
+                            job_config=self._query_config(parameters=parameters),
+                            location=self.location,
+                        )
+                    )
+                ),
+                None,
+            )
+        except GoogleAPICallError as error:
+            _LOG.warning("atomic tag rename did not complete: %s", error)
+            raise CuratedRenameError("atomic tag rename did not complete") from error
+        if row is None:
+            raise CuratedRenameError("atomic tag rename returned no result")
+        return CuratedRenameResult(
+            renamed=bool(row["source_exists"]) and not bool(row["destination_exists"]),
+            destination_exists=bool(row["destination_exists"]),
         )
 
     @contextmanager
