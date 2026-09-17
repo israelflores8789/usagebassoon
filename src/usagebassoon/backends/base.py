@@ -90,6 +90,19 @@ class BatchPersistResult:
         return sum(result.updated for result in self.per_table.values())
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveTransaction:
+    """One active backend transaction relevant to warehouse diagnostics.
+
+    Attributes:
+        job_id: Backend-assigned job identifier.
+        transaction_id: Backend-assigned transaction identifier.
+    """
+
+    job_id: str
+    transaction_id: str
+
+
 def is_simple_identifier(value: str) -> bool:
     """Return whether a value is a portable unquoted internal identifier."""
     return value.isascii() and value.isidentifier()
@@ -127,6 +140,14 @@ class StorageBackend(Protocol):
 
     def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
         """Atomically commit or reject every write in one collection cycle."""
+        ...
+
+    def is_retryable_error(self, error: Exception) -> bool:
+        """Return whether an error permits retrying the same collection run."""
+        ...
+
+    def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
+        """Return active transactions relevant to this backend, if supported."""
         ...
 
     def upsert(
@@ -176,6 +197,31 @@ class AbstractStorageBackend(ABC):
     @abstractmethod
     def apply_ddl(self) -> None:
         """Create the backend's dialect-native schema and views idempotently."""
+
+    def is_retryable_error(self, error: Exception) -> bool:
+        """Return whether an error permits retrying the current collection run.
+
+        Args:
+            error: Failure raised while persisting the atomic batch.
+
+        Returns:
+            False unless a concrete backend recognizes a safe retry condition.
+        """
+        del error
+        return False
+
+    def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
+        """Return active write transactions when the backend can inspect them.
+
+        Args:
+            limit: Maximum diagnostic rows to return.
+
+        Returns:
+            An empty tuple for backends without transaction-job observability.
+        """
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        return ()
 
     @abstractmethod
     def has_committed_run(self, run_id: str) -> bool:

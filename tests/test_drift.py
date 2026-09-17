@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import override
 from uuid import uuid4
 
 import pyarrow as pa
 
+from usagebassoon.backends.base import ActiveTransaction
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.drift import (
     format_checks,
@@ -108,6 +110,36 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
             "SELECT count(*) AS count FROM schema_drift"
         ).to_pylist() == [{"count": 1}]
         assert format_checks(report.checks)[0].startswith("OK configuration:")
+    finally:
+        backend.close()
+
+
+def test_run_doctor_reports_active_bigquery_transactions() -> None:
+    """Surface jobs that can delay a BigQuery collection transaction."""
+
+    class _TransactionsBackend(DuckDBBackend):
+        """DuckDB test double with BigQuery transaction diagnostics."""
+
+        @override
+        def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
+            """Return one active transaction while honoring the requested limit."""
+            assert limit == 20
+            return (ActiveTransaction("job-1", "transaction-1"),)
+
+    backend = _TransactionsBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        report = run_doctor(
+            backend,
+            backend_name="bigquery",
+            database="usagebassoon_it",
+            snapshot_enabled=False,
+        )
+        transaction_check = next(
+            check for check in report.checks if check.name == "transactions"
+        )
+        assert transaction_check.status == "warning"
+        assert transaction_check.details == ("job job-1; transaction transaction-1",)
     finally:
         backend.close()
 

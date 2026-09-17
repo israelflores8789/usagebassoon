@@ -55,7 +55,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def apply_ddl(self) -> None:
         """Apply the shared DuckDB and MotherDuck DDL plus views."""
         package = resources.files("usagebassoon.sql.duckdb")
-        for filename in ("ddl.sql", "migrations.sql", "views.sql"):
+        for filename in ("ddl.sql", "views.sql"):
             self.connection.execute(package.joinpath(filename).read_text())
 
     @override

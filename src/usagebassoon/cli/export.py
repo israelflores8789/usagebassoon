@@ -22,13 +22,13 @@ ExportFormat = Literal["csv", "json", "parquet"]
 _EXPORTABLE_RELATIONS = frozenset(
     {
         "daily_activity",
-        "daily_activity_current",
         "daily_stats",
-        "daily_stats_current",
+        "daily_cost",
+        "daily_processed_state",
         "ingest_runs",
         "notes",
         "noted_sessions",
-        "pricing_snapshots",
+        "price_versions",
         "reconciliation_issues",
         "run_metrics",
         "schema_drift",
@@ -36,7 +36,6 @@ _EXPORTABLE_RELATIONS = frozenset(
         "session_model_stats_current",
         "session_tags",
         "sessions",
-        "sessions_current",
         "tagged_sessions",
         "tags",
     }

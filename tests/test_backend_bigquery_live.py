@@ -22,13 +22,13 @@ from uuid import uuid4
 
 import pyarrow as pa
 import pytest
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from typer.testing import CliRunner
 
 from tests.conftest import (
-    EXPECTED_DAILY_ROWS,
+    EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_DAYS,
-    EXPECTED_MODELS_ENTRIES,
     EXPECTED_REPORT_ROWS,
 )
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
@@ -74,6 +74,25 @@ def _require_live_access() -> None:
         )
 
 
+def _reset_test_schema(client: bigquery.Client, dataset_id: str) -> None:
+    """Remove leftover relations from the dedicated integration dataset.
+
+    Args:
+        client: Authenticated BigQuery client for the test project.
+        dataset_id: Fully qualified dedicated integration dataset identifier.
+    """
+    try:
+        relations = list(client.list_tables(dataset_id))
+    except NotFound:
+        return
+    for relation in relations:
+        if relation.table_type in {"VIEW", "MATERIALIZED_VIEW"}:
+            client.delete_table(relation.reference, not_found_ok=True)
+    for relation in relations:
+        if relation.table_type not in {"VIEW", "MATERIALIZED_VIEW"}:
+            client.delete_table(relation.reference, not_found_ok=True)
+
+
 @pytest.fixture(scope="module")
 def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSettings]:
     """Create an explicit ADC-backed config for the disposable dataset."""
@@ -105,6 +124,7 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
         )
         backend = BigQueryBackend(project, _DATASET, location=location)
         try:
+            _reset_test_schema(client, f"{project}.{_DATASET}")
             backend.apply_ddl()
             dataset = backend.client.get_dataset(f"{project}.{_DATASET}")
             assert isinstance(dataset.location, str)
@@ -174,9 +194,10 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
     bigquery_backend = _backend(live_settings)
     expected_inserted = (
         EXPECTED_REPORT_ROWS
-        + EXPECTED_MODELS_ENTRIES
-        + EXPECTED_DAILY_ROWS
+        + EXPECTED_DAILY_STATS_ROWS
         + EXPECTED_DAYS
+        + sum(len(prices) for prices in collection_bundle.pricing_by_day.values())
+        + len(collection_bundle.processed_targets)
     )
     try:
         duckdb_backend.apply_ddl()
@@ -192,8 +213,10 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         for table, order_by in (
             ("sessions", "client, session_id"),
             ("session_model_stats", "client, session_id, model"),
-            ("daily_stats", "day, client, model"),
+            ("daily_stats", "day, client, session_id, model"),
             ("daily_activity", "day"),
+            ("price_versions", "day, model"),
+            ("daily_processed_state", "day, target"),
         ):
             assert _rows_for_source(
                 bigquery_backend,
@@ -210,10 +233,13 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             "SELECT rows_inserted, rows_updated FROM ingest_runs "
             f"WHERE run_id = '{normalized.run_id}'"
         ).to_pylist() == [{"rows_inserted": expected_inserted, "rows_updated": 0}]
+        price_count = sum(
+            len(prices) for prices in collection_bundle.pricing_by_day.values()
+        )
         assert bigquery_backend.query(
-            "SELECT count(*) AS n FROM pricing_snapshots "
-            f"WHERE run_id = '{normalized.run_id}'"
-        ).to_pylist() == [{"n": 1}]
+            "SELECT count(*) AS n FROM price_versions "
+            f"WHERE source_id = '{live_settings.source_id}'"
+        ).to_pylist() == [{"n": price_count}]
 
         retried = persist_run(bigquery_backend, normalized)
         assert (retried.inserted, retried.updated) == (0, 0)
@@ -331,14 +357,19 @@ def test_live_location_and_credential_errors_are_actionable(
         )
 
 
-def test_live_concurrent_runs_use_distinct_stages_and_retry(
+def test_live_concurrent_sources_use_distinct_stages_and_retry(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Persist two run IDs concurrently through the collector retry path."""
-    source_id = str(uuid4())
-    first = _normalized_bundle(live_settings, collection_bundle, source_id=source_id)
-    second = _normalized_bundle(live_settings, collection_bundle, source_id=source_id)
+    """Persist independent source namespaces concurrently through the retry path."""
+    first_source_id = str(uuid4())
+    second_source_id = str(uuid4())
+    first = _normalized_bundle(
+        live_settings, collection_bundle, source_id=first_source_id
+    )
+    second = _normalized_bundle(
+        live_settings, collection_bundle, source_id=second_source_id
+    )
     configuration = ConfigurationManager(live_settings.config_path).load()
 
     def persist(normalized: NormalizedBundle) -> PersistSummary:
@@ -358,6 +389,10 @@ def test_live_concurrent_runs_use_distinct_stages_and_retry(
         assert backend.query(
             "SELECT count(*) AS n FROM ingest_runs "
             f"WHERE run_id IN ('{first.run_id}', '{second.run_id}')"
+        ).to_pylist() == [{"n": 2}]
+        assert backend.query(
+            "SELECT count(DISTINCT source_id) AS n FROM sessions "
+            f"WHERE source_id IN ('{first_source_id}', '{second_source_id}')"
         ).to_pylist() == [{"n": 2}]
         assert _stage_tables(backend.client, live_settings.dataset_id) == []
     finally:

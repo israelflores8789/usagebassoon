@@ -22,15 +22,15 @@ REQUIRED_RELATIONS: tuple[str, ...] = (
     "session_model_stats",
     "daily_stats",
     "daily_activity",
-    "pricing_snapshots",
+    "price_versions",
+    "daily_processed_state",
     "run_metrics",
     "reconciliation_issues",
     "tags",
     "notes",
-    "sessions_current",
     "session_model_stats_current",
-    "daily_stats_current",
-    "daily_activity_current",
+    "report_summary",
+    "report_models",
 )
 
 
@@ -377,6 +377,36 @@ def run_doctor(
             f"all {len(REQUIRED_RELATIONS)} required tables and views exist",
         )
     )
+
+    if backend_name == "bigquery":
+        try:
+            transactions = backend.active_transactions(limit)
+        except Exception as error:
+            checks.append(
+                DoctorCheck(
+                    "transactions",
+                    "warning",
+                    f"could not inspect active BigQuery transactions: {error}",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    "transactions",
+                    "warning" if transactions else "ok",
+                    (
+                        f"{len(transactions)} active transaction(s) may delay "
+                        "collection"
+                        if transactions
+                        else "no active BigQuery transactions for this dataset"
+                    ),
+                    tuple(
+                        f"job {transaction.job_id}; "
+                        f"transaction {transaction.transaction_id}"
+                        for transaction in transactions
+                    ),
+                )
+            )
 
     try:
         drift = unresolved_schema_drift(backend, limit=limit)

@@ -24,10 +24,10 @@ from usagebassoon.backends.base import StorageBackend
 
 SNAPSHOT_TABLES: tuple[str, ...] = (
     "sessions",
-    "session_model_stats",
     "daily_stats",
     "daily_activity",
-    "pricing_snapshots",
+    "price_versions",
+    "daily_processed_state",
     "run_metrics",
     "reconciliation_issues",
     "schema_drift",

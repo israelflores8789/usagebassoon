@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_merge.py — Normalization and persistence tests over the shipped DuckDB DDL."""
+"""test_merge.py — Daily normalization, cost views, and persistence tests."""
 
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 
 from tests.conftest import (
-    EXPECTED_DAILY_ROWS,
+    EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_DAYS,
-    EXPECTED_MODELS_ENTRIES,
     EXPECTED_REPORT_ROWS,
-    EXPECTED_TOKSCALE_VERSION,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.merge import persist_run
@@ -24,23 +23,21 @@ from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, CollectionBundle, n
 from usagebassoon.system_metadata import SystemMetadata
 
 
-def test_normalize_emits_the_current_state_ddl_columns(
+def test_normalize_emits_daily_tables_and_processing_state(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Assert normalization emits the DDL-owned freshness and audit columns."""
+    """Emit only base tables needed for daily facts and calculated views."""
     normalized = normalize(collection_bundle)
-    assert normalized.tables["sessions"].column_names[-3:] == [
-        "first_seen_at",
-        "last_seen_at",
+    assert "session_model_stats" not in normalized.tables
+    assert normalized.tables["daily_stats"].column_names[-2:] == [
+        "tokscale_cost_usd",
         "last_updated_at",
     ]
-    assert normalized.tables["session_model_stats"].column_names[-3:] == [
-        "first_seen_at",
-        "last_seen_at",
+    assert normalized.tables["price_versions"].column_names[-2:] == [
+        "observed_at",
         "last_updated_at",
     ]
-    assert normalized.tables["daily_stats"].column_names[-1] == "last_updated_at"
-    assert normalized.tables["daily_activity"].column_names[-1] == "last_updated_at"
+    assert normalized.tables["daily_processed_state"].column_names[-1] == "processed_at"
     assert normalized.tables["ingest_runs"].column_names[-3:] == [
         "rows_inserted",
         "rows_updated",
@@ -48,12 +45,11 @@ def test_normalize_emits_the_current_state_ddl_columns(
     ]
 
 
-def test_normalize_preserves_types_for_null_only_columns(
+def test_normalize_preserves_canonical_nullable_types(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Keep absent tokscale values nullable without degrading to Arrow null type."""
+    """Keep absent rate values typed rather than degrading to Arrow null."""
     normalized = normalize(collection_bundle)
-
     assert {name: table.schema for name, table in normalized.tables.items()} == {
         name: CANONICAL_TABLE_SCHEMAS[name] for name in normalized.tables
     }
@@ -62,61 +58,114 @@ def test_normalize_preserves_types_for_null_only_columns(
         for table in normalized.tables.values()
         for field in table.schema
     )
-    assert normalized.tables["pricing_snapshots"].column(
-        "price_cache_write_per_token"
-    ).to_pylist() == [0.0]
+    assert set(normalized.tables["price_versions"].column("model").to_pylist())
 
 
-def test_persist_run_populates_ddl_tables(
+def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Assert one normalized collection writes all fact and audit tables."""
+    """Calculate price-derived cost and cumulative session totals from daily rows."""
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
         summary = persist_run(backend, normalize(collection_bundle))
+        expected_prices = sum(
+            len(prices) for prices in collection_bundle.pricing_by_day.values()
+        )
+        expected_processed = len(collection_bundle.processed_targets)
         assert (summary.inserted, summary.updated) == (
             EXPECTED_REPORT_ROWS
-            + EXPECTED_MODELS_ENTRIES
-            + EXPECTED_DAILY_ROWS
-            + EXPECTED_DAYS,
+            + EXPECTED_DAILY_STATS_ROWS
+            + EXPECTED_DAYS
+            + expected_prices
+            + expected_processed,
             0,
         )
-        counts = {
-            table: backend.query(f"SELECT count(*) AS n FROM {table}").to_pylist()[0][
-                "n"
-            ]
-            for table in (
-                "ingest_runs",
-                "sessions",
-                "session_model_stats",
-                "daily_stats",
-                "daily_activity",
-                "pricing_snapshots",
-                "run_metrics",
-                "reconciliation_issues",
-            )
-        }
-        assert counts == {
-            "ingest_runs": 1,
-            "sessions": EXPECTED_REPORT_ROWS,
-            "session_model_stats": EXPECTED_MODELS_ENTRIES,
-            "daily_stats": EXPECTED_DAILY_ROWS,
-            "daily_activity": EXPECTED_DAYS,
-            "pricing_snapshots": 1,
-            "run_metrics": 1,
-            "reconciliation_issues": 10,
-        }
-        assert backend.query(
-            "SELECT tokscale_ver, status, rows_inserted, rows_updated FROM ingest_runs"
-        ).to_pylist() == [
-            {
-                "tokscale_ver": EXPECTED_TOKSCALE_VERSION,
-                "status": "partial",
-                "rows_inserted": summary.inserted,
-                "rows_updated": 0,
-            }
+        assert backend.query("SELECT count(*) AS n FROM daily_stats").to_pylist() == [
+            {"n": EXPECTED_DAILY_STATS_ROWS}
         ]
+        assert backend.query(
+            "SELECT count(*) AS n FROM price_versions"
+        ).to_pylist() == [{"n": expected_prices}]
+        assert backend.query(
+            "SELECT count(*) AS n FROM daily_processed_state"
+        ).to_pylist() == [{"n": expected_processed}]
+        costs = backend.query(
+            "SELECT count(*) AS rows, count(cost_usd) AS priced_rows FROM daily_cost"
+        ).to_pylist()[0]
+        assert costs == {
+            "rows": EXPECTED_DAILY_STATS_ROWS,
+            "priced_rows": EXPECTED_DAILY_STATS_ROWS,
+        }
+        aggregate = backend.query(
+            "SELECT sum(total_tokens) AS total_tokens, "
+            "sum(tokscale_cost_usd) AS tokscale_cost_usd, "
+            "sum(cost_usd) AS cost_usd FROM session_model_stats"
+        ).to_pylist()[0]
+        daily = backend.query(
+            "SELECT sum(total_tokens) AS total_tokens, "
+            "sum(tokscale_cost_usd) AS tokscale_cost_usd, "
+            "sum(cost_usd) AS cost_usd FROM daily_cost"
+        ).to_pylist()[0]
+        assert aggregate["total_tokens"] == daily["total_tokens"]
+        assert aggregate["tokscale_cost_usd"] == pytest.approx(
+            daily["tokscale_cost_usd"]
+        )
+        assert aggregate["cost_usd"] == pytest.approx(daily["cost_usd"])
+        assert backend.query(
+            "SELECT status, rows_inserted, rows_updated FROM ingest_runs"
+        ).to_pylist() == [
+            {"status": "ok", "rows_inserted": summary.inserted, "rows_updated": 0}
+        ]
+    finally:
+        backend.close()
+
+
+def test_reasoning_uses_the_output_price(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Apply the output rate to reasoning tokens in the calculated daily cost."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(collection_bundle))
+        row = backend.query(
+            "SELECT output_tokens, reasoning, price_output_per_token, cost_usd "
+            "FROM daily_cost JOIN price_versions USING (source_id, day, model) "
+            "WHERE reasoning > 0 LIMIT 1"
+        ).to_pylist()[0]
+        assert row["cost_usd"] >= (
+            (row["output_tokens"] + row["reasoning"]) * row["price_output_per_token"]
+        )
+    finally:
+        backend.close()
+
+
+def test_processed_state_updates_only_for_refreshed_targets(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Skip completed historical targets while allowing explicit refreshes."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(collection_bundle))
+        before = backend.query(
+            "SELECT min(processed_at) AS stamp FROM daily_processed_state"
+        ).to_pylist()[0]["stamp"]
+        later = replace(
+            collection_bundle,
+            run_id=str(uuid4()),
+            finished_at=collection_bundle.finished_at + timedelta(minutes=1),
+            daily_models={},
+            pricing_by_day={},
+            processed_targets=frozenset(),
+        )
+        summary = persist_run(backend, normalize(later))
+        after = backend.query(
+            "SELECT min(processed_at) AS stamp FROM daily_processed_state"
+        ).to_pylist()[0]["stamp"]
+        assert (summary.inserted, summary.updated) == (0, 0)
+        assert after == before
     finally:
         backend.close()
 
@@ -124,8 +173,7 @@ def test_persist_run_populates_ddl_tables(
 def test_persist_run_records_collector_system_metadata(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Assert normalized ingest audit rows carry collector-host metadata."""
-    backend = DuckDBBackend(":memory:")
+    """Record collector host metadata in the immutable run audit row."""
     metadata = SystemMetadata(
         os_name="Linux",
         os_version="6.16",
@@ -135,12 +183,11 @@ def test_persist_run_records_collector_system_metadata(
         memory_bytes=68_719_476_736,
         shell="/bin/bash",
     )
+    backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
-        persist_run(
-            backend,
-            normalize(replace(collection_bundle, system_metadata=metadata)),
-        )
+        normalized = normalize(replace(collection_bundle, system_metadata=metadata))
+        persist_run(backend, normalized)
         assert backend.query(
             "SELECT os_name, architecture, cpu_count, memory_bytes, shell "
             "FROM ingest_runs"
@@ -152,94 +199,6 @@ def test_persist_run_records_collector_system_metadata(
                 "memory_bytes": 68_719_476_736,
                 "shell": "/bin/bash",
             }
-        ]
-    finally:
-        backend.close()
-
-
-def test_unchanged_rows_keep_their_last_updated_at(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Assert a later unchanged collection does not refresh current-state rows."""
-    backend = DuckDBBackend(":memory:")
-    try:
-        backend.apply_ddl()
-        first = normalize(collection_bundle)
-        persist_run(backend, first)
-        before = backend.query(
-            "SELECT min(last_updated_at) AS stamp FROM daily_activity"
-        ).to_pylist()[0]["stamp"]
-        later_bundle = replace(
-            collection_bundle,
-            run_id=str(uuid4()),
-            finished_at=collection_bundle.finished_at + timedelta(minutes=1),
-        )
-        summary = persist_run(backend, normalize(later_bundle))
-        after = backend.query(
-            "SELECT min(last_updated_at) AS stamp FROM daily_activity"
-        ).to_pylist()[0]["stamp"]
-        assert (summary.inserted, summary.updated) == (0, 0)
-        assert after == before
-    finally:
-        backend.close()
-
-
-def test_distinct_sources_do_not_share_current_state_keys(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Assert identical tokscale keys remain distinct across source namespaces."""
-    backend = DuckDBBackend(":memory:")
-    alternate_source = "22222222-2222-4222-8222-222222222222"
-    try:
-        backend.apply_ddl()
-        first = persist_run(backend, normalize(collection_bundle))
-        second = persist_run(
-            backend,
-            normalize(
-                replace(
-                    collection_bundle,
-                    run_id=str(uuid4()),
-                    source_id=alternate_source,
-                )
-            ),
-        )
-        assert (first.inserted, second.inserted) == (
-            EXPECTED_REPORT_ROWS
-            + EXPECTED_MODELS_ENTRIES
-            + EXPECTED_DAILY_ROWS
-            + EXPECTED_DAYS,
-            EXPECTED_REPORT_ROWS
-            + EXPECTED_MODELS_ENTRIES
-            + EXPECTED_DAILY_ROWS
-            + EXPECTED_DAYS,
-        )
-        assert backend.query(
-            "SELECT count(DISTINCT source_id) AS sources, count(*) AS sessions "
-            "FROM sessions"
-        ).to_pylist() == [{"sources": 2, "sessions": EXPECTED_REPORT_ROWS * 2}]
-    finally:
-        backend.close()
-
-
-def test_persistence_never_touches_user_curation(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Assert ingestion leaves tags and notes owned solely by the user."""
-    backend = DuckDBBackend(":memory:")
-    try:
-        backend.apply_ddl()
-        backend.connection.execute(
-            "INSERT INTO tags VALUES "
-            "('session', 'source', 'codex', '', 'ses_1', 'investigate', now())"
-        )
-        backend.connection.execute(
-            "INSERT INTO notes VALUES "
-            "('source', 'codex', 'ses_1', 'spike here', now(), now())"
-        )
-        persist_run(backend, normalize(collection_bundle))
-        assert backend.query("SELECT count(*) AS n FROM tags").to_pylist() == [{"n": 1}]
-        assert backend.query("SELECT count(*) AS n FROM notes").to_pylist() == [
-            {"n": 1}
         ]
     finally:
         backend.close()

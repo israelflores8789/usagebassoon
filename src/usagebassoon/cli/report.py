@@ -37,15 +37,8 @@ def report(
     """Render a personal-use warehouse summary."""
     _, backend = configured_backend(config)
     try:
-        sessions = backend.query(
-            "SELECT count(*) AS sessions, COALESCE(sum(cost_usd), 0) AS cost_usd "
-            "FROM sessions"
-        )
-        models = backend.query(
-            "SELECT model, COALESCE(sum(total_tokens), 0) AS total_tokens, "
-            "COALESCE(sum(cost_usd), 0) AS cost_usd FROM session_model_stats "
-            "GROUP BY model ORDER BY cost_usd DESC, model"
-        )
+        sessions = backend.query("SELECT * FROM report_summary")
+        models = backend.query("SELECT * FROM report_models")
     finally:
         backend.close()
     if sanitize:

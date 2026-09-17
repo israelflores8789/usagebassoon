@@ -11,12 +11,14 @@ import pytest
 
 from tests.conftest import (
     EXPECTED_DAILY_ROWS,
+    EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_DAYS,
     EXPECTED_MODELS_ENTRIES,
     EXPECTED_REPORT_ROWS,
     EXPECTED_TOKSCALE_VERSION,
 )
 from usagebassoon.json_types import JsonArray, JsonObject
+from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.models import ModelsPayload, parse_models
 from usagebassoon.parsers.pricing import PricingRow
@@ -47,6 +49,28 @@ def test_models_invalid_payload_type() -> None:
     """Assert non-object payloads are rejected."""
     with pytest.raises(ValueError, match="must be a JSON object"):
         parse_models(["not", "an", "object"])
+
+
+def test_daily_models_attach_requested_days(
+    daily_models: dict[date, DailyModelsPayload],
+) -> None:
+    """Persist each date-filtered models row at the requested day grain."""
+    assert (
+        sum(len(payload.entries) for payload in daily_models.values())
+        == EXPECTED_DAILY_STATS_ROWS
+    )
+    assert all(
+        row.day == day
+        for day, payload in daily_models.items()
+        for row in payload.entries
+    )
+
+
+def test_daily_models_reuse_the_models_contract(models_raw: JsonObject) -> None:
+    """Reject non-model payloads through the shared strict models parser."""
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        parse_daily([], day=date(2026, 9, 10))
+    assert parse_daily(models_raw, day=date(2026, 9, 10)).entries
 
 
 def test_report_shape(report_rows: list[SessionRow]) -> None:

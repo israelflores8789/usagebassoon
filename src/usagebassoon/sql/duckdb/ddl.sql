@@ -2,194 +2,148 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 
 -- usagebassoon warehouse DDL for DuckDB and MotherDuck.
---
--- Arrow owns cross-backend normalization and validation. For example, the
--- SQL backends store run_id as TEXT instead of UUID so DuckDB/MotherDuck
--- and BigQuery paths receive the same canonical value.
---
--- Fact tables use current-state upserts: an existing natural key is updated
--- in place, a new natural key is inserted, and absent input rows are never
--- deleted. last_updated_at records the last material change, not collection
--- freshness or a version key.
--- Normalized table snapshots provide restore capability; raw tokscale
--- JSON is intentionally not stored on every ingest.
+-- Arrow owns cross-backend normalization. Usage facts are current-state
+-- upserts: new natural keys are inserted, changed keys update in place, and
+-- absent observations are never deleted.
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
-    run_id          TEXT PRIMARY KEY,
-    source_id       TEXT NOT NULL,
-    started_at      TIMESTAMPTZ NOT NULL,
-    finished_at     TIMESTAMPTZ,
-    host            TEXT,
-    os_name         TEXT,
-    os_version      TEXT,
-    architecture    TEXT,
-    cpu_model       TEXT,
-    cpu_count       INTEGER,
-    memory_bytes    BIGINT,
-    shell           TEXT,
-    tokscale_ver    TEXT,
-    status          TEXT,             -- ok | partial | schema_drift | failed
-    rows_in         INTEGER,
-    rows_inserted   INTEGER,          -- new natural keys inserted this run
-    rows_updated    INTEGER,          -- existing natural keys overwritten
-    drift_events    INTEGER
+    run_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    finished_at TIMESTAMPTZ,
+    host TEXT,
+    os_name TEXT,
+    os_version TEXT,
+    architecture TEXT,
+    cpu_model TEXT,
+    cpu_count INTEGER,
+    memory_bytes BIGINT,
+    shell TEXT,
+    tokscale_ver TEXT,
+    status TEXT,
+    rows_in INTEGER,
+    rows_inserted INTEGER,
+    rows_updated INTEGER,
+    drift_events INTEGER
 );
 
--- Non-fatal schema contract deviations observed during collection.
--- Arrow validates UUID-shaped run_id values before they reach this table.
 CREATE TABLE IF NOT EXISTS schema_drift (
-    drift_id        TEXT PRIMARY KEY,
-    run_id          TEXT NOT NULL,
-    source_id       TEXT NOT NULL,
-    detected_at     TIMESTAMPTZ NOT NULL,
-    payload_kind    TEXT,
-    drift_kind      TEXT,             -- unknown_field | missing_field | type_change
-    path            TEXT,
-    detail          TEXT,
-    tokscale_ver    TEXT,
-    resolved        BOOLEAN DEFAULT FALSE
+    drift_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL,
+    payload_kind TEXT,
+    drift_kind TEXT,
+    path TEXT,
+    detail TEXT,
+    tokscale_ver TEXT,
+    resolved BOOLEAN DEFAULT FALSE
 );
 
--- Session dimension from `tokscale report --json --no-summarize`.
--- One current row exists per (source_id, client, session_id). Stable fields are kept;
--- tokscale-generated summary fields are intentionally excluded. session_label
--- is derived deterministically in Arrow for backend portability.
 CREATE TABLE IF NOT EXISTS sessions (
-    source_id       TEXT NOT NULL,
-    client          TEXT NOT NULL,
-    session_id      TEXT NOT NULL,
-    workspace       TEXT,
+    source_id TEXT NOT NULL,
+    client TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    workspace TEXT,
     workspace_label TEXT,
-    created_at      TIMESTAMPTZ,
-    last_active     TIMESTAMPTZ,
+    created_at TIMESTAMPTZ,
+    last_active TIMESTAMPTZ,
     duration_minutes INTEGER,
-    message_count   BIGINT,
-    cost_usd        DOUBLE,
-    models_used     TEXT[],
-    session_label   TEXT,
-    first_seen_at   TIMESTAMPTZ NOT NULL,
-    last_seen_at    TIMESTAMPTZ NOT NULL,
-    last_updated_at      TIMESTAMPTZ NOT NULL,
+    message_count BIGINT,
+    tokscale_cost_usd DOUBLE,
+    models_used TEXT[],
+    session_label TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    last_updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, client, session_id)
 );
 
--- Fact table from `tokscale models --json --group-by client,session,model`.
--- Values are cumulative for each natural key and are overwritten by a newer
--- observation. Point-in-time pricing is embedded so each current row remains
--- self-contained. total_tokens is computed in Arrow, not by DuckDB, so both
--- SQL dialects receive the same normalized value.
-CREATE TABLE IF NOT EXISTS session_model_stats (
-    source_id       TEXT NOT NULL,
-    client          TEXT NOT NULL,
-    session_id      TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    provider        TEXT,
-    input_tokens    BIGINT,
-    output_tokens   BIGINT,
-    cache_read      BIGINT,
-    cache_write     BIGINT,
-    reasoning       BIGINT,
-    total_tokens    BIGINT NOT NULL,
-    message_count   BIGINT,
-    cost_usd        DOUBLE,
-    ms_per_1k_tokens    DOUBLE,
-    perf_duration_ms    BIGINT,
-    perf_token_coverage DOUBLE,
-    price_input_per_token       DOUBLE,
-    price_output_per_token      DOUBLE,
-    price_cache_read_per_token  DOUBLE,
-    price_cache_write_per_token DOUBLE,
-    price_matched_key   TEXT,
-    price_match_kind    TEXT,
-    price_alias_applied BOOLEAN,
-    price_source        TEXT,
-    price_captured_at   TIMESTAMPTZ,
-    first_seen_at       TIMESTAMPTZ NOT NULL,
-    last_seen_at        TIMESTAMPTZ NOT NULL,
-    last_updated_at     TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (source_id, client, session_id, model)
-);
-
--- Daily fact from `tokscale graph` contributions[]. One current row exists
--- per (source_id, day, client, model); newer observations overwrite that key.
+-- Date-filtered tokscale models facts at session and model granularity.
 CREATE TABLE IF NOT EXISTS daily_stats (
-    source_id         TEXT NOT NULL,
-    day               DATE NOT NULL,
-    client            TEXT NOT NULL,
-    model             TEXT NOT NULL,
-    provider          TEXT,
-    input_tokens      BIGINT,
-    output_tokens     BIGINT,
-    cache_read        BIGINT,
-    cache_write       BIGINT,
-    reasoning         BIGINT,
-    message_count     BIGINT,
-    cost_usd          DOUBLE,
-    last_updated_at   TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (source_id, day, client, model)
+    source_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    client TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    provider TEXT,
+    input_tokens BIGINT,
+    output_tokens BIGINT,
+    cache_read BIGINT,
+    cache_write BIGINT,
+    reasoning BIGINT,
+    total_tokens BIGINT NOT NULL,
+    message_count BIGINT,
+    tokscale_cost_usd DOUBLE,
+    last_updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_id, day, client, session_id, model)
 );
 
--- Day-level activity from contributions[].
+-- Graph contributions supply activity only and identify candidate days.
 CREATE TABLE IF NOT EXISTS daily_activity (
-    source_id         TEXT NOT NULL,
-    day               DATE NOT NULL,
-    intensity         INTEGER,
-    active_time_ms    BIGINT,
-    last_updated_at   TIMESTAMPTZ NOT NULL,
+    source_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    intensity INTEGER,
+    active_time_ms BIGINT,
+    last_updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day)
 );
 
--- Historical point-in-time rates resolved by tokscale. Unlike current-state
--- usage facts, pricing history is intentionally append-mostly.
-CREATE TABLE IF NOT EXISTS pricing_snapshots (
-    run_id          TEXT NOT NULL,
-    source_id       TEXT NOT NULL,
-    captured_at     TIMESTAMPTZ NOT NULL,
-    model           TEXT NOT NULL,
-    source          TEXT NOT NULL,
-    matched_key     TEXT,
-    match_kind      TEXT,
-    price_input_per_token       DOUBLE,
-    price_output_per_token      DOUBLE,
-    price_cache_read_per_token  DOUBLE,
+-- Rates tokscale resolved while processing usage for each day.
+CREATE TABLE IF NOT EXISTS price_versions (
+    source_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    model TEXT NOT NULL,
+    source TEXT NOT NULL,
+    matched_key TEXT,
+    match_kind TEXT,
+    price_input_per_token DOUBLE,
+    price_output_per_token DOUBLE,
+    price_cache_read_per_token DOUBLE,
     price_cache_write_per_token DOUBLE,
-    PRIMARY KEY (source_id, captured_at, model)
+    observed_at TIMESTAMPTZ NOT NULL,
+    last_updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_id, day, model)
 );
 
--- Run-level aggregate telemetry from graph summary and timeMetrics.
--- One row is retained for each collection run.
+-- Each successful target is independently marked, including empty results.
+CREATE TABLE IF NOT EXISTS daily_processed_state (
+    source_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    target TEXT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_id, day, target)
+);
+
 CREATE TABLE IF NOT EXISTS run_metrics (
-    run_id                 TEXT PRIMARY KEY,
-    source_id              TEXT NOT NULL,
-    captured_at            TIMESTAMPTZ NOT NULL,
-    total_tokens           BIGINT,
-    total_cost             DOUBLE,
-    active_days            INTEGER,
-    total_active_time_ms   BIGINT,
-    longest_continuous_ms  BIGINT,
+    run_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    captured_at TIMESTAMPTZ NOT NULL,
+    total_tokens BIGINT,
+    tokscale_total_cost_usd DOUBLE,
+    active_days INTEGER,
+    total_active_time_ms BIGINT,
+    longest_continuous_ms BIGINT,
     max_concurrent_sessions INTEGER,
-    graph_session_count    INTEGER
+    graph_session_count INTEGER
 );
 
--- Non-fatal cross-payload reconciliation observations per run.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
-    run_id          TEXT NOT NULL,
-    source_id       TEXT NOT NULL,
-    check_name      TEXT,
-    issue_key       TEXT,
-    message         TEXT
+    run_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    check_name TEXT,
+    issue_key TEXT,
+    message TEXT
 );
 
--- User curation: tags have only three scopes. Client and workspace tags are
--- resolved onto matching sessions by session_tags; session tags are direct.
 CREATE TABLE IF NOT EXISTS tags (
-    scope           TEXT NOT NULL CHECK (scope IN ('client', 'workspace', 'session')),
-    source_id       TEXT NOT NULL,
-    client          TEXT NOT NULL DEFAULT '',
-    workspace       TEXT NOT NULL DEFAULT '',
-    session_id      TEXT NOT NULL DEFAULT '',
-    tag             TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('client', 'workspace', 'session')),
+    source_id TEXT NOT NULL,
+    client TEXT NOT NULL DEFAULT '',
+    workspace TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    tag TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, scope, client, workspace, session_id, tag),
     CHECK (
         (scope = 'client' AND client <> '' AND workspace = '' AND session_id = '')
@@ -198,13 +152,12 @@ CREATE TABLE IF NOT EXISTS tags (
     )
 );
 
--- User curation: one editable free-text note per session.
 CREATE TABLE IF NOT EXISTS notes (
-    source_id       TEXT NOT NULL,
-    client          TEXT NOT NULL,
-    session_id      TEXT NOT NULL,
-    note            TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL,
-    updated_at      TIMESTAMPTZ NOT NULL,
+    source_id TEXT NOT NULL,
+    client TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, client, session_id)
 );

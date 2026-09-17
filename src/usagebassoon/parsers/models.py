@@ -31,7 +31,7 @@ class ModelStatsRow(BaseModel):
     cache_write: int = Field(default=0, alias="cacheWrite")
     reasoning: int = 0
     message_count: int = Field(default=0, alias="messageCount")
-    cost_usd: float = Field(default=0.0, alias="cost")
+    tokscale_cost_usd: float = Field(default=0.0, alias="cost")
     ms_per_1k_tokens: float | None = None
     perf_duration_ms: int | None = None
     perf_token_coverage: float | None = None

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
@@ -27,14 +27,14 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _payloads(
-    models_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
     pricing_raw: JsonObject,
 ) -> dict[str, tuple[JsonValue, ...]]:
     """Build the raw payload mapping expected by contract validation."""
     return {
-        "models": (models_raw,),
+        "models": tuple(daily_raws.values()),
         "report": (report_raw,),
         "graph": (graph_raw,),
         "pricing": (pricing_raw,),
@@ -42,34 +42,39 @@ def _payloads(
 
 
 def test_shipped_contracts_accept_the_golden_payloads(
-    models_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
     pricing_raw: JsonObject,
 ) -> None:
     """Assert checked-in contracts reproduce their sanitized source payloads."""
     result = validate_payloads(
-        _payloads(models_raw, report_raw, graph_raw, pricing_raw),
+        _payloads(daily_raws, report_raw, graph_raw, pricing_raw),
         run_id=str(uuid4()),
     )
     assert result == type(result)(events=(), fatal=False)
 
 
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
-    models_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
     pricing_raw: JsonObject,
 ) -> None:
     """Assert additive raw fields are preserved as non-fatal drift events."""
-    changed_models = {**models_raw, "futureMetric": 1}
+    day = min(daily_raws)
+    changed_models = {**daily_raws[day], "futureMetric": 1}
     when = datetime.now(UTC)
     bundle = build_collection_bundle(
         RawCollection(
-            models=changed_models,
+            daily_models={day: changed_models},
             report=report_raw,
             graph=graph_raw,
-            pricing={"gemini-3.8-flash": pricing_raw},
+            pricing_by_day={day: {"gemini-3.8-flash": pricing_raw}},
+            processed_targets=frozenset(
+                {(day, "daily_stats"), (day, "price_versions")}
+            ),
+            failed_targets=frozenset(),
         ),
         run_id=str(uuid4()),
         source_id=SOURCE_ID,
@@ -100,22 +105,25 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
 
 
 def test_required_missing_field_blocks_parsing(
-    models_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
     pricing_raw: JsonObject,
 ) -> None:
     """Assert required contract loss raises before parser invocation."""
-    changed_models = dict(models_raw)
+    day = min(daily_raws)
+    changed_models = dict(daily_raws[day])
     del changed_models["groupBy"]
     when = datetime.now(UTC)
     with pytest.raises(ContractValidationError) as error:
         build_collection_bundle(
             RawCollection(
-                models=changed_models,
+                daily_models={day: changed_models},
                 report=report_raw,
                 graph=graph_raw,
-                pricing={"gemini-3.8-flash": pricing_raw},
+                pricing_by_day={day: {"gemini-3.8-flash": pricing_raw}},
+                processed_targets=frozenset(),
+                failed_targets=frozenset({(day, "daily_stats")}),
             ),
             run_id=str(uuid4()),
             source_id=SOURCE_ID,

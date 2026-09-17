@@ -10,6 +10,7 @@ from typing import cast
 from uuid import uuid4
 
 import pyarrow as pa
+from google.api_core.exceptions import BadRequest
 from google.cloud import bigquery
 
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
@@ -99,6 +100,30 @@ class _BatchClient:
         """Satisfy the BigQuery client close surface."""
 
 
+class _TransactionClient:
+    """Offline client recording active-transaction inspection SQL."""
+
+    def __init__(self) -> None:
+        """Initialize the recorded inspection statement."""
+        self.statement = ""
+
+    def query(
+        self,
+        statement: str,
+        *,
+        job_config: bigquery.QueryJobConfig,
+        location: str,
+    ) -> _Job:
+        """Return one running transaction job for diagnostic assertions."""
+        assert job_config.default_dataset is not None
+        assert location == "US"
+        self.statement = statement
+        return _Job([{"job_id": "job-1", "transaction_id": "transaction-1"}])
+
+    def close(self) -> None:
+        """Satisfy the BigQuery client close surface."""
+
+
 def _backend() -> BigQueryBackend:
     """Build a BigQuery backend without credentials or network access."""
     return BigQueryBackend(
@@ -182,14 +207,47 @@ def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     backend = _backend()
 
     qualified = backend._qualify_view_sql(
-        "CREATE OR REPLACE VIEW sessions_current AS "
+        "CREATE OR REPLACE VIEW report_summary AS "
         "SELECT * FROM sessions JOIN tags ON TRUE"
     )
 
     table_prefix = "usagebassoon-test.usagebassoon_emulated"
-    assert f"CREATE OR REPLACE VIEW `{table_prefix}.sessions_current`" in qualified
+    assert f"CREATE OR REPLACE VIEW `{table_prefix}.report_summary`" in qualified
     assert f"FROM `{table_prefix}.sessions` AS sessions" in qualified
     assert f"JOIN `{table_prefix}.tags` AS tags" in qualified
+
+
+def test_bigquery_classifies_only_concurrent_transaction_aborts_as_retryable() -> None:
+    """Retry the documented transaction-conflict response and no other bad request."""
+    backend = _backend()
+
+    assert backend.is_retryable_error(
+        BadRequest("Transaction is aborted due to concurrent update against table")
+    )
+    assert not backend.is_retryable_error(BadRequest("invalid query"))
+
+
+def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
+    """Query regional job metadata for running transactions affecting this dataset."""
+    client = _TransactionClient()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+
+    transactions = backend.active_transactions(2)
+
+    assert [(item.job_id, item.transaction_id) for item in transactions] == [
+        ("job-1", "transaction-1")
+    ]
+    assert "`usagebassoon-test`.`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT" in (
+        client.statement
+    )
+    assert (
+        "query LIKE '%`usagebassoon-test.usagebassoon_emulated.%'" in client.statement
+    )
+    assert client.statement.endswith("LIMIT 2")
 
 
 def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:

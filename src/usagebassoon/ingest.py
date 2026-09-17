@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""ingest.py — Raw tokscale payload validation and parsing for one collection run."""
+"""ingest.py — Raw tokscale payload validation and collection bundle assembly."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from usagebassoon.contracts import (
     ContractValidation,
@@ -17,9 +17,9 @@ from usagebassoon.contracts import (
     validate_payloads,
 )
 from usagebassoon.json_types import JsonArray, JsonObject
-from usagebassoon.normalizer import CollectionBundle
+from usagebassoon.normalizer import CollectionBundle, ProcessingTarget
+from usagebassoon.parsers.daily import parse_daily
 from usagebassoon.parsers.graph import parse_graph
-from usagebassoon.parsers.models import parse_models
 from usagebassoon.parsers.pricing import parse_pricing
 from usagebassoon.parsers.report import parse_report
 from usagebassoon.reconcile import reconcile_all
@@ -31,16 +31,20 @@ class RawCollection:
     """Raw JSON-decoded tokscale outputs for one collection run.
 
     Attributes:
-        models: Output from the grouped tokscale models command.
+        daily_models: Date-filtered models output keyed by requested UTC day.
         report: Output from tokscale report without summarization.
         graph: Output from tokscale graph.
-        pricing: Pricing output keyed by requested model identifier.
+        pricing_by_day: Pricing output keyed first by usage day, then request model.
+        processed_targets: Targets whose data was fetched successfully.
+        failed_targets: Targets omitted because a request failed.
     """
 
-    models: JsonObject
+    daily_models: Mapping[date, JsonObject]
     report: JsonArray
     graph: JsonObject
-    pricing: Mapping[str, JsonObject]
+    pricing_by_day: Mapping[date, Mapping[str, JsonObject]]
+    processed_targets: frozenset[ProcessingTarget]
+    failed_targets: frozenset[ProcessingTarget]
 
 
 def build_collection_bundle(
@@ -70,16 +74,20 @@ def build_collection_bundle(
         Parsed collection bundle carrying non-fatal drift events.
 
     Raises:
-        ContractValidationError: If a required contract field is absent or
-            has an incompatible type.
+        ContractValidationError: If a required contract field is absent or has
+            an incompatible type.
         ValueError: If a payload does not meet its parser's top-level shape.
     """
     validation: ContractValidation = validate_payloads(
         {
-            "models": (raw.models,),
+            "models": tuple(raw.daily_models.values()),
             "report": (raw.report,),
             "graph": (raw.graph,),
-            "pricing": tuple(raw.pricing.values()),
+            "pricing": tuple(
+                payload
+                for pricing in raw.pricing_by_day.values()
+                for payload in pricing.values()
+            ),
         },
         run_id=run_id,
         contracts=contracts,
@@ -87,28 +95,36 @@ def build_collection_bundle(
     )
     if validation.fatal:
         raise ContractValidationError(validation)
-
-    models = parse_models(raw.models)
+    daily_models = {
+        day: parse_daily(payload, day=day) for day, payload in raw.daily_models.items()
+    }
+    pricing_by_day = {
+        day: {
+            pricing.model_id: pricing
+            for pricing in (parse_pricing(payload) for payload in raw_pricing.values())
+        }
+        for day, raw_pricing in raw.pricing_by_day.items()
+    }
     report_rows = parse_report(raw.report)
     graph = parse_graph(raw.graph)
-    pricing_rows = [parse_pricing(payload) for payload in raw.pricing.values()]
-    pricing_by_model = {row.model_id: row for row in pricing_rows}
     return CollectionBundle(
         run_id=run_id,
         source_id=source_id,
         started_at=started_at,
         finished_at=finished_at,
         host=host,
-        models=models,
+        daily_models=daily_models,
         report_rows=report_rows,
         graph=graph,
-        pricing_by_model=pricing_by_model,
-        reconciliation=reconcile_all(models, report_rows, graph),
+        pricing_by_day=pricing_by_day,
+        processed_targets=raw.processed_targets,
+        failed_targets=raw.failed_targets,
+        reconciliation=reconcile_all(),
         contract_drift=validation.events,
         fetch_summary={
-            "rows_in": len(models.entries)
+            "rows_in": sum(len(payload.entries) for payload in daily_models.values())
             + len(report_rows)
-            + sum(len(contribution.clients) for contribution in graph.contributions)
+            + len(graph.contributions)
         },
         system_metadata=system_metadata or capture_system_metadata(),
     )

@@ -10,7 +10,7 @@ sanitized.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -19,6 +19,7 @@ import pytest
 
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.normalizer import CollectionBundle
+from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.models import ModelsPayload, parse_models
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
@@ -35,6 +36,7 @@ EXPECTED_MODELS_ENTRIES = 88
 EXPECTED_REPORT_ROWS = 81
 EXPECTED_DAILY_ROWS = 23
 EXPECTED_DAYS = 18
+EXPECTED_DAILY_STATS_ROWS = 97
 EXPECTED_TOTAL_INPUT = 78_318_668
 EXPECTED_TOTAL_OUTPUT = 1_415_099
 EXPECTED_TOTAL_CACHE_READ = 496_893_790
@@ -99,6 +101,32 @@ def _load_array(name: str) -> JsonArray:
     return payload
 
 
+def _load_daily(day: date) -> JsonObject:
+    """Load one date-filtered models fixture.
+
+    Args:
+        day: Requested tokscale day.
+
+    Returns:
+        The decoded date-filtered models JSON object.
+    """
+    payload = cast(
+        JsonValue,
+        json.loads(
+            (
+                FIXTURES
+                / (
+                    f"golden-{day.isoformat()}-tokscale-"
+                    f"{EXPECTED_TOKSCALE_VERSION}.daily.json"
+                )
+            ).read_text()
+        ),
+    )
+    if not isinstance(payload, dict):
+        raise TypeError(f"daily fixture {day.isoformat()} must be a JSON object")
+    return payload
+
+
 @pytest.fixture(scope="session")
 def models_raw() -> JsonObject:
     """Return the raw models payload as decoded JSON."""
@@ -142,28 +170,38 @@ def graph_payload(graph_raw: JsonObject) -> GraphPayload:
 
 
 @pytest.fixture(scope="session")
+def daily_raws(graph_payload: GraphPayload) -> dict[date, JsonObject]:
+    """Return daily models payloads for every graph candidate day."""
+    return {
+        contribution.date: _load_daily(contribution.date)
+        for contribution in graph_payload.contributions
+    }
+
+
+@pytest.fixture(scope="session")
+def daily_models(daily_raws: dict[date, JsonObject]) -> dict[date, DailyModelsPayload]:
+    """Return date-attached model statistics for graph candidate days."""
+    return {day: parse_daily(payload, day=day) for day, payload in daily_raws.items()}
+
+
+@pytest.fixture(scope="session")
 def pricing_row(pricing_raw: JsonObject) -> PricingRow:
     """Return the validated pricing row."""
     return parse_pricing(pricing_raw)
 
 
 @pytest.fixture(scope="session")
-def recon_result(
-    models_payload: ModelsPayload,
-    report_rows: list[SessionRow],
-    graph_payload: GraphPayload,
-) -> ReconciliationResult:
+def recon_result() -> ReconciliationResult:
     """Run full reconciliation over the golden fixture set."""
-    return reconcile_all(models_payload, report_rows, graph_payload)
+    return reconcile_all()
 
 
 @pytest.fixture
 def collection_bundle(
-    models_payload: ModelsPayload,
     report_rows: list[SessionRow],
     graph_payload: GraphPayload,
     pricing_row: PricingRow,
-    models_raw: JsonObject,
+    daily_models: dict[date, DailyModelsPayload],
     report_raw: JsonArray,
     graph_raw: JsonObject,
     pricing_raw: JsonObject,
@@ -176,9 +214,23 @@ def collection_bundle(
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC) + timedelta(seconds=2),
         host="pytest",
-        models=models_payload,
+        daily_models=daily_models,
         report_rows=report_rows,
         graph=graph_payload,
-        pricing_by_model={"gemini-3.8-flash": pricing_row},
+        pricing_by_day={
+            day: {
+                row.stats.model: pricing_row.model_copy(
+                    update={"model_id": row.stats.model}
+                )
+                for row in payload.entries
+            }
+            for day, payload in daily_models.items()
+        },
+        processed_targets=frozenset(
+            (day, target)
+            for day in daily_models
+            for target in ("daily_stats", "price_versions")
+        ),
+        failed_targets=frozenset(),
         reconciliation=recon_result,
     )

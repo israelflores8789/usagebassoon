@@ -36,9 +36,12 @@ def test_replaying_a_committed_run_is_an_idempotent_no_op(
         assert backend.query("SELECT count(*) AS n FROM ingest_runs").to_pylist() == [
             {"n": 1}
         ]
+        price_count = sum(
+            len(prices) for prices in collection_bundle.pricing_by_day.values()
+        )
         assert backend.query(
-            "SELECT count(*) AS n FROM pricing_snapshots"
-        ).to_pylist() == [{"n": 1}]
+            "SELECT count(*) AS n FROM price_versions"
+        ).to_pylist() == [{"n": price_count}]
     finally:
         backend.close()
 
@@ -96,21 +99,27 @@ def test_persistence_retries_one_normalized_run_without_recollection(
         database=":memory:",
     )
     attempts: list[str] = []
+    schema_attempts: list[None] = []
 
     class _Backend:
         """Minimal retry target that never reaches a real database."""
 
         def apply_ddl(self) -> None:
             """Satisfy collection setup."""
+            schema_attempts.append(None)
 
         def close(self) -> None:
             """Satisfy collection teardown."""
+
+        def is_retryable_error(self, _: Exception) -> bool:
+            """Classify the controlled first failure as a transaction conflict."""
+            return True
 
     def open_backend(_: UsageBassoonConfig) -> object:
         """Return the controlled retry target instead of a real backend."""
         return _Backend()
 
-    monkeypatch.setattr("usagebassoon.config.open_backend", open_backend)
+    monkeypatch.setattr("usagebassoon.collector.open_backend", open_backend)
 
     def persist(_: object, bundle: NormalizedBundle) -> PersistSummary:
         """Fail once, then record the same normalized bundle run identity."""
@@ -125,7 +134,12 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     def sleep(_: float) -> None:
         """Avoid a real retry delay in this deterministic unit test."""
 
+    def uniform(_: float, maximum: float) -> float:
+        """Use the upper backoff bound in this deterministic unit test."""
+        return maximum
+
     monkeypatch.setattr("usagebassoon.collector.time.sleep", sleep)
+    monkeypatch.setattr("usagebassoon.collector.random.uniform", uniform)
     normalized = normalize(collection_bundle)
     result = _persist_with_retries(
         config,
@@ -134,3 +148,4 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     assert result.inserted == 1
     assert attempts == [normalized.run_id, normalized.run_id]
+    assert schema_attempts == [None]

@@ -23,6 +23,7 @@ from google.oauth2 import service_account
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
+    ActiveTransaction,
     BatchPersistResult,
     CurrentStateWrite,
     PersistenceBatch,
@@ -33,17 +34,20 @@ from usagebassoon.backends.base import (
 _PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
 _LOG = logging.getLogger("usagebassoon")
+_CONCURRENT_TRANSACTION_MESSAGE = "transaction is aborted due to concurrent update"
 _VIEW_RELATIONS = (
+    "report_summary",
+    "report_models",
     "session_model_stats_current",
-    "daily_activity_current",
-    "daily_stats_current",
+    "daily_cost",
     "tagged_sessions",
     "noted_sessions",
-    "sessions_current",
     "session_tags",
     "session_model_stats",
     "daily_activity",
     "daily_stats",
+    "daily_processed_state",
+    "price_versions",
     "sessions",
     "notes",
     "tags",
@@ -189,6 +193,65 @@ class BigQueryBackend(AbstractStorageBackend):
             query_parameters=parameters or [],
         )
 
+    @override
+    def is_retryable_error(self, error: Exception) -> bool:
+        """Recognize BigQuery's transaction-concurrency abort response.
+
+        Args:
+            error: Exception raised while executing a persistence batch.
+
+        Returns:
+            True only for the documented concurrent-update transaction abort.
+        """
+        return isinstance(error, GoogleAPICallError) and (
+            _CONCURRENT_TRANSACTION_MESSAGE in str(error).casefold()
+        )
+
+    @override
+    def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
+        """Return running transaction jobs that mutate this configured dataset.
+
+        Args:
+            limit: Maximum jobs to return.
+
+        Returns:
+            Active transaction identifiers ordered by start time.
+
+        Raises:
+            RuntimeError: If BigQuery cannot read project job metadata.
+            ValueError: If ``limit`` is not positive.
+        """
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        jobs_view = (
+            f"`{self.project}`.`region-{self.location.casefold()}`."
+            "INFORMATION_SCHEMA.JOBS_BY_PROJECT"
+        )
+        statement = (
+            "SELECT job_id, transaction_id "
+            f"FROM {jobs_view} "
+            "WHERE state = 'RUNNING' "
+            "AND transaction_id IS NOT NULL "
+            f"AND query LIKE '%`{self.dataset_ref}.%' "
+            "ORDER BY creation_time DESC "
+            f"LIMIT {limit}"
+        )
+        try:
+            rows = self.client.query(
+                statement,
+                job_config=self._query_config(),
+                location=self.location,
+            ).result()
+        except GoogleAPICallError as error:
+            raise RuntimeError(
+                "BigQuery active-transaction inspection failed"
+            ) from error
+        return tuple(
+            ActiveTransaction(str(row["job_id"]), str(row["transaction_id"]))
+            for row in rows
+            if row["job_id"] is not None and row["transaction_id"] is not None
+        )
+
     def _qualify_view_sql(self, sql: str) -> str:
         """Fully qualify view relations required by BigQuery view definitions."""
         relations = "|".join(re.escape(relation) for relation in _VIEW_RELATIONS)
@@ -232,7 +295,7 @@ class BigQueryBackend(AbstractStorageBackend):
             )
         package = resources.files("usagebassoon.sql.bigquery")
         try:
-            for filename in ("ddl.sql", "migrations.sql", "views.sql"):
+            for filename in ("ddl.sql", "views.sql"):
                 sql = package.joinpath(filename).read_text()
                 if filename == "views.sql":
                     sql = self._qualify_view_sql(sql)

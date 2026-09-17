@@ -18,10 +18,11 @@ usagebassoon/
 │   ├── cli/                  # Typer app; one module per CLI command
 │   ├── parsers/              # one module per payload kind
 │   │   ├── __init__.py
-│   │   ├── models.py         # per session×model rows → session_model_stats
+│   │   ├── daily.py          # date-filtered models rows → daily_stats
+│   │   ├── models.py         # grouped tokscale models payload parser
 │   │   ├── report.py         # session metadata       → sessions (no LLM summary fields)
-│   │   ├── graph.py          # daily contributions    → daily_stats/daily_activity/run_metrics
-│   │   └── pricing.py        # rates + resolution     → pricing_snapshots + row stamps
+│   │   ├── graph.py          # activity and candidate dates → daily_activity
+│   │   └── pricing.py        # rates + resolution     → price_versions
 │   ├── contracts/            # JSON schema contracts per payload kind
 │   │   ├── models.json
 │   │   ├── report.json
@@ -39,11 +40,11 @@ usagebassoon/
 │   ├── frames.py             # Arrow conversion to pandas or optional polars
 │   ├── ingest.py             # raw payload contract validation and parsing
 │   ├── json_types.py         # recursive types for JSON-decoded payloads
-│   ├── normalizer.py         # normalizer: models → Arrow, derived columns
+│   ├── normalizer.py         # daily facts and price versions → Arrow
 │   ├── drift.py              # schema_drift detection + reporting
 │   ├── snapshots.py          # local/GCS rotating snapshots + restore
-│   ├── merge.py              # staging + delta append + current-view logic + session_label
-│   ├── reconcile.py          # cross-payload consistency checks
+│   ├── merge.py              # staging + daily current-state upserts
+│   ├── reconcile.py          # report/session consistency checks
 │   ├── curation.py           # tags + notes
 │   ├── system_metadata.py    # best-effort collector-host metadata
 │   ├── obfuscate.py          # export-time pseudonymization
@@ -54,7 +55,7 @@ usagebassoon/
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py           # shared golden-payload fixtures and collection bundle
-│   ├── fixtures/             # sanitized golden captures: models, report, graph, pricing
+│   ├── fixtures/             # sanitized golden captures: daily, models, report, graph, pricing
 │   │   ├── golden-2026-09-10-tokscale-4.15.1.graph.json
 │   │   ├── golden-2026-09-10-tokscale-4.15.1.models.json
 │   │   ├── golden-2026-09-10-tokscale-4.15.1.pricing.json
@@ -62,6 +63,7 @@ usagebassoon/
 │   ├── test_backends.py      # StorageBackend integration and DDL checks
 │   ├── test_cli_curation.py  # tag/note command integration
 │   ├── test_cli_init.py      # config and schema initialization
+│   ├── test_collector_daily.py # daily candidate selection and retries
 │   ├── test_contracts.py     # schema-contract and drift validation
 │   ├── test_merge.py         # delta persistence semantics
 │   ├── test_parsers.py       # fixture-derived parser invariants
@@ -81,8 +83,8 @@ flowchart TD
     subgraph ENV[Ephemeral container / VM / laptop]
         CRON[cron or systemd timer] --> COLLECT[bassoon collect]
         COLLECT -->|subprocess| TS[tokscale CLI — all JSON on stdout<br/>pricing &lt;model&gt; --json · graph<br/>models --json --group-by client,session,model<br/>report --json --no-summarize]
-        TS --> NORM[validate against schema contract<br/>pydantic strict + drift log]
-        NORM --> ARROW[normalize → Arrow tables<br/>derived columns computed here<br/>total_tokens · session_label · price stamps]
+        TS --> NORM[graph candidates → date-filtered models<br/>validate against schema contract + drift log]
+        NORM --> ARROW[normalize → Arrow tables<br/>derived columns computed here<br/>total_tokens · session_label]
     end
 
     subgraph BACKEND[StorageBackend protocol — Arrow in, Arrow out]
@@ -175,7 +177,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **tokscale derived metrics:** We invoke `tokscale` as a subprocess and treat its stdout as the only source of truth for token usage statistics. A future major version may make token statistics collection native.
 
-- **tokscale-resolved pricing only:** Rejected deriving price data from external APIs like Models.dev or LiteLLM because (a) usagebassoon wraps tokscale, and storing rates tokscale did *not* use breaks data fidelity between `cost_usd` and the embedded prices; (b) it would silently ignore downstream users' `custom-pricing.json` tokscale overrides; (c) corrective pricing under any rate card is a query-time recomputation users can do themselves.
+- **Daily tokscale pricing:** `price_versions` stores the tokscale rates observed for each model with activity on a processed day. `daily_cost` calculates `cost_usd` from those rates and daily token components; `tokscale_cost_usd` remains diagnostic. Historical price drift before collection is the downstream user's responsibility.
 
 - **No at-rest obfuscation of stored data:** Session data is stored raw at-rest and obfuscated at export-time. The CLI command `bassoon export` will *default* to obfuscating potentially personal information including session IDs, workspace names and paths, project names, and anything similar. For example, a project name may be pseudonymized as "project-alpha". Downstream users may optionally export their raw data as JSON via the flag `--raw-json`.
 
@@ -185,19 +187,19 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Session and curation identity:** A session key is `(source_id, client, session_id)`; workspace remains metadata. Client and workspace are peer scopes, not a hierarchy. Effective session tags combine direct session tags with tags on its source-scoped client and workspace.
 
-- **Raw tokscale data semantics:** Raw tokscale JSON output from every `bassoon collect` is a *cumulative* state and will be used to compare against the database's current state. A collect run stages the incoming Arrow batch and upserts the data; **never** deletes.
+- **Daily facts:** `tokscale graph` supplies candidate dates and `daily_activity`. For each candidate day, date-filtered `tokscale models` supplies `daily_stats` at `(source_id, day, client, session_id, model)`. Completed historical targets skip by default; the current day refreshes.
 
 - **Token calculation invariants:**
   - "reasoning" tokens are a component of the total token count such that total_tokens = input + cache_read + cache_write + reasoning + output tokens (fixture-verified against tokscale 4.15.1).
   - "reasoning" tokens are considered output tokens for pricing purposes (fixture-verified against tokscale 4.15.1).
 
-- **Data ingest pipeline:** `bassoon collect` (target runtime < 10s):
+- **Data ingest pipeline:** `bassoon collect`:
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
-  2. Run the extraction set: `pricing` per distinct model first (both calls then observe the same LiteLLM ~1h disk-cache state), then `models`, `graph`, `report --no-summarize`. All emit JSON on stdout.
+  2. Run `graph`, use its contribution dates to select daily models work, run date-filtered `models` per required day, then fetch prices for each model used on those days and `report --no-summarize`.
   3. Validate against the schema contract with pydantic strict mode. Required-field absence **fails the run** with a clear error; *unknown* fields or changed cardinalities are **drift events** — recorded in `schema_drift`, surfaced in output, surfaced again on the next `bassoon doctor`, and the run continues (tolerant reader) so collection is never blocked by additive changes. (Be careful! this can cause migration issues if a hotfix is released!)
-  4. Reconcile models ↔ report session overlap and cost drift; graph totals ↔ models grand totals per token type. Mismatches go to `ingest_runs` and are surfaced by `bassoon doctor`.
+  4. Graph totals are not reconciled with daily models totals; graph is only the activity and candidate-date source.
   5. Normalize to Arrow tables; compute derived columns. Stage each fact table in one batch.
-  6. Stage the Arrow batch, match rows by natural key, update changed existing rows, insert new rows, and leave absent rows untouched. Use a transactional upsert/MERGE; **never** delete.
+  6. Stage the Arrow batch, match rows by natural key, update changed existing rows, insert new rows, and leave absent rows untouched. Use one transactional upsert/MERGE per collection run; **never** delete.
   7. Optionally: if `snapshots.interval` has elapsed, run `bassoon snapshot`.
 
 - **Database management:** Locally, data will be managed and stored by DuckDB. Remotely, data will be managed and stored by either MotherDuck or GCP BigQuery. DDL and SQL views will be written natively to their respective dialect (e.g. `sql/duckdb/{ddl,views}.sql` and `sql/bigquery/{ddl,views}.sql`). `SQLGlot` will be used during CI to prevent structural drift. Dedicated pytests will be used during CI to prevent semantic drift against the golden fixtures.
@@ -207,7 +209,7 @@ The following are out-of-scope and/or antithetical to the design goals:
   2. Transpiles `bigquery/*` → duckdb dialect, asserts AST-equivalence against the duckdb tree (and vice-versa for the view sets).
   3. A **replay test** runs the same golden-fixture dataset through both dialects in DuckDB (translated BigQuery SQL) and asserts identical result sets. Transpiler parity is *structural*, not semantic.
 
-- **Ingest semantics:** tokscale reports *cumulative* totals per session in `models`; dedupe keeps the latest snapshot per key and values are never summed across rows. `graph` contributions are authoritative daily totals at `(day, client, model)` and are upserted; repeated cumulative observations are never summed. Tags and notes are owned by the user and are never touched by merge — they persist across `collect` runs and are exported by `bassoon export` like any other table.
+- **Ingest semantics:** Date-filtered `models` rows are upserted at daily session/model grain. `graph` contributions are authoritative only for `daily_activity` and candidate dates. `session_model_stats` is an all-time calculated view over `daily_stats`. Tags and notes are owned by the user and are never touched by merge.
 
 - **Snapshot semantics:** Snapshots are an optional layer that contain normalized tables that provide portability, restore, and seed of the current database state. They are not raw-payload replay points:
   - `bassoon snapshot` writes every table to Parquet locally at `~/.usagebassoon/snapshots/` (UTC timestamp in the filename) or remotely in GCS `gs://<uri>/<UTC-date>-<short-sha>/`, plus a `manifest.json` (table list, row counts, tokscale contract version, DuckDB/BigQuery schema hashes).
@@ -229,9 +231,9 @@ $ bassoon collect
 - **Data-engine agnostic abstraction:** `DatabaseBackend` in `backends/base.py` is deprecated and will be replaced with `StorageBackend`, a higher-order abstraction using Arrow. Implementations:
   - `duckdb_local.py` — local file; `register(arrow_table)` is zero-copy
   - `motherduck.py` — identical code path, `md:` connection string
-  - `bigquery.py` — `google-cloud-bigquery`; `merge()` via `MERGE` DML on a staging table; Arrow → load job → stage; query → `.to_arrow()`
+  - `bigquery.py` — `google-cloud-bigquery`; Arrow staging then one transaction script per collection run. Concurrent-update aborts retry with jitter and active transactions are exposed to `bassoon doctor`.
 
-  Derived columns (`total_tokens`, `session_label`, per-row pricing stamps) are computed **in the normalizer**, before the protocol layer — so dialect differences in computed-column DDL never leak into data. The pipeline is:
+  Derived columns (`total_tokens`, `session_label`) are computed **in the normalizer**; calculated costs remain dialect-paired views. The pipeline is:
   ```
   tokscale JSON → pydantic contract validation (strict, drift events)
               → pydantic models (typed objects)
@@ -245,27 +247,25 @@ $ bassoon collect
   - `last_seen_at` is metadata from tokscale's `last_active` or similar.
   - `last_collected_at` is a freshness marker internal to usagebassoon.
 
-- **General storage model:** Usage facts use current-state upserts. Existing natural keys are overwritten in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Only audit, pricing-history, drift, reconciliation, and snapshot artifacts are append-only. Current-state tables do not retain prior versions of session facts.
+- **General storage model:** Usage facts and day/model price versions use current-state upserts. Existing natural keys are overwritten in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Audit, drift, reconciliation, and snapshot artifacts are append-only.
 
 ### Canonical Ingest Commands
 
-These are the `tokscale` commands used to generate ingest data. Each command is authoritative for their given data domain. Cross-payload reconciliation runs at ingest. Mismatches are surfaced to request bug reporting, never silently resolved:
+These are the `tokscale` commands used to generate ingest data. Each command is authoritative for its data domain. Graph supplies activity and candidate dates only; it is not reconciled with daily models totals:
 
-- `tokscale models --json --group-by client,session,model --merge-worktrees` — authoritative for token/cost metrics.
 - `tokscale models --json --group-by client,session,model --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for daily statistics with session-level granularity.
 - `tokscale report --json --no-summarize` — authoritative for session metadata.
 - `tokscale graph` — authoritative for daily activity statistics.
-- `tokscale pricing <model-id> --json` — authoritative for current point-in-time rates.
+- `tokscale pricing <model-id> --json` — authoritative for the rate observed while processing a daily usage fact.
 
 ### Shipped views (per-dialect: `sql/{duckdb,bigquery}/views.sql`)
 
-- `sessions_current`, `session_model_stats_current`, `daily_stats_current`,
-  `daily_activity_current` — current-state compatibility views
+- `daily_cost`, `session_model_stats`, `session_model_stats_current` — calculated token and cost views
+- `report_summary`, `report_models` — terminal report inputs
 - `session_tags`, `tagged_sessions`, `noted_sessions` — source-aware curation
 
 ### Planned views (not yet implemented)
 
-- `daily_cost` — cost and tokens per day
 - `cost_by_model` — lifetime cost/tokens per model and client
 - `cost_by_workspace` — cost and duration per project
 - `cache_efficiency` — cache_read hit ratios per model
@@ -313,7 +313,7 @@ import usagebassoon
 
 df  = usagebassoon.query("SELECT * FROM cost_by_model")                   # pandas
 df  = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")     # polars
-tbl = usagebassoon.query_arrow("SELECT * FROM sessions_current")          # raw Arrow
+tbl = usagebassoon.query_arrow("SELECT * FROM sessions")                  # raw Arrow
 con = usagebassoon.connect()          # duckdb conn, or ibis-style BigQuery session
 ```
 

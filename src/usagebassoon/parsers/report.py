@@ -35,7 +35,7 @@ class SessionRow(BaseModel):
     total_output_tokens: int = 0
     total_cache_read: int | None = 0
     message_count: int = 0
-    cost_usd: float = Field(default=0.0, alias="total_cost")
+    tokscale_cost_usd: float = Field(default=0.0, alias="total_cost")
     models_used: tuple[str, ...] = ()
 
     @field_validator("created_at", "last_active", mode="before")
