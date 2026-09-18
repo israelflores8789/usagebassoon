@@ -194,6 +194,29 @@ def _rows_for_source(
     ).to_pylist()
 
 
+def _assert_rows_match(
+    table: str,
+    actual: list[dict[str, object]],
+    expected: list[dict[str, object]],
+) -> None:
+    """Assert row parity and report the first differing fields clearly."""
+    if actual == expected:
+        return
+    for index, (actual_row, expected_row) in enumerate(
+        zip(actual, expected, strict=False)
+    ):
+        differences = {
+            field: (actual_row.get(field), expected_row.get(field))
+            for field in actual_row.keys() | expected_row.keys()
+            if actual_row.get(field) != expected_row.get(field)
+        }
+        if differences:
+            pytest.fail(f"{table} row {index} differs by field: {differences!r}")
+    pytest.fail(
+        f"{table} row count differs: BigQuery={len(actual)}, DuckDB={len(expected)}"
+    )
+
+
 def _stage_tables(
     client: bigquery.Client,
     dataset_id: str,
@@ -248,16 +271,22 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             ("price_versions", "day, model"),
             ("daily_processed_state", "day, target"),
         ):
-            assert _rows_for_source(
+            bigquery_rows = _rows_for_source(
                 bigquery_backend,
                 table,
                 normalized.tables["ingest_runs"].column("source_id").to_pylist()[0],
                 order_by,
-            ) == _rows_for_source(
+            )
+            duckdb_rows = _rows_for_source(
                 duckdb_backend,
                 table,
                 normalized.tables["ingest_runs"].column("source_id").to_pylist()[0],
                 order_by,
+            )
+            _assert_rows_match(
+                table,
+                bigquery_rows,
+                duckdb_rows,
             )
         assert bigquery_backend.query(
             "SELECT rows_inserted, rows_updated FROM ingest_runs "

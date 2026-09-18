@@ -7,13 +7,15 @@ from __future__ import annotations
 
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime
-from typing import cast
+from types import TracebackType
+from typing import Self, cast
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 from google.api_core.exceptions import BadRequest
-from google.cloud import bigquery
+from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 
 from usagebassoon.backends.base import (
     CuratedIdentity,
@@ -98,6 +100,8 @@ class _BatchClient:
         assert "`" not in destination
         assert hasattr(payload, "read")
         assert job_config.source_format == bigquery.SourceFormat.PARQUET
+        assert job_config.parquet_options is not None
+        assert job_config.parquet_options.enable_list_inference
         self.loads.append((destination, job_config))
         return _Job()
 
@@ -212,6 +216,70 @@ def _backend() -> BigQueryBackend:
     )
 
 
+class _StorageReadClient:
+    """Fake Storage Read API client recording stream-name arguments."""
+
+    def __init__(self, stream_name: str, table: pa.Table) -> None:
+        """Prepare one read session and one Arrow result."""
+        self._stream_name = stream_name
+        self._table = table
+        self.stream_names: list[str] = []
+
+    def __enter__(self) -> Self:
+        """Return this fake as a context-managed client."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the context without additional work."""
+
+    def create_read_session(
+        self,
+        *,
+        parent: str,
+        read_session: bigquery_storage_types.ReadSession,
+        max_stream_count: int,
+        timeout: float,
+    ) -> bigquery_storage_types.ReadSession:
+        """Return a session containing one stream."""
+        assert parent == "projects/usagebassoon-test"
+        assert read_session.data_format == bigquery_storage_types.DataFormat.ARROW
+        assert max_stream_count == 1
+        assert timeout == 120.0
+        serialized_schema = pa.BufferOutputStream()
+        with pa.ipc.new_stream(serialized_schema, self._table.schema):
+            pass
+        return bigquery_storage_types.ReadSession(
+            arrow_schema=bigquery_storage_types.ArrowSchema(
+                serialized_schema=serialized_schema.getvalue().to_pybytes()
+            ),
+            streams=[bigquery_storage_types.ReadStream(name=self._stream_name)],
+        )
+
+    def read_rows(
+        self,
+        name: str,
+        *,
+        timeout: float,
+    ) -> list[bigquery_storage_types.ReadRowsResponse]:
+        """Record a stream name and return one serialized Arrow response."""
+        assert timeout == 120.0
+        self.stream_names.append(name)
+        return [
+            bigquery_storage_types.ReadRowsResponse(
+                arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
+                    serialized_record_batch=self._table.to_batches()[0]
+                    .serialize()
+                    .to_pybytes()
+                )
+            )
+        ]
+
+
 def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
     """Cancel a stuck remote job and expose its identity in the exception."""
     job = _TimeoutJob()
@@ -220,6 +288,44 @@ def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
         _backend()._wait_for_job(cast(bigquery.job.QueryJob, job))
 
     assert job.cancelled
+
+
+def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pass each ReadStream name to the Storage client's read_rows method."""
+    stream_name = "projects/usagebassoon-test/locations/us/sessions/s/streams/x"
+    expected = pa.table(
+        {
+            "value": [1],
+            "models_used": [["gpt-5.6-luna", "gpt-5.6-terra"]],
+        }
+    )
+    storage_reader = _StorageReadClient(stream_name, expected)
+
+    def make_storage_reader(*, credentials: object) -> _StorageReadClient:
+        """Return the recording fake in place of a network client."""
+        assert credentials is None
+        return storage_reader
+
+    monkeypatch.setattr(
+        bigquery_storage_v1,
+        "BigQueryReadClient",
+        make_storage_reader,
+    )
+    destination = bigquery.TableReference(
+        bigquery.DatasetReference("usagebassoon-test", "usagebassoon_emulated"),
+        "query_results",
+    )
+    job = cast(
+        bigquery.job.QueryJob,
+        type("QueryJobStub", (), {"destination": destination})(),
+    )
+
+    result = _backend()._read_query_arrow(job)
+
+    assert result.equals(expected)
+    assert storage_reader.stream_names == [stream_name]
 
 
 def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:

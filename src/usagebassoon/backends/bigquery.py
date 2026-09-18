@@ -14,7 +14,7 @@ from datetime import datetime
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryFile
-from typing import cast, override
+from typing import Protocol, cast, override
 from uuid import uuid4
 
 import pyarrow as pa
@@ -23,9 +23,9 @@ from google.api_core.exceptions import GoogleAPICallError, NotFound
 from google.auth.credentials import Credentials
 from google.auth.exceptions import GoogleAuthError
 from google.cloud import bigquery, bigquery_storage_v1
-from google.cloud.bigquery_storage_v1 import reader as bigquery_storage_reader
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from google.oauth2 import service_account
+from pandas_gbq.arrow import from_read_rows_response
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
@@ -63,6 +63,18 @@ _VIEW_RELATIONS = (
     "notes",
     "tags",
 )
+
+
+class _StorageReadClient(Protocol):
+    """Expose the high-level Storage client's stream-name read method."""
+
+    def read_rows(
+        self,
+        name: str,
+        *,
+        timeout: float,
+    ) -> Iterable[bigquery_storage_types.ReadRowsResponse]:
+        """Return response messages for the named Storage read stream."""
 
 
 def _validate_project(project: str) -> None:
@@ -362,6 +374,8 @@ class BigQueryBackend(AbstractStorageBackend):
         schema: Sequence[bigquery.SchemaField] | None = None,
     ) -> None:
         """Load canonical Arrow data through an explicit Parquet payload."""
+        parquet_options = bigquery.ParquetOptions()
+        parquet_options.enable_list_inference = True
         with TemporaryFile(mode="w+b") as payload:
             pq.write_table(data, payload)
             payload.seek(0)
@@ -371,6 +385,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     destination,
                     job_config=bigquery.LoadJobConfig(
                         source_format=bigquery.SourceFormat.PARQUET,
+                        parquet_options=parquet_options,
                         schema=(
                             list(schema)
                             if schema is not None
@@ -789,18 +804,26 @@ class BigQueryBackend(AbstractStorageBackend):
                 max_stream_count=1,
                 timeout=_JOB_WAIT_SECONDS,
             )
-            tables = [
-                cast(
-                    bigquery_storage_reader.ReadRowsStream,
-                    reader.read_rows(
-                        bigquery_storage_types.ReadRowsRequest(read_stream=stream.name),
-                        timeout=_JOB_WAIT_SECONDS,
-                    ),
-                ).to_arrow(read_session=session)
-                for stream in session.streams
-            ]
+            arrow_schema = pa.ipc.read_schema(
+                pa.BufferReader(session.arrow_schema.serialized_schema)
+            )
+            tables: list[pa.Table] = []
+            for stream in session.streams:
+                responses = cast(_StorageReadClient, reader).read_rows(
+                    stream.name,
+                    timeout=_JOB_WAIT_SECONDS,
+                )
+                batches = [
+                    cast(
+                        pa.RecordBatch,
+                        from_read_rows_response(response, arrow_schema),
+                    )
+                    for response in responses
+                    if response.arrow_record_batch.serialized_record_batch
+                ]
+                tables.append(pa.Table.from_batches(batches, schema=arrow_schema))
         if not tables:
-            return pa.table({})
+            return pa.Table.from_batches([], schema=arrow_schema)
         return pa.concat_tables(tables)
 
     @override

@@ -54,13 +54,33 @@ spell-fix:
 test *args:
     {{pytest}} -v -s {{args}}
 
+test-bq-live test-name reset="0":
+    @mkdir -p .codex_logs
+    @bash -o pipefail -c '{ \
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"; \
+        PYTHONUNBUFFERED=1 USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{reset}} uv run pytest -vv \
+        --tb=short \
+        --color=no \
+        "{{test-name}}" < /dev/null; \
+    } 2>&1 | tee .codex_logs/pytest-bq-live.log'
+
 # Run tests with coverage reporting
 coverage *args:
     {{pytest}} --cov=src --cov-report=term-missing {{args}}
 
 lint:
-    uv run ruff check {{src_dir}} {{test_dir}}
-    uv run ruff format --check {{src_dir}} {{test_dir}}
+    #!/usr/bin/env bash
+    set -u
+    status=0
+
+    uv run ruff check {{src_dir}} {{test_dir}} || status=1
+    uv run ruff format --check {{src_dir}} {{test_dir}} || status=1
+
+    exit "$status"
+
+lint-fix:
+    uv run ruff check --fix {{src_dir}} {{test_dir}}
+    uv run ruff format {{src_dir}} {{test_dir}}
 
 typecheck:
     uv run pyrefly check {{src_dir}} {{test_dir}}
