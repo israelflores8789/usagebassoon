@@ -61,11 +61,11 @@ def dialect_for_backend(backend: str) -> str:
     return "duckdb" if backend == "motherduck" else backend
 
 
-def _identifier(value: str, *, name: str) -> str:
-    """Validate and quote a portable public-query identifier."""
+def _identifier(value: str, *, name: str, quote: str) -> str:
+    """Validate and quote a public-query identifier for one SQL dialect."""
     if not value.isascii() or not value.isidentifier():
         raise ValueError(f"{name} must be a simple identifier")
-    return f'"{value}"'
+    return f"{quote}{value}{quote}"
 
 
 def build_relation_query(
@@ -73,8 +73,16 @@ def build_relation_query(
     *,
     filters: Mapping[str, str] | None = None,
     limit: int = 1_000,
+    dialect: str = "duckdb",
 ) -> tuple[str, dict[str, str]]:
-    """Build a bounded allowlisted relation query with bound equality filters."""
+    """Build a bounded relation query with bound equality filters.
+
+    Args:
+        relation: Allowlisted public relation name.
+        filters: Equality predicates to bind as query parameters.
+        limit: Maximum number of rows to return.
+        dialect: SQL dialect used for identifier quoting.
+    """
     if relation not in PUBLIC_RELATIONS:
         raise ValueError(f"query relation is not supported: {relation!r}")
     if (
@@ -83,16 +91,19 @@ def build_relation_query(
         or not 1 <= limit <= MAX_PUBLIC_QUERY_LIMIT
     ):
         raise ValueError(f"query limit must be between 1 and {MAX_PUBLIC_QUERY_LIMIT}")
+    quote = "`" if dialect == "bigquery" else '"'
     predicates: list[str] = []
     parameters: dict[str, str] = {}
     for index, (column, value) in enumerate((filters or {}).items()):
         if not isinstance(value, str):
             raise ValueError("query filter values must be strings")
         parameter = f"filter_{index}"
-        predicates.append(f"{_identifier(column, name='query filter')} = :{parameter}")
+        predicates.append(
+            f"{_identifier(column, name='query filter', quote=quote)} = :{parameter}"
+        )
         parameters[parameter] = value
     where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
-    quoted_relation = _identifier(relation, name="query relation")
+    quoted_relation = _identifier(relation, name="query relation", quote=quote)
     return (
         f"SELECT * FROM {quoted_relation}{where} LIMIT {limit}",
         parameters,

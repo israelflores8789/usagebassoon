@@ -64,6 +64,20 @@ def test_public_sql_validator_accepts_one_allowlisted_bounded_relation() -> None
     assert parameters == {"filter_0": "codex"}
 
 
+def test_public_sql_validator_uses_bigquery_identifier_quoting() -> None:
+    """Generate SQL that BigQuery accepts for an allowlisted relation."""
+    sql, parameters = build_relation_query(
+        "report_summary",
+        limit=1,
+        dialect="bigquery",
+    )
+
+    validate_read_only_sql(sql, dialect="bigquery")
+
+    assert sql == "SELECT * FROM `report_summary` LIMIT 1"
+    assert parameters == {}
+
+
 def test_python_query_apis_apply_the_public_validator(
     initialized_config: Path,
 ) -> None:

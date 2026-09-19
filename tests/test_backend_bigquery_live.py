@@ -485,7 +485,9 @@ def test_live_cli_commands_except_report(
         ["init", "--config", str(live_settings.config_path)],
         [
             "query",
-            "SELECT count(*) AS n FROM sessions",
+            "report_summary",
+            "--limit",
+            "1",
             "--config",
             str(live_settings.config_path),
         ],
@@ -524,7 +526,12 @@ def test_live_cli_commands_except_report(
     )
     results = [runner.invoke(app, command) for command in commands]
 
-    assert all(result.exit_code == 0 for result in results)
+    failures = [
+        f"{command!r} exited with {result.exit_code}:\n{result.output}"
+        for command, result in zip(commands, results, strict=True)
+        if result.exit_code != 0
+    ]
+    assert not failures, "CLI command failures:\n" + "\n".join(failures)
     renamed = runner.invoke(
         app,
         [

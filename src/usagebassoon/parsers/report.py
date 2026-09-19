@@ -102,22 +102,100 @@ def parse_report(payload: JsonValue) -> list[SessionRow]:
         Validated rows, one per (client, session_id).
 
     Raises:
-        ValueError: If the payload is not an array or contains duplicate
-            session keys.
+        ValueError: If the payload is not an array or contains conflicting
+            duplicate session metadata.
         pydantic.ValidationError: If any row fails validation.
     """
     if not isinstance(payload, list):
         raise ValueError("report payload must be a JSON array")
-    rows: list[SessionRow] = []
-    seen: set[tuple[str, str]] = set()
+    rows_by_key: dict[tuple[str, str], SessionRow] = {}
     for row in payload:
         session = SessionRow.model_validate(row)
         key = (session.client, session.session_id)
-        if key in seen:
-            raise ValueError(f"duplicate report session key: {key}")
-        seen.add(key)
-        rows.append(session)
-    return rows
+        existing = rows_by_key.get(key)
+        if existing is None:
+            rows_by_key[key] = session
+        else:
+            rows_by_key[key] = _merge_duplicate_session(existing, session)
+    return list(rows_by_key.values())
+
+
+def _merge_duplicate_session(
+    existing: SessionRow,
+    duplicate: SessionRow,
+) -> SessionRow:
+    """Merge repeated metadata for one report session key.
+
+    Args:
+        existing: The first validated row for the session key.
+        duplicate: A later validated row for the same session key.
+
+    Returns:
+        One merged session row. The row with the newest ``last_active`` value
+        supplies fields not otherwise covered by the merge policy.
+
+    Raises:
+        ValueError: If stable workspace metadata differs between duplicates.
+    """
+    key = (existing.client, existing.session_id)
+    if (
+        existing.client != duplicate.client
+        or existing.session_id != duplicate.session_id
+    ):
+        raise ValueError(f"cannot merge different report session keys: {key}")
+    conflicting_fields = [
+        field
+        for field, first, second in (
+            ("workspace", existing.workspace, duplicate.workspace),
+            ("workspace_label", existing.workspace_label, duplicate.workspace_label),
+        )
+        if first != second
+    ]
+    if conflicting_fields:
+        fields = ", ".join(conflicting_fields)
+        raise ValueError(
+            f"conflicting report session metadata for {key}: {fields} must match"
+        )
+
+    created_values = tuple(
+        value
+        for value in (existing.created_at, duplicate.created_at)
+        if value is not None
+    )
+    last_active_values = tuple(
+        value
+        for value in (existing.last_active, duplicate.last_active)
+        if value is not None
+    )
+    latest = _newest_report_row(existing, duplicate)
+    return latest.model_copy(
+        update={
+            "created_at": min(created_values) if created_values else None,
+            "last_active": max(last_active_values) if last_active_values else None,
+            "models_used": _merge_models(existing.models_used, duplicate.models_used),
+        }
+    )
+
+
+def _newest_report_row(existing: SessionRow, duplicate: SessionRow) -> SessionRow:
+    """Select the duplicate row with the newest known activity timestamp."""
+    if existing.last_active is None:
+        return duplicate
+    if duplicate.last_active is None:
+        return existing
+    return duplicate if duplicate.last_active >= existing.last_active else existing
+
+
+def _merge_models(
+    existing: tuple[str, ...],
+    duplicate: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Preserve model order while appending models seen in a duplicate row."""
+    models = list(existing)
+    for model in duplicate:
+        if model not in models:
+            models.append(model)
+    return tuple(models)
 
 
 def make_session_label(row: SessionRow) -> str:

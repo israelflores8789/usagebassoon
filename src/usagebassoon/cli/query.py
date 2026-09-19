@@ -113,12 +113,14 @@ def query(
     Console(stderr=True).print(_RAW_QUERY_WARNING, style="yellow")
     try:
         configuration = ConfigurationManager(config).load()
+        dialect = dialect_for_backend(configuration.backend)
         sql, parameters = build_relation_query(
             relation,
             filters=_filters(tuple(filters or ())),
             limit=limit,
+            dialect=dialect,
         )
-        validate_read_only_sql(sql, dialect=dialect_for_backend(configuration.backend))
+        validate_read_only_sql(sql, dialect=dialect)
         backend = open_backend(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="relation") from error

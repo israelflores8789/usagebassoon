@@ -152,10 +152,62 @@ def test_report_no_llm_summary_fields(report_rows: list[SessionRow]) -> None:
         assert excluded.isdisjoint(row.model_fields_set | set(row.model_dump()))
 
 
-def test_report_duplicate_session_rejected(report_raw: JsonArray) -> None:
-    """Assert duplicate session keys are rejected."""
-    with pytest.raises(ValueError, match="duplicate report session key"):
-        parse_report([*report_raw, report_raw[0]])
+def test_report_duplicate_session_rows_are_merged() -> None:
+    """Merge repeated daily report rows using stable session metadata rules."""
+    rows = parse_report(
+        [
+            {
+                "client": "codex",
+                "session_id": "session-1",
+                "workspace": "/project",
+                "workspace_label": "project",
+                "created_at": "2026-09-10T12:00:00+00:00",
+                "last_active": "2026-09-10T12:30:00+00:00",
+                "models_used": ["gpt-5"],
+                "message_count": 1,
+                "total_cost": 0.1,
+            },
+            {
+                "client": "codex",
+                "session_id": "session-1",
+                "workspace": "/project",
+                "workspace_label": "project",
+                "created_at": "2026-09-10T12:05:00+00:00",
+                "last_active": "2026-09-10T13:00:00+00:00",
+                "models_used": ["gpt-5", "gpt-5-mini"],
+                "message_count": 2,
+                "total_cost": 0.2,
+            },
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0].created_at == datetime(2026, 9, 10, 12, tzinfo=UTC)
+    assert rows[0].last_active == datetime(2026, 9, 10, 13, tzinfo=UTC)
+    assert rows[0].client == "codex"
+    assert rows[0].workspace == "/project"
+    assert rows[0].workspace_label == "project"
+    assert rows[0].models_used == ("gpt-5", "gpt-5-mini")
+    assert rows[0].message_count == 2
+    assert rows[0].tokscale_cost_usd == 0.2
+
+
+@pytest.mark.parametrize("field", ["workspace", "workspace_label"])
+def test_report_duplicate_stable_metadata_must_match(field: str) -> None:
+    """Reject duplicate report rows with conflicting stable metadata."""
+    first: JsonObject = {
+        "client": "codex",
+        "session_id": "session-1",
+        "workspace": "/project",
+        "workspace_label": "project",
+    }
+    duplicate: JsonObject = {
+        **first,
+        field: "/other" if field == "workspace" else "other",
+    }
+
+    with pytest.raises(ValueError, match=f"{field} must match"):
+        parse_report([first, duplicate])
 
 
 def test_session_label_unique(report_rows: list[SessionRow]) -> None:
