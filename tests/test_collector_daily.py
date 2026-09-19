@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
-from subprocess import CompletedProcess
+from sys import executable
 from typing import cast
 
 import pytest
@@ -66,21 +66,9 @@ def test_package_runner_commands_are_passed_to_tokscale(
         tokscale_bin=command,
     )
     monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
-    invocations: list[list[str]] = []
-
-    def run(arguments: list[str], **_kwargs: object) -> CompletedProcess[str]:
-        """Capture the executable argument vector and return valid JSON."""
-        invocations.append(arguments)
-        return CompletedProcess(arguments, 0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(collector.subprocess, "run", run)
-
     prefix = collector._prefix(configuration)
-    payload = collector._json_command(prefix, "graph", "--json")
 
     assert prefix == expected_prefix
-    assert payload == {}
-    assert invocations == [[*expected_prefix, "graph", "--json"]]
 
 
 def test_daily_models_command_uses_each_candidate_day(
@@ -91,7 +79,12 @@ def test_daily_models_command_uses_each_candidate_day(
     day = min(daily_raws)
     calls: list[tuple[str, ...]] = []
 
-    def command(_prefix: object, *arguments: str) -> JsonValue:
+    def command(
+        _configuration: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
         """Record one generated tokscale invocation and return its fixture."""
         calls.append(arguments)
         return daily_raws[day]
@@ -99,7 +92,11 @@ def test_daily_models_command_uses_each_candidate_day(
     monkeypatch.setattr(collector, "_json_command", command)
 
     payloads, failed = collector._fetch_daily_models(
-        ["tokscale"], [day], logging.getLogger("usagebassoon-test")
+        _config(Path("config.toml")),
+        ["tokscale"],
+        [day],
+        logging.getLogger("usagebassoon-test"),
+        deadline=None,
     )
 
     assert payloads == {day: daily_raws[day]}
@@ -118,11 +115,97 @@ def test_daily_models_command_uses_each_candidate_day(
     ]
 
 
+def test_tokscale_child_environment_excludes_unrelated_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pass only documented and explicitly opted-in environment variables."""
+    monkeypatch.setenv("PATH", "/test/bin")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("TOKSCALE_EXTRA_DIRS", "/agent-storage")
+    monkeypatch.setenv("CUSTOM_TOKSCALE_AUTH", "allowed")
+    monkeypatch.setenv("MOTHERDUCK_TOKEN", "secret")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secret.json")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "secret")
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        database=":memory:",
+        tokscale_env=("CUSTOM_TOKSCALE_AUTH",),
+    )
+
+    child = collector._child_environment(configuration)
+
+    assert child["PATH"] == "/test/bin"
+    assert child["LANG"] == "C.UTF-8"
+    assert child["TOKSCALE_EXTRA_DIRS"] == "/agent-storage"
+    assert child["CUSTOM_TOKSCALE_AUTH"] == "allowed"
+    assert "MOTHERDUCK_TOKEN" not in child
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in child
+    assert "AWS_ACCESS_KEY_ID" not in child
+
+
+def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
+    """Terminate a subprocess that exceeds the configured hard timeout."""
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        database=":memory:",
+        tokscale_timeout_seconds=0.05,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded 0 seconds and was killed"):
+        collector._json_command(
+            configuration,
+            [executable, "-c", "import time; time.sleep(30)"],
+            "graph",
+        )
+
+
+def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
+    """Reject excessive graph output before it can exhaust collector memory."""
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        database=":memory:",
+        tokscale_max_stdout_bytes=128,
+    )
+
+    with pytest.raises(RuntimeError, match="stdout exceeded its 128 byte limit"):
+        collector._json_command(
+            configuration,
+            [executable, "-c", "import sys; sys.stdout.write('x' * 4096)"],
+            "graph",
+            max_stdout_bytes=128,
+        )
+
+
+def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
+    """Reject excessive tokscale diagnostics before retaining unbounded text."""
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        database=":memory:",
+        tokscale_max_stderr_bytes=128,
+    )
+
+    with pytest.raises(RuntimeError, match="stderr exceeded its 128 byte limit"):
+        collector._json_command(
+            configuration,
+            [executable, "-c", "import sys; sys.stderr.write('x' * 4096)"],
+            "graph",
+        )
+
+
 def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     graph_raw: JsonObject,
-    report_raw: JsonArray,
+    report_raws: dict[date, JsonArray],
     daily_raws: dict[date, JsonObject],
 ) -> None:
     """Use graph dates, refresh today, and only mark successfully fetched targets."""
@@ -132,20 +215,34 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
     requested_models: list[tuple[date, ...]] = []
     requested_prices: list[dict[date, set[str]]] = []
 
-    def command(_prefix: object, *arguments: str) -> JsonValue:
+    def command(
+        _configuration: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
         """Supply graph and report payloads while fetch helpers handle daily calls."""
         if arguments == ("graph",):
             return graph_raw
-        if arguments == ("report", "--json", "--no-summarize"):
-            return report_raw
+        if (
+            len(arguments) == 7
+            and arguments[:4] == ("report", "--json", "--no-summarize", "--since")
+            and arguments[5] == "--until"
+            and arguments[4] == arguments[6]
+        ):
+            return report_raws[date.fromisoformat(arguments[4])]
         raise AssertionError(f"unexpected tokscale command: {arguments}")
 
     def daily_models(
+        _configuration: UsageBassoonConfig,
         _prefix: object,
         selected_days: tuple[date, ...],
         _logger: logging.Logger,
+        *,
+        deadline: float | None,
     ) -> tuple[dict[date, JsonObject], set[tuple[date, str]]]:
         """Return all selected daily facts except one failed candidate day."""
+        assert deadline is None
         requested_models.append(selected_days)
         return (
             {day: daily_raws[day] for day in selected_days if day != failed_day},
@@ -153,11 +250,15 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
         )
 
     def pricing(
+        _configuration: UsageBassoonConfig,
         _prefix: object,
         models_by_day: dict[date, set[str]],
         _logger: logging.Logger,
+        *,
+        deadline: float | None,
     ) -> tuple[dict[date, dict[str, JsonObject]], set[tuple[date, str]]]:
         """Record model-day pricing requests and complete the successful targets."""
+        assert deadline is None
         requested_prices.append(models_by_day)
         return ({day: {} for day in models_by_day}, set())
 
@@ -220,6 +321,7 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
     assert set(requested_prices[0]) == expected_successes
     assert captured[0].graph is graph_raw
     assert set(captured[0].daily_models) == expected_successes
+    assert captured[0].report == [row for day in days for row in report_raws[day]]
     assert captured[0].processed_targets == frozenset(
         (day, target)
         for day in expected_successes

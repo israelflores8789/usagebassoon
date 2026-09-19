@@ -6,49 +6,87 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from math import inf
 
 import pytest
+from pydantic import ValidationError
 
 from tests.conftest import (
     EXPECTED_DAILY_ROWS,
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_DAYS,
-    EXPECTED_MODELS_ENTRIES,
     EXPECTED_REPORT_ROWS,
     EXPECTED_TOKSCALE_VERSION,
 )
 from usagebassoon.json_types import JsonArray, JsonObject
-from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
+from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily, parse_models
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
-from usagebassoon.parsers.models import ModelsPayload, parse_models
-from usagebassoon.parsers.pricing import PricingRow
+from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, make_session_label, parse_report
 
 
-def test_models_shape(models_payload: ModelsPayload) -> None:
-    """Assert the models payload carries the expected fixture shape."""
-    assert len(models_payload.entries) == EXPECTED_MODELS_ENTRIES
-    assert models_payload.group_by == "client,session,model"
-    assert models_payload.processing_time_ms is not None
+def test_daily_models_shape(
+    daily_models: dict[date, DailyModelsPayload],
+) -> None:
+    """Assert date-filtered models fixtures preserve the expected total grain."""
+    assert sum(len(payload.entries) for payload in daily_models.values()) == (
+        EXPECTED_DAILY_STATS_ROWS
+    )
 
 
-def test_models_field_promotion(models_payload: ModelsPayload) -> None:
+def test_models_field_promotion(
+    daily_models: dict[date, DailyModelsPayload],
+) -> None:
     """Assert the undocumented performance object flattens onto each row."""
-    row = next(e for e in models_payload.entries if e.model == "gemini-3.8-flash")
+    row = next(
+        daily.stats
+        for payload in daily_models.values()
+        for daily in payload.entries
+        if daily.stats.model == "gemini-3.8-flash"
+    )
     assert row.ms_per_1k_tokens is not None
     assert row.perf_duration_ms is not None
     assert 0.0 <= (row.perf_token_coverage or 0.0) <= 1.0
 
 
-def test_models_merged_clients_nullable(models_payload: ModelsPayload) -> None:
+def test_models_merged_clients_nullable(
+    daily_models: dict[date, DailyModelsPayload],
+) -> None:
     """Assert mergedClients nulls normalize to empty tuples."""
-    assert all(e.merged_clients == () for e in models_payload.entries)
+    assert all(
+        entry.stats.merged_clients == ()
+        for payload in daily_models.values()
+        for entry in payload.entries
+    )
 
 
 def test_models_invalid_payload_type() -> None:
     """Assert non-object payloads are rejected."""
     with pytest.raises(ValueError, match="must be a JSON object"):
         parse_models(["not", "an", "object"])
+
+
+def test_tokscale_metrics_reject_negative_and_non_finite_values(
+    daily_raws: dict[date, JsonObject],
+    pricing_raw: JsonObject,
+) -> None:
+    """Reject invalid token and pricing values before normalization."""
+    day = min(daily_raws)
+    invalid_models = dict(daily_raws[day])
+    entries = invalid_models["entries"]
+    assert isinstance(entries, list)
+    first_entry = entries[0]
+    assert isinstance(first_entry, dict)
+    invalid_models["entries"] = [{**first_entry, "input": -1}, *entries[1:]]
+    invalid_pricing = dict(pricing_raw)
+    pricing = pricing_raw["pricing"]
+    assert isinstance(pricing, dict)
+    invalid_pricing["pricing"] = {**pricing, "inputCostPerToken": inf}
+
+    with pytest.raises(ValidationError):
+        parse_daily(invalid_models, day=day)
+    with pytest.raises(ValidationError):
+        parse_pricing(invalid_pricing)
 
 
 def test_daily_models_attach_requested_days(
@@ -66,16 +104,29 @@ def test_daily_models_attach_requested_days(
     )
 
 
-def test_daily_models_reuse_the_models_contract(models_raw: JsonObject) -> None:
+def test_daily_models_reuse_the_models_contract(
+    daily_raws: dict[date, JsonObject],
+) -> None:
     """Reject non-model payloads through the shared strict models parser."""
     with pytest.raises(ValueError, match="must be a JSON object"):
         parse_daily([], day=date(2026, 9, 10))
-    assert parse_daily(models_raw, day=date(2026, 9, 10)).entries
+    assert parse_daily(daily_raws[min(daily_raws)], day=min(daily_raws)).entries
 
 
 def test_report_shape(report_rows: list[SessionRow]) -> None:
     """Assert the report payload carries the expected fixture shape."""
     assert len(report_rows) == EXPECTED_REPORT_ROWS
+
+
+def test_daily_reports_are_partitioned_by_session_creation_date(
+    report_raws: dict[date, JsonArray],
+) -> None:
+    """Keep report metadata daily by session creation, not usage-token day."""
+    for day, payload in report_raws.items():
+        assert all(
+            row.created_at is not None and row.created_at.date() == day
+            for row in parse_report(payload)
+        )
 
 
 def test_report_timestamps_parsed(report_rows: list[SessionRow]) -> None:

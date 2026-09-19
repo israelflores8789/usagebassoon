@@ -42,6 +42,7 @@ from usagebassoon.backends.base import (
 
 _PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
+_LOCATION_ID = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}\Z")
 _LOG = logging.getLogger("usagebassoon")
 _CONCURRENT_TRANSACTION_MESSAGE = "transaction is aborted due to concurrent update"
 _JOB_WAIT_SECONDS = 120.0
@@ -87,6 +88,12 @@ def _validate_dataset(dataset: str) -> None:
     """Require a canonical BigQuery dataset identifier."""
     if not _DATASET_ID.fullmatch(dataset):
         raise ValueError(f"invalid BigQuery dataset identifier: {dataset!r}")
+
+
+def _validate_location(location: str) -> None:
+    """Require a safe canonical BigQuery location identifier."""
+    if _LOCATION_ID.fullmatch(location) is None:
+        raise ValueError(f"invalid BigQuery location identifier: {location!r}")
 
 
 def _schema_from_arrow(data: pa.Table) -> list[bigquery.SchemaField]:
@@ -147,6 +154,7 @@ class BigQueryBackend(AbstractStorageBackend):
         location: str = "US",
         credentials: Credentials | None = None,
         credentials_file: Path | None = None,
+        maximum_bytes_billed: int = 1_073_741_824,
         client: bigquery.Client | None = None,
     ) -> None:
         """Create a backend bound to a validated BigQuery dataset.
@@ -157,6 +165,7 @@ class BigQueryBackend(AbstractStorageBackend):
             location: Required dataset and job location.
             credentials: Explicit Google credentials, normally for tests.
             credentials_file: Service-account JSON file, preferred over ADC.
+            maximum_bytes_billed: Billing cap applied to query jobs.
             client: Injected client for offline unit tests.
 
         Raises:
@@ -164,8 +173,9 @@ class BigQueryBackend(AbstractStorageBackend):
         """
         _validate_project(project)
         _validate_dataset(dataset)
-        if not location.strip():
-            raise ValueError("BigQuery location must not be empty")
+        _validate_location(location)
+        if maximum_bytes_billed < 1:
+            raise ValueError("maximum_bytes_billed must be positive")
         if credentials is not None and credentials_file is not None:
             raise ValueError("credentials and credentials_file cannot be combined")
         resolved_credentials = credentials
@@ -183,6 +193,7 @@ class BigQueryBackend(AbstractStorageBackend):
         self.project = project
         self.dataset = dataset
         self.location = location
+        self.maximum_bytes_billed = maximum_bytes_billed
         self.dataset_ref = f"{project}.{dataset}"
         self._credentials = resolved_credentials
         try:
@@ -244,6 +255,7 @@ class BigQueryBackend(AbstractStorageBackend):
         """Build the fixed Standard SQL configuration for backend jobs."""
         return bigquery.QueryJobConfig(
             default_dataset=self.dataset_ref,
+            maximum_bytes_billed=self.maximum_bytes_billed,
             query_parameters=parameters or [],
         )
 

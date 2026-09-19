@@ -30,6 +30,8 @@ _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_BIGQUERY_LOCATION_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}\Z")
 _ROOT_CONFIG_KEYS = frozenset(
     {
         "source_id",
@@ -42,9 +44,13 @@ _ROOT_CONFIG_KEYS = frozenset(
         "snapshots",
     }
 )
-_TOKSCALE_CONFIG_KEYS = frozenset({"bin"})
-_BIGQUERY_CONFIG_KEYS = frozenset({"project", "location", "credentials_file"})
-_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds"})
+_TOKSCALE_CONFIG_KEYS = frozenset(
+    {"bin", "env", "timeout_seconds", "max_stdout_bytes", "max_stderr_bytes"}
+)
+_BIGQUERY_CONFIG_KEYS = frozenset(
+    {"project", "location", "credentials_file", "maximum_bytes_billed"}
+)
+_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds", "cadence"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
 _SNAPSHOT_CONFIG_KEYS = frozenset({"gcs_uri", "max_snapshots", "interval"})
 
@@ -87,11 +93,13 @@ class BigQueryConfig:
         project: GCP project identifier.
         location: BigQuery dataset and job location.
         credentials_file: Optional service-account credential file path.
+        maximum_bytes_billed: Per-query billing cap for user-facing reads.
     """
 
     project: str
     location: str = "US"
     credentials_file: Path | None = None
+    maximum_bytes_billed: int = 1_073_741_824
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +109,12 @@ class CollectionConfig:
     Attributes:
         max_retries: Additional persistence attempts after the first failure.
         retry_initial_seconds: Initial exponential-backoff delay.
+        cadence: Optional external collection cadence used to bound subprocesses.
     """
 
     max_retries: int = 3
     retry_initial_seconds: float = 1.0
+    cadence: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +157,10 @@ class UsageBassoonConfig:
         backend: Selected storage backend.
         database: Backend database, dataset, or local file path.
         tokscale_bin: Optional tokscale executable override.
+        tokscale_env: Explicit parent environment variables passed to tokscale.
+        tokscale_timeout_seconds: Maximum duration for one tokscale command.
+        tokscale_max_stdout_bytes: Maximum captured tokscale standard output.
+        tokscale_max_stderr_bytes: Maximum captured tokscale standard error.
         bigquery: BigQuery settings when that backend is selected.
         collection: Collection retry settings.
         logging: Local operational logging settings.
@@ -158,6 +172,10 @@ class UsageBassoonConfig:
     backend: BackendName
     database: str
     tokscale_bin: str | None = None
+    tokscale_env: tuple[str, ...] = ()
+    tokscale_timeout_seconds: float = 300.0
+    tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
+    tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
     bigquery: BigQueryConfig | None = None
     collection: CollectionConfig = CollectionConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -242,11 +260,54 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _environment_names(value: object | None) -> tuple[str, ...]:
+    """Validate explicit tokscale environment variable names."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigurationError("tokscale.env must be a list of variable names")
+    names = tuple(value)
+    if len(set(names)) != len(names):
+        raise ConfigurationError("tokscale.env must not contain duplicate names")
+    if any(_ENVIRONMENT_VARIABLE_PATTERN.fullmatch(name) is None for name in names):
+        raise ConfigurationError("tokscale.env contains an invalid variable name")
+    return names
+
+
+def _tokscale_config(
+    value: object | None,
+) -> tuple[str | None, tuple[str, ...], float, int, int]:
+    """Parse restricted tokscale subprocess settings."""
+    table = _table(value, "tokscale", _TOKSCALE_CONFIG_KEYS)
+    timeout_seconds = table.get("timeout_seconds", 300.0)
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ConfigurationError("tokscale.timeout_seconds must be a positive number")
+    return (
+        _string(table.get("bin"), "tokscale.bin"),
+        _environment_names(table.get("env")),
+        float(timeout_seconds),
+        _positive_int(
+            table.get("max_stdout_bytes", 64 * 1024 * 1024),
+            "tokscale.max_stdout_bytes",
+        ),
+        _positive_int(
+            table.get("max_stderr_bytes", 8 * 1024 * 1024),
+            "tokscale.max_stderr_bytes",
+        ),
+    )
+
+
 def _collection_config(value: object | None) -> CollectionConfig:
     """Parse optional collection retry settings."""
     table = _table(value, "collection", _COLLECTION_CONFIG_KEYS)
     max_retries = table.get("max_retries", 3)
     retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
+    cadence = _string(table.get("cadence"), "collection.cadence")
     if (
         not isinstance(max_retries, int)
         or isinstance(max_retries, bool)
@@ -264,9 +325,21 @@ def _collection_config(value: object | None) -> CollectionConfig:
         raise ConfigurationError(
             "collection.retry_initial_seconds must be a positive number"
         )
+    if cadence is not None:
+        from usagebassoon.snapshots import parse_interval
+
+        try:
+            parsed_cadence = parse_interval(cadence)
+        except ValueError as error:
+            raise ConfigurationError(
+                "collection.cadence must be like 30m, 12h, or 7d"
+            ) from error
+        if parsed_cadence is None:
+            raise ConfigurationError("collection.cadence must be like 30m, 12h, or 7d")
     return CollectionConfig(
         max_retries=max_retries,
         retry_initial_seconds=float(retry_initial_seconds),
+        cadence=cadence,
     )
 
 
@@ -304,12 +377,21 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
     )
     if project is None or location is None:
         raise ConfigurationError("bigquery.project and bigquery.location are required")
+    if _BIGQUERY_LOCATION_PATTERN.fullmatch(location) is None:
+        raise ConfigurationError(
+            "bigquery.location must be a canonical location identifier"
+        )
+    maximum_bytes_billed = _positive_int(
+        table.get("maximum_bytes_billed", 1_073_741_824),
+        "bigquery.maximum_bytes_billed",
+    )
     return BigQueryConfig(
         project=project,
         location=location,
         credentials_file=Path(credentials_file).expanduser()
         if credentials_file
         else None,
+        maximum_bytes_billed=maximum_bytes_billed,
     )
 
 
@@ -331,8 +413,13 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         canonical_source_id = str(UUID(source_id))
     except ValueError as error:
         raise ConfigurationError("source_id must be a UUID") from error
-    tokscale = _table(payload.get("tokscale"), "tokscale", _TOKSCALE_CONFIG_KEYS)
-    tokscale_bin = _string(tokscale.get("bin"), "tokscale.bin")
+    (
+        tokscale_bin,
+        tokscale_env,
+        tokscale_timeout_seconds,
+        tokscale_max_stdout_bytes,
+        tokscale_max_stderr_bytes,
+    ) = _tokscale_config(payload.get("tokscale"))
     bigquery = _bigquery_config(payload.get("bigquery"))
     if backend_value == "bigquery" and bigquery is None:
         raise ConfigurationError("[bigquery] is required for the BigQuery backend")
@@ -342,6 +429,10 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         backend=cast(BackendName, backend_value),
         database=database,
         tokscale_bin=tokscale_bin,
+        tokscale_env=tokscale_env,
+        tokscale_timeout_seconds=tokscale_timeout_seconds,
+        tokscale_max_stdout_bytes=tokscale_max_stdout_bytes,
+        tokscale_max_stderr_bytes=tokscale_max_stderr_bytes,
         bigquery=bigquery,
         collection=_collection_config(payload.get("collection")),
         logging=_logging_config(payload.get("logging")),
@@ -414,6 +505,7 @@ def open_backend(config: UsageBassoonConfig) -> StorageBackend:
         config.database,
         location=config.bigquery.location,
         credentials_file=config.bigquery.credentials_file,
+        maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
     )
 
 

@@ -19,6 +19,7 @@ from usagebassoon.config import (
     UsageBassoonConfig,
     open_backend,
 )
+from usagebassoon.display import sanitize_display
 from usagebassoon.drift import DoctorReport, run_doctor
 from usagebassoon.privacy import sanitize_doctor_text
 
@@ -31,7 +32,7 @@ def _print_report(
     database: str | None,
 ) -> None:
     """Render a structured doctor report with Rich."""
-    console = Console()
+    console = Console(markup=False, highlight=False)
     styles = {"ok": "green", "warning": "yellow", "error": "red"}
     for check in report.checks:
         line = Text(f"{check.status.upper()} ", style=styles[check.status])
@@ -44,7 +45,7 @@ def _print_report(
                 database=database,
             )
         )
-        line.append(f"{check.name}: {message}")
+        line.append(f"{sanitize_display(check.name)}: {sanitize_display(message)}")
         console.print(line)
         for detail in check.details:
             text = (
@@ -56,7 +57,7 @@ def _print_report(
                     database=database,
                 )
             )
-            console.print(f"  - {text}", markup=False)
+            console.print(f"  - {sanitize_display(text)}", markup=False)
     console.print(f"\nOverall status: {report.status}")
 
 

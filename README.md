@@ -34,15 +34,22 @@ bin = "bunx tokscale@latest"                        # Command prefix with runner
                                                     # Examples: `npx tokscale@latest`,
                                                     #           `bunx tokscale@latest`, or
                                                     #           `deno x npm:tokscale@latest`.
+env = ["YOUR_ENV_VAR"]                              # Optional; additional env-vars for the tokscale subprocess.
+timeout_seconds = 300                               # Optional; max duration of one tokscale call.
+max_stdout_bytes = 67108864                         # Optional; max stdout captured from tokscale for one command.
+max_stderr_bytes = 8388608                          # Optional; this and the above prevent memory-leaks and abuse.
 
 [bigquery]                                          # Required when backend is `bigquery`.
 project = "my-gcp-project"                          # Google Cloud project ID.
 location = "US"                                     # Optional dataset and job location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
+maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
 
 [collection]                                        # Optional scheduled collection & retry settings.
 max_retries = 3                                     # Additional attempts after the first persistence failure.
 retry_initial_seconds = 1.0                         # Positive initial delay for exponential backoff.
+cadence = "5m"                                      # Optional; the scheduled interval for automatic `bassoon collect`
+                                                    # (e.g. through systemd); (`2m`, `1h`).
 
 [logging]                                           # Optional rotating operational log settings.
 directory = "~/.local/state/usagebassoon/logs"      # Log files directory.

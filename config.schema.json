@@ -80,6 +80,33 @@
         "bin": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "Command prefix for running tokscale, including any runner arguments (for example, `npx tokscale@latest`, `bunx tokscale@latest`, or `deno x npm:tokscale@latest`). This setting overrides the `TOKSCALE_BIN` environment variable."
+        },
+        "env": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "description": "Additional parent environment-variable names intentionally copied into the tokscale subprocess. Values are read from the parent process; missing names are ignored. Credentials are never inherited automatically."
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 300,
+          "description": "Maximum duration of one tokscale subprocess invocation, additionally bounded by collection.cadence when configured."
+        },
+        "max_stdout_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 67108864,
+          "description": "Maximum tokscale stdout captured for one command. Output exceeding this limit terminates the subprocess."
+        },
+        "max_stderr_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 8388608,
+          "description": "Maximum tokscale stderr captured for one command. Output exceeding this limit terminates the subprocess."
         }
       }
     },
@@ -102,6 +129,12 @@
         "credentials_file": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "Optional service-account credentials file path. When omitted, Google Application Default Credentials are used."
+        },
+        "maximum_bytes_billed": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1073741824,
+          "description": "Per-job maximum bytes billed for BigQuery queries, including user-facing relation queries."
         }
       }
     },
@@ -120,6 +153,11 @@
           "exclusiveMinimum": 0,
           "default": 1.0,
           "description": "Initial exponential-backoff delay in seconds."
+        },
+        "cadence": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmMhH]$",
+          "description": "Optional external collection cadence. When present, tokscale subprocesses share a deadline below this interval."
         }
       }
     },

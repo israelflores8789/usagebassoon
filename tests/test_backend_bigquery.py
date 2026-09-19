@@ -290,6 +290,32 @@ def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
     assert job.cancelled
 
 
+def test_bigquery_query_configuration_sets_the_billing_ceiling() -> None:
+    """Apply the configured bytes-billed cap to every query-job configuration."""
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        maximum_bytes_billed=1_073_741_824,
+        client=cast(bigquery.Client, _OfflineClient()),
+    )
+
+    assert backend._query_config().maximum_bytes_billed == 1_073_741_824
+
+
+@pytest.mark.parametrize("location", ["US`", "US; DROP TABLE jobs", "us central1"])
+def test_bigquery_rejects_locations_unsafe_for_information_schema(
+    location: str,
+) -> None:
+    """Reject interpolated job-metadata locations before constructing SQL."""
+    with pytest.raises(ValueError, match="location identifier"):
+        BigQueryBackend(
+            "usagebassoon-test",
+            "usagebassoon_emulated",
+            location=location,
+            client=cast(bigquery.Client, _OfflineClient()),
+        )
+
+
 def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

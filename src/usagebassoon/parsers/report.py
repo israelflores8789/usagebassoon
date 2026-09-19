@@ -12,31 +12,38 @@ boundary; they remain recoverable from raw_exports.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from usagebassoon.json_types import JsonValue
+from usagebassoon.parsers._validation import (
+    Identifier,
+    Metadata,
+    NonNegativeFloat,
+    NonNegativeInt,
+)
 
 
 class SessionRow(BaseModel):
     """Stable session metadata; LLM-summary fields intentionally excluded."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    client: str
-    session_id: str
-    workspace: str | None = None
-    workspace_label: str | None = None
+    client: Identifier
+    session_id: Identifier
+    workspace: Metadata | None = None
+    workspace_label: Metadata | None = None
     created_at: datetime | None = None
     last_active: datetime | None = None
-    duration_minutes: int | None = None
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    total_cache_read: int | None = 0
-    message_count: int = 0
-    tokscale_cost_usd: float = Field(default=0.0, alias="total_cost")
-    models_used: tuple[str, ...] = ()
+    duration_minutes: NonNegativeInt | None = None
+    total_input_tokens: NonNegativeInt = 0
+    total_output_tokens: NonNegativeInt = 0
+    total_cache_read: NonNegativeInt | None = 0
+    message_count: NonNegativeInt = 0
+    tokscale_cost_usd: NonNegativeFloat = Field(default=0.0, alias="total_cost")
+    models_used: tuple[Identifier, ...] = ()
 
     @field_validator("created_at", "last_active", mode="before")
     @classmethod
@@ -57,6 +64,8 @@ class SessionRow(BaseModel):
         if isinstance(value, bool):
             raise ValueError("epoch timestamp must not be bool")
         if isinstance(value, (int, float)):
+            if not isfinite(value):
+                raise ValueError("epoch timestamp must be finite")
             return datetime.fromtimestamp(value / 1000, tz=UTC)
         if isinstance(value, str):
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -74,7 +83,13 @@ class SessionRow(BaseModel):
         Returns:
             A tuple of model ids, empty when null.
         """
-        return tuple(value or ())
+        if value is None:
+            return ()
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError("models_used must be null or a list of strings")
+        return tuple(value)
 
 
 def parse_report(payload: JsonValue) -> list[SessionRow]:

@@ -48,13 +48,13 @@ def query_arrow(
     *,
     config: str | Path | None = None,
 ) -> pa.Table:
-    """Execute read-only SQL and return the result as an Arrow table.
+    """Execute one bounded allowlisted SQL relation query as an Arrow table.
 
     This function opens and closes a backend for one query. Use ``connect``
     when multiple queries should share one connection.
 
     Args:
-        sql: One read-only SELECT or WITH query in the configured dialect.
+        sql: One bounded SELECT from a supported UsageBassoon relation.
         config: Optional configuration file path.
 
     Returns:
@@ -76,10 +76,10 @@ def query(
     engine: Engine = "pandas",
     config: str | Path | None = None,
 ) -> object:
-    """Execute read-only SQL and return a pandas or Polars DataFrame.
+    """Execute one bounded allowlisted SQL relation query as a DataFrame.
 
     Args:
-        sql: One read-only SELECT or WITH query in the configured dialect.
+        sql: One bounded SELECT from a supported UsageBassoon relation.
         engine: Result frame library, either ``"pandas"`` (the default) or
             ``"polars"``.
         config: Optional configuration file path.

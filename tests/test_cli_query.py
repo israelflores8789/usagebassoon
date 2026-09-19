@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_cli_query.py — Typer integration tests for read-only SQL queries."""
+"""test_cli_query.py — Typer integration tests for bounded relation queries."""
 
 from __future__ import annotations
 
@@ -29,6 +29,28 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend = DuckDBBackend(database)
     backend.apply_ddl()
     backend.append(
+        "sessions",
+        pa.table(
+            {
+                "source_id": [SOURCE_ID],
+                "client": ["codex"],
+                "session_id": ["ses_private"],
+                "workspace": ["/project-alpha"],
+                "workspace_label": ["project-alpha"],
+                "created_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                "last_active": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                "duration_minutes": [1],
+                "message_count": [1],
+                "tokscale_cost_usd": [0.0],
+                "models_used": [["gpt-5"]],
+                "session_label": ["project-alpha · 2026-09-15 · ses_private"],
+                "first_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                "last_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                "updated_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+            }
+        ),
+    )
+    backend.append(
         "notes",
         pa.table(
             {
@@ -44,46 +66,54 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     return config, backend
 
 
-def test_query_warns_and_rejects_mutating_sql(tmp_path: Path) -> None:
-    """Keep query raw but prevent it from changing the configured warehouse."""
+def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> None:
+    """Expose raw relation output without accepting arbitrary warehouse SQL."""
     config, backend = _configured_store(tmp_path)
     backend.close()
     runner = CliRunner()
 
     query_result = runner.invoke(
         app,
-        ["query", "SELECT client, session_id FROM notes", "--config", str(config)],
+        [
+            "query",
+            "session_notes",
+            "--filter",
+            "client=codex",
+            "--limit",
+            "1",
+            "--config",
+            str(config),
+        ],
     )
     delete_result = runner.invoke(
         app,
-        ["query", "DELETE FROM notes", "--config", str(config)],
+        ["query", "notes", "--config", str(config)],
     )
 
     assert query_result.exit_code == 0
     assert "ses_private" in query_result.output
     assert "returns raw data" in query_result.stderr
     assert delete_result.exit_code != 0
-    assert "read-only SELECT or WITH" in delete_result.output
+    assert "not supported" in delete_result.output
 
 
 def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
-    """Serialize a permitted common-table-expression query in every file format."""
+    """Serialize a permitted bounded relation query in every file format."""
     config, backend = _configured_store(tmp_path)
     backend.close()
     json_path = tmp_path / "notes.json"
     csv_path = tmp_path / "notes.csv"
     parquet_path = tmp_path / "notes.parquet"
     runner = CliRunner()
-    sql = (
-        "WITH selected AS (SELECT session_id, created_at FROM notes) "
-        "SELECT * FROM selected"
-    )
-
     json_result = runner.invoke(
         app,
         [
             "query",
-            sql,
+            "session_notes",
+            "--filter",
+            "client=codex",
+            "--limit",
+            "1",
             "--format",
             "json",
             "--output",
@@ -96,7 +126,11 @@ def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
         app,
         [
             "query",
-            sql,
+            "session_notes",
+            "--filter",
+            "client=codex",
+            "--limit",
+            "1",
             "--format",
             "csv",
             "--output",
@@ -109,7 +143,11 @@ def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
         app,
         [
             "query",
-            sql,
+            "session_notes",
+            "--filter",
+            "client=codex",
+            "--limit",
+            "1",
             "--format",
             "parquet",
             "--output",
@@ -138,7 +176,7 @@ def test_query_requires_output_only_for_file_formats(tmp_path: Path) -> None:
         app,
         [
             "query",
-            "SELECT 1",
+            "session_notes",
             "--output",
             str(tmp_path / "out"),
             "--config",
@@ -147,7 +185,14 @@ def test_query_requires_output_only_for_file_formats(tmp_path: Path) -> None:
     )
     parquet_without_output = runner.invoke(
         app,
-        ["query", "SELECT 1", "--format", "parquet", "--config", str(config)],
+        [
+            "query",
+            "session_notes",
+            "--format",
+            "parquet",
+            "--config",
+            str(config),
+        ],
     )
 
     assert table_output.exit_code != 0

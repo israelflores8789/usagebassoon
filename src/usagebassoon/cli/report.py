@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from usagebassoon.cli._utils import configured_backend
+from usagebassoon.display import sanitize_display
 from usagebassoon.privacy import sanitize_table
 
 
@@ -51,10 +52,12 @@ def report(
     table.add_row("Cost (USD)", f"{summary['cost_usd']:.6f}")
     model_table = Table(title="Models")
     for column in models.column_names:
-        model_table.add_column(column)
+        model_table.add_column(sanitize_display(column))
     for row in models.to_pylist():
-        model_table.add_row(*(str(row[column]) for column in models.column_names))
-    console = Console(record=save is not None)
+        model_table.add_row(
+            *(sanitize_display(row[column]) for column in models.column_names)
+        )
+    console = Console(record=save is not None, markup=False, highlight=False)
     console.print(table)
     console.print(model_table)
     if save is None and not sanitize:

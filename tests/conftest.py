@@ -3,8 +3,8 @@
 
 """conftest.py — Shared fixtures for the usagebassoon test suite.
 
-Golden payloads were captured from tokscale 4.15.1 on 2026-09-10 and
-sanitized.
+Golden payloads were captured from tokscale 4.15.1 and sanitized at daily
+collection granularity.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.normalizer import CollectionBundle
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
-from usagebassoon.parsers.models import ModelsPayload, parse_models
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, parse_report
 from usagebassoon.reconcile import ReconciliationResult, reconcile_all
@@ -32,7 +31,6 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # regressions in parsing and normalization instead of merely rechecking the fixture.
 # If tests were based on the fixture alone, a parser could silently produce a bug
 # because the expected value would be compute from the same transformed fixture data.
-EXPECTED_MODELS_ENTRIES = 88
 EXPECTED_REPORT_ROWS = 81
 EXPECTED_DAILY_ROWS = 23
 EXPECTED_DAYS = 18
@@ -54,7 +52,7 @@ def _load(name: str) -> JsonValue:
     """Load a golden fixture by stem name.
 
     Args:
-        name: Fixture stem, e.g. "models".
+        name: Fixture stem, e.g. "graph".
 
     Returns:
         The decoded JSON payload.
@@ -69,7 +67,7 @@ def _load_object(name: str) -> JsonObject:
     """Load a golden fixture known to have an object top-level shape.
 
     Args:
-        name: Fixture stem, e.g. "models".
+        name: Fixture stem, e.g. "graph".
 
     Returns:
         The decoded JSON object.
@@ -127,16 +125,29 @@ def _load_daily(day: date) -> JsonObject:
     return payload
 
 
-@pytest.fixture(scope="session")
-def models_raw() -> JsonObject:
-    """Return the raw models payload as decoded JSON."""
-    return _load_object("models")
+def _load_report(day: date) -> JsonArray:
+    """Load one date-filtered tokscale report fixture."""
+    payload = cast(
+        JsonValue,
+        json.loads(
+            (
+                FIXTURES
+                / (
+                    f"golden-{day.isoformat()}-tokscale-"
+                    f"{EXPECTED_TOKSCALE_VERSION}.report.json"
+                )
+            ).read_text()
+        ),
+    )
+    if not isinstance(payload, list):
+        raise TypeError(f"report fixture {day.isoformat()} must be a JSON array")
+    return payload
 
 
 @pytest.fixture(scope="session")
-def report_raw() -> JsonArray:
-    """Return the raw report payload as decoded JSON."""
-    return _load_array("report")
+def report_raw(report_raws: dict[date, JsonArray]) -> JsonArray:
+    """Return all daily report rows as the collector's combined report input."""
+    return [row for payload in report_raws.values() for row in payload]
 
 
 @pytest.fixture(scope="session")
@@ -152,12 +163,6 @@ def pricing_raw() -> JsonObject:
 
 
 @pytest.fixture(scope="session")
-def models_payload(models_raw: JsonObject) -> ModelsPayload:
-    """Return the validated models payload."""
-    return parse_models(models_raw)
-
-
-@pytest.fixture(scope="session")
 def report_rows(report_raw: JsonArray) -> list[SessionRow]:
     """Return the validated report rows."""
     return parse_report(report_raw)
@@ -167,6 +172,15 @@ def report_rows(report_raw: JsonArray) -> list[SessionRow]:
 def graph_payload(graph_raw: JsonObject) -> GraphPayload:
     """Return the validated graph payload."""
     return parse_graph(graph_raw)
+
+
+@pytest.fixture(scope="session")
+def report_raws(graph_payload: GraphPayload) -> dict[date, JsonArray]:
+    """Return daily tokscale report output for every graph candidate day."""
+    return {
+        contribution.date: _load_report(contribution.date)
+        for contribution in graph_payload.contributions
+    }
 
 
 @pytest.fixture(scope="session")

@@ -136,11 +136,11 @@ def test_required_missing_field_blocks_parsing(
 
 
 def test_non_nullable_required_field_rejects_null(
-    models_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
 ) -> None:
     """Assert null is a type change unless the contract explicitly permits it."""
     contract = load_shipped_contracts()["models"]
-    changed_models = {**models_raw, "totalInput": None}
+    changed_models = {**daily_raws[min(daily_raws)], "totalInput": None}
     result = diff_contract(contract, changed_models, run_id=str(uuid4()))
     assert result.fatal is True
     assert any(

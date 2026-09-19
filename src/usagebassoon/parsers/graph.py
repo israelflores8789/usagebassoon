@@ -11,72 +11,86 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from usagebassoon.json_types import JsonValue
+from usagebassoon.parsers._validation import (
+    Identifier,
+    Metadata,
+    NonNegativeFloat,
+    NonNegativeInt,
+)
 
 
 class TokenBreakdown(BaseModel):
     """The five token buckets for one contribution client entry."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    input: int = 0
-    output: int = 0
-    cache_read: int = Field(default=0, alias="cacheRead")
-    cache_write: int = Field(default=0, alias="cacheWrite")
-    reasoning: int = 0
+    input: NonNegativeInt = 0
+    output: NonNegativeInt = 0
+    cache_read: NonNegativeInt = Field(default=0, alias="cacheRead")
+    cache_write: NonNegativeInt = Field(default=0, alias="cacheWrite")
+    reasoning: NonNegativeInt = 0
 
 
 class ContributionClient(BaseModel):
     """One (client, model) fact within a daily contribution."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    client: str
-    model_id: str = Field(alias="modelId")
-    provider_id: str | None = Field(default=None, alias="providerId")
+    client: Identifier
+    model_id: Identifier = Field(alias="modelId")
+    provider_id: Metadata | None = Field(default=None, alias="providerId")
     tokens: TokenBreakdown
-    cost: float = 0.0
-    messages: int = 0
+    cost: NonNegativeFloat = 0.0
+    messages: NonNegativeInt = 0
 
 
 class Contribution(BaseModel):
     """One day of tokscale activity."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
     date: date
-    intensity: int = 0
-    active_time_ms: int = Field(default=0, alias="activeTimeMs")
-    clients: list[ContributionClient] = []
+    intensity: NonNegativeInt = 0
+    active_time_ms: NonNegativeInt = Field(default=0, alias="activeTimeMs")
+    clients: list[ContributionClient] = Field(default_factory=list)
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def _date(cls, value: Any) -> date:
+        """Parse the ISO 8601 contribution day emitted by tokscale."""
+        if isinstance(value, str):
+            return date.fromisoformat(value)
+        raise ValueError("contribution date must be an ISO date")
 
 
 class GraphSummary(BaseModel):
     """Graph-level totals used for reconciliation and run metrics."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    total_tokens: int = Field(alias="totalTokens")
-    total_cost: float = Field(alias="totalCost")
-    active_days: int = Field(alias="activeDays")
+    total_tokens: NonNegativeInt = Field(alias="totalTokens")
+    total_cost: NonNegativeFloat = Field(alias="totalCost")
+    active_days: NonNegativeInt = Field(alias="activeDays")
 
 
 class TimeMetrics(BaseModel):
     """Session-activity telemetry for one graph payload."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    total_active_time_ms: int = Field(alias="totalActiveTimeMs")
-    longest_continuous_ms: int = Field(alias="longestContinuousMs")
-    max_concurrent_sessions: int = Field(alias="maxConcurrentSessions")
-    session_count: int = Field(alias="sessionCount")
+    total_active_time_ms: NonNegativeInt = Field(alias="totalActiveTimeMs")
+    longest_continuous_ms: NonNegativeInt = Field(alias="longestContinuousMs")
+    max_concurrent_sessions: NonNegativeInt = Field(alias="maxConcurrentSessions")
+    session_count: NonNegativeInt = Field(alias="sessionCount")
 
 
 class GraphMeta(BaseModel):
     """Payload provenance: generation timestamp + tokscale version."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
     generated_at: datetime = Field(alias="generatedAt")
-    version: str
+    version: Identifier
 
     @field_validator("generated_at", mode="before")
     @classmethod
@@ -99,6 +113,8 @@ class GraphMeta(BaseModel):
 
 class GraphPayload(BaseModel):
     """The complete graph payload."""
+
+    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
     meta: GraphMeta
     summary: GraphSummary
