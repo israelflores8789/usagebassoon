@@ -262,7 +262,7 @@ $ bassoon collect
 These are the `tokscale` commands used to generate ingest data. Each command is authoritative for its data domain. Graph supplies activity and candidate dates only; it is not reconciled with daily models totals:
 
 - `tokscale models --json --group-by client,session,model --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for daily statistics with session-level granularity.
-- `tokscale report --json --no-summarize` — authoritative for session metadata.
+- `tokscale report --json --no-summarize --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for session metadata.
 - `tokscale graph` — authoritative for daily activity statistics.
 - `tokscale pricing <model-id> --json` — authoritative for the rate observed while processing a daily usage fact.
 

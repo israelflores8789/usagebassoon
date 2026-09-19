@@ -1,0 +1,26 @@
+[
+  {
+    "session_id": "ses_b6e88d468bb705cbb5e14d4c1a",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1787434207949,
+    "last_active": 1787443527871,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 2215467,
+    "total_output_tokens": 51032,
+    "total_cache_read": 10448976,
+    "total_cost": 2.7614322,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 111,
+    "duration_minutes": 155332,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  }
+]

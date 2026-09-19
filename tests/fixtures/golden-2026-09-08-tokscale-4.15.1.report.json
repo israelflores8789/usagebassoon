@@ -1,0 +1,51 @@
+[
+  {
+    "session_id": "ses_3faaa357255cffc876c3f3cb44",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788839086593,
+    "last_active": 1788839529172,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.8-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 102554,
+    "total_output_tokens": 1061,
+    "total_cache_read": 388012,
+    "total_cost": 0.1346439,
+    "models_used": [
+      "gemini-3.8-flash"
+    ],
+    "message_count": 19,
+    "duration_minutes": 7376,
+    "summarized_at": 1789000069,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_42391e8d8306df683a8ec5b87f",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788836040391,
+    "last_active": 1788837719395,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.7-flash, gemini-3.8-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 806437,
+    "total_output_tokens": 20276,
+    "total_cache_read": 4469720,
+    "total_cost": 1.1076367499999997,
+    "models_used": [
+      "gemini-3.7-flash",
+      "gemini-3.8-flash"
+    ],
+    "message_count": 43,
+    "duration_minutes": 27983,
+    "summarized_at": 1789000069,
+    "fm_version": null
+  }
+]

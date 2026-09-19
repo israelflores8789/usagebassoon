@@ -1,0 +1,74 @@
+[
+  {
+    "session_id": "ses_e8d4b3658e96780089da4d5cea",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788382308668,
+    "last_active": 1788382484043,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 85031,
+    "total_output_tokens": 760,
+    "total_cache_read": 146070,
+    "total_cost": 0.08972100000000001,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 10,
+    "duration_minutes": 2922,
+    "summarized_at": 1788511345,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_8a1fef985110be57d095cb877a",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788381361390,
+    "last_active": 1788381682441,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 379653,
+    "total_output_tokens": 2710,
+    "total_cache_read": 2519563,
+    "total_cost": 0.5628219749999999,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 45,
+    "duration_minutes": 5350,
+    "summarized_at": 1788511345,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_01c92d109174f118f0e0ae8707",
+    "client": "opencode",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788316104334,
+    "last_active": 1788317354011,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 874961,
+    "total_output_tokens": 7789,
+    "total_cache_read": 3879459,
+    "total_cost": 1.0331076750000001,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 88,
+    "duration_minutes": 20827,
+    "summarized_at": 1788317745,
+    "fm_version": null
+  }
+]
