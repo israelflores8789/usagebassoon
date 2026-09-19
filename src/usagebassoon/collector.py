@@ -16,7 +16,6 @@ import subprocess
 import time
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from pathlib import Path
 from queue import Empty, Queue
 from socket import gethostname
 from threading import Thread
@@ -64,14 +63,9 @@ def _snapshot_after_collect(
     settings = config.snapshots
     if settings is None or settings.interval is None:
         return
-    uri = settings.gcs_uri or f"file://{Path('~/.usagebassoon/snapshots').expanduser()}"
     backend = open_backend(config)
     try:
-        SnapshotStore(
-            uri,
-            max_snapshots=settings.max_snapshots,
-            interval=settings.interval,
-        ).write(backend, run_id=run_id)
+        SnapshotStore.from_config(config).write(backend, run_id=run_id)
     except Exception:
         logger.exception("snapshot after collection run %s failed", run_id)
     finally:

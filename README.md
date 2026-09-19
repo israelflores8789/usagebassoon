@@ -40,16 +40,22 @@ max_stdout_bytes = 67108864                         # Optional; max stdout captu
 max_stderr_bytes = 8388608                          # Optional; this and the above prevent memory-leaks and abuse.
 
 [bigquery]                                          # Required when backend is `bigquery`.
-project = "my-gcp-project"                          # Google Cloud project ID.
+project = "my-gcp-project"                          # Required; Google Cloud project ID.
 location = "US"                                     # Optional dataset and job location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
+
+[gcs]                                               # Optional; configure GCS snapshots independently of the data backend.
+uri = "gs://my-private-bucket/usagebassoon"         # Required if `gcs` is present; private Google Cloud Storage URI.
+project = "my-gcp-project"                          # Required; Google Cloud project ID.
+location = "US"                                     # Optional configured bucket location; defaults to `US`.
+credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 
 [collection]                                        # Optional scheduled collection & retry settings.
 max_retries = 3                                     # Additional attempts after the first persistence failure.
 retry_initial_seconds = 1.0                         # Positive initial delay for exponential backoff.
 cadence = "5m"                                      # Optional; the scheduled interval for automatic `bassoon collect`
-                                                    # (e.g. through systemd); (`2m`, `1h`).
+                                                    # (e.g. through systemd); (`2m`, `10m`, `1h` not recommended).
 
 [logging]                                           # Optional rotating operational log settings.
 directory = "~/.local/state/usagebassoon/logs"      # Log files directory.
@@ -57,13 +63,16 @@ max_files = 5                                       # Retained files, including 
 max_bytes = 10485760                                # Max size of the active log file before rotation.
 
 [snapshots]                                         # Optional retention and automatic snapshot settings.
-gcs_uri = "gs://my-private-bucket/usagebassoon"     # Optional local `file://` or private `gs://` archive.
+file_uri = "file:///var/lib/usagebassoon/snapshots" # Optional local path or `file://` archive;
+                                                    # with `gcs.uri`, snapshots go both locally and to GCS.
 max_snapshots = 3                                   # Max number of snapshots to retain.
 interval = "12h"                                    # Optional positive cadence (`30m`, `12h`, `7d`);
                                                     # enables due-only snapshots after collection when set.
 ```
 
-The `bigquery` table is only required for the BigQuery backend. BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery. If `snapshots.gcs_uri` is omitted, snapshots use the conventional local archive at `~/.usagebassoon/snapshots/`.
+The `bigquery` table is only required for the BigQuery backend. BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery.
+
+If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the conventional local archive at `~/.usagebassoon/snapshots/`. If `gcs.uri` and `snapshots.file_uri` are both present, snapshots will archive both locally *and* to GCS.
 
 ## Source identity and curation
 
@@ -88,7 +97,7 @@ Reports are raw by default for personal terminal use; run `bassoon report --sani
 
 ## Snapshots
 
-`bassoon snapshot` writes a catalog-published Parquet restoration archive and `bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Local archives rotate under `~/.usagebassoon/snapshots/` by default. Configure `[snapshots] max_snapshots = 3` and an optional positive interval such as `12h`; an interval also enables due-only automatic snapshots after collection. Set `gcs_uri = "gs://bucket/private/usagebassoon-snapshots"` to use Google Cloud Storage (install `usagebassoon[gcs]`); the archive uses generation-conditional catalog publication and stores raw private data.
+`bassoon snapshot` writes a catalog-published Parquet restoration archive and `bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Local archives rotate under `~/.usagebassoon/snapshots/` by default. Configure `[snapshots] max_snapshots = 3` and an optional positive interval such as `12h`; an interval also enables due-only automatic snapshots after collection. Set `gcs.uri = "gs://bucket/private/usagebassoon-snapshots"` to use Google Cloud Storage (install `usagebassoon[gcs]`); set both `gcs.uri` and `snapshots.file_uri` to publish the same complete snapshot to both destinations. GCS archives use generation-conditional catalog publication and all snapshot archives contain raw private data.
 
 ## License & Disclaimers
 

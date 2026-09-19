@@ -40,23 +40,12 @@ def configured_backend(
 
 
 def snapshot_store(configuration: UsageBassoonConfig) -> SnapshotStore:
-    """Create the configured or conventional local snapshot archive.
+    """Create the configured snapshot archive destinations.
 
     Args:
         configuration: Loaded UsageBassoon configuration.
 
     Returns:
-        Snapshot archive with configured retention.
+        Snapshot archive with configured retention and destinations.
     """
-    snapshots = configuration.snapshots
-    if snapshots and snapshots.gcs_uri:
-        return SnapshotStore(
-            snapshots.gcs_uri,
-            max_snapshots=snapshots.max_snapshots,
-            interval=snapshots.interval,
-        )
-    return SnapshotStore(
-        f"file://{Path('~/.usagebassoon/snapshots').expanduser()}",
-        max_snapshots=snapshots.max_snapshots if snapshots else 3,
-        interval=snapshots.interval if snapshots else None,
-    )
+    return SnapshotStore.from_config(configuration)

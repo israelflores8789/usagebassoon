@@ -38,6 +38,9 @@
     "bigquery": {
       "$ref": "#/$defs/bigquery"
     },
+    "gcs": {
+      "$ref": "#/$defs/gcs"
+    },
     "collection": {
       "$ref": "#/$defs/collection"
     },
@@ -138,6 +141,35 @@
         }
       }
     },
+    "gcs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "project"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^gs://\\S+$",
+          "description": "Google Cloud Storage snapshot archive URI."
+        },
+        "project": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "Google Cloud project ID used by the Storage client."
+        },
+        "location": {
+          "$ref": "#/$defs/nonEmptyString",
+          "default": "US",
+          "description": "Configured GCS bucket location metadata. Defaults to `US`."
+        },
+        "credentials_file": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "Optional service-account credentials file path. When omitted, Google Application Default Credentials are used."
+        }
+      }
+    },
     "collection": {
       "type": "object",
       "additionalProperties": false,
@@ -188,9 +220,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "gcs_uri": {
+        "file_uri": {
           "$ref": "#/$defs/nonEmptyString",
-          "description": "Optional local (`file://`) or Google Cloud Storage (`gs://`) archive URI. When omitted, the conventional local archive is used."
+          "description": "Optional local path or `file://` snapshot archive URI. When omitted, the conventional local archive is used unless `gcs.uri` is configured."
         },
         "max_snapshots": {
           "type": "integer",

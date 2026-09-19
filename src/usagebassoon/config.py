@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from usagebassoon.backends.base import StorageBackend
@@ -39,6 +40,7 @@ _ROOT_CONFIG_KEYS = frozenset(
         "database",
         "tokscale",
         "bigquery",
+        "gcs",
         "collection",
         "logging",
         "snapshots",
@@ -52,7 +54,8 @@ _BIGQUERY_CONFIG_KEYS = frozenset(
 )
 _COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds", "cadence"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
-_SNAPSHOT_CONFIG_KEYS = frozenset({"gcs_uri", "max_snapshots", "interval"})
+_GCS_CONFIG_KEYS = frozenset({"uri", "project", "location", "credentials_file"})
+_SNAPSHOT_CONFIG_KEYS = frozenset({"file_uri", "max_snapshots", "interval"})
 
 
 class ConfigurationError(ValueError):
@@ -103,6 +106,23 @@ class BigQueryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GcsConfig:
+    """Google Cloud Storage snapshot settings.
+
+    Attributes:
+        uri: GCS archive root used for snapshots.
+        project: GCP project identifier used by the Storage client.
+        location: Configured GCS bucket location metadata.
+        credentials_file: Optional service-account credential file path.
+    """
+
+    uri: str
+    project: str
+    location: str = "US"
+    credentials_file: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CollectionConfig:
     """Retry settings for one scheduled collection cycle.
 
@@ -137,12 +157,12 @@ class SnapshotConfig:
     """Optional snapshot settings from the configuration file.
 
     Attributes:
-        gcs_uri: Optional remote snapshot prefix.
+        file_uri: Optional local snapshot archive path or URI.
         max_snapshots: Maximum retained snapshots.
         interval: Optional collection interval.
     """
 
-    gcs_uri: str | None = None
+    file_uri: str | None = None
     max_snapshots: int = 3
     interval: str | None = None
 
@@ -162,6 +182,7 @@ class UsageBassoonConfig:
         tokscale_max_stdout_bytes: Maximum captured tokscale standard output.
         tokscale_max_stderr_bytes: Maximum captured tokscale standard error.
         bigquery: BigQuery settings when that backend is selected.
+        gcs: Google Cloud Storage settings when GCS snapshots are configured.
         collection: Collection retry settings.
         logging: Local operational logging settings.
         snapshots: Optional snapshot settings.
@@ -177,6 +198,7 @@ class UsageBassoonConfig:
     tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
     tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
     bigquery: BigQueryConfig | None = None
+    gcs: GcsConfig | None = None
     collection: CollectionConfig = CollectionConfig()
     logging: LoggingConfig = LoggingConfig()
     snapshots: SnapshotConfig | None = None
@@ -222,7 +244,15 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     if value is None:
         return None
     table = _table(value, "snapshots", _SNAPSHOT_CONFIG_KEYS)
-    gcs_uri = _string(table.get("gcs_uri"), "snapshots.gcs_uri")
+    file_uri = _string(table.get("file_uri"), "snapshots.file_uri")
+    if file_uri is not None:
+        parsed = urlparse(file_uri)
+        if parsed.scheme not in {"", "file"} or (
+            parsed.scheme == "file" and not parsed.path
+        ):
+            raise ConfigurationError(
+                "snapshots.file_uri must be a local path or file:// URI"
+            )
     interval = _string(table.get("interval"), "snapshots.interval")
     max_snapshots = table.get("max_snapshots", 3)
     if not isinstance(max_snapshots, int) or isinstance(max_snapshots, bool):
@@ -239,7 +269,7 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
     return SnapshotConfig(
-        gcs_uri=gcs_uri,
+        file_uri=file_uri,
         max_snapshots=max_snapshots,
         interval=interval,
     )
@@ -395,6 +425,35 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
     )
 
 
+def _gcs_config(value: object | None) -> GcsConfig | None:
+    """Parse optional Google Cloud Storage snapshot settings."""
+    if value is None:
+        return None
+    table = _table(value, "gcs", _GCS_CONFIG_KEYS)
+    uri = _string(table.get("uri"), "gcs.uri", required=True)
+    project = _string(table.get("project"), "gcs.project", required=True)
+    location = _string(table.get("location", "US"), "gcs.location", required=True)
+    credentials_file = _string(table.get("credentials_file"), "gcs.credentials_file")
+    if uri is None or project is None or location is None:
+        raise ConfigurationError("gcs.uri, gcs.project, and gcs.location are required")
+    from usagebassoon.backends.gcs import parse_gcs_uri
+
+    try:
+        parse_gcs_uri(uri)
+    except ValueError as error:
+        raise ConfigurationError(str(error)) from error
+    if _BIGQUERY_LOCATION_PATTERN.fullmatch(location) is None:
+        raise ConfigurationError("gcs.location must be a canonical location identifier")
+    return GcsConfig(
+        uri=uri,
+        project=project,
+        location=location,
+        credentials_file=Path(credentials_file).expanduser()
+        if credentials_file
+        else None,
+    )
+
+
 def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConfig:
     """Validate decoded TOML and create the typed configuration object."""
     _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
@@ -421,6 +480,7 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         tokscale_max_stderr_bytes,
     ) = _tokscale_config(payload.get("tokscale"))
     bigquery = _bigquery_config(payload.get("bigquery"))
+    gcs = _gcs_config(payload.get("gcs"))
     if backend_value == "bigquery" and bigquery is None:
         raise ConfigurationError("[bigquery] is required for the BigQuery backend")
     return UsageBassoonConfig(
@@ -434,6 +494,7 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         tokscale_max_stdout_bytes=tokscale_max_stdout_bytes,
         tokscale_max_stderr_bytes=tokscale_max_stderr_bytes,
         bigquery=bigquery,
+        gcs=gcs,
         collection=_collection_config(payload.get("collection")),
         logging=_logging_config(payload.get("logging")),
         snapshots=_snapshot_config(payload.get("snapshots")),

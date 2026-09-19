@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
@@ -119,11 +120,22 @@ def parse_gcs_uri(uri: str) -> tuple[str, str]:
 class GcsArchive:
     """Small adapter for generation-aware archive object operations."""
 
-    def __init__(self, uri: str, *, client: GcsClient | None = None) -> None:
+    def __init__(
+        self,
+        uri: str,
+        *,
+        project: str | None = None,
+        location: str | None = None,
+        credentials_file: Path | None = None,
+        client: GcsClient | None = None,
+    ) -> None:
         """Open an archive bucket through the optional official GCS client.
 
         Args:
             uri: GCS archive root.
+            project: Optional GCP project identifier.
+            location: Configured bucket location metadata.
+            credentials_file: Optional service-account credential file.
             client: Injectable ``google.cloud.storage.Client`` for tests.
 
         Raises:
@@ -131,6 +143,9 @@ class GcsArchive:
         """
         self.uri = uri.rstrip("/")
         self.bucket_name, self.prefix = parse_gcs_uri(self.uri)
+        self.project = project
+        self.location = location
+        self.credentials_file = credentials_file
         if client is None:
             try:
                 from google.cloud import storage
@@ -138,7 +153,42 @@ class GcsArchive:
                 raise RuntimeError(
                     "GCS snapshots require the usagebassoon[gcs] extra"
                 ) from error
-            client_value = cast(GcsClient, storage.Client())
+            resolved_credentials = None
+            if credentials_file is not None:
+                try:
+                    from google.auth.exceptions import GoogleAuthError
+                    from google.oauth2 import service_account
+                except ImportError as error:
+                    raise RuntimeError(
+                        "GCS snapshots require the usagebassoon[gcs] extra"
+                    ) from error
+                try:
+                    resolved_credentials = (
+                        service_account.Credentials.from_service_account_file(
+                            str(credentials_file)
+                        )
+                    )
+                except (GoogleAuthError, OSError, ValueError) as error:
+                    raise RuntimeError(
+                        "GCS credentials file could not be loaded"
+                    ) from error
+            try:
+                client_value = cast(
+                    GcsClient,
+                    storage.Client(
+                        project=project,
+                        credentials=resolved_credentials,
+                    ),
+                )
+            except Exception as error:
+                if error.__class__.__name__ in {
+                    "DefaultCredentialsError",
+                    "GoogleAuthError",
+                }:
+                    raise RuntimeError(
+                        "GCS authentication failed; configure ADC or credentials_file"
+                    ) from error
+                raise
         else:
             client_value = client
         self.client = client_value

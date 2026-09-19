@@ -187,3 +187,46 @@ def test_snapshot_defaults_and_interval_validation_are_consistent(
     invalid.write_text(valid.read_text().replace('"12h"', '"zero"'))
     with pytest.raises(ConfigurationError, match=r"snapshots\.interval"):
         ConfigurationManager(invalid).load()
+
+
+def test_gcs_and_local_snapshot_destinations_are_typed(
+    tmp_path: Path,
+) -> None:
+    """Parse independent GCS and local snapshot destinations."""
+    path = tmp_path / "config.toml"
+    credentials = tmp_path / "service-account.json"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[gcs]\nuri = "gs://bucket/archive"\n'
+        'project = "usagebassoon-test"\n'
+        'location = "us-central1"\n'
+        f'credentials_file = "{credentials}"\n'
+        "[snapshots]\n"
+        f'file_uri = "file://{tmp_path / "snapshots"}"\n'
+        'max_snapshots = 5\ninterval = "12h"\n'
+    )
+
+    config = ConfigurationManager(path).load()
+
+    assert config.gcs is not None
+    assert config.gcs.uri == "gs://bucket/archive"
+    assert config.gcs.project == "usagebassoon-test"
+    assert config.gcs.location == "us-central1"
+    assert config.gcs.credentials_file == credentials
+    assert config.snapshots is not None
+    assert config.snapshots.file_uri == f"file://{tmp_path / 'snapshots'}"
+    assert config.snapshots.max_snapshots == 5
+
+
+def test_snapshots_gcs_uri_is_removed(tmp_path: Path) -> None:
+    """Reject the removed unified snapshot URI field."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[snapshots]\ngcs_uri = "gs://bucket/archive"\n'
+    )
+
+    with pytest.raises(ConfigurationError, match=r"\[snapshots\]"):
+        ConfigurationManager(path).load()

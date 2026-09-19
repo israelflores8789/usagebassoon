@@ -29,6 +29,8 @@ class MemoryGcsArchive:
         """Create an empty bucket-relative object store."""
         self.objects: dict[str, tuple[int, bytes]] = {}
         self.next_generation = 1
+        self.catalog_writes = 0
+        self.fail_catalog_write_at: int | None = None
 
     def relative(self, object_name: str) -> str:
         """Return the archive-relative object name."""
@@ -86,6 +88,10 @@ class MemoryGcsArchive:
         generation: int | None,
     ) -> GcsObject:
         """Write a JSON document with a generation compare-and-swap guard."""
+        if relative_name == "catalog.json":
+            self.catalog_writes += 1
+            if self.catalog_writes == self.fail_catalog_write_at:
+                raise RuntimeError("catalog publication failed")
         return self.write_bytes(
             relative_name,
             json.dumps(payload).encode(),
@@ -124,9 +130,11 @@ class TableBackend:
         """Create fixed one-row Arrow tables, optionally failing one query."""
         self.failed_table = failed_table
         self.table = pa.table({"value": [1]})
+        self.queries = 0
 
     def query(self, sql: str) -> pa.Table:
         """Return an Arrow table or simulate a failed expected-table capture."""
+        self.queries += 1
         table = sql.removeprefix("SELECT * FROM ").removesuffix(" LIMIT 0")
         if table == self.failed_table:
             raise RuntimeError("capture failed")
@@ -255,6 +263,87 @@ def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
     assert first is not None and second is not None
     assert store.list_snapshots() == [second.rsplit("/", 1)[-1]]
     assert all(first.rsplit("/", 1)[-1] not in name for name in archive.objects)
+
+
+def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Write matching complete archives locally and to GCS from one capture."""
+    archive = MemoryGcsArchive()
+    backend = TableBackend()
+    store = SnapshotStore(
+        file_uri=f"file://{tmp_path}/local",
+        gcs_archive_uri="gs://bucket/archive",
+        gcs_archive=archive,
+    )
+
+    local_uri = store.write(cast(StorageBackend, backend), run_id="dual")
+
+    assert local_uri is not None
+    assert backend.queries == len(SNAPSHOT_TABLES)
+    snapshot_id = local_uri.rsplit("/", 1)[-1]
+    local_catalog = json.loads((tmp_path / "local" / "catalog.json").read_text())
+    gcs_catalog, _ = archive.read_json("catalog.json")
+    assert gcs_catalog is not None
+    gcs_entries = cast(list[dict[str, object]], gcs_catalog["entries"])
+    assert [entry["snapshot_id"] for entry in local_catalog["entries"]] == [snapshot_id]
+    assert [entry["snapshot_id"] for entry in gcs_entries] == [snapshot_id]
+    assert local_catalog["entries"][0]["published_at"] == gcs_entries[0]["published_at"]
+
+    local_manifest = json.loads(
+        (tmp_path / "local" / snapshot_id / "manifest.json").read_text()
+    )
+    gcs_manifest_ref = cast(dict[str, object], gcs_entries[0]["manifest"])
+    gcs_manifest_name = cast(str, gcs_manifest_ref["name"])
+    gcs_manifest_generation = cast(int, gcs_manifest_ref["generation"])
+    gcs_manifest = json.loads(
+        archive.read_bytes(gcs_manifest_name, generation=gcs_manifest_generation)
+    )
+    assert local_manifest["snapshot_id"] == gcs_manifest["snapshot_id"]
+    assert local_manifest["schema_fingerprint"] == gcs_manifest["schema_fingerprint"]
+    for table in SNAPSHOT_TABLES:
+        local_spec = local_manifest["tables"][table]
+        gcs_spec = gcs_manifest["tables"][table]
+        for field in ("status", "completed_at", "rows", "schema", "schema_ipc"):
+            assert local_spec[field] == gcs_spec[field]
+        assert len(local_spec["objects"]) == len(gcs_spec["objects"])
+        for local_object, gcs_object in zip(
+            local_spec["objects"], gcs_spec["objects"], strict=True
+        ):
+            assert local_object["name"] == gcs_object["name"]
+            assert (tmp_path / "local" / local_object["name"]).read_bytes() == (
+                archive.read_bytes(
+                    gcs_object["name"], generation=gcs_object["generation"]
+                )
+            )
+
+
+def test_dual_publication_failure_does_not_prune_previous_snapshots(
+    tmp_path: Path,
+) -> None:
+    """Retain the previous catalog entry when the second publication fails."""
+    archive = MemoryGcsArchive()
+    backend = TableBackend()
+    store = SnapshotStore(
+        file_uri=f"file://{tmp_path}/local",
+        gcs_archive_uri="gs://bucket/archive",
+        gcs_archive=archive,
+        max_snapshots=1,
+    )
+
+    first = store.write(cast(StorageBackend, backend), run_id="first")
+    assert first is not None
+    first_id = first.rsplit("/", 1)[-1]
+    archive.fail_catalog_write_at = archive.catalog_writes + 2
+
+    with pytest.raises(RuntimeError, match="catalog publication failed"):
+        store.write(cast(StorageBackend, backend), run_id="second")
+
+    assert store.list_snapshots() == [first_id]
+    gcs_catalog, _ = archive.read_json("catalog.json")
+    assert gcs_catalog is not None
+    gcs_entries = cast(list[dict[str, object]], gcs_catalog["entries"])
+    assert [entry["snapshot_id"] for entry in gcs_entries] == [first_id]
 
 
 @pytest.mark.gcs_live

@@ -111,14 +111,14 @@ def doctor(
         config_path=str(manager.path),
         config_error=config_error,
         connection_error=connection_error,
-        snapshot_enabled=(configuration.snapshots is not None)
+        snapshot_enabled=(
+            configuration.snapshots is not None or configuration.gcs is not None
+        )
         if configuration
         else None,
         snapshot_warnings=(
             _snapshot_warnings(configuration)
-            if configuration
-            and configuration.snapshots
-            and configuration.snapshots.gcs_uri
+            if configuration and configuration.gcs
             else ()
         ),
         limit=limit,

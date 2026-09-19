@@ -22,10 +22,11 @@ def snapshot(
     """Write a raw private restoration snapshot of the configured warehouse."""
     configuration, backend = configured_backend(config)
     try:
+        store = snapshot_store(configuration)
         latest = backend.query(
             "SELECT run_id FROM ingest_runs ORDER BY finished_at DESC LIMIT 1"
         ).to_pylist()
-        uri = snapshot_store(configuration).write(
+        uri = store.write(
             backend,
             run_id=str(latest[0]["run_id"]) if latest else "manual",
         )
@@ -36,4 +37,5 @@ def snapshot(
             "Snapshot skipped: the configured interval is not due or is reserved."
         )
     else:
-        typer.echo(f"Created private raw snapshot at {uri}.")
+        destinations = ", ".join(store.destination_uris)
+        typer.echo(f"Created private raw snapshot at {destinations}.")
