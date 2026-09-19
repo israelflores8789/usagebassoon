@@ -55,14 +55,14 @@ test *args:
     {{pytest}} -v -s {{args}}
 
 test-bq-live test-name reset="0":
-    @mkdir -p .codex_logs
+    @mkdir -p .test_logs
     @bash -o pipefail -c '{ \
         echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"; \
         PYTHONUNBUFFERED=1 USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{reset}} uv run pytest -vv \
         --tb=short \
         --color=no \
         "{{test-name}}" < /dev/null; \
-    } 2>&1 | tee .codex_logs/pytest-bq-live.log'
+    } 2>&1 | tee .test_logs/pytest-bq-live.log'
 
 # Run tests with coverage reporting
 coverage *args:
