@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import cast
 
 import pytest
@@ -41,6 +42,45 @@ def _config(path: Path) -> UsageBassoonConfig:
         database=":memory:",
         logging=LoggingConfig(directory=path.parent / "logs"),
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_prefix"),
+    [
+        ("npx tokscale@latest", ["npx", "tokscale@latest"]),
+        ("bunx tokscale@latest", ["bunx", "tokscale@latest"]),
+        ("deno x npm:tokscale@latest", ["deno", "x", "npm:tokscale@latest"]),
+    ],
+)
+def test_package_runner_commands_are_passed_to_tokscale(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    expected_prefix: list[str],
+) -> None:
+    """Pass configured package-runner prefixes and tokscale args to subprocess."""
+    configuration = UsageBassoonConfig(
+        path=Path("config.toml"),
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        database=":memory:",
+        tokscale_bin=command,
+    )
+    monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
+    invocations: list[list[str]] = []
+
+    def run(arguments: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        """Capture the executable argument vector and return valid JSON."""
+        invocations.append(arguments)
+        return CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+
+    prefix = collector._prefix(configuration)
+    payload = collector._json_command(prefix, "graph", "--json")
+
+    assert prefix == expected_prefix
+    assert payload == {}
+    assert invocations == [[*expected_prefix, "graph", "--json"]]
 
 
 def test_daily_models_command_uses_each_candidate_day(

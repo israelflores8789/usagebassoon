@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from usagebassoon.config import LoggingConfig
 
@@ -47,3 +48,26 @@ def configure(config: LoggingConfig) -> logging.Logger:
     )
     logger.addHandler(handler)
     return logger
+
+
+def log_configuration_error(
+    message: str,
+    *,
+    directory: Path,
+    max_files: int,
+    max_bytes: int,
+) -> None:
+    """Write one configuration error using the selected rotating log settings.
+
+    Args:
+        message: Configuration failure detail to record.
+        directory: Directory containing the operational log.
+        max_files: Number of retained log files, including the active file.
+        max_bytes: Maximum active log file size before rotation.
+    """
+    config = LoggingConfig(
+        directory=directory,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    configure(config).error("%s", message)

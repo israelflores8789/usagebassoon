@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,23 @@ from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
 )
+from usagebassoon.logger import LOGGER_NAME
+
+
+@pytest.fixture(autouse=True)
+def isolate_config_error_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[None]:
+    """Keep invalid-config log files inside each test's temporary directory."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    logger = logging.getLogger(LOGGER_NAME)
+    existing_handlers = tuple(logger.handlers)
+    yield
+    for handler in tuple(logger.handlers):
+        if handler not in existing_handlers:
+            logger.removeHandler(handler)
+            handler.close()
 
 
 def test_explicit_config_path_has_highest_precedence(tmp_path: Path) -> None:
@@ -70,8 +89,61 @@ def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
     path.write_text(
         'source_id = "not-a-uuid"\nbackend = "duckdb"\ndatabase = ":memory:"\n'
     )
-    with pytest.raises(ConfigurationError, match="source_id must be a UUID"):
+    with pytest.raises(ConfigurationError, match="source_id must be a canonical UUID"):
         ConfigurationManager(path).load()
+
+
+@pytest.mark.parametrize("scope", ["root", "tokscale"])
+def test_unknown_config_keys_fail_and_are_written_to_the_log(
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    """Reject unsupported keys and log their location before failing."""
+    path = tmp_path / "config.toml"
+    log_directory = tmp_path / "configured-logs"
+    content = (
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\n'
+        'database = ":memory:"\n'
+    )
+    if scope == "root":
+        content += "unknown_option = true\n"
+    content += f'\n[logging]\ndirectory = "{log_directory}"\n'
+    if scope == "tokscale":
+        content += '\n[tokscale]\ncommand = "bunx tokscale@latest"\n'
+    path.write_text(content)
+
+    with pytest.raises(ConfigurationError) as captured:
+        ConfigurationManager(path).load()
+
+    error = str(captured.value)
+    expected_scope = "the root configuration table" if scope == "root" else "[tokscale]"
+    assert f"unknown key(s) in {expected_scope}" in error
+    log_path = log_directory / "usagebassoon.log"
+    assert str(log_path) in error
+    log_content = log_path.read_text()
+    assert "ERROR usagebassoon configuration file" in log_content
+    assert str(path) in log_content
+    assert f"unknown key(s) in {expected_scope}" in log_content
+
+
+def test_invalid_logging_settings_use_the_default_error_log(
+    tmp_path: Path,
+) -> None:
+    """Use the default file logger if the configured logger settings are invalid."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        "[logging]\nmax_files = 0\n"
+    )
+
+    with pytest.raises(ConfigurationError, match=r"logging\.max_files"):
+        ConfigurationManager(path).load()
+
+    log_path = tmp_path / ".local/state/usagebassoon/logs/usagebassoon.log"
+    assert log_path.is_file()
+    assert "logging.max_files must be a positive integer" in log_path.read_text()
 
 
 def test_bigquery_credentials_and_operational_settings_are_typed(

@@ -66,13 +66,17 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
 ) -> None:
     """Report an invalid preserved config without exposing a traceback."""
     config_path = tmp_path / "config.toml"
+    log_directory = tmp_path / "logs"
     config_path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "unsupported"\n'
         'database = "usagebassoon"\n'
+        f'\n[logging]\ndirectory = "{log_directory}"\n'
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
 
     assert result.exit_code != 0
     assert "backend must be one of" in result.output
+    log_path = log_directory / "usagebassoon.log"
+    assert "backend must be one of" in log_path.read_text()

@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID, uuid4
@@ -23,6 +26,27 @@ DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
 DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
+_UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_ROOT_CONFIG_KEYS = frozenset(
+    {
+        "source_id",
+        "backend",
+        "database",
+        "tokscale",
+        "bigquery",
+        "collection",
+        "logging",
+        "snapshots",
+    }
+)
+_TOKSCALE_CONFIG_KEYS = frozenset({"bin"})
+_BIGQUERY_CONFIG_KEYS = frozenset({"project", "location", "credentials_file"})
+_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds"})
+_LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
+_SNAPSHOT_CONFIG_KEYS = frozenset({"gcs_uri", "max_snapshots", "interval"})
 
 
 class ConfigurationError(ValueError):
@@ -140,13 +164,28 @@ class UsageBassoonConfig:
     snapshots: SnapshotConfig | None = None
 
 
-def _table(value: object | None, name: str) -> dict[str, object]:
+def _reject_unknown_keys(
+    value: Mapping[str, object], name: str, allowed_keys: frozenset[str]
+) -> None:
+    """Reject keys that are not part of a supported configuration table."""
+    unknown = sorted(set(value) - allowed_keys)
+    if unknown:
+        scope = "the root configuration table" if name == "root" else f"[{name}]"
+        formatted = ", ".join(repr(key) for key in unknown)
+        raise ConfigurationError(f"unknown key(s) in {scope}: {formatted}")
+
+
+def _table(
+    value: object | None, name: str, allowed_keys: frozenset[str]
+) -> dict[str, object]:
     """Return a TOML table or an empty mapping when it is absent."""
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise ConfigurationError(f"[{name}] must be a TOML table")
-    return cast(dict[str, object], value)
+    table = cast(dict[str, object], value)
+    _reject_unknown_keys(table, name, allowed_keys)
+    return table
 
 
 def _string(value: object | None, name: str, *, required: bool = False) -> str | None:
@@ -164,7 +203,7 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     """Parse optional snapshot settings."""
     if value is None:
         return None
-    table = _table(value, "snapshots")
+    table = _table(value, "snapshots", _SNAPSHOT_CONFIG_KEYS)
     gcs_uri = _string(table.get("gcs_uri"), "snapshots.gcs_uri")
     interval = _string(table.get("interval"), "snapshots.interval")
     max_snapshots = table.get("max_snapshots", 3)
@@ -173,6 +212,8 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     if max_snapshots < 1:
         raise ConfigurationError("snapshots.max_snapshots must be positive")
     if interval is not None:
+        if interval != interval.strip():
+            raise ConfigurationError("snapshots.interval must be like 30m, 12h, or 7d")
         from usagebassoon.snapshots import parse_interval
 
         try:
@@ -203,7 +244,7 @@ def _positive_int(value: object, name: str) -> int:
 
 def _collection_config(value: object | None) -> CollectionConfig:
     """Parse optional collection retry settings."""
-    table = _table(value, "collection")
+    table = _table(value, "collection", _COLLECTION_CONFIG_KEYS)
     max_retries = table.get("max_retries", 3)
     retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
     if (
@@ -217,6 +258,7 @@ def _collection_config(value: object | None) -> CollectionConfig:
     if (
         not isinstance(retry_initial_seconds, (int, float))
         or isinstance(retry_initial_seconds, bool)
+        or not isfinite(retry_initial_seconds)
         or retry_initial_seconds <= 0
     ):
         raise ConfigurationError(
@@ -230,7 +272,7 @@ def _collection_config(value: object | None) -> CollectionConfig:
 
 def _logging_config(value: object | None) -> LoggingConfig:
     """Parse optional local rotating-log settings."""
-    table = _table(value, "logging")
+    table = _table(value, "logging", _LOGGING_CONFIG_KEYS)
     directory = _string(table.get("directory"), "logging.directory")
     max_files = _positive_int(table.get("max_files", 10), "logging.max_files")
     max_bytes = _positive_int(
@@ -249,7 +291,7 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
     """Parse optional BigQuery settings."""
     if value is None:
         return None
-    table = _table(value, "bigquery")
+    table = _table(value, "bigquery", _BIGQUERY_CONFIG_KEYS)
     project = _string(table.get("project"), "bigquery.project", required=True)
     location = _string(
         table.get("location", "US"),
@@ -273,6 +315,7 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
 
 def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConfig:
     """Validate decoded TOML and create the typed configuration object."""
+    _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
     source_id = _string(payload.get("source_id"), "source_id", required=True)
     backend_value = _string(payload.get("backend"), "backend", required=True)
     database = _string(payload.get("database"), "database", required=True)
@@ -282,11 +325,13 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         )
     if source_id is None or database is None:
         raise ConfigurationError("source_id and database are required")
+    if _UUID_PATTERN.fullmatch(source_id) is None:
+        raise ConfigurationError("source_id must be a canonical UUID")
     try:
         canonical_source_id = str(UUID(source_id))
     except ValueError as error:
         raise ConfigurationError("source_id must be a UUID") from error
-    tokscale = _table(payload.get("tokscale"), "tokscale")
+    tokscale = _table(payload.get("tokscale"), "tokscale", _TOKSCALE_CONFIG_KEYS)
     tokscale_bin = _string(tokscale.get("bin"), "tokscale.bin")
     bigquery = _bigquery_config(payload.get("bigquery"))
     if backend_value == "bigquery" and bigquery is None:
@@ -301,6 +346,46 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         collection=_collection_config(payload.get("collection")),
         logging=_logging_config(payload.get("logging")),
         snapshots=_snapshot_config(payload.get("snapshots")),
+    )
+
+
+def _configuration_error_with_log(
+    path: Path,
+    error: ConfigurationError,
+    payload: object | None,
+) -> ConfigurationError:
+    """Log one configuration error and add the log location to its message."""
+    log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
+    if isinstance(payload, Mapping):
+        with suppress(ConfigurationError):
+            log_config = _logging_config(payload.get("logging"))
+
+    default_log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
+    candidates = [log_config]
+    if log_config != default_log_config:
+        candidates.append(default_log_config)
+
+    from usagebassoon.logger import log_configuration_error
+
+    last_error: OSError | None = None
+    attempted_path = DEFAULT_LOG_DIRECTORY.expanduser() / "usagebassoon.log"
+    for candidate in candidates:
+        attempted_path = candidate.directory.expanduser() / "usagebassoon.log"
+        try:
+            log_configuration_error(
+                f"configuration file {path} is invalid: {error}",
+                directory=candidate.directory,
+                max_files=candidate.max_files,
+                max_bytes=candidate.max_bytes,
+            )
+        except OSError as log_error:
+            last_error = log_error
+            continue
+        return ConfigurationError(f"{error} (details logged to {attempted_path})")
+
+    return ConfigurationError(
+        f"{error} (could not write the configuration error log at "
+        f"{attempted_path}: {last_error})"
     )
 
 
@@ -375,21 +460,34 @@ class ConfigurationManager:
             Typed, immutable configuration settings.
 
         Raises:
-            ConfigurationError: If the file cannot be read or is invalid TOML.
+            ConfigurationError: If the file is unreadable, invalid TOML, or has
+                unsupported or invalid configuration values. Details are logged
+                to the operational log when it is writable.
         """
         path = self.path
+        decoded: object | None = None
         try:
             decoded = tomllib.loads(path.read_text())
         except FileNotFoundError as error:
-            raise ConfigurationError(f"configuration file not found: {path}") from error
+            failure = ConfigurationError(f"configuration file not found: {path}")
+            raise _configuration_error_with_log(path, failure, decoded) from error
         except OSError as error:
-            raise ConfigurationError(
+            failure = ConfigurationError(
                 f"could not read configuration {path}: {error}"
-            ) from error
+            )
+            raise _configuration_error_with_log(path, failure, decoded) from error
+        except UnicodeError as error:
+            failure = ConfigurationError(f"configuration is not valid UTF-8: {path}")
+            raise _configuration_error_with_log(path, failure, decoded) from error
         except tomllib.TOMLDecodeError as error:
-            raise ConfigurationError(
+            failure = ConfigurationError(
                 f"invalid TOML in configuration {path}: {error}"
-            ) from error
+            )
+            raise _configuration_error_with_log(path, failure, decoded) from error
         if not isinstance(decoded, dict):
-            raise ConfigurationError("configuration root must be a TOML table")
-        return _parse_config(path, cast(dict[str, object], decoded))
+            failure = ConfigurationError("configuration root must be a TOML table")
+            raise _configuration_error_with_log(path, failure, decoded)
+        try:
+            return _parse_config(path, cast(dict[str, object], decoded))
+        except ConfigurationError as error:
+            raise _configuration_error_with_log(path, error, decoded) from error
