@@ -64,6 +64,16 @@ test-bq-live test-name reset="0":
         "{{test-name}}" < /dev/null; \
     } 2>&1 | tee .test_logs/pytest-bq-live.log'
 
+test-gcs-live test-name:
+    @mkdir -p .test_logs
+    @bash -o pipefail -c '{ \
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"; \
+        PYTHONUNBUFFERED=1 USAGEBASSOON_GCS_LIVE=1 uv run pytest -vv \
+        --tb=short \
+        --color=no \
+        "{{test-name}}" < /dev/null; \
+    } 2>&1 | tee .test_logs/pytest-gcs-live.log'
+
 # Run tests with coverage reporting
 coverage *args:
     {{pytest}} --cov=src --cov-report=term-missing {{args}}

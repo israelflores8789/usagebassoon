@@ -13,6 +13,36 @@ from typing import Protocol, cast
 from urllib.parse import urlparse
 
 
+def validate_relative_name(value: str, *, allow_empty: bool = False) -> str:
+    """Validate a portable archive-relative object name.
+
+    Args:
+        value: POSIX-style object name relative to an archive root.
+        allow_empty: Whether an empty name is valid for prefix listing.
+
+    Returns:
+        The validated object name.
+
+    Raises:
+        ValueError: If the name is absolute, empty when disallowed, or has a
+            traversal, backslash, or NUL component.
+    """
+    if not isinstance(value, str):
+        raise ValueError("archive object name must be a string")
+    if not value:
+        if allow_empty:
+            return value
+        raise ValueError("archive object name must not be empty")
+    if value.startswith(("/", "\\\\")) or "\\" in value or "\x00" in value:
+        raise ValueError(f"archive object name is not relative: {value!r}")
+    components = value.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ValueError(f"archive object name has an unsafe component: {value!r}")
+    if len(value) >= 2 and value[0].isalpha() and value[1] == ":":
+        raise ValueError(f"archive object name is not relative: {value!r}")
+    return value
+
+
 class GcsPreconditionError(RuntimeError):
     """Raised when a generation-conditional GCS operation loses a race."""
 
@@ -114,7 +144,8 @@ def parse_gcs_uri(uri: str) -> tuple[str, str]:
     parsed = urlparse(uri)
     if parsed.scheme != "gs" or not parsed.netloc or parsed.params or parsed.query:
         raise ValueError(f"invalid GCS archive URI: {uri!r}")
-    return parsed.netloc, parsed.path.strip("/")
+    prefix = parsed.path.strip("/")
+    return parsed.netloc, validate_relative_name(prefix, allow_empty=True)
 
 
 class GcsArchive:
@@ -196,17 +227,17 @@ class GcsArchive:
 
     def key(self, relative_name: str) -> str:
         """Return an archive-root-relative name as a bucket object name."""
-        relative = relative_name.strip("/")
+        relative = validate_relative_name(relative_name, allow_empty=True)
         return f"{self.prefix}/{relative}" if self.prefix else relative
 
     def relative(self, object_name: str) -> str:
         """Return an object name relative to this archive root."""
         if not self.prefix:
-            return object_name
+            return validate_relative_name(object_name)
         expected = f"{self.prefix}/"
         if not object_name.startswith(expected):
             raise ValueError(f"object lies outside archive root: {object_name!r}")
-        return object_name.removeprefix(expected)
+        return validate_relative_name(object_name.removeprefix(expected))
 
     @staticmethod
     def _object(blob: GcsBlob) -> GcsObject:
@@ -223,9 +254,13 @@ class GcsArchive:
         )
 
     @staticmethod
-    def _raise_precondition(error: Exception) -> None:
-        """Convert a client precondition exception without coupling tests."""
-        if error.__class__.__name__ in {"PreconditionFailed", "Conflict"}:
+    def _raise_precondition(
+        error: Exception, *, exact_generation: bool = False
+    ) -> None:
+        """Convert generation-race errors without coupling to GCS exceptions."""
+        if error.__class__.__name__ in {"PreconditionFailed", "Conflict"} or (
+            exact_generation and error.__class__.__name__ == "NotFound"
+        ):
             raise GcsPreconditionError("GCS object generation changed") from error
         raise error
 
@@ -235,7 +270,7 @@ class GcsArchive:
         try:
             return blob.download_as_bytes(if_generation_match=generation)
         except Exception as error:
-            self._raise_precondition(error)
+            self._raise_precondition(error, exact_generation=generation is not None)
         raise AssertionError("unreachable")
 
     def write_bytes(
@@ -308,7 +343,7 @@ class GcsArchive:
                 if_generation_match=generation
             )
         except Exception as error:
-            self._raise_precondition(error)
+            self._raise_precondition(error, exact_generation=True)
 
     def lifecycle_delete_warnings(self) -> tuple[str, ...]:
         """Report lifecycle delete rules that could apply to this archive root."""

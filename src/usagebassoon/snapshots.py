@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from usagebassoon.backends.base import StorageBackend
-from usagebassoon.backends.gcs import GcsObject
+from usagebassoon.backends.gcs import GcsObject, validate_relative_name
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -40,8 +40,11 @@ SNAPSHOT_TABLES: tuple[str, ...] = (
     "notes",
 )
 _CATALOG_NAME = "catalog.json"
+_FORMAT_VERSION = 1
 _LEASE_SECONDS = 300
 _DURATION = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])\Z", re.I)
+_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GcsArchive(Protocol):
@@ -136,7 +139,66 @@ def _timestamp(value: str) -> datetime:
 
 def _empty_catalog() -> dict[str, object]:
     """Return the initial archive catalog document."""
-    return {"version": 1, "entries": [], "reservation": None, "fence": 0}
+    return {
+        "version": _FORMAT_VERSION,
+        "entries": [],
+        "reservation": None,
+        "fence": 0,
+    }
+
+
+def _validate_snapshot_id(value: object) -> str:
+    """Validate one generated snapshot identifier.
+
+    Args:
+        value: Untrusted catalog or command-line snapshot identifier.
+
+    Returns:
+        The validated identifier.
+
+    Raises:
+        ValueError: If the identifier cannot name one snapshot directory.
+    """
+    if not isinstance(value, str) or _SNAPSHOT_ID.fullmatch(value) is None:
+        raise ValueError(f"invalid snapshot identifier: {value!r}")
+    return value
+
+
+def _reference_metadata(
+    reference: object, *, expected_name: str
+) -> tuple[str, int, int, str]:
+    """Validate one checksum-protected archive object reference.
+
+    Args:
+        reference: Untrusted catalog or manifest object reference.
+        expected_name: Exact archive-relative name expected for the object.
+
+    Returns:
+        Object name, generation, size, and SHA-256 digest.
+
+    Raises:
+        ValueError: If the reference does not have the expected safe shape.
+    """
+    if not isinstance(reference, dict):
+        raise ValueError("snapshot object reference must be an object")
+    name = reference.get("name")
+    generation = reference.get("generation")
+    size = reference.get("size")
+    sha256 = reference.get("sha256")
+    if (
+        not isinstance(name, str)
+        or validate_relative_name(name) != expected_name
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(sha256, str)
+        or _SHA256.fullmatch(sha256) is None
+    ):
+        raise ValueError("snapshot object reference is invalid")
+    return name, generation, size, sha256
 
 
 class _SnapshotArchive:
@@ -156,7 +218,31 @@ class _SnapshotArchive:
             self.local = None
         else:
             self.gcs = None
-            self.local = Path(self.uri.removeprefix("file://")).expanduser()
+            self.local = Path(self.uri.removeprefix("file://")).expanduser().resolve()
+
+    def _local_path(self, relative_name: str) -> Path:
+        """Resolve one validated local archive object below its root.
+
+        Args:
+            relative_name: Archive-relative object name.
+
+        Returns:
+            Resolved path confined to the archive root.
+
+        Raises:
+            ValueError: If the resolved path escapes the archive root.
+        """
+        assert self.local is not None
+        relative = validate_relative_name(relative_name)
+        root = self.local.resolve()
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                f"archive object escapes local root: {relative!r}"
+            ) from error
+        return candidate
 
     @property
     def is_gcs(self) -> bool:
@@ -168,8 +254,7 @@ class _SnapshotArchive:
         if self.gcs is not None:
             catalog, generation = self.gcs.read_json(_CATALOG_NAME)
             return _empty_catalog() if catalog is None else catalog, generation
-        assert self.local is not None
-        path = self.local / _CATALOG_NAME
+        path = self._local_path(_CATALOG_NAME)
         if not path.exists():
             return _empty_catalog(), None
         payload = json.loads(path.read_text())
@@ -184,9 +269,10 @@ class _SnapshotArchive:
             return
         assert self.local is not None
         self.local.mkdir(parents=True, exist_ok=True)
-        temporary = self.local / f".{_CATALOG_NAME}.{uuid4().hex}.tmp"
+        path = self._local_path(_CATALOG_NAME)
+        temporary = path.with_name(f".{_CATALOG_NAME}.{uuid4().hex}.tmp")
         temporary.write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
-        temporary.replace(self.local / _CATALOG_NAME)
+        temporary.replace(path)
 
     def write_bytes(
         self,
@@ -196,19 +282,19 @@ class _SnapshotArchive:
         content_type: str = "application/octet-stream",
     ) -> GcsObject:
         """Write one snapshot object."""
+        relative = validate_relative_name(relative_name)
         if self.gcs is not None:
             return self.gcs.write_bytes(
-                relative_name,
+                relative,
                 payload,
                 content_type=content_type,
             )
         del content_type
-        assert self.local is not None
-        path = self.local / relative_name
+        path = self._local_path(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
         return GcsObject(
-            name=relative_name,
+            name=relative,
             generation=0,
             size=len(payload),
             checksum=hashlib.sha256(payload).hexdigest(),
@@ -216,24 +302,27 @@ class _SnapshotArchive:
 
     def read_bytes(self, relative_name: str, *, generation: int) -> bytes:
         """Read one exact snapshot object."""
+        relative = validate_relative_name(relative_name)
         if self.gcs is not None:
-            return self.gcs.read_bytes(relative_name, generation=generation)
+            return self.gcs.read_bytes(relative, generation=generation)
         del generation
-        assert self.local is not None
-        return (self.local / relative_name).read_bytes()
+        return self._local_path(relative).read_bytes()
 
     def delete(self, relative_name: str, *, generation: int) -> None:
         """Delete one snapshot object without crossing a GCS generation."""
+        relative = validate_relative_name(relative_name)
         if self.gcs is not None:
-            self.gcs.delete(relative_name, generation=generation)
+            self.gcs.delete(relative, generation=generation)
             return
         del generation
-        assert self.local is not None
-        (self.local / relative_name).unlink(missing_ok=True)
+        self._local_path(relative).unlink(missing_ok=True)
 
     def relative(self, object_name: str) -> str:
         """Return a destination-relative object name."""
-        return self.gcs.relative(object_name) if self.gcs is not None else object_name
+        relative = (
+            self.gcs.relative(object_name) if self.gcs is not None else object_name
+        )
+        return validate_relative_name(relative)
 
     def lifecycle_warnings(self) -> tuple[str, ...]:
         """Return advisory lifecycle warnings for this destination."""
@@ -242,7 +331,13 @@ class _SnapshotArchive:
     def remove_snapshot_tree(self, snapshot_id: str) -> None:
         """Remove a local snapshot prefix during retention or rollback."""
         if self.local is not None:
-            shutil.rmtree(self.local / snapshot_id, ignore_errors=True)
+            path = self._local_path(_validate_snapshot_id(snapshot_id))
+            if path.is_symlink():
+                raise ValueError(
+                    f"snapshot cleanup target is a symlink: {snapshot_id!r}"
+                )
+            if path.exists():
+                shutil.rmtree(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,12 +479,24 @@ class SnapshotStore:
     @staticmethod
     def _entries(catalog: dict[str, object]) -> list[dict[str, object]]:
         """Validate and return catalog entries in publication order."""
+        if catalog.get("version") != _FORMAT_VERSION:
+            raise ValueError("snapshot catalog must use format version 2")
         entries = catalog.get("entries", [])
         if not isinstance(entries, list) or not all(
             isinstance(item, dict) for item in entries
         ):
             raise ValueError("snapshot catalog entries must be objects")
-        return [dict(item) for item in entries]
+        result: list[dict[str, object]] = []
+        for item in entries:
+            snapshot_id = _validate_snapshot_id(item.get("snapshot_id"))
+            if item.get("prefix") != snapshot_id:
+                raise ValueError("snapshot catalog entry prefix is invalid")
+            _reference_metadata(
+                item.get("manifest"),
+                expected_name=f"{snapshot_id}/manifest.json",
+            )
+            result.append(dict(item))
+        return result
 
     def _due(self, catalog: dict[str, object], now: datetime) -> bool:
         """Return whether this instance's configured cadence permits capture."""
@@ -513,14 +620,14 @@ class SnapshotStore:
 
     @staticmethod
     def _object_reference(
-        archive: _SnapshotArchive, object_ref: GcsObject
+        archive: _SnapshotArchive, object_ref: GcsObject, payload: bytes
     ) -> dict[str, object]:
         """Convert one archive object to a manifest reference."""
         return {
             "name": archive.relative(object_ref.name),
             "generation": object_ref.generation,
             "size": object_ref.size,
-            "checksum": object_ref.checksum,
+            "sha256": hashlib.sha256(payload).hexdigest(),
         }
 
     def _write_target(
@@ -542,7 +649,11 @@ class SnapshotStore:
                         f"{snapshot_id}/{table}.parquet",
                         captured.payload,
                     )
-                    object_value = self._object_reference(archive, object_ref)
+                    object_value = self._object_reference(
+                        archive,
+                        object_ref,
+                        captured.payload,
+                    )
                     objects.append(object_value)
                     written.append(object_value)
                 tables[table] = {
@@ -561,10 +672,7 @@ class SnapshotStore:
                 raw,
                 content_type="application/json",
             )
-            manifest_value: dict[str, object] = {
-                "name": archive.relative(manifest_ref.name),
-                "generation": manifest_ref.generation,
-            }
+            manifest_value = self._object_reference(archive, manifest_ref, raw)
             written.append(manifest_value)
             return {
                 "snapshot_id": snapshot_id,
@@ -683,13 +791,20 @@ class SnapshotStore:
         """Load an exact catalog-referenced manifest and validate completeness."""
         destination = self._primary if archive is None else archive
         reference, snapshot_id = entry.get("manifest"), entry.get("snapshot_id")
-        if not isinstance(reference, dict) or not isinstance(snapshot_id, str):
+        if not isinstance(reference, dict):
             raise ValueError("snapshot catalog entry is incomplete")
-        name, generation = reference.get("name"), reference.get("generation")
-        if not isinstance(name, str) or not isinstance(generation, int):
-            raise ValueError("snapshot catalog manifest reference is invalid")
-        manifest = json.loads(destination.read_bytes(name, generation=generation))
-        if not isinstance(manifest, dict) or manifest.get("snapshot_id") != snapshot_id:
+        validated_snapshot_id = _validate_snapshot_id(snapshot_id)
+        raw = self._read_verified_reference(
+            destination,
+            reference,
+            expected_name=f"{validated_snapshot_id}/manifest.json",
+        )
+        manifest = json.loads(raw)
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != _FORMAT_VERSION
+            or manifest.get("snapshot_id") != validated_snapshot_id
+        ):
             raise ValueError("snapshot manifest does not match its catalog entry")
         tables = manifest.get("tables")
         if (
@@ -705,16 +820,52 @@ class SnapshotStore:
             )
         return manifest
 
+    @staticmethod
+    def _read_verified_reference(
+        archive: _SnapshotArchive,
+        reference: object,
+        *,
+        expected_name: str,
+    ) -> bytes:
+        """Read one exact object and verify its manifest SHA-256 before parsing.
+
+        Args:
+            archive: Snapshot destination that owns the object.
+            reference: Untrusted object metadata.
+            expected_name: Exact archive-relative name expected for the object.
+
+        Returns:
+            Verified raw object bytes.
+
+        Raises:
+            ValueError: If metadata, size, or SHA-256 verification fails.
+        """
+        name, generation, size, sha256 = _reference_metadata(
+            reference,
+            expected_name=expected_name,
+        )
+        raw = archive.read_bytes(name, generation=generation)
+        if len(raw) != size:
+            raise ValueError(f"snapshot object size does not match: {name!r}")
+        if hashlib.sha256(raw).hexdigest() != sha256:
+            raise ValueError(f"snapshot object SHA-256 does not match: {name!r}")
+        return raw
+
     def _cleanup_entry(
         self, entry: dict[str, object], archive: _SnapshotArchive | None = None
     ) -> None:
         """Remove unretained published objects without crossing generations."""
         destination = self._primary if archive is None else archive
         snapshot_id = entry.get("snapshot_id")
-        if not isinstance(snapshot_id, str):
-            return
+        validated_snapshot_id = _validate_snapshot_id(snapshot_id)
+        if entry.get("prefix") != validated_snapshot_id:
+            raise ValueError("snapshot catalog entry prefix is invalid")
+        _reference_metadata(
+            entry.get("manifest"),
+            expected_name=f"{validated_snapshot_id}/manifest.json",
+        )
         if not destination.is_gcs:
-            destination.remove_snapshot_tree(snapshot_id)
+            destination.remove_snapshot_tree(validated_snapshot_id)
             return
         manifest = self._load_manifest(entry, destination)
         tables = manifest["tables"]
@@ -744,9 +895,13 @@ class SnapshotStore:
         )
         cutoff = now - timedelta(seconds=_LEASE_SECONDS)
         for object_ref in archive.gcs.list(""):
-            relative = archive.gcs.relative(object_ref.name)
+            relative = validate_relative_name(archive.gcs.relative(object_ref.name))
             snapshot_id = relative.split("/", 1)[0]
-            if snapshot_id in retained or "_" not in snapshot_id:
+            if (
+                _SNAPSHOT_ID.fullmatch(snapshot_id) is None
+                or snapshot_id in retained
+                or "_" not in snapshot_id
+            ):
                 continue
             stamp = snapshot_id.split("_", 1)[0]
             try:
@@ -785,7 +940,7 @@ class SnapshotStore:
                 ).encode()
             ).hexdigest()
             manifest_base: dict[str, object] = {
-                "version": 1,
+                "version": _FORMAT_VERSION,
                 "snapshot_id": snapshot_id,
                 "created_at": created.isoformat(),
                 "source_backend": getattr(backend, "dialect", type(backend).__name__),
@@ -834,16 +989,15 @@ class SnapshotStore:
         catalog, _ = self._read_catalog()
         values: list[str] = []
         for entry in self._entries(catalog):
-            snapshot_id = entry.get("snapshot_id")
-            if not isinstance(snapshot_id, str):
-                raise ValueError("snapshot catalog entry has no snapshot_id")
-            values.append(snapshot_id)
+            values.append(_validate_snapshot_id(entry.get("snapshot_id")))
         return values
 
     def _restore_entry(
         self, snapshot: str
     ) -> tuple[_SnapshotArchive, dict[str, object]]:
         """Select the first destination containing the requested publication."""
+        if snapshot != "latest":
+            _validate_snapshot_id(snapshot)
         any_entries = False
         for archive in self._archives:
             catalog, _ = self._read_catalog_for(archive)
@@ -873,6 +1027,7 @@ class SnapshotStore:
         self, backend: StorageBackend, snapshot: str = "latest"
     ) -> dict[str, int]:
         """Validate then append a complete snapshot into an empty backend."""
+        self._ensure_empty(backend)
         archive, entry = self._restore_entry(snapshot)
         manifest = self._load_manifest(entry, archive)
         tables = manifest["tables"]
@@ -893,22 +1048,27 @@ class SnapshotStore:
             object_refs = spec.get("objects", [])
             if not isinstance(object_refs, list):
                 raise ValueError(f"snapshot table {table} has invalid object metadata")
+            rows = spec.get("rows")
+            if (
+                not isinstance(rows, int)
+                or isinstance(rows, bool)
+                or rows < 0
+                or (rows == 0 and object_refs)
+                or (rows > 0 and len(object_refs) != 1)
+            ):
+                raise ValueError(f"snapshot table {table} has invalid row metadata")
             parts: list[pa.Table] = []
             for reference in object_refs:
-                if (
-                    not isinstance(reference, dict)
-                    or not isinstance(reference.get("name"), str)
-                    or not isinstance(reference.get("generation"), int)
-                ):
-                    raise ValueError(
-                        f"snapshot table {table} has invalid object reference"
-                    )
-                raw = archive.read_bytes(
-                    reference["name"], generation=reference["generation"]
+                raw = self._read_verified_reference(
+                    archive,
+                    reference,
+                    expected_name=f"{entry['snapshot_id']}/{table}.parquet",
                 )
                 parts.append(pq.read_table(pa.BufferReader(raw)))
             if parts:
                 data = pa.concat_tables(parts)
+                if data.num_rows != rows:
+                    raise ValueError(f"snapshot table {table} row count does not match")
                 loaded[table] = data
         restored: dict[str, int] = {}
         for table in SNAPSHOT_TABLES:
@@ -918,3 +1078,26 @@ class SnapshotStore:
                 backend.append(table, data)
             restored[table] = rows
         return restored
+
+    @staticmethod
+    def _ensure_empty(backend: StorageBackend) -> None:
+        """Require every snapshot table in the destination to be empty.
+
+        Args:
+            backend: Initialized destination warehouse.
+
+        Raises:
+            ValueError: If the destination contains any restorable data.
+        """
+        populated: list[str] = []
+        for table in SNAPSHOT_TABLES:
+            rows = backend.query(f"SELECT count(*) AS count FROM {table}").to_pylist()
+            if len(rows) != 1 or not isinstance(rows[0].get("count"), int):
+                raise ValueError(f"could not count destination snapshot table {table}")
+            if rows[0]["count"]:
+                populated.append(table)
+        if populated:
+            raise ValueError(
+                "restore requires an empty warehouse; populated tables: "
+                + ", ".join(populated)
+            )

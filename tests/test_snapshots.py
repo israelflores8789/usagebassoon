@@ -6,19 +6,22 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
-from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.backends.gcs import GcsArchive as RealGcsArchive
-from usagebassoon.backends.gcs import GcsObject, GcsPreconditionError
+from usagebassoon.backends.gcs import (
+    GcsArchive,
+    GcsClient,
+    GcsObject,
+    GcsPreconditionError,
+)
 from usagebassoon.snapshots import SNAPSHOT_TABLES, SnapshotStore
 
 
@@ -121,6 +124,47 @@ class MemoryGcsArchive:
         return ("a GCS Delete lifecycle rule could match the snapshot archive",)
 
 
+class _RecordingBucket:
+    """Minimal bucket double that records whether an object operation was attempted."""
+
+    lifecycle_rules: tuple[object, ...] = ()
+
+    def __init__(self) -> None:
+        """Create an empty operation record."""
+        self.blob_calls = 0
+
+    def blob(self, name: str, generation: int | None = None) -> object:
+        """Record an attempted object lookup."""
+        del name, generation
+        self.blob_calls += 1
+        raise AssertionError("unsafe archive names must not reach GCS")
+
+    def reload(self) -> None:
+        """Satisfy the GCS bucket protocol."""
+
+
+class _RecordingClient:
+    """Minimal client double that records whether listing was attempted."""
+
+    def __init__(self) -> None:
+        """Create a recording client and its bucket."""
+        self.recording_bucket = _RecordingBucket()
+        self.list_calls = 0
+
+    def bucket(self, bucket_name: str) -> _RecordingBucket:
+        """Return the recording bucket."""
+        del bucket_name
+        return self.recording_bucket
+
+    def list_blobs(
+        self, bucket: _RecordingBucket, *, prefix: str
+    ) -> tuple[object, ...]:
+        """Record an attempted listing."""
+        del bucket, prefix
+        self.list_calls += 1
+        raise AssertionError("unsafe archive prefixes must not reach GCS")
+
+
 class TableBackend:
     """Minimal Arrow reader used to force snapshot capture outcomes."""
 
@@ -146,6 +190,24 @@ def _backend() -> DuckDBBackend:
     backend = DuckDBBackend(":memory:")
     backend.apply_ddl()
     return backend
+
+
+def _append_note(backend: DuckDBBackend) -> None:
+    """Insert one restorable row so a snapshot includes a Parquet object."""
+    captured_at = datetime(2026, 9, 19, tzinfo=UTC)
+    backend.append(
+        "notes",
+        pa.table(
+            {
+                "source_id": ["11111111-1111-4111-8111-111111111111"],
+                "client": ["codex"],
+                "session_id": ["private-session"],
+                "note": ["private note"],
+                "created_at": [captured_at],
+                "updated_at": [captured_at],
+            }
+        ),
+    )
 
 
 def test_default_local_rotation_retains_three_complete_snapshots(
@@ -216,6 +278,149 @@ def test_zero_row_tables_are_complete_manifest_entries(tmp_path: Path) -> None:
         )
     finally:
         backend.close()
+
+
+def test_snapshot_catalog_rejects_traversal_ids_and_local_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Reject catalog traversal before it can influence local deletion."""
+    archive = tmp_path / "archive"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel.txt").write_text("keep")
+    backend = _backend()
+    store = SnapshotStore(f"file://{archive}")
+    try:
+        snapshot = store.write(backend, run_id="safe")
+        assert snapshot is not None
+        catalog, generation = store._read_catalog()
+        entries = cast(list[dict[str, object]], catalog["entries"])
+        entries[0]["snapshot_id"] = "../../outside"
+        store._write_catalog(catalog, generation)
+
+        with pytest.raises(ValueError, match="invalid snapshot identifier"):
+            store.list_snapshots()
+        with pytest.raises(ValueError, match="invalid snapshot identifier"):
+            store._cleanup_entry({"snapshot_id": "../../outside"})
+        assert (outside / "sentinel.txt").read_text() == "keep"
+    finally:
+        backend.close()
+
+
+def test_restore_rejects_traversal_manifest_and_object_names(tmp_path: Path) -> None:
+    """Constrain catalog and manifest references to their snapshot directory."""
+    archive = tmp_path / "archive"
+    source = _backend()
+    target = _backend()
+    _append_note(source)
+    store = SnapshotStore(f"file://{archive}")
+    try:
+        uri = store.write(source, run_id="safe")
+        assert uri is not None
+        snapshot_id = uri.rsplit("/", 1)[-1]
+        catalog_path = archive / "catalog.json"
+        catalog = json.loads(catalog_path.read_text())
+        entry = catalog["entries"][0]
+        entry["manifest"]["name"] = "../../private-file"
+        catalog_path.write_text(json.dumps(catalog))
+        with pytest.raises(ValueError, match="unsafe component"):
+            store.restore(target, snapshot_id)
+
+        entry["manifest"]["name"] = f"{snapshot_id}/manifest.json"
+        catalog_path.write_text(json.dumps(catalog))
+
+        uri = store.write(source, run_id="second")
+        assert uri is not None
+        snapshot_id = uri.rsplit("/", 1)[-1]
+        catalog = json.loads(catalog_path.read_text())
+        entry = catalog["entries"][-1]
+        manifest_path = archive / snapshot_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["tables"]["notes"]["objects"][0]["name"] = "../../private-file"
+        raw = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+        manifest_path.write_bytes(raw)
+        entry["manifest"]["size"] = len(raw)
+        entry["manifest"]["sha256"] = sha256(raw).hexdigest()
+        catalog_path.write_text(json.dumps(catalog))
+        with pytest.raises(ValueError, match="unsafe component"):
+            store.restore(target, snapshot_id)
+    finally:
+        source.close()
+        target.close()
+
+
+def test_restore_verifies_manifest_and_object_sha256(tmp_path: Path) -> None:
+    """Reject corrupt bytes before JSON or Parquet parsing can consume them."""
+    archive = tmp_path / "archive"
+    source = _backend()
+    target = _backend()
+    _append_note(source)
+    store = SnapshotStore(f"file://{archive}")
+    try:
+        uri = store.write(source, run_id="safe")
+        assert uri is not None
+        snapshot_id = uri.rsplit("/", 1)[-1]
+        object_path = archive / snapshot_id / "notes.parquet"
+        object_path.write_bytes(b"x" * len(object_path.read_bytes()))
+        with pytest.raises(ValueError, match="SHA-256"):
+            store.restore(target, snapshot_id)
+
+        uri = store.write(source, run_id="second")
+        assert uri is not None
+        snapshot_id = uri.rsplit("/", 1)[-1]
+        manifest_path = archive / snapshot_id / "manifest.json"
+        manifest_path.write_bytes(b"x" * len(manifest_path.read_bytes()))
+        with pytest.raises(ValueError, match="SHA-256"):
+            store.restore(target, snapshot_id)
+    finally:
+        source.close()
+        target.close()
+
+
+def test_snapshot_store_restore_requires_an_empty_backend(tmp_path: Path) -> None:
+    """Enforce empty destinations for direct library callers as well as the CLI."""
+    backend = _backend()
+    _append_note(backend)
+    store = SnapshotStore(f"file://{tmp_path}/archive")
+    try:
+        uri = store.write(backend, run_id="safe")
+        assert uri is not None
+        with pytest.raises(ValueError, match="restore requires an empty warehouse"):
+            store.restore(backend)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["../private", "/absolute", "C:\\Users\\Alice", "\\\\server\\share", "a/../b"],
+)
+def test_gcs_archive_rejects_unsafe_names_before_provider_calls(
+    unsafe_name: str,
+) -> None:
+    """Reject traversal and Windows names without contacting the GCS client."""
+    client = _RecordingClient()
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+
+    with pytest.raises(ValueError):
+        archive.key(unsafe_name)
+    with pytest.raises(ValueError):
+        archive.relative(unsafe_name)
+    with pytest.raises(ValueError):
+        archive.read_bytes(unsafe_name, generation=1)
+    with pytest.raises(ValueError):
+        archive.write_bytes(unsafe_name, b"payload")
+    with pytest.raises(ValueError):
+        archive.read_json(unsafe_name)
+    with pytest.raises(ValueError):
+        archive.write_json_cas(unsafe_name, {}, generation=None)
+    with pytest.raises(ValueError):
+        archive.list(unsafe_name)
+    with pytest.raises(ValueError):
+        archive.delete(unsafe_name, generation=1)
+
+    assert client.recording_bucket.blob_calls == 0
+    assert client.list_calls == 0
 
 
 def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:
@@ -344,32 +549,3 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
     assert gcs_catalog is not None
     gcs_entries = cast(list[dict[str, object]], gcs_catalog["entries"])
     assert [entry["snapshot_id"] for entry in gcs_entries] == [first_id]
-
-
-@pytest.mark.gcs_live
-def test_live_gcs_generation_operations_use_only_the_dedicated_bucket() -> None:
-    """Verify the official client against an isolated, deleted-after-test prefix."""
-    if os.environ.get("USAGEBASSOON_GCS_LIVE") != "1":
-        pytest.skip("set USAGEBASSOON_GCS_LIVE=1 to run the GCS integration test")
-    archive = RealGcsArchive(
-        "gs://usagebassoon-test-snapshots-gen-lang-client-0670612427/"
-        f"usagebassoon-tests/{uuid4().hex}"
-    )
-    try:
-        first = archive.write_bytes("probe", b"one", if_generation_match=0)
-        assert archive.read_bytes("probe", generation=first.generation) == b"one"
-        with pytest.raises(GcsPreconditionError):
-            archive.write_bytes("probe", b"two", if_generation_match=0)
-        catalog = archive.write_json_cas(
-            "catalog.json", {"entries": []}, generation=None
-        )
-        assert archive.read_json("catalog.json") == (
-            {"entries": []},
-            catalog.generation,
-        )
-        archive.lifecycle_delete_warnings()
-    finally:
-        for object_ref in archive.list(""):
-            archive.delete(
-                archive.relative(object_ref.name), generation=object_ref.generation
-            )
