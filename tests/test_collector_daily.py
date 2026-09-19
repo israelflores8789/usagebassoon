@@ -407,3 +407,24 @@ def test_graph_failure_skips_cycle_and_logs_to_operational_log(
     assert summary == PersistSummary(0, 0, {})
     log = (tmp_path / "logs" / "usagebassoon.log").read_text()
     assert "graph collection failed; skipping this cycle" in log
+
+
+def test_unexpected_graph_failure_skips_cycle_and_logs_to_operational_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep an unexpected subprocess failure from escaping the graph boundary."""
+    configuration = _config(tmp_path / "config.toml")
+
+    def command(*_args: object, **_kwargs: object) -> JsonValue:
+        """Raise an exception outside the normal subprocess error family."""
+        raise TypeError("unexpected graph process failure")
+
+    monkeypatch.setattr(collector, "_json_command", command)
+
+    run_id, summary = collector.collect(configuration)
+
+    assert run_id == ""
+    assert summary == PersistSummary(0, 0, {})
+    log = (tmp_path / "logs" / "usagebassoon.log").read_text()
+    assert "graph collection failed; skipping this cycle" in log

@@ -539,7 +539,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
                 ),
                 "graph",
             )
-        except RuntimeError:
+        except Exception:
             logger.exception("graph collection failed; skipping this cycle")
             return _empty_collection_result()
         graph = parse_graph(graph_raw)

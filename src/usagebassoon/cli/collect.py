@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -12,6 +13,9 @@ import typer
 
 from usagebassoon.collector import collect as collect_run
 from usagebassoon.config import ConfigurationError, ConfigurationManager
+from usagebassoon.logger import LOGGER_NAME
+
+_LOG = logging.getLogger(LOGGER_NAME)
 
 
 def collect(
@@ -26,6 +30,13 @@ def collect(
         run_id, summary = collect_run(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
+    except Exception as error:
+        _LOG.exception("unexpected collection command failure")
+        typer.echo(
+            "Collection failed unexpectedly; see the operational log.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from error
     if not run_id:
         typer.echo("Collection skipped; see the operational log.", err=True)
     else:

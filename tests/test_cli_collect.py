@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -53,3 +54,27 @@ def test_collect_formats_configuration_errors_as_cli_errors(tmp_path: Path) -> N
 
     assert result.exit_code != 0
     assert "--config" in result.output
+
+
+def test_collect_formats_unexpected_errors_without_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log unexpected command errors and return a clean nonzero CLI status."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "usagebassoon.duckdb")
+
+    def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        """Raise an unexpected exception from the delegated collector."""
+        raise TypeError("unexpected collector failure")
+
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
+
+    with caplog.at_level(logging.ERROR, logger="usagebassoon"):
+        result = CliRunner().invoke(app, ["collect", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "Collection failed unexpectedly; see the operational log." in result.output
+    assert "Traceback" not in result.output
+    assert "unexpected collection command failure" in caplog.text
