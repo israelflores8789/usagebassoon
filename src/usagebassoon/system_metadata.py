@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 from dataclasses import dataclass
+
+_LOG = logging.getLogger("usagebassoon")
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,7 @@ def _physical_memory_bytes() -> int | None:
         page_size = os.sysconf("SC_PAGE_SIZE")
         page_count = os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, OSError, ValueError):
+        _LOG.exception("physical memory metadata is unavailable")
         return None
     if not isinstance(page_size, int) or not isinstance(page_count, int):
         return None
@@ -55,13 +59,25 @@ def capture_system_metadata() -> SystemMetadata:
     Returns:
         Metadata that is safe to omit field by field on constrained platforms.
     """
-    processor = platform.processor().strip() or None
-    return SystemMetadata(
-        os_name=platform.system().strip() or None,
-        os_version=platform.release().strip() or None,
-        architecture=platform.machine().strip() or None,
-        cpu_model=processor,
-        cpu_count=os.cpu_count(),
-        memory_bytes=_physical_memory_bytes(),
-        shell=os.environ.get("SHELL") or None,
-    )
+    try:
+        processor = platform.processor().strip() or None
+        return SystemMetadata(
+            os_name=platform.system().strip() or None,
+            os_version=platform.release().strip() or None,
+            architecture=platform.machine().strip() or None,
+            cpu_model=processor,
+            cpu_count=os.cpu_count(),
+            memory_bytes=_physical_memory_bytes(),
+            shell=os.environ.get("SHELL") or None,
+        )
+    except Exception:
+        _LOG.exception("system metadata capture failed; omitting host metadata")
+        return SystemMetadata(
+            os_name=None,
+            os_version=None,
+            architecture=None,
+            cpu_model=None,
+            cpu_count=None,
+            memory_bytes=None,
+            shell=None,
+        )

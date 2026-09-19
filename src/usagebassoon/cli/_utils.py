@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -30,12 +30,16 @@ def configured_backend(
     Returns:
         Configuration and initialized backend.
     """
+    backend: StorageBackend | None = None
     try:
         configuration = ConfigurationManager(config).load()
         backend = open_backend(configuration)
         backend.apply_ddl()
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
+        if backend is not None:
+            close_backend(backend, context="backend initialization")
         raise typer.BadParameter(str(error), param_hint="--config") from error
+    assert backend is not None
     return configuration, backend
 
 

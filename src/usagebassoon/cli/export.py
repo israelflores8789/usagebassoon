@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 import typer
 from rich.console import Console
 
+from usagebassoon.backends.base import close_backend
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.privacy import sanitize_table
 
@@ -98,7 +99,7 @@ def export(
     try:
         result = backend.query(f"SELECT * FROM {target}")
     finally:
-        backend.close()
+        close_backend(backend, context="exporting data")
     if not raw:
         result = sanitize_table(result)
     if format == "csv":

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -21,7 +22,11 @@ from usagebassoon.config import (
 )
 from usagebassoon.display import sanitize_display
 from usagebassoon.drift import DoctorReport, run_doctor
+from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.logger import configure as configure_logging
 from usagebassoon.privacy import sanitize_doctor_text
+
+_LOG = logging.getLogger(LOGGER_NAME)
 
 
 def _print_report(
@@ -91,6 +96,7 @@ def doctor(
 ) -> None:
     """Check the configured backend, schema, drift, and ingest health."""
     manager = ConfigurationManager(config)
+    logger = _LOG
     opened = None
     config_error: str | None = None
     connection_error: str | None = None
@@ -98,8 +104,13 @@ def doctor(
     try:
         configuration = manager.load()
         try:
+            logger = configure_logging(configuration.logging)
+        except Exception:
+            logger.exception("could not configure doctor logging")
+        try:
             opened = open_backend(configuration)
         except Exception as error:
+            logger.exception("could not open the configured backend")
             connection_error = str(error)
     except ConfigurationError as error:
         config_error = str(error)
@@ -122,6 +133,7 @@ def doctor(
             else ()
         ),
         limit=limit,
+        logger=logger,
     )
     try:
         if raw:
@@ -140,7 +152,10 @@ def doctor(
         )
     finally:
         if opened is not None:
-            opened.close()
+            try:
+                opened.close()
+            except Exception:
+                logger.exception("could not close the doctor backend")
     if report.exit_code(strict=strict):
         raise typer.Exit(code=1)
 
@@ -150,4 +165,5 @@ def _snapshot_warnings(configuration: UsageBassoonConfig) -> tuple[str, ...]:
     try:
         return snapshot_store(configuration).lifecycle_warnings()
     except Exception as error:
+        _LOG.exception("GCS lifecycle inspection failed")
         return (f"GCS lifecycle inspection unavailable: {error}",)

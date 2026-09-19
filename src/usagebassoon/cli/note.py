@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import subprocess
@@ -14,7 +15,7 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.backends.base import UpsertResult
+from usagebassoon.backends.base import UpsertResult, close_backend
 from usagebassoon.cli._utils import configured_backend
 from usagebassoon.curation import (
     NoteAssignment,
@@ -66,7 +67,7 @@ def set(
             _assignment(configuration.source_id, client, session_id, note_text),
         )
     finally:
-        backend.close()
+        close_backend(backend, context="setting a note")
     typer.echo(f"{_note_action(result)} note for session {session_id!r}.")
 
 
@@ -139,8 +140,13 @@ def edit(
         )
     finally:
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        backend.close()
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logging.getLogger("usagebassoon").exception(
+                    "could not remove temporary note file %s", temporary_path
+                )
+        close_backend(backend, context="editing a note")
     typer.echo(f"{_note_action(result)} note for session {session_id!r}.")
 
 
@@ -161,6 +167,6 @@ def remove(
         assignment = _assignment(configuration.source_id, client, session_id, "present")
         deleted = remove_note(backend, assignment)
     finally:
-        backend.close()
+        close_backend(backend, context="removing a note")
     action = "Removed" if deleted else "No note exists for"
     typer.echo(f"{action} session {session_id!r}.")

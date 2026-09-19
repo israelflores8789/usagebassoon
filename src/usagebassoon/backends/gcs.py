@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
+
+_LOG = logging.getLogger("usagebassoon")
 
 
 def validate_relative_name(value: str, *, allow_empty: bool = False) -> str:
@@ -351,6 +354,7 @@ class GcsArchive:
             self.bucket.reload()
             rules = self.bucket.lifecycle_rules
         except Exception as error:
+            _LOG.exception("could not inspect GCS lifecycle rules for %s", self.uri)
             return (f"GCS lifecycle inspection unavailable: {error}",)
         warnings: list[str] = []
         for rule in rules:

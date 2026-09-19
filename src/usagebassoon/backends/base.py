@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -263,6 +264,26 @@ class StorageBackend(Protocol):
     def close(self) -> None:
         """Release backend resources."""
         ...
+
+
+def close_backend(
+    backend: StorageBackend,
+    *,
+    context: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Close a backend without allowing cleanup to mask the real outcome.
+
+    Args:
+        backend: Open backend to close.
+        context: Operation after which the backend is being closed.
+        logger: Optional logger used for cleanup diagnostics.
+    """
+    active_logger = logger or logging.getLogger("usagebassoon")
+    try:
+        backend.close()
+    except Exception:
+        active_logger.exception("could not close backend after %s", context)
 
 
 class AbstractStorageBackend(ABC):

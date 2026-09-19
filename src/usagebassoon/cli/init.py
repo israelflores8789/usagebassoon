@@ -10,6 +10,7 @@ from typing import Annotated
 
 import typer
 
+from usagebassoon.backends.base import close_backend
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -41,7 +42,7 @@ def init(
     try:
         backend.apply_ddl()
     finally:
-        backend.close()
+        close_backend(backend, context="initializing the schema")
     action = "Created" if created else "Using existing"
     typer.echo(f"{action} configuration at {manager.path}.")
     typer.echo(f"Initialized {configuration.backend} schema.")

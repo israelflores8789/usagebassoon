@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.config import ConfigurationManager, open_backend
 from usagebassoon.frames import Engine, query_frame
 from usagebassoon.sql_safety import dialect_for_backend, validate_read_only_sql
@@ -67,7 +67,7 @@ def query_arrow(
     try:
         return backend.query(sql)
     finally:
-        backend.close()
+        close_backend(backend, context="running an Arrow query")
 
 
 def query(
@@ -98,4 +98,4 @@ def query(
     try:
         return query_frame(backend, sql, engine=engine)
     finally:
-        backend.close()
+        close_backend(backend, context="running a frame query")

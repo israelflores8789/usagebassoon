@@ -10,6 +10,7 @@ from typing import Annotated
 
 import typer
 
+from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend, snapshot_store
 
 
@@ -31,7 +32,7 @@ def snapshot(
             run_id=str(latest[0]["run_id"]) if latest else "manual",
         )
     finally:
-        backend.close()
+        close_backend(backend, context="writing a snapshot")
     if uri is None:
         typer.echo(
             "Snapshot skipped: the configured interval is not due or is reserved."

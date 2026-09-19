@@ -22,10 +22,12 @@ from threading import Thread
 from typing import BinaryIO, cast
 from uuid import uuid4
 
+from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.config import UsageBassoonConfig, open_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.ingest import RawCollection, build_collection_bundle
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
+from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.merge import PersistSummary, persist_run
 from usagebassoon.normalizer import NormalizedBundle, ProcessingTarget, normalize
@@ -52,6 +54,12 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
         "XDG_CONFIG_HOME",
     }
 )
+_LOG = logging.getLogger(LOGGER_NAME)
+
+
+def _empty_collection_result() -> tuple[str, PersistSummary]:
+    """Return the explicit result used when a recoverable cycle is skipped."""
+    return "", PersistSummary(inserted=0, updated=0, per_table={})
 
 
 def _snapshot_after_collect(
@@ -63,13 +71,19 @@ def _snapshot_after_collect(
     settings = config.snapshots
     if settings is None or settings.interval is None:
         return
-    backend = open_backend(config)
+    backend: StorageBackend | None = None
     try:
+        backend = open_backend(config)
         SnapshotStore.from_config(config).write(backend, run_id=run_id)
     except Exception:
         logger.exception("snapshot after collection run %s failed", run_id)
     finally:
-        backend.close()
+        if backend is not None:
+            close_backend(
+                backend,
+                context=f"snapshot after collection run {run_id}",
+                logger=logger,
+            )
 
 
 def _prefix(config: UsageBassoonConfig) -> list[str]:
@@ -108,7 +122,12 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         return
     except OSError:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        except OSError:
+            _LOG.exception("could not terminate tokscale process %s", process.pid)
 
 
 def _read_pipe(
@@ -120,8 +139,13 @@ def _read_pipe(
     try:
         while chunk := pipe.read(64 * 1024):
             queue.put((name, chunk))
+    except Exception:
+        _LOG.exception("could not read tokscale %s", name)
     finally:
-        queue.put((name, None))
+        try:
+            queue.put((name, None))
+        except Exception:
+            _LOG.exception("could not signal tokscale %s completion", name)
 
 
 def _capture_process(
@@ -210,15 +234,20 @@ def _json_command(
 ) -> JsonValue:
     """Run one bounded tokscale JSON command and decode its standard output."""
     command = [*prefix, *arguments]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_child_environment(config),
-        shell=False,
-        start_new_session=True,
-    )
+    command_name = sanitize_display(" ".join(arguments))
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_environment(config),
+            shell=False,
+            start_new_session=True,
+        )
+    except OSError as error:
+        _LOG.exception("could not start tokscale %s", command_name)
+        raise RuntimeError(f"could not start tokscale {command_name}") from error
     stdout, stderr = _capture_process(
         process,
         timeout_seconds=_command_timeout(config, deadline),
@@ -228,7 +257,6 @@ def _json_command(
         ),
         max_stderr_bytes=config.tokscale_max_stderr_bytes,
     )
-    command_name = sanitize_display(" ".join(arguments))
     if process.returncode:
         detail = sanitize_display(stderr.decode("utf-8", errors="replace").strip())
         raise RuntimeError(
@@ -299,7 +327,7 @@ def _daily_state(
             models_by_day.setdefault(day, set()).add(model)
         return frozenset(processed), models_by_day
     finally:
-        backend.close()
+        close_backend(backend, context="loading daily collection state", logger=_LOG)
 
 
 def _persist_with_retries(
@@ -308,19 +336,37 @@ def _persist_with_retries(
     logger: logging.Logger,
 ) -> PersistSummary:
     """Persist one normalized cycle with bounded conflict-aware retries."""
-    schema_backend = open_backend(config)
+    schema_backend: StorageBackend | None = None
     try:
+        schema_backend = open_backend(config)
         schema_backend.apply_ddl()
+    except Exception:
+        logger.exception(
+            "collection run %s could not initialize the schema", bundle.run_id
+        )
+        raise
     finally:
-        schema_backend.close()
+        if schema_backend is not None:
+            close_backend(
+                schema_backend,
+                context=f"schema initialization for {bundle.run_id}",
+                logger=logger,
+            )
     attempts = config.collection.max_retries + 1
     for attempt in range(1, attempts + 1):
-        backend = None
+        backend: StorageBackend | None = None
         try:
             backend = open_backend(config)
             return persist_run(backend, bundle)
         except Exception as error:
-            retryable = backend is not None and backend.is_retryable_error(error)
+            try:
+                retryable = backend is not None and backend.is_retryable_error(error)
+            except Exception:
+                logger.exception(
+                    "could not classify collection run %s failure for retry",
+                    bundle.run_id,
+                )
+                retryable = False
             if not retryable or attempt == attempts:
                 logger.exception(
                     "collection run %s failed%s",
@@ -344,7 +390,11 @@ def _persist_with_retries(
             time.sleep(delay)
         finally:
             if backend is not None:
-                backend.close()
+                close_backend(
+                    backend,
+                    context=f"persistence attempt {attempt}",
+                    logger=logger,
+                )
     raise RuntimeError("collection persistence exhausted without an exception")
 
 
@@ -377,7 +427,7 @@ def _fetch_daily_models(
                 ),
                 f"models --since {day.isoformat()} --until {day.isoformat()}",
             )
-        except RuntimeError:
+        except Exception:
             failed.add((day, _DAILY_STATS_TARGET))
             logger.exception("daily models collection failed for %s", day.isoformat())
     return payloads, failed
@@ -409,7 +459,7 @@ def _fetch_pricing(
                     ),
                     f"pricing {model}",
                 )
-        except RuntimeError:
+        except Exception:
             failed.add((day, _PRICE_VERSIONS_TARGET))
             logger.exception("pricing collection failed for %s", day.isoformat())
         else:
@@ -423,26 +473,32 @@ def _fetch_reports(
     days: Sequence[date],
     *,
     deadline: float | None,
+    logger: logging.Logger | None = None,
 ) -> JsonArray:
     """Fetch daily-bounded session metadata without session-token attribution."""
     reports: JsonArray = []
+    active_logger = logger or _LOG
     for day in days:
-        report = _array(
-            _json_command(
-                config,
-                prefix,
-                "report",
-                "--json",
-                "--no-summarize",
-                "--since",
-                day.isoformat(),
-                "--until",
-                day.isoformat(),
-                deadline=deadline,
-            ),
-            f"report --since {day.isoformat()} --until {day.isoformat()}",
-        )
-        reports.extend(report)
+        try:
+            report = _array(
+                _json_command(
+                    config,
+                    prefix,
+                    "report",
+                    "--json",
+                    "--no-summarize",
+                    "--since",
+                    day.isoformat(),
+                    "--until",
+                    day.isoformat(),
+                    deadline=deadline,
+                ),
+                f"report --since {day.isoformat()} --until {day.isoformat()}",
+            )
+        except Exception:
+            active_logger.exception("session report collection failed for %s", day)
+        else:
+            reports.extend(report)
     return reports
 
 
@@ -453,7 +509,11 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     supplies token facts. Completed historical targets are skipped while a
     candidate for the current UTC day is always refreshed.
     """
-    logger = configure_logging(config.logging)
+    try:
+        logger = configure_logging(config.logging)
+    except Exception:
+        logger = _LOG
+        logger.exception("could not configure collection logging")
     started_at = datetime.now(UTC)
     try:
         prefix = _prefix(config)
@@ -468,18 +528,26 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
                 0.0,
                 cadence.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
             )
-        graph_raw = _object(
-            _json_command(
-                config,
-                prefix,
+        try:
+            graph_raw = _object(
+                _json_command(
+                    config,
+                    prefix,
+                    "graph",
+                    deadline=deadline,
+                    max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
+                ),
                 "graph",
-                deadline=deadline,
-                max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
-            ),
-            "graph",
-        )
+            )
+        except RuntimeError:
+            logger.exception("graph collection failed; skipping this cycle")
+            return _empty_collection_result()
         graph = parse_graph(graph_raw)
-        processed, persisted_models = _daily_state(config)
+        try:
+            processed, persisted_models = _daily_state(config)
+        except Exception:
+            logger.exception("could not load collection state; skipping this cycle")
+            return _empty_collection_result()
         today = datetime.now(UTC).date()
         candidate_days = tuple(
             sorted({contribution.date for contribution in graph.contributions})
@@ -531,6 +599,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
                 prefix,
                 candidate_days,
                 deadline=deadline,
+                logger=logger,
             ),
             graph=graph_raw,
             pricing_by_day=pricing_by_day,

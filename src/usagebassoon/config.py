@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tomllib
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -20,6 +20,8 @@ from uuid import UUID, uuid4
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
+
+_LOG = logging.getLogger("usagebassoon")
 
 BackendName = Literal["duckdb", "motherduck", "bigquery"]
 DEFAULT_CONFIG_PATH = Path("~/.config/usagebassoon/config.toml")
@@ -509,8 +511,12 @@ def _configuration_error_with_log(
     """Log one configuration error and add the log location to its message."""
     log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
     if isinstance(payload, Mapping):
-        with suppress(ConfigurationError):
+        try:
             log_config = _logging_config(payload.get("logging"))
+        except ConfigurationError:
+            _LOG.exception(
+                "configuration logging settings are invalid; using the default log"
+            )
 
     default_log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
     candidates = [log_config]
@@ -519,7 +525,7 @@ def _configuration_error_with_log(
 
     from usagebassoon.logger import log_configuration_error
 
-    last_error: OSError | None = None
+    last_error: Exception | None = None
     attempted_path = DEFAULT_LOG_DIRECTORY.expanduser() / "usagebassoon.log"
     for candidate in candidates:
         attempted_path = candidate.directory.expanduser() / "usagebassoon.log"
@@ -530,8 +536,11 @@ def _configuration_error_with_log(
                 max_files=candidate.max_files,
                 max_bytes=candidate.max_bytes,
             )
-        except OSError as log_error:
+        except Exception as log_error:
             last_error = log_error
+            _LOG.exception(
+                "could not write the configuration error log at %s", attempted_path
+            )
             continue
         return ConfigurationError(f"{error} (details logged to {attempted_path})")
 

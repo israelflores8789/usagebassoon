@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.privacy import sanitize_table
@@ -41,7 +42,7 @@ def report(
         sessions = backend.query("SELECT * FROM report_summary")
         models = backend.query("SELECT * FROM report_models")
     finally:
-        backend.close()
+        close_backend(backend, context="rendering a report")
     if sanitize:
         models = sanitize_table(models)
     summary = sessions.to_pylist()[0]

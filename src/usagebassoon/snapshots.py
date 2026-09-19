@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import shutil
 from base64 import b64decode, b64encode
@@ -45,6 +46,7 @@ _LEASE_SECONDS = 300
 _DURATION = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])\Z", re.I)
 _SNAPSHOT_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_LOG = logging.getLogger("usagebassoon")
 
 
 class GcsArchive(Protocol):
@@ -541,6 +543,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "snapshot reservation claim raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
                 continue
             return fence
         return None
@@ -587,6 +594,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "snapshot reservation release raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _schema(data: pa.Table) -> str:
@@ -695,6 +707,11 @@ class SnapshotStore:
                 except RuntimeError as error:
                     if error.__class__.__name__ != "GcsPreconditionError":
                         raise
+                    _LOG.warning(
+                        "snapshot object cleanup raced with another writer for %s",
+                        archive.uri,
+                        exc_info=True,
+                    )
 
     def _publish_for(
         self,
@@ -731,6 +748,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "snapshot publication raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
                 continue
             return True
         return None
@@ -749,6 +771,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "snapshot retention update raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
                 continue
             return retired
         raise RuntimeError(f"could not rotate snapshot catalog for {archive.uri}")
@@ -782,6 +809,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "snapshot rollback raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
                 continue
             return
 
@@ -909,6 +941,11 @@ class SnapshotStore:
                     tzinfo=UTC
                 )
             except ValueError:
+                _LOG.warning(
+                    "ignoring stale GCS object with invalid snapshot timestamp %s",
+                    snapshot_id,
+                    exc_info=True,
+                )
                 continue
             if created >= cutoff:
                 continue
@@ -917,6 +954,11 @@ class SnapshotStore:
             except RuntimeError as error:
                 if error.__class__.__name__ != "GcsPreconditionError":
                     raise
+                _LOG.warning(
+                    "stale GCS snapshot cleanup raced with another writer for %s",
+                    archive.uri,
+                    exc_info=True,
+                )
 
     def write(self, backend: StorageBackend, *, run_id: str) -> str | None:
         """Capture once, publish to every destination, and rotate snapshots."""

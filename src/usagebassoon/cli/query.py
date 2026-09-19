@@ -17,6 +17,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from usagebassoon.backends.base import close_backend
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.sql_safety import (
@@ -127,7 +128,7 @@ def query(
     try:
         result = backend.query(sql, parameters)
     finally:
-        backend.close()
+        close_backend(backend, context="running a CLI query")
     if format == "table":
         if output is not None:
             raise typer.BadParameter("--output requires csv, json, or parquet")

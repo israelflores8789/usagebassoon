@@ -26,7 +26,10 @@ def collect(
         run_id, summary = collect_run(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
-    typer.echo(
-        f"Collected run {run_id}: {summary.inserted} inserted, "
-        f"{summary.updated} updated."
-    )
+    if not run_id:
+        typer.echo("Collection skipped; see the operational log.", err=True)
+    else:
+        typer.echo(
+            f"Collected run {run_id}: {summary.inserted} inserted, "
+            f"{summary.updated} updated."
+        )

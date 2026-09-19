@@ -10,7 +10,7 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.backends.base import CuratedRenameError
+from usagebassoon.backends.base import CuratedRenameError, close_backend
 from usagebassoon.cli._utils import configured_backend
 from usagebassoon.curation import TagAssignment, add_tag, remove_tag, rename_tag
 
@@ -82,7 +82,7 @@ def add(
         )
         result = add_tag(backend, assignment)
     finally:
-        backend.close()
+        close_backend(backend, context="adding a tag")
     action = "Added" if result.inserted else "Already present"
     typer.echo(
         f"{action} tag {tag_name!r} for {assignment.scope} {_target(assignment)!r}."
@@ -118,7 +118,7 @@ def rename(
             typer.echo(f"Warning: {error}; no tag assignment was changed.", err=True)
             raise typer.Exit(1) from error
     finally:
-        backend.close()
+        close_backend(backend, context="renaming a tag")
     if result.destination_exists:
         typer.echo(f"Tag {new!r} is already assigned; kept {old!r} unchanged.")
     elif result.renamed:
@@ -151,6 +151,6 @@ def remove(
         )
         deleted = remove_tag(backend, assignment)
     finally:
-        backend.close()
+        close_backend(backend, context="removing a tag")
     action = "Removed" if deleted else "No tag exists for"
     typer.echo(f"{action} {assignment.scope} {_target(assignment)!r}.")

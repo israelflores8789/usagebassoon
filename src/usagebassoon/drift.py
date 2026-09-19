@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +15,7 @@ from usagebassoon.backends.base import StorageBackend
 
 CheckStatus = Literal["ok", "warning", "error"]
 DRIFT_ISSUE_URL = "https://github.com/israelflores8789/usagebassoon/issues/new"
+_LOG = logging.getLogger("usagebassoon")
 
 REQUIRED_RELATIONS: tuple[str, ...] = (
     "ingest_runs",
@@ -289,6 +291,7 @@ def run_doctor(
     snapshot_enabled: bool | None = None,
     snapshot_warnings: tuple[str, ...] = (),
     limit: int = 20,
+    logger: logging.Logger | None = None,
 ) -> DoctorReport:
     """Run read-only diagnostics against a configured backend.
 
@@ -302,6 +305,7 @@ def run_doctor(
         snapshot_enabled: Whether optional snapshots are configured.
         snapshot_warnings: Advisories from configured snapshot storage.
         limit: Maximum number of drift and ingest records to display.
+        logger: Optional logger used for recoverable diagnostic failures.
 
     Returns:
         Ordered diagnostic results. Backend exceptions are converted to checks
@@ -309,6 +313,8 @@ def run_doctor(
     """
     if limit < 1:
         raise ValueError("limit must be positive")
+
+    active_logger = logger or _LOG
 
     checks: list[DoctorCheck] = []
     config_details = (f"path: {config_path}",) if config_path else ()
@@ -352,6 +358,7 @@ def run_doctor(
     try:
         backend.query("SELECT 1 AS doctor_ok")
     except Exception as error:
+        active_logger.exception("doctor connectivity check failed")
         checks.append(DoctorCheck("backend", "error", f"connectivity failed: {error}"))
         return DoctorReport(tuple(checks))
     checks.append(DoctorCheck("backend", "ok", "connection and query succeeded"))
@@ -361,6 +368,7 @@ def run_doctor(
         try:
             backend.query(f"SELECT * FROM {table} LIMIT 0")
         except Exception:
+            active_logger.exception("doctor schema check failed for %s", table)
             missing.append(table)
     if missing:
         checks.append(
@@ -384,6 +392,7 @@ def run_doctor(
         try:
             transactions = backend.active_transactions(limit)
         except Exception as error:
+            active_logger.exception("doctor transaction inspection failed")
             checks.append(
                 DoctorCheck(
                     "transactions",
@@ -413,6 +422,7 @@ def run_doctor(
     try:
         drift = unresolved_schema_drift(backend, limit=limit)
     except Exception as error:
+        active_logger.exception("doctor schema-drift inspection failed")
         checks.append(
             DoctorCheck(
                 "schema_drift",
@@ -440,6 +450,7 @@ def run_doctor(
     try:
         issues = ingest_issues(backend, limit=limit)
     except Exception as error:
+        active_logger.exception("doctor ingest-run inspection failed")
         checks.append(
             DoctorCheck(
                 "ingest_runs",
@@ -469,6 +480,7 @@ def run_doctor(
     try:
         reconciliation_count = unresolved_reconciliation_count(backend)
     except Exception as error:
+        active_logger.exception("doctor reconciliation inspection failed")
         checks.append(
             DoctorCheck(
                 "reconciliation",

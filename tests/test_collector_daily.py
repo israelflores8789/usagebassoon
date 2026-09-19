@@ -333,3 +333,77 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
             (failed_day, "price_versions"),
         }
     )
+
+
+def test_daily_models_failure_is_logged_and_left_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Treat one transient tokscale failure as a failed target, not a crash."""
+    logger = logging.getLogger("usagebassoon.test.daily-failure")
+
+    def command(*_args: object, **_kwargs: object) -> JsonValue:
+        """Raise the kind of process-start failure a scheduled run can see."""
+        raise OSError("tokscale executable unavailable")
+
+    monkeypatch.setattr(collector, "_json_command", command)
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        payloads, failed = collector._fetch_daily_models(
+            _config(Path("config.toml")),
+            ["tokscale"],
+            [date(2026, 9, 10)],
+            logger,
+            deadline=None,
+        )
+
+    assert payloads == {}
+    assert failed == {(date(2026, 9, 10), "daily_stats")}
+    assert "daily models collection failed" in caplog.text
+
+
+def test_report_failure_is_logged_and_does_not_abort_collection(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep token collection usable when optional session metadata is unavailable."""
+    logger = logging.getLogger("usagebassoon.test.report-failure")
+
+    def command(*_args: object, **_kwargs: object) -> JsonValue:
+        """Raise a transient report command failure."""
+        raise RuntimeError("report process failed")
+
+    monkeypatch.setattr(collector, "_json_command", command)
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        reports = collector._fetch_reports(
+            _config(Path("config.toml")),
+            ["tokscale"],
+            [date(2026, 9, 10)],
+            deadline=None,
+            logger=logger,
+        )
+
+    assert reports == []
+    assert "session report collection failed" in caplog.text
+
+
+def test_graph_failure_skips_cycle_and_logs_to_operational_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return a no-op result for a transient graph failure in an autonomous run."""
+    configuration = _config(tmp_path / "config.toml")
+
+    def command(*_args: object, **_kwargs: object) -> JsonValue:
+        """Raise a transient graph command failure."""
+        raise RuntimeError("graph process failed")
+
+    monkeypatch.setattr(collector, "_json_command", command)
+
+    run_id, summary = collector.collect(configuration)
+
+    assert run_id == ""
+    assert summary == PersistSummary(0, 0, {})
+    log = (tmp_path / "logs" / "usagebassoon.log").read_text()
+    assert "graph collection failed; skipping this cycle" in log
