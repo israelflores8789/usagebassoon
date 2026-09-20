@@ -1,0 +1,266 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+# Repo-level values (Settings > Secrets and variables > Actions > Variables):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  e.g. projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#   GCP_CI_SERVICE_ACCOUNT          e.g. usagebassoon-ci@<project>.iam.gserviceaccount.com
+#   GCP_PROJECT_ID                  GCP project containing the dedicated test resources
+#
+# The live tests intentionally use fixed, pre-provisioned resources from the
+# repository contract. They must not be replaced with per-run resources:
+#   BigQuery dataset: usagebassoon_it
+#   GCS bucket: gs://usagebassoon-test-snapshots-gen-lang-client-0670612427
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Ruff lint and format checks
+      run: just lint
+    - name: Pyrefly type check
+      run: just typecheck
+
+  unit:
+    name: Unit + local DuckDB (py ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python ${{ matrix.python }}
+      run: uv python install ${{ matrix.python }}
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python ${{ matrix.python }}
+    - name: Run unit and local DuckDB tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: Unit + local DuckDB (Python ${{ matrix.python }})
+        custom-arguments: >-
+          -m "not (bigquery_live or gcs_live)" --junitxml=junit-unit-${{ matrix.python }}.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-unit-py-${{ matrix.python }}
+        path: junit-unit-${{ matrix.python }}.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Build distributions
+      run: uv build --no-sources
+    - name: Validate distributions
+      run: uv run twine check dist/*
+
+  bigquery-live:
+    name: Live BigQuery (WIF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Cloud tests run only from the protected dev branch. Pull requests,
+    # including same-repository pull requests, must not receive cloud access.
+    if: >-
+      github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/dev')
+    concurrency:
+      # These tests reset the shared dedicated dataset at module setup, so
+      # separate workflow runs must not overlap.
+      group: usagebassoon-bigquery-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USAGEBASSOON_BIGQUERY_LIVE: "1"
+      USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
+      USAGEBASSOON_BIGQUERY_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      USAGEBASSOON_BIGQUERY_DATASET: usagebassoon_it
+      USAGEBASSOON_BIGQUERY_LOCATION: US
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Verify dedicated CI dataset
+      env:
+        GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      run: |
+        set -euo pipefail
+        test -n "$GCP_PROJECT_ID"
+        bq show --project_id "$GCP_PROJECT_ID" \
+          "$GCP_PROJECT_ID:usagebassoon_it" >/dev/null
+    - name: Run bigquery_live tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: BigQuery live tests
+        custom-arguments: >-
+          -m bigquery_live --junitxml=junit-bigquery-live.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-bigquery-live
+        path: junit-bigquery-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  gcs-live:
+    name: Live GCS snapshots (WIF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: >-
+      github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/dev')
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USAGEBASSOON_GCS_LIVE: "1"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Run gcs_live tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: GCS live tests
+        custom-arguments: >-
+          -m gcs_live --junitxml=junit-gcs-live.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-gcs-live
+        path: junit-gcs-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, unit, build, bigquery-live, gcs-live]
+    if: always()
+    steps:
+    - name: Evaluate results
+      env:
+        LINT: ${{ needs.lint.result }}
+        UNIT: ${{ needs.unit.result }}
+        BUILD: ${{ needs.build.result }}
+        BQ: ${{ needs.bigquery-live.result }}
+        GCS: ${{ needs.gcs-live.result }}
+        LIVE_REQUIRED: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev') }}
+      run: |
+        set -euo pipefail
+        echo "lint=$LINT unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS live_required=$LIVE_REQUIRED"
+        for r in "$LINT" "$UNIT" "$BUILD"; do
+          [ "$r" = "success" ] || exit 1
+        done
+        if [ "$LIVE_REQUIRED" = "true" ]; then
+          for r in "$BQ" "$GCS"; do
+            [ "$r" = "success" ] || exit 1
+          done
+        else
+          # Pull requests and non-dev manual dispatches intentionally do not
+          # receive cloud credentials, so their live jobs must be skipped.
+          for r in "$BQ" "$GCS"; do
+            [ "$r" = "skipped" ] || exit 1
+          done
+        fi
