@@ -25,6 +25,7 @@ from usagebassoon.drift import DoctorReport, run_doctor
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.privacy import sanitize_doctor_text
+from usagebassoon.scheduling import schedule_doctor_check
 
 _LOG = logging.getLogger(LOGGER_NAME)
 
@@ -135,6 +136,7 @@ def doctor(
         limit=limit,
         logger=logger,
     )
+    report = DoctorReport((*report.checks, schedule_doctor_check(configuration)))
     try:
         if raw:
             Console(stderr=True).print(

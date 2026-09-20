@@ -86,21 +86,88 @@ def _snapshot_after_collect(
             )
 
 
-def _prefix(config: UsageBassoonConfig) -> list[str]:
-    """Resolve the tokscale executable command prefix.
+def resolve_tokscale_command(config: UsageBassoonConfig) -> tuple[str, ...]:
+    """Resolve the complete tokscale executable command prefix.
 
     Args:
         config: Active UsageBassoon configuration.
 
     Returns:
         Command tokens ending in the tokscale executable or package spec.
+
+    Raises:
+        RuntimeError: If a configured command cannot be tokenized.
     """
     override = config.tokscale_bin or os.environ.get("TOKSCALE_BIN")
     if override:
-        return shlex.split(override)
+        try:
+            command = tuple(shlex.split(override))
+        except ValueError as error:
+            raise RuntimeError("TOKSCALE_BIN is not a valid command line") from error
+        if not command:
+            raise RuntimeError("TOKSCALE_BIN did not contain an executable")
+        return command
     if shutil.which("tokscale"):
-        return ["tokscale"]
-    return ["bunx", "tokscale@latest"]
+        return ("tokscale",)
+    return ("bunx", "tokscale@latest")
+
+
+def _prefix(config: UsageBassoonConfig) -> list[str]:
+    """Return the tokscale command as a mutable argv for collection helpers."""
+    return list(resolve_tokscale_command(config))
+
+
+def preflight_tokscale(config: UsageBassoonConfig) -> tuple[str, ...]:
+    """Verify that the effective tokscale command can execute.
+
+    Args:
+        config: Active UsageBassoon configuration.
+
+    Returns:
+        The command prefix used by the collector.
+
+    Raises:
+        RuntimeError: If tokscale cannot be started, times out, or rejects the
+            version probe.
+    """
+    command = resolve_tokscale_command(config)
+    try:
+        process = subprocess.Popen(
+            [*command, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_environment(config),
+            shell=False,
+            start_new_session=os.name == "posix",
+        )
+        _stdout, stderr = _capture_process(
+            process,
+            timeout_seconds=config.tokscale_timeout_seconds,
+            max_stdout_bytes=config.tokscale_max_stdout_bytes,
+            max_stderr_bytes=config.tokscale_max_stderr_bytes,
+        )
+    except FileNotFoundError as error:
+        if command == ("bunx", "tokscale@latest"):
+            raise RuntimeError(
+                "tokscale was not found on PATH and the bunx fallback is "
+                "unavailable; install tokscale or configure [tokscale].bin"
+            ) from error
+        raise RuntimeError(
+            "could not start tokscale preflight; executable "
+            f"{command[0]!r} was not found"
+        ) from error
+    except RuntimeError as error:
+        raise RuntimeError(f"tokscale preflight failed: {error}") from error
+    except OSError as error:
+        raise RuntimeError(f"could not start tokscale preflight: {error}") from error
+    if process.returncode != 0:
+        detail = sanitize_display(stderr.decode("utf-8", errors="replace").strip())
+        raise RuntimeError(
+            "tokscale preflight failed: "
+            f"{detail or 'tokscale exited without diagnostics'}"
+        )
+    return command
 
 
 def _child_environment(config: UsageBassoonConfig) -> dict[str, str]:
@@ -221,7 +288,7 @@ def _command_timeout(
         return config.tokscale_timeout_seconds
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RuntimeError("collection cadence elapsed before tokscale completed")
+        raise RuntimeError("collection timeout elapsed before tokscale completed")
     return min(config.tokscale_timeout_seconds, remaining)
 
 
@@ -559,15 +626,15 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     try:
         prefix = _prefix(config)
         deadline = None
-        if config.collection.cadence is not None:
+        if config.collection.timeout is not None:
             from usagebassoon.snapshots import parse_interval
 
-            cadence = parse_interval(config.collection.cadence)
-            if cadence is None:
-                raise RuntimeError("collection cadence must be configured")
+            timeout = parse_interval(config.collection.timeout)
+            if timeout is None:
+                raise RuntimeError("collection timeout must be configured")
             deadline = time.monotonic() + max(
                 0.0,
-                cadence.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
+                timeout.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
             )
         graph_raw = _object(
             _json_command(

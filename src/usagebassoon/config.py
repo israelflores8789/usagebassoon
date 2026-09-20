@@ -8,9 +8,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Literal, cast
@@ -44,6 +47,7 @@ _ROOT_CONFIG_KEYS = frozenset(
         "bigquery",
         "gcs",
         "collection",
+        "schedule",
         "logging",
         "snapshots",
     }
@@ -54,10 +58,12 @@ _TOKSCALE_CONFIG_KEYS = frozenset(
 _BIGQUERY_CONFIG_KEYS = frozenset(
     {"project", "location", "credentials_file", "maximum_bytes_billed"}
 )
-_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds", "cadence"})
+_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds", "timeout"})
+_SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
 _GCS_CONFIG_KEYS = frozenset({"uri", "project", "location", "credentials_file"})
 _SNAPSHOT_CONFIG_KEYS = frozenset({"file_uri", "max_snapshots", "interval"})
+DEFAULT_SCHEDULE_INTERVAL = "15m"
 
 
 class ConfigurationError(ValueError):
@@ -81,6 +87,8 @@ def write_initial_config(path: Path) -> bool:
         f'source_id = "{uuid4()}"\n'
         'backend = "duckdb"\n'
         f'database = "{DEFAULT_DUCKDB_DATABASE}"\n'
+        "\n[schedule]\n"
+        f'interval = "{DEFAULT_SCHEDULE_INTERVAL}"\n'
     )
     try:
         with path.open("x") as handle:
@@ -131,12 +139,23 @@ class CollectionConfig:
     Attributes:
         max_retries: Additional persistence attempts after the first failure.
         retry_initial_seconds: Initial exponential-backoff delay.
-        cadence: Optional external collection cadence used to bound subprocesses.
+        timeout: Optional end-to-end collection deadline.
     """
 
     max_retries: int = 3
     retry_initial_seconds: float = 1.0
-    cadence: str | None = None
+    timeout: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleConfig:
+    """Configuration for the external or container collection scheduler.
+
+    Attributes:
+        interval: Positive duration between scheduled collection attempts.
+    """
+
+    interval: str = DEFAULT_SCHEDULE_INTERVAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +204,7 @@ class UsageBassoonConfig:
         tokscale_max_stderr_bytes: Maximum captured tokscale standard error.
         bigquery: BigQuery settings when that backend is selected.
         gcs: Google Cloud Storage settings when GCS snapshots are configured.
+        schedule: Scheduler interval settings.
         collection: Collection retry settings.
         logging: Local operational logging settings.
         snapshots: Optional snapshot settings.
@@ -201,6 +221,7 @@ class UsageBassoonConfig:
     tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
     bigquery: BigQueryConfig | None = None
     gcs: GcsConfig | None = None
+    schedule: ScheduleConfig = ScheduleConfig()
     collection: CollectionConfig = CollectionConfig()
     logging: LoggingConfig = LoggingConfig()
     snapshots: SnapshotConfig | None = None
@@ -277,6 +298,35 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     )
 
 
+def _duration(value: object | None, name: str) -> tuple[str | None, timedelta | None]:
+    """Validate one optional minute/hour duration and return its parsed value."""
+    text = _string(value, name)
+    if text is None:
+        return None, None
+    message = f"{name} must be a positive duration in minutes or hours"
+    if text != text.strip() or re.fullmatch(r"\d+(?:\.\d+)?[mh]", text, re.I) is None:
+        raise ConfigurationError(message)
+    from usagebassoon.snapshots import parse_interval
+
+    try:
+        parsed = parse_interval(text)
+    except ValueError as error:
+        raise ConfigurationError(message) from error
+    if parsed is None:
+        raise ConfigurationError(message)
+    return text, parsed
+
+
+def _schedule_config(value: object | None) -> ScheduleConfig:
+    """Parse the configured scheduler interval."""
+    table = _table(value, "schedule", _SCHEDULE_CONFIG_KEYS)
+    raw_interval = table.get("interval", DEFAULT_SCHEDULE_INTERVAL)
+    interval, parsed = _duration(raw_interval, "schedule.interval")
+    if interval is None or parsed is None:
+        raise ConfigurationError("schedule.interval must be positive")
+    return ScheduleConfig(interval=interval)
+
+
 def _positive_int(value: object, name: str) -> int:
     """Return a strictly positive TOML integer.
 
@@ -339,7 +389,7 @@ def _collection_config(value: object | None) -> CollectionConfig:
     table = _table(value, "collection", _COLLECTION_CONFIG_KEYS)
     max_retries = table.get("max_retries", 3)
     retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
-    cadence = _string(table.get("cadence"), "collection.cadence")
+    timeout, _ = _duration(table.get("timeout"), "collection.timeout")
     if (
         not isinstance(max_retries, int)
         or isinstance(max_retries, bool)
@@ -357,21 +407,10 @@ def _collection_config(value: object | None) -> CollectionConfig:
         raise ConfigurationError(
             "collection.retry_initial_seconds must be a positive number"
         )
-    if cadence is not None:
-        from usagebassoon.snapshots import parse_interval
-
-        try:
-            parsed_cadence = parse_interval(cadence)
-        except ValueError as error:
-            raise ConfigurationError(
-                "collection.cadence must be like 30m, 12h, or 7d"
-            ) from error
-        if parsed_cadence is None:
-            raise ConfigurationError("collection.cadence must be like 30m, 12h, or 7d")
     return CollectionConfig(
         max_retries=max_retries,
         retry_initial_seconds=float(retry_initial_seconds),
-        cadence=cadence,
+        timeout=timeout,
     )
 
 
@@ -456,7 +495,12 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
     )
 
 
-def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConfig:
+def _parse_config(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    schedule_interval: str | None = None,
+) -> UsageBassoonConfig:
     """Validate decoded TOML and create the typed configuration object."""
     _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
     source_id = _string(payload.get("source_id"), "source_id", required=True)
@@ -483,6 +527,23 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
     ) = _tokscale_config(payload.get("tokscale"))
     bigquery = _bigquery_config(payload.get("bigquery"))
     gcs = _gcs_config(payload.get("gcs"))
+    schedule_payload = payload.get("schedule")
+    if schedule_interval is not None:
+        if schedule_payload is None:
+            schedule_payload = {"interval": schedule_interval}
+        elif isinstance(schedule_payload, dict):
+            schedule_payload = {**schedule_payload, "interval": schedule_interval}
+    schedule = _schedule_config(schedule_payload)
+    collection = _collection_config(payload.get("collection"))
+    if collection.timeout is not None:
+        _, interval_duration = _duration(schedule.interval, "schedule.interval")
+        _, timeout_duration = _duration(collection.timeout, "collection.timeout")
+        assert interval_duration is not None
+        assert timeout_duration is not None
+        if interval_duration < timeout_duration:
+            raise ConfigurationError(
+                "schedule.interval must be greater than or equal to collection.timeout"
+            )
     if backend_value == "bigquery" and bigquery is None:
         raise ConfigurationError("[bigquery] is required for the BigQuery backend")
     return UsageBassoonConfig(
@@ -497,10 +558,75 @@ def _parse_config(path: Path, payload: Mapping[str, object]) -> UsageBassoonConf
         tokscale_max_stderr_bytes=tokscale_max_stderr_bytes,
         bigquery=bigquery,
         gcs=gcs,
-        collection=_collection_config(payload.get("collection")),
+        schedule=schedule,
+        collection=collection,
         logging=_logging_config(payload.get("logging")),
         snapshots=_snapshot_config(payload.get("snapshots")),
     )
+
+
+def update_schedule_interval(path: Path, interval: str) -> None:
+    """Persist one schedule interval in an existing TOML configuration.
+
+    Args:
+        path: Configuration file to update.
+        interval: Validated compact duration such as ``15m``.
+
+    Raises:
+        OSError: If the configuration cannot be read or atomically replaced.
+        ValueError: If the interval contains unsafe TOML text.
+    """
+    if not re.fullmatch(r"\d+(?:\.\d+)?[mh]", interval, re.IGNORECASE):
+        raise ValueError(
+            "schedule.interval must be a positive duration in minutes or hours"
+        )
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    schedule_start: int | None = None
+    schedule_end = len(lines)
+    interval_line: int | None = None
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\s*\[schedule\]\s*(?:#.*)?(?:\r?\n)?", line):
+            schedule_start = index
+            continue
+        if schedule_start is not None and re.match(r"\s*\[.*\]", line):
+            schedule_end = index
+            break
+        if schedule_start is not None and re.match(r"\s*interval\s*=", line):
+            interval_line = index
+    replacement = f'interval = "{interval}"\n'
+    if interval_line is not None:
+        lines[interval_line] = replacement
+    elif schedule_start is not None:
+        lines.insert(schedule_end, replacement)
+    else:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(["[schedule]\n", replacement])
+    _atomic_replace(path, "".join(lines))
+
+
+def _atomic_replace(path: Path, content: str) -> None:
+    """Replace one file atomically while preserving its permission bits."""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _configuration_error_with_log(
@@ -615,8 +741,12 @@ class ConfigurationManager:
             return Path(configured).expanduser()
         return DEFAULT_CONFIG_PATH.expanduser()
 
-    def load(self) -> UsageBassoonConfig:
+    def load(self, *, schedule_interval: str | None = None) -> UsageBassoonConfig:
         """Load and validate the resolved configuration file.
+
+        Args:
+            schedule_interval: Optional in-memory schedule override used by the
+                schedule command before persisting a requested interval.
 
         Returns:
             Typed, immutable configuration settings.
@@ -650,6 +780,10 @@ class ConfigurationManager:
             failure = ConfigurationError("configuration root must be a TOML table")
             raise _configuration_error_with_log(path, failure, decoded)
         try:
-            return _parse_config(path, cast(dict[str, object], decoded))
+            return _parse_config(
+                path,
+                cast(dict[str, object], decoded),
+                schedule_interval=schedule_interval,
+            )
         except ConfigurationError as error:
             raise _configuration_error_with_log(path, error, decoded) from error

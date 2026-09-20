@@ -26,8 +26,10 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
         "timeout_seconds = 120\n"
         "max_stdout_bytes = 1024\n"
         "max_stderr_bytes = 512\n"
+        "\n[schedule]\n"
+        'interval = "30m"\n'
         "\n[collection]\n"
-        'cadence = "30m"\n'
+        'timeout = "30m"\n'
         "\n[bigquery]\n"
         'project = "usagebassoon-test"\n'
         'location = "us-central1"\n'
@@ -40,7 +42,8 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     assert configuration.tokscale_timeout_seconds == 120.0
     assert configuration.tokscale_max_stdout_bytes == 1024
     assert configuration.tokscale_max_stderr_bytes == 512
-    assert configuration.collection.cadence == "30m"
+    assert configuration.schedule.interval == "30m"
+    assert configuration.collection.timeout == "30m"
     assert configuration.bigquery is not None
     assert configuration.bigquery.maximum_bytes_billed == 1_048_576
 

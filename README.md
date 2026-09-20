@@ -51,11 +51,13 @@ project = "my-gcp-project"                          # Required; Google Cloud pro
 location = "US"                                     # Optional configured bucket location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 
-[collection]                                        # Optional scheduled collection & retry settings.
+[schedule]                                          # Optional automated collection scheduling.
+interval = "15m"                                    # Minutes or hours between collection cycles (`30m`, `2h`).
+
+[collection]                                        # Optional collection deadline & retry settings.
 max_retries = 3                                     # Additional attempts after the first persistence failure.
 retry_initial_seconds = 1.0                         # Positive initial delay for exponential backoff.
-cadence = "5m"                                      # Optional; the scheduled interval for automatic `bassoon collect`
-                                                    # (e.g. through systemd); (`2m`, `10m`, `1h` not recommended).
+timeout = "5m"                                      # Optional end-to-end collection deadline (`30m`, `2h`).
 
 [logging]                                           # Optional rotating operational log settings.
 directory = "~/.local/state/usagebassoon/logs"      # Log files directory.
@@ -73,6 +75,31 @@ interval = "12h"                                    # Optional positive cadence 
 The `bigquery` table is only required for the BigQuery backend. BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery.
 
 If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the conventional local archive at `~/.usagebassoon/snapshots/`. If `gcs.uri` and `snapshots.file_uri` are both present, snapshots will archive both locally *and* to GCS.
+
+## Automated Scheduling
+
+`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection without changing that boundary.
+
+On Linux, install a systemd user timer; on macOS, install a launchd agent:
+
+```bash
+bassoon schedule install --interval 15m
+bassoon schedule status --json
+bassoon schedule stop
+bassoon schedule remove
+```
+
+`--interval` persists `[schedule].interval` in `config.toml`. The value must use minutes or hours; `1d` and `30s` are rejected. `bassoon schedule install` and `bassoon schedule worker` both run a tokscale preflight before scheduling.
+
+For interactive use, `bassoon schedule worker --interval 15m` starts a detached self-contained worker and reports its PID and log path. Use `bassoon schedule status`, `bassoon schedule logs`, and `bassoon schedule stop` to manage it.
+
+For containers, run the worker in the foreground so it remains the container's main process:
+
+```bash
+bassoon schedule worker --foreground --interval 15m
+```
+
+The worker invokes `bassoon collect` at the configured interval and does not call Docker or Podman or control the host. Container deployments should consider MotherDuck or BigQuery for persistence and GCS for snapshots, but these backends are not enforced.
 
 ## Source identity and curation
 

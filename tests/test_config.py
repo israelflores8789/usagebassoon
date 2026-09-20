@@ -16,6 +16,7 @@ from usagebassoon.config import (
     DEFAULT_LOG_DIRECTORY,
     ConfigurationError,
     ConfigurationManager,
+    update_schedule_interval,
 )
 from usagebassoon.logger import LOGGER_NAME
 
@@ -70,6 +71,78 @@ def test_environment_path_precedes_default(
     manager = ConfigurationManager()
     assert manager.path == configured
     assert manager.load().backend == "duckdb"
+
+
+def test_schedule_defaults_and_collection_timeout_are_typed(tmp_path: Path) -> None:
+    """Load the schedule default and the optional collection deadline."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[collection]\ntimeout = "5m"\n'
+    )
+
+    configuration = ConfigurationManager(path).load()
+
+    assert configuration.schedule.interval == "15m"
+    assert configuration.collection.timeout == "5m"
+
+
+def test_schedule_interval_must_cover_collection_timeout(tmp_path: Path) -> None:
+    """Reject a schedule that can interrupt its own collection deadline."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[schedule]\ninterval = "4m"\n'
+        '[collection]\ntimeout = "5m"\n'
+    )
+
+    with pytest.raises(ConfigurationError, match=r"schedule\.interval"):
+        ConfigurationManager(path).load()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("schedule", "1d"), ("collection", "1s"), ("schedule", "1w")],
+)
+def test_schedule_durations_are_limited_to_minutes_or_hours(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    """Reject day-, week-, and second-granularity scheduler durations."""
+    path = tmp_path / "config.toml"
+    setting = (
+        f'[schedule]\ninterval = "{value}"\n'
+        if field == "schedule"
+        else f'[collection]\ntimeout = "{value}"\n'
+    )
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n' + setting
+    )
+
+    with pytest.raises(ConfigurationError, match="minutes or hours"):
+        ConfigurationManager(path).load()
+
+
+def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) -> None:
+    """Persist an interval in place without rewriting unrelated TOML values."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        '[schedule]\ninterval = "15m"\n'
+        "[logging]\nmax_files = 4\n"
+    )
+
+    update_schedule_interval(path, "30m")
+
+    content = path.read_text()
+    assert 'interval = "30m"' in content
+    assert "max_files = 4" in content
+    assert ConfigurationManager(path).load().schedule.interval == "30m"
 
 
 def test_bigquery_requires_its_connection_settings(tmp_path: Path) -> None:

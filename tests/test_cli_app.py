@@ -19,6 +19,7 @@ COMMANDS = (
     "report",
     "restore",
     "snapshot",
+    "schedule",
     "tag",
 )
 

@@ -14,6 +14,7 @@ from usagebassoon.cli.note import note_app
 from usagebassoon.cli.query import query
 from usagebassoon.cli.report import report
 from usagebassoon.cli.restore import restore
+from usagebassoon.cli.schedule import schedule_app
 from usagebassoon.cli.snapshot import snapshot
 from usagebassoon.cli.tag import tag_app
 
@@ -40,3 +41,4 @@ app.command(name="report")(report)
 app.command(name="restore")(restore)
 app.command(name="audit")(audit)
 app.command(name="snapshot")(snapshot)
+app.add_typer(schedule_app, name="schedule")
