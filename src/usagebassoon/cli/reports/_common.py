@@ -393,7 +393,7 @@ def format_tokens(value: object) -> str:
     return f"{amount:.1f}"
 
 
-def format_cost(value: object, *, precision: int = 3) -> str:
+def format_cost(value: object, *, precision: int = 2) -> str:
     """Format one optional USD amount without treating missing pricing as zero.
 
     Args:

@@ -111,9 +111,9 @@ def sessions(
                 record["cache_read"], record["input_tokens"]
             ),
             "Total": format_tokens(record["total_tokens"]),
-            "Cost": format_cost(record["cost_usd"], precision=2),
+            "Cost": format_cost(record["cost_usd"]),
             "Cost/1M": format_cost_per_million(
-                record["cost_usd"], record["total_tokens"], precision=2
+                record["cost_usd"], record["total_tokens"]
             ),
             "Last Active": format_timestamp(
                 record["last_active"], compact=output_width is not None

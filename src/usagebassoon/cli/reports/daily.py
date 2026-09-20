@@ -95,7 +95,7 @@ def daily(
                 record["cache_read"], record["input_tokens"]
             ),
             "Total": format_tokens(record["total_tokens"]),
-            "Cost (USD)": format_cost(record["cost_usd"]),
+            "Cost": format_cost(record["cost_usd"]),
             "Cost/1M": format_cost_per_million(
                 record["cost_usd"], record["total_tokens"]
             ),
@@ -111,7 +111,7 @@ def daily(
             ("Cache R", "right"),
             (CACHE_MULTIPLIER_HEADER, "right"),
             ("Total", "right"),
-            ("Cost (USD)", "right"),
+            ("Cost", "right"),
             ("Cost/1M", "right"),
         ),
         rows,
