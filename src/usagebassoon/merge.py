@@ -62,7 +62,17 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "observed_at",
         ),
     ),
-    "daily_processed_state": (("source_id", "day", "target"), ("processed_at",)),
+    "ingest_status": (
+        ("source_id", "day", "domain"),
+        (
+            "status",
+            "expected_count",
+            "succeeded_count",
+            "last_attempted_run",
+            "last_succeeded_run",
+            "failure_code",
+        ),
+    ),
 }
 
 APPEND_ONLY_TABLES = frozenset(

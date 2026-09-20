@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, date, datetime
 from uuid import uuid4
 
@@ -41,6 +42,29 @@ def _payloads(
     }
 
 
+def _raw_collection(
+    *,
+    day: date,
+    daily_models: dict[date, JsonObject],
+    report: JsonArray,
+    graph: JsonObject,
+    pricing: JsonObject,
+) -> RawCollection:
+    """Build one complete raw collection fixture for contract tests."""
+    return RawCollection(
+        daily_models=daily_models,
+        report_by_day={day: report},
+        report_days=frozenset({day}),
+        report_fetch_failures=frozenset(),
+        graph=graph,
+        pricing_by_day={day: {"gemini-3.8-flash": pricing}},
+        pricing_expected_models={day: frozenset({"gemini-3.8-flash"})},
+        pricing_existing_models={},
+        pricing_fetch_failures={},
+        prior_statuses={},
+    )
+
+
 def test_shipped_contracts_accept_the_golden_payloads(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -66,15 +90,12 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
     changed_models = {**daily_raws[day], "futureMetric": 1}
     when = datetime.now(UTC)
     bundle = build_collection_bundle(
-        RawCollection(
+        _raw_collection(
+            day=day,
             daily_models={day: changed_models},
             report=report_raw,
             graph=graph_raw,
-            pricing_by_day={day: {"gemini-3.8-flash": pricing_raw}},
-            processed_targets=frozenset(
-                {(day, "daily_stats"), (day, "price_versions")}
-            ),
-            failed_targets=frozenset(),
+            pricing=pricing_raw,
         ),
         run_id=str(uuid4()),
         source_id=SOURCE_ID,
@@ -117,13 +138,12 @@ def test_required_missing_field_blocks_parsing(
     when = datetime.now(UTC)
     with pytest.raises(ContractValidationError) as error:
         build_collection_bundle(
-            RawCollection(
+            _raw_collection(
+                day=day,
                 daily_models={day: changed_models},
                 report=report_raw,
                 graph=graph_raw,
-                pricing_by_day={day: {"gemini-3.8-flash": pricing_raw}},
-                processed_targets=frozenset(),
-                failed_targets=frozenset({(day, "daily_stats")}),
+                pricing=pricing_raw,
             ),
             run_id=str(uuid4()),
             source_id=SOURCE_ID,
@@ -159,3 +179,83 @@ def test_mixed_contract_types_are_explicit_not_silently_collapsed() -> None:
     result = diff_contract(contract, observed, run_id=str(uuid4()))
     assert result.fatal is True
     assert result.events[0].drift_kind == "type_change"
+
+
+def test_empty_report_is_a_successful_secondary_domain(
+    daily_raws: dict[date, JsonObject],
+    graph_raw: JsonObject,
+    pricing_raw: JsonObject,
+) -> None:
+    """Accept an empty report response while recording completed coverage."""
+    day = min(daily_raws)
+    run_id = str(uuid4())
+    when = datetime.now(UTC)
+
+    bundle = build_collection_bundle(
+        _raw_collection(
+            day=day,
+            daily_models={day: daily_raws[day]},
+            report=[],
+            graph=graph_raw,
+            pricing=pricing_raw,
+        ),
+        run_id=run_id,
+        source_id=SOURCE_ID,
+        started_at=when,
+        finished_at=when,
+        host="pytest",
+    )
+
+    assert bundle.report_rows == []
+    report_status = next(
+        status for status in bundle.ingest_status if status.domain == "report"
+    )
+    assert (
+        report_status.status,
+        report_status.expected_count,
+        report_status.succeeded_count,
+        report_status.last_succeeded_run,
+        report_status.failure_code,
+    ) == ("complete", 1, 1, run_id, None)
+
+
+def test_secondary_contract_failures_do_not_block_required_collection(
+    daily_raws: dict[date, JsonObject],
+    graph_raw: JsonObject,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Record failed report and pricing domains without discarding usage facts."""
+    day = min(daily_raws)
+    run_id = str(uuid4())
+    when = datetime.now(UTC)
+
+    with caplog.at_level(logging.WARNING, logger="usagebassoon"):
+        bundle = build_collection_bundle(
+            _raw_collection(
+                day=day,
+                daily_models={day: daily_raws[day]},
+                report=[{}],
+                graph=graph_raw,
+                pricing={},
+            ),
+            run_id=run_id,
+            source_id=SOURCE_ID,
+            started_at=when,
+            finished_at=when,
+            host="pytest",
+        )
+
+    statuses = {status.domain: status for status in bundle.ingest_status}
+    assert bundle.daily_models[day].entries
+    assert bundle.report_rows == []
+    assert bundle.pricing_by_day == {}
+    assert (statuses["report"].status, statuses["report"].failure_code) == (
+        "failed",
+        "contract",
+    )
+    assert (statuses["pricing"].status, statuses["pricing"].failure_code) == (
+        "failed",
+        "contract",
+    )
+    assert "report contract validation failed" in caplog.text
+    assert "pricing contract validation failed" in caplog.text

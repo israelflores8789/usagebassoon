@@ -32,9 +32,9 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
         assert tables == [
             "daily_activity",
             "daily_cost",
-            "daily_processed_state",
             "daily_stats",
             "ingest_runs",
+            "ingest_status",
             "noted_sessions",
             "notes",
             "price_versions",

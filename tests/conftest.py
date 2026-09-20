@@ -18,7 +18,7 @@ from uuid import uuid4
 import pytest
 
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
-from usagebassoon.normalizer import CollectionBundle
+from usagebassoon.normalizer import CollectionBundle, IngestStatus
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
@@ -222,8 +222,9 @@ def collection_bundle(
     recon_result: ReconciliationResult,
 ) -> CollectionBundle:
     """Build a complete, validated CollectionBundle from the fixtures."""
+    run_id = str(uuid4())
     return CollectionBundle(
-        run_id=str(uuid4()),
+        run_id=run_id,
         source_id=SOURCE_ID,
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC) + timedelta(seconds=2),
@@ -240,11 +241,26 @@ def collection_bundle(
             }
             for day, payload in daily_models.items()
         },
-        processed_targets=frozenset(
-            (day, target)
-            for day in daily_models
-            for target in ("daily_stats", "price_versions")
+        ingest_status=tuple(
+            IngestStatus(
+                day=day,
+                domain=domain,
+                status="complete",
+                expected_count=(
+                    1
+                    if domain == "models"
+                    else len({row.stats.model for row in payload.entries})
+                ),
+                succeeded_count=(
+                    1
+                    if domain == "models"
+                    else len({row.stats.model for row in payload.entries})
+                ),
+                last_attempted_run=run_id,
+                last_succeeded_run=run_id,
+            )
+            for day, payload in daily_models.items()
+            for domain in ("models", "pricing")
         ),
-        failed_targets=frozenset(),
         reconciliation=recon_result,
     )

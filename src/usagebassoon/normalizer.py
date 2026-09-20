@@ -19,7 +19,7 @@ from usagebassoon.reconcile import ReconciliationResult
 from usagebassoon.system_metadata import SystemMetadata
 
 type ColumnarData = dict[str, list[object | None]]
-type ProcessingTarget = tuple[date, str]
+type IngestTarget = tuple[date, str]
 
 _TIMESTAMP = pa.timestamp("us", tz="UTC")
 
@@ -87,12 +87,18 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("updated_at", _TIMESTAMP),
         ]
     ),
-    "daily_processed_state": pa.schema(
+    "ingest_status": pa.schema(
         [
             pa.field("source_id", pa.string()),
             pa.field("day", pa.date32()),
-            pa.field("target", pa.string()),
-            pa.field("processed_at", _TIMESTAMP),
+            pa.field("domain", pa.string()),
+            pa.field("status", pa.string()),
+            pa.field("expected_count", pa.int64()),
+            pa.field("succeeded_count", pa.int64()),
+            pa.field("last_attempted_run", pa.string()),
+            pa.field("last_succeeded_run", pa.string()),
+            pa.field("failure_code", pa.string()),
+            pa.field("updated_at", _TIMESTAMP),
         ]
     ),
     "run_metrics": pa.schema(
@@ -171,8 +177,7 @@ class CollectionBundle:
         report_rows: Stable session metadata from tokscale report.
         graph: Activity dates and graph telemetry.
         pricing_by_day: Rate cards keyed by their associated usage day.
-        processed_targets: Targets whose data is safe to mark processed.
-        failed_targets: Targets left unmarked for the next collection retry.
+        ingest_status: Domain status rows that control daily retry eligibility.
         reconciliation: Non-fatal collection consistency observations.
         contract_drift: Schema contract deviations observed this run.
         fetch_summary: Rows-in counts for the ingest audit.
@@ -188,8 +193,7 @@ class CollectionBundle:
     report_rows: list[SessionRow]
     graph: GraphPayload
     pricing_by_day: dict[date, dict[str, PricingRow]]
-    processed_targets: frozenset[ProcessingTarget]
-    failed_targets: frozenset[ProcessingTarget]
+    ingest_status: tuple[IngestStatus, ...]
     reconciliation: ReconciliationResult
     contract_drift: tuple[ContractDrift, ...] = ()
     fetch_summary: dict[str, int] | None = None
@@ -203,6 +207,24 @@ class NormalizedBundle:
 
     run_id: str
     tables: dict[str, pa.Table]
+
+
+@dataclass(frozen=True, slots=True)
+class IngestStatus:
+    """One domain-level daily collection status.
+
+    ``expected_count`` and ``succeeded_count`` measure processing units rather
+    than output rows. For pricing, they represent expected and covered models.
+    """
+
+    day: date
+    domain: str
+    status: str
+    expected_count: int | None
+    succeeded_count: int | None
+    last_attempted_run: str
+    last_succeeded_run: str | None
+    failure_code: str | None = None
 
 
 def _col_major[T](records: list[dict[str, T]]) -> ColumnarData:
@@ -332,15 +354,31 @@ def _price_version_rows(
     return _col_major(records) if records else {}
 
 
-def _processed_state_rows(
-    targets: frozenset[ProcessingTarget], at: datetime, source_id: str
+def _ingest_status_rows(
+    statuses: tuple[IngestStatus, ...], at: datetime, source_id: str
 ) -> ColumnarData:
-    """Build state rows only for targets whose data is in this batch."""
+    """Build retry-ledger rows for domain outcomes in this collection."""
     records = [
-        {"source_id": source_id, "day": day, "target": target, "processed_at": at}
-        for day, target in sorted(targets)
+        {
+            "source_id": source_id,
+            "day": status.day,
+            "domain": status.domain,
+            "status": status.status,
+            "expected_count": status.expected_count,
+            "succeeded_count": status.succeeded_count,
+            "last_attempted_run": status.last_attempted_run,
+            "last_succeeded_run": status.last_succeeded_run,
+            "failure_code": status.failure_code,
+            "updated_at": at,
+        }
+        for status in sorted(statuses, key=_ingest_status_key)
     ]
     return _col_major(records) if records else {}
+
+
+def _ingest_status_key(status: IngestStatus) -> tuple[date, str]:
+    """Order one retry-ledger row deterministically by day and domain."""
+    return (status.day, status.domain)
 
 
 def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarData]:
@@ -354,7 +392,10 @@ def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarDa
         status = "failed"
     elif bundle.contract_drift:
         status = "schema_drift"
-    elif bundle.failed_targets or not bundle.reconciliation.ok:
+    elif (
+        any(status.status != "complete" for status in bundle.ingest_status)
+        or not bundle.reconciliation.ok
+    ):
         status = "partial"
     else:
         status = "ok"
@@ -450,8 +491,8 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
             _price_version_rows(bundle.pricing_by_day, at, bundle.source_id),
         ),
         (
-            "daily_processed_state",
-            _processed_state_rows(bundle.processed_targets, at, bundle.source_id),
+            "ingest_status",
+            _ingest_status_rows(bundle.ingest_status, at, bundle.source_id),
         ),
     )
     tables = {

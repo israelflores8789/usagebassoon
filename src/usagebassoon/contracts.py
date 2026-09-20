@@ -432,6 +432,7 @@ def validate_payloads(
     run_id: str,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
     detected_at: datetime | None = None,
+    required_kinds: frozenset[PayloadKind] | None = None,
 ) -> ContractValidation:
     """Validate every raw collection payload before parser invocation.
 
@@ -441,23 +442,34 @@ def validate_payloads(
         run_id: Owning collection run id.
         contracts: Explicit contracts for tests or custom deployments.
         detected_at: Shared drift timestamp when available.
+        required_kinds: Payload kinds that must be present. All supported kinds
+            are required when omitted.
 
     Returns:
         Aggregated drift events and fatal status.
 
     Raises:
-        ValueError: If a supported payload is absent or an unknown kind appears.
+        ValueError: If a required payload is absent or an unknown kind appears.
     """
     expected = contracts if contracts is not None else load_shipped_contracts()
     unknown = set(payloads) - set(PAYLOAD_KINDS)
     if unknown:
         raise ValueError(f"unknown payload kinds: {sorted(unknown)}")
+    required = (
+        required_kinds if required_kinds is not None else frozenset(PAYLOAD_KINDS)
+    )
+    if unsupported_required := required - frozenset(PAYLOAD_KINDS):
+        raise ValueError(
+            f"unsupported required payload kinds: {sorted(unsupported_required)}"
+        )
     events: list[ContractDrift] = []
     fatal = False
     for kind in PAYLOAD_KINDS:
         observations = payloads.get(kind)
         if observations is None or not observations:
-            raise ValueError(f"missing raw payload for {kind}")
+            if kind in required:
+                raise ValueError(f"missing raw payload for {kind}")
+            continue
         contract = expected[_payload_kind(kind)]
         for observed in observations:
             result = diff_contract(

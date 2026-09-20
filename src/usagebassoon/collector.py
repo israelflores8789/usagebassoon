@@ -30,13 +30,18 @@ from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.merge import PersistSummary, persist_run
-from usagebassoon.normalizer import NormalizedBundle, ProcessingTarget, normalize
+from usagebassoon.normalizer import (
+    IngestStatus,
+    IngestTarget,
+    NormalizedBundle,
+    normalize,
+)
 from usagebassoon.parsers.daily import parse_daily
 from usagebassoon.parsers.graph import parse_graph
 from usagebassoon.snapshots import SnapshotStore
 
-_DAILY_STATS_TARGET = "daily_stats"
-_PRICE_VERSIONS_TARGET = "price_versions"
+_MODELS_DOMAIN = "models"
+_PRICING_DOMAIN = "pricing"
 _MAX_TRANSACTION_RETRY_SECONDS = 30.0
 _COLLECTION_DEADLINE_MARGIN_SECONDS = 5.0
 _GRAPH_MAX_STDOUT_BYTES = 16 * 1024 * 1024
@@ -55,11 +60,6 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
     }
 )
 _LOG = logging.getLogger(LOGGER_NAME)
-
-
-def _empty_collection_result() -> tuple[str, PersistSummary]:
-    """Return the explicit result used when a recoverable cycle is skipped."""
-    return "", PersistSummary(inserted=0, updated=0, per_table={})
 
 
 def _snapshot_after_collect(
@@ -290,31 +290,61 @@ def _source_literal(source_id: str) -> str:
     return "'" + source_id.replace("'", "''") + "'"
 
 
-def _daily_state(
+def _load_ingest_status(
     config: UsageBassoonConfig,
-) -> tuple[frozenset[ProcessingTarget], dict[date, set[str]]]:
-    """Load processed targets and existing daily models for one source.
+) -> tuple[
+    dict[IngestTarget, IngestStatus], dict[date, set[str]], dict[date, set[str]]
+]:
+    """Load retry status plus persisted daily model and price coverage.
 
     Args:
         config: Active source and storage configuration.
 
     Returns:
-        Persisted completion markers and model ids by usage day.
+        Retry-ledger rows, persisted usage models, and persisted price models.
     """
     backend = open_backend(config)
     source = _source_literal(config.source_id)
     try:
         backend.apply_ddl()
-        state_rows = backend.query(
-            f"SELECT day, target FROM daily_processed_state WHERE source_id = {source}"
+        status_rows = backend.query(
+            "SELECT day, domain, status, expected_count, succeeded_count, "
+            "last_attempted_run, last_succeeded_run, failure_code "
+            f"FROM ingest_status WHERE source_id = {source}"
         ).to_pylist()
-        processed: set[ProcessingTarget] = set()
-        for row in state_rows:
+        statuses: dict[IngestTarget, IngestStatus] = {}
+        for row in status_rows:
             day = row["day"]
-            target = row["target"]
-            if not isinstance(day, date) or not isinstance(target, str):
-                raise RuntimeError("daily_processed_state contains an invalid row")
-            processed.add((day, target))
+            domain = row["domain"]
+            status = row["status"]
+            attempted = row["last_attempted_run"]
+            succeeded = row["last_succeeded_run"]
+            failure_code = row["failure_code"]
+            expected_count = row["expected_count"]
+            succeeded_count = row["succeeded_count"]
+            if (
+                not isinstance(day, date)
+                or not isinstance(domain, str)
+                or not isinstance(status, str)
+                or not isinstance(attempted, str)
+                or (succeeded is not None and not isinstance(succeeded, str))
+                or (failure_code is not None and not isinstance(failure_code, str))
+                or (expected_count is not None and not isinstance(expected_count, int))
+                or (
+                    succeeded_count is not None and not isinstance(succeeded_count, int)
+                )
+            ):
+                raise RuntimeError("ingest_status contains an invalid row")
+            statuses[(day, domain)] = IngestStatus(
+                day=day,
+                domain=domain,
+                status=status,
+                expected_count=expected_count,
+                succeeded_count=succeeded_count,
+                last_attempted_run=attempted,
+                last_succeeded_run=succeeded,
+                failure_code=failure_code,
+            )
         model_rows = backend.query(
             f"SELECT DISTINCT day, model FROM daily_stats WHERE source_id = {source}"
         ).to_pylist()
@@ -325,9 +355,19 @@ def _daily_state(
             if not isinstance(day, date) or not isinstance(model, str):
                 raise RuntimeError("daily_stats contains an invalid daily model key")
             models_by_day.setdefault(day, set()).add(model)
-        return frozenset(processed), models_by_day
+        price_rows = backend.query(
+            f"SELECT DISTINCT day, model FROM price_versions WHERE source_id = {source}"
+        ).to_pylist()
+        prices_by_day: dict[date, set[str]] = {}
+        for row in price_rows:
+            day = row["day"]
+            model = row["model"]
+            if not isinstance(day, date) or not isinstance(model, str):
+                raise RuntimeError("price_versions contains an invalid daily model key")
+            prices_by_day.setdefault(day, set()).add(model)
+        return statuses, models_by_day, prices_by_day
     finally:
-        close_backend(backend, context="loading daily collection state", logger=_LOG)
+        close_backend(backend, context="loading ingest status", logger=_LOG)
 
 
 def _persist_with_retries(
@@ -402,35 +442,29 @@ def _fetch_daily_models(
     config: UsageBassoonConfig,
     prefix: Sequence[str],
     days: Sequence[date],
-    logger: logging.Logger,
     *,
     deadline: float | None,
-) -> tuple[dict[date, JsonObject], set[ProcessingTarget]]:
-    """Fetch daily models payloads without marking failed days complete."""
+) -> dict[date, JsonObject]:
+    """Fetch every required daily models payload or raise on the first failure."""
     payloads: dict[date, JsonObject] = {}
-    failed: set[ProcessingTarget] = set()
     for day in days:
-        try:
-            payloads[day] = _object(
-                _json_command(
-                    config,
-                    prefix,
-                    "models",
-                    "--json",
-                    "--group-by",
-                    "client,session,model",
-                    "--since",
-                    day.isoformat(),
-                    "--until",
-                    day.isoformat(),
-                    deadline=deadline,
-                ),
-                f"models --since {day.isoformat()} --until {day.isoformat()}",
-            )
-        except Exception:
-            failed.add((day, _DAILY_STATS_TARGET))
-            logger.exception("daily models collection failed for %s", day.isoformat())
-    return payloads, failed
+        payloads[day] = _object(
+            _json_command(
+                config,
+                prefix,
+                "models",
+                "--json",
+                "--group-by",
+                "client,session,model",
+                "--since",
+                day.isoformat(),
+                "--until",
+                day.isoformat(),
+                deadline=deadline,
+            ),
+            f"models --since {day.isoformat()} --until {day.isoformat()}",
+        )
+    return payloads
 
 
 def _fetch_pricing(
@@ -440,14 +474,15 @@ def _fetch_pricing(
     logger: logging.Logger,
     *,
     deadline: float | None,
-) -> tuple[dict[date, dict[str, JsonObject]], set[ProcessingTarget]]:
-    """Fetch all rates needed for successfully available daily usage facts."""
+) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
+    """Fetch optional model prices while retaining successful per-model results."""
     pricing_by_day: dict[date, dict[str, JsonObject]] = {}
-    failed: set[ProcessingTarget] = set()
+    failures: dict[date, frozenset[str]] = {}
     for day, models in sorted(models_by_day.items()):
         prices: dict[str, JsonObject] = {}
-        try:
-            for model in sorted(models):
+        failed_models: set[str] = set()
+        for model in sorted(models):
+            try:
                 prices[model] = _object(
                     _json_command(
                         config,
@@ -459,12 +494,15 @@ def _fetch_pricing(
                     ),
                     f"pricing {model}",
                 )
-        except Exception:
-            failed.add((day, _PRICE_VERSIONS_TARGET))
-            logger.exception("pricing collection failed for %s", day.isoformat())
-        else:
-            pricing_by_day[day] = prices
-    return pricing_by_day, failed
+            except Exception:
+                failed_models.add(model)
+                logger.exception(
+                    "pricing collection failed for %s on %s", day.isoformat(), model
+                )
+        pricing_by_day[day] = prices
+        if failed_models:
+            failures[day] = frozenset(failed_models)
+    return pricing_by_day, failures
 
 
 def _fetch_reports(
@@ -474,9 +512,10 @@ def _fetch_reports(
     *,
     deadline: float | None,
     logger: logging.Logger | None = None,
-) -> JsonArray:
-    """Fetch daily-bounded session metadata without session-token attribution."""
-    reports: JsonArray = []
+) -> tuple[dict[date, JsonArray], frozenset[date]]:
+    """Fetch optional daily report payloads while preserving valid empty arrays."""
+    reports: dict[date, JsonArray] = {}
+    failures: set[date] = set()
     active_logger = logger or _LOG
     for day in days:
         try:
@@ -496,10 +535,11 @@ def _fetch_reports(
                 f"report --since {day.isoformat()} --until {day.isoformat()}",
             )
         except Exception:
+            failures.add(day)
             active_logger.exception("session report collection failed for %s", day)
         else:
-            reports.extend(report)
-    return reports
+            reports[day] = report
+    return reports, frozenset(failures)
 
 
 def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
@@ -515,6 +555,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
         logger = _LOG
         logger.exception("could not configure collection logging")
     started_at = datetime.now(UTC)
+    run_id = str(uuid4())
     try:
         prefix = _prefix(config)
         deadline = None
@@ -528,26 +569,21 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
                 0.0,
                 cadence.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
             )
-        try:
-            graph_raw = _object(
-                _json_command(
-                    config,
-                    prefix,
-                    "graph",
-                    deadline=deadline,
-                    max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
-                ),
+        graph_raw = _object(
+            _json_command(
+                config,
+                prefix,
                 "graph",
-            )
-        except Exception:
-            logger.exception("graph collection failed; skipping this cycle")
-            return _empty_collection_result()
+                deadline=deadline,
+                max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
+            ),
+            "graph",
+        )
         graph = parse_graph(graph_raw)
-        try:
-            processed, persisted_models = _daily_state(config)
-        except Exception:
-            logger.exception("could not load collection state; skipping this cycle")
-            return _empty_collection_result()
+        statuses, persisted_models, persisted_prices = _load_ingest_status(config)
+        completed = {
+            target for target, status in statuses.items() if status.status == "complete"
+        }
         today = datetime.now(UTC).date()
         candidate_days = tuple(
             sorted({contribution.date for contribution in graph.contributions})
@@ -555,58 +591,64 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
         daily_days = tuple(
             day
             for day in candidate_days
-            if day == today or (day, _DAILY_STATS_TARGET) not in processed
+            if day == today or (day, _MODELS_DOMAIN) not in completed
         )
         requested_price_days = tuple(
             day
             for day in candidate_days
-            if day == today or (day, _PRICE_VERSIONS_TARGET) not in processed
+            if day == today or (day, _PRICING_DOMAIN) not in completed
         )
-        daily_models, failed_targets = _fetch_daily_models(
+        daily_models = _fetch_daily_models(
             config,
             prefix,
             daily_days,
-            logger,
             deadline=deadline,
         )
-        pricing_models: dict[date, set[str]] = {}
+        pricing_expected_models: dict[date, frozenset[str]] = {}
+        pricing_requests: dict[date, set[str]] = {}
         for day in requested_price_days:
             if day in daily_models:
                 daily_payload = parse_daily(daily_models[day], day=day)
-                pricing_models[day] = {row.stats.model for row in daily_payload.entries}
-            elif (day, _DAILY_STATS_TARGET) in processed:
-                pricing_models[day] = persisted_models.get(day, set())
+                models = {row.stats.model for row in daily_payload.entries}
+            elif (day, _MODELS_DOMAIN) in completed:
+                models = persisted_models.get(day, set())
             else:
-                failed_targets.add((day, _PRICE_VERSIONS_TARGET))
-        pricing_by_day, pricing_failed = _fetch_pricing(
+                raise RuntimeError(
+                    f"pricing for {day.isoformat()} has no completed models status"
+                )
+            pricing_expected_models[day] = frozenset(models)
+            pricing_requests[day] = (
+                models if day == today else models - persisted_prices.get(day, set())
+            )
+        pricing_by_day, pricing_failures = _fetch_pricing(
             config,
             prefix,
-            pricing_models,
+            pricing_requests,
             logger,
             deadline=deadline,
         )
-        failed_targets.update(pricing_failed)
-        processed_targets: set[ProcessingTarget] = {
-            (day, _DAILY_STATS_TARGET) for day in daily_models
-        }
-        processed_targets.update(
-            (day, _PRICE_VERSIONS_TARGET) for day in pricing_by_day
+        report_by_day, report_fetch_failures = _fetch_reports(
+            config,
+            prefix,
+            candidate_days,
+            deadline=deadline,
+            logger=logger,
         )
         raw = RawCollection(
             daily_models=daily_models,
-            report=_fetch_reports(
-                config,
-                prefix,
-                candidate_days,
-                deadline=deadline,
-                logger=logger,
-            ),
+            report_by_day=report_by_day,
+            report_days=frozenset(candidate_days),
+            report_fetch_failures=report_fetch_failures,
             graph=graph_raw,
             pricing_by_day=pricing_by_day,
-            processed_targets=frozenset(processed_targets),
-            failed_targets=frozenset(failed_targets),
+            pricing_expected_models=pricing_expected_models,
+            pricing_existing_models={
+                day: frozenset(persisted_prices.get(day, set()))
+                for day in requested_price_days
+            },
+            pricing_fetch_failures=pricing_failures,
+            prior_statuses=statuses,
         )
-        run_id = str(uuid4())
         bundle = build_collection_bundle(
             raw,
             run_id=run_id,

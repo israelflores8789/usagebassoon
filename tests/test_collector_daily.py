@@ -18,7 +18,12 @@ from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.ingest import RawCollection
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.merge import PersistSummary
-from usagebassoon.normalizer import CollectionBundle, NormalizedBundle, ProcessingTarget
+from usagebassoon.normalizer import (
+    CollectionBundle,
+    IngestStatus,
+    IngestTarget,
+    NormalizedBundle,
+)
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -91,16 +96,14 @@ def test_daily_models_command_uses_each_candidate_day(
 
     monkeypatch.setattr(collector, "_json_command", command)
 
-    payloads, failed = collector._fetch_daily_models(
+    payloads = collector._fetch_daily_models(
         _config(Path("config.toml")),
         ["tokscale"],
         [day],
-        logging.getLogger("usagebassoon-test"),
         deadline=None,
     )
 
     assert payloads == {day: daily_raws[day]}
-    assert failed == set()
     assert calls == [
         (
             "models",
@@ -201,16 +204,16 @@ def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
-def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
+def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     graph_raw: JsonObject,
     report_raws: dict[date, JsonArray],
     daily_raws: dict[date, JsonObject],
 ) -> None:
-    """Use graph dates, refresh today, and only mark successfully fetched targets."""
+    """Use graph dates, skip completed history, and refresh the current day."""
     days = tuple(sorted(daily_raws))
-    completed_day, failed_day, *_, current_day = days
+    completed_day, *_, current_day = days
     captured: list[RawCollection] = []
     requested_models: list[tuple[date, ...]] = []
     requested_prices: list[dict[date, set[str]]] = []
@@ -237,17 +240,13 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
         _configuration: UsageBassoonConfig,
         _prefix: object,
         selected_days: tuple[date, ...],
-        _logger: logging.Logger,
         *,
         deadline: float | None,
-    ) -> tuple[dict[date, JsonObject], set[tuple[date, str]]]:
-        """Return all selected daily facts except one failed candidate day."""
+    ) -> dict[date, JsonObject]:
+        """Return all selected mandatory daily facts."""
         assert deadline is None
         requested_models.append(selected_days)
-        return (
-            {day: daily_raws[day] for day in selected_days if day != failed_day},
-            {(failed_day, "daily_stats")},
-        )
+        return {day: daily_raws[day] for day in selected_days}
 
     def pricing(
         _configuration: UsageBassoonConfig,
@@ -256,11 +255,11 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
         _logger: logging.Logger,
         *,
         deadline: float | None,
-    ) -> tuple[dict[date, dict[str, JsonObject]], set[tuple[date, str]]]:
+    ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
         """Record model-day pricing requests and complete the successful targets."""
         assert deadline is None
         requested_prices.append(models_by_day)
-        return ({day: {} for day in models_by_day}, set())
+        return ({day: {} for day in models_by_day}, {})
 
     def build(raw: RawCollection, **_kwargs: object) -> object:
         """Capture the raw bundle before normalization and persistence."""
@@ -271,19 +270,30 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
         """Return a deterministic tokscale executable for this unit test."""
         return ["tokscale"]
 
-    def daily_state(
+    def ingest_status(
         _configuration: UsageBassoonConfig,
-    ) -> tuple[frozenset[ProcessingTarget], dict[date, set[str]]]:
+    ) -> tuple[
+        dict[IngestTarget, IngestStatus],
+        dict[date, set[str]],
+        dict[date, set[str]],
+    ]:
         """Return one completed historical day and one refreshable current day."""
         return (
-            frozenset(
-                {
-                    (completed_day, "daily_stats"),
-                    (completed_day, "price_versions"),
-                    (current_day, "daily_stats"),
-                    (current_day, "price_versions"),
-                }
-            ),
+            {
+                (completed_day, "models"): IngestStatus(
+                    completed_day, "models", "complete", 1, 1, "old", "old"
+                ),
+                (completed_day, "pricing"): IngestStatus(
+                    completed_day, "pricing", "complete", 1, 1, "old", "old"
+                ),
+                (current_day, "models"): IngestStatus(
+                    current_day, "models", "complete", 1, 1, "old", "old"
+                ),
+                (current_day, "pricing"): IngestStatus(
+                    current_day, "pricing", "complete", 1, 1, "old", "old"
+                ),
+            },
+            {},
             {},
         )
 
@@ -302,11 +312,7 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
     monkeypatch.setattr(collector, "datetime", _FixedDatetime)
     monkeypatch.setattr(collector, "_prefix", prefix)
     monkeypatch.setattr(collector, "_json_command", command)
-    monkeypatch.setattr(
-        collector,
-        "_daily_state",
-        daily_state,
-    )
+    monkeypatch.setattr(collector, "_load_ingest_status", ingest_status)
     monkeypatch.setattr(collector, "_fetch_daily_models", daily_models)
     monkeypatch.setattr(collector, "_fetch_pricing", pricing)
     monkeypatch.setattr(collector, "build_collection_bundle", build)
@@ -315,32 +321,21 @@ def test_graph_candidates_skip_completed_targets_and_leave_failures_retryable(
 
     _, summary = collector.collect(_config(tmp_path / "config.toml"))
 
-    expected_successes = set(days) - {completed_day, failed_day}
+    expected_successes = set(days) - {completed_day}
     assert summary == PersistSummary(0, 0, {})
     assert requested_models == [tuple(day for day in days if day != completed_day)]
     assert set(requested_prices[0]) == expected_successes
     assert captured[0].graph is graph_raw
     assert set(captured[0].daily_models) == expected_successes
-    assert captured[0].report == [row for day in days for row in report_raws[day]]
-    assert captured[0].processed_targets == frozenset(
-        (day, target)
-        for day in expected_successes
-        for target in ("daily_stats", "price_versions")
-    )
-    assert captured[0].failed_targets == frozenset(
-        {
-            (failed_day, "daily_stats"),
-            (failed_day, "price_versions"),
-        }
-    )
+    assert captured[0].report_by_day == report_raws
+    assert captured[0].report_fetch_failures == frozenset()
+    assert set(captured[0].pricing_expected_models) == expected_successes
 
 
-def test_daily_models_failure_is_logged_and_left_retryable(
+def test_daily_models_failure_aborts_collection(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Treat one transient tokscale failure as a failed target, not a crash."""
-    logger = logging.getLogger("usagebassoon.test.daily-failure")
+    """Treat a required daily models failure as a failed collection run."""
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
         """Raise the kind of process-start failure a scheduled run can see."""
@@ -348,18 +343,13 @@ def test_daily_models_failure_is_logged_and_left_retryable(
 
     monkeypatch.setattr(collector, "_json_command", command)
 
-    with caplog.at_level(logging.ERROR, logger=logger.name):
-        payloads, failed = collector._fetch_daily_models(
+    with pytest.raises(OSError, match="tokscale executable unavailable"):
+        collector._fetch_daily_models(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],
-            logger,
             deadline=None,
         )
-
-    assert payloads == {}
-    assert failed == {(date(2026, 9, 10), "daily_stats")}
-    assert "daily models collection failed" in caplog.text
 
 
 def test_report_failure_is_logged_and_does_not_abort_collection(
@@ -376,7 +366,7 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
     monkeypatch.setattr(collector, "_json_command", command)
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
-        reports = collector._fetch_reports(
+        reports, failures = collector._fetch_reports(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],
@@ -384,15 +374,16 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
             logger=logger,
         )
 
-    assert reports == []
+    assert reports == {}
+    assert failures == frozenset({date(2026, 9, 10)})
     assert "session report collection failed" in caplog.text
 
 
-def test_graph_failure_skips_cycle_and_logs_to_operational_log(
+def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Return a no-op result for a transient graph failure in an autonomous run."""
+    """Fail the run when its required graph command is unavailable."""
     configuration = _config(tmp_path / "config.toml")
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
@@ -401,19 +392,18 @@ def test_graph_failure_skips_cycle_and_logs_to_operational_log(
 
     monkeypatch.setattr(collector, "_json_command", command)
 
-    run_id, summary = collector.collect(configuration)
+    with pytest.raises(RuntimeError, match="graph process failed"):
+        collector.collect(configuration)
 
-    assert run_id == ""
-    assert summary == PersistSummary(0, 0, {})
     log = (tmp_path / "logs" / "usagebassoon.log").read_text()
-    assert "graph collection failed; skipping this cycle" in log
+    assert "collection cycle failed before completion" in log
 
 
-def test_unexpected_graph_failure_skips_cycle_and_logs_to_operational_log(
+def test_unexpected_graph_failure_aborts_cycle_and_logs_to_operational_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep an unexpected subprocess failure from escaping the graph boundary."""
+    """Propagate unexpected required graph failures after recording context."""
     configuration = _config(tmp_path / "config.toml")
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
@@ -422,9 +412,8 @@ def test_unexpected_graph_failure_skips_cycle_and_logs_to_operational_log(
 
     monkeypatch.setattr(collector, "_json_command", command)
 
-    run_id, summary = collector.collect(configuration)
+    with pytest.raises(TypeError, match="unexpected graph process failure"):
+        collector.collect(configuration)
 
-    assert run_id == ""
-    assert summary == PersistSummary(0, 0, {})
     log = (tmp_path / "logs" / "usagebassoon.log").read_text()
-    assert "graph collection failed; skipping this cycle" in log
+    assert "collection cycle failed before completion" in log

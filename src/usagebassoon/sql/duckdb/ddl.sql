@@ -106,13 +106,24 @@ CREATE TABLE IF NOT EXISTS price_versions (
     PRIMARY KEY (source_id, day, model)
 );
 
--- Each successful target is independently marked, including empty results.
-CREATE TABLE IF NOT EXISTS daily_processed_state (
+-- ingest_status is the current daily retry ledger, not an ingest-run audit.
+-- day is the UTC usage day. expected_count and succeeded_count count work
+-- units rather than output rows; pricing counts expected and covered models.
+-- last_attempted_run and last_succeeded_run correlate status to collection
+-- runs. updated_at supports chronological inspection without changing
+-- ingest_runs, which remains the environment and run-metadata audit.
+CREATE TABLE IF NOT EXISTS ingest_status (
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
-    target TEXT NOT NULL,
-    processed_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (source_id, day, target)
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL,
+    expected_count BIGINT,
+    succeeded_count BIGINT,
+    last_attempted_run TEXT NOT NULL,
+    last_succeeded_run TEXT,
+    failure_code TEXT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_id, day, domain)
 );
 
 CREATE TABLE IF NOT EXISTS run_metrics (

@@ -246,7 +246,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         + EXPECTED_DAILY_STATS_ROWS
         + EXPECTED_DAYS
         + sum(len(prices) for prices in collection_bundle.pricing_by_day.values())
-        + len(collection_bundle.processed_targets)
+        + len(collection_bundle.ingest_status)
     )
     try:
         duckdb_backend.apply_ddl()
@@ -269,7 +269,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             ("daily_stats", "day, client, session_id, model"),
             ("daily_activity", "day"),
             ("price_versions", "day, model"),
-            ("daily_processed_state", "day, target"),
+            ("ingest_status", "day, domain"),
         ):
             bigquery_rows = _rows_for_source(
                 bigquery_backend,

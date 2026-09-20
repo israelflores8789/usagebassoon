@@ -23,7 +23,7 @@ from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, CollectionBundle, n
 from usagebassoon.system_metadata import SystemMetadata
 
 
-def test_normalize_emits_daily_tables_and_processing_state(
+def test_normalize_emits_daily_tables_and_ingest_status(
     collection_bundle: CollectionBundle,
 ) -> None:
     """Emit only base tables needed for daily facts and calculated views."""
@@ -37,7 +37,12 @@ def test_normalize_emits_daily_tables_and_processing_state(
         "observed_at",
         "updated_at",
     ]
-    assert normalized.tables["daily_processed_state"].column_names[-1] == "processed_at"
+    assert normalized.tables["ingest_status"].column_names[-4:] == [
+        "last_attempted_run",
+        "last_succeeded_run",
+        "failure_code",
+        "updated_at",
+    ]
     assert normalized.tables["ingest_runs"].column_names[-3:] == [
         "rows_inserted",
         "rows_updated",
@@ -72,13 +77,13 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         expected_prices = sum(
             len(prices) for prices in collection_bundle.pricing_by_day.values()
         )
-        expected_processed = len(collection_bundle.processed_targets)
+        expected_status = len(collection_bundle.ingest_status)
         assert (summary.inserted, summary.updated) == (
             EXPECTED_REPORT_ROWS
             + EXPECTED_DAILY_STATS_ROWS
             + EXPECTED_DAYS
             + expected_prices
-            + expected_processed,
+            + expected_status,
             0,
         )
         assert backend.query("SELECT count(*) AS n FROM daily_stats").to_pylist() == [
@@ -87,9 +92,9 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         assert backend.query(
             "SELECT count(*) AS n FROM price_versions"
         ).to_pylist() == [{"n": expected_prices}]
-        assert backend.query(
-            "SELECT count(*) AS n FROM daily_processed_state"
-        ).to_pylist() == [{"n": expected_processed}]
+        assert backend.query("SELECT count(*) AS n FROM ingest_status").to_pylist() == [
+            {"n": expected_status}
+        ]
         costs = backend.query(
             "SELECT count(*) AS rows, count(cost_usd) AS priced_rows FROM daily_cost"
         ).to_pylist()[0]
@@ -141,7 +146,7 @@ def test_reasoning_uses_the_output_price(
         backend.close()
 
 
-def test_processed_state_updates_only_for_refreshed_targets(
+def test_ingest_status_is_unchanged_when_no_domains_are_refreshed(
     collection_bundle: CollectionBundle,
 ) -> None:
     """Skip completed historical targets while allowing explicit refreshes."""
@@ -150,7 +155,7 @@ def test_processed_state_updates_only_for_refreshed_targets(
         backend.apply_ddl()
         persist_run(backend, normalize(collection_bundle))
         before = backend.query(
-            "SELECT min(processed_at) AS stamp FROM daily_processed_state"
+            "SELECT min(updated_at) AS stamp FROM ingest_status"
         ).to_pylist()[0]["stamp"]
         later = replace(
             collection_bundle,
@@ -158,11 +163,11 @@ def test_processed_state_updates_only_for_refreshed_targets(
             finished_at=collection_bundle.finished_at + timedelta(minutes=1),
             daily_models={},
             pricing_by_day={},
-            processed_targets=frozenset(),
+            ingest_status=(),
         )
         summary = persist_run(backend, normalize(later))
         after = backend.query(
-            "SELECT min(processed_at) AS stamp FROM daily_processed_state"
+            "SELECT min(updated_at) AS stamp FROM ingest_status"
         ).to_pylist()[0]["stamp"]
         assert (summary.inserted, summary.updated) == (0, 0)
         assert after == before
