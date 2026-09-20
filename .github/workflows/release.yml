@@ -1,0 +1,224 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Release
+
+on:
+  push:
+    tags:
+    - 'v[0-9]+.[0-9]+.[0-9]+*' # v1.2.3, v1.2.3rc1, ...
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false # never cancel a publish halfway
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Verify, test, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0 # hatch-vcs needs full tag history
+
+    - name: Verify Tag is on Main
+      env:
+        TAG_NAME: ${{ github.ref_name }}
+        TAG_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9.-]*)$ ]]; then
+          echo "Tag $TAG_NAME is not a supported version tag." >&2
+          exit 1
+        fi
+
+        git fetch origin main:refs/remotes/origin/main
+        if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+          echo "Tag $TAG_NAME does not point to a commit on main." >&2
+          exit 1
+        fi
+
+    - name: Extract Release Notes from CHANGELOG
+      env:
+        TAG_NAME: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+
+        VERSION="${TAG_NAME#v}"
+        CHANGELOG="CHANGELOG.md"
+        HEADING="## [$VERSION]"
+
+        if [[ ! -f "$CHANGELOG" ]]; then
+          echo "$CHANGELOG is missing." >&2
+          exit 1
+        fi
+
+        awk -v heading="$HEADING" '
+          index($0, heading) == 1 &&
+            (length($0) == length(heading) ||
+             substr($0, length(heading) + 1, 2) == " -") {
+              found=1
+              next
+          }
+          found && /^## \[/ { exit }
+          found { print }
+        ' "$CHANGELOG" > release-notes.md
+
+        if ! awk '/^[[:space:]]*[-*] / { found=1 } END { exit !found }' release-notes.md; then
+          echo "No bullet entries found in [$VERSION] — write release notes first." >&2
+          exit 1
+        fi
+
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: false # keep release builds independent of PR caches
+
+    - name: Install Python
+      run: uv python install 3.12
+
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+
+    - name: Run test suite (pre-publish gate)
+      run: |
+        # Live GCP tests already ran on the PR; re-run the hermetic suite
+        # so a tag on a stale main can still be caught.
+        uv run pytest -m "not (bigquery_live or gcs_live)" -q
+
+    - name: Build distributions
+      run: uv build --out-dir dist/
+
+    - name: Verify built version matches tag
+      id: meta
+      run: |
+        set -euo pipefail
+
+        shopt -s nullglob
+        wheels=(dist/*.whl)
+        if (( ${#wheels[@]} != 1 )); then
+          echo "Expected exactly one wheel, found ${#wheels[@]}." >&2
+          exit 1
+        fi
+
+        BUILT_VER="$(unzip -p "${wheels[0]}" '*/METADATA' | awk -F': ' '$1 == "Version" { print $2; exit }')"
+        TAG_VER="${GITHUB_REF_NAME#v}"
+        if [[ -z "$BUILT_VER" || "$TAG_VER" != "$BUILT_VER" ]]; then
+          echo "Tag $TAG_VER does not match built version $BUILT_VER." >&2
+          exit 1
+        fi
+
+        echo "built=$BUILT_VER tag=$TAG_VER"
+        echo "version=$BUILT_VER" >> "$GITHUB_OUTPUT"
+        if [[ "$BUILT_VER" =~ (a|b|rc|dev)[0-9]+$ ]]; then
+          echo "prerelease=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "prerelease=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload distributions
+      uses: actions/upload-artifact@v6
+      with:
+        name: dist
+        path: dist/
+        if-no-files-found: error
+
+    - name: Upload release notes
+      uses: actions/upload-artifact@v6
+      with:
+        name: release-notes
+        path: release-notes.md
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # GitHub "pypi" environment: add protection rules (e.g. required
+    # reviewers) here so a tag push alone can't ship unattended, and point
+    # the PyPI trusted publisher at this environment.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/usagebassoon
+    permissions:
+      id-token: write # OIDC trusted publishing — no API token
+    steps:
+    - name: Download distributions
+      uses: actions/download-artifact@v7
+      with:
+        name: dist
+        path: dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        # PEP 740 Sigstore attestations are generated and uploaded by
+        # default; leave explicit for clarity.
+        attestations: true
+        # A rerun after a successful upload should not fail on the same
+        # immutable package version.
+        skip-existing: true
+        # For a dry-run target instead, point a separate workflow at:
+        # repository-url: https://test.pypi.org/legacy/
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [prepare, publish-pypi] # only announce what actually shipped
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write # artifact attestations
+      attestations: write
+    steps:
+    - name: Download distributions
+      uses: actions/download-artifact@v7
+      with:
+        name: dist
+        path: dist/
+
+    - name: Download release notes
+      uses: actions/download-artifact@v7
+      with:
+        name: release-notes
+        path: .
+
+    - name: Attest build provenance
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: dist/*
+
+    - name: Publish GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ github.ref_name }}
+        PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      run: |
+        set -euo pipefail
+
+        if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "GitHub Release $RELEASE_TAG already exists; leaving it unchanged."
+          exit 0
+        fi
+
+        args=(
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --title "$RELEASE_TAG"
+          --notes-file release-notes.md
+        )
+        [[ "$PRERELEASE" == "true" ]] && args+=(--prerelease)
+        gh release create "$RELEASE_TAG" "${args[@]}" dist/*

@@ -128,8 +128,86 @@ release-check:
 release-test:
     uv publish --publish-url https://test.pypi.org/legacy/
 
-release:
-    uv publish
+# Rotate the changelog locally before opening the release PR.
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CHANGELOG="CHANGELOG.md"
+    VERSION="{{ version }}"
+
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9.-]*)$ ]]; then
+        echo "error: version must look like 1.2.3 or 1.2.3rc1" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$CHANGELOG" ]]; then
+        echo "error: $CHANGELOG is missing" >&2
+        exit 1
+    fi
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "error: working tree is dirty; commit or stash first" >&2
+        exit 1
+    fi
+
+    unreleased_count="$(awk '$0 == "## [Unreleased]" { count += 1 } END { print count + 0 }' "$CHANGELOG")"
+    if [[ "$unreleased_count" -ne 1 ]]; then
+        echo "error: expected exactly one '## [Unreleased]' heading, found $unreleased_count" >&2
+        exit 1
+    fi
+
+    if awk -v heading="## [$VERSION]" '
+        index($0, heading) == 1 &&
+          (length($0) == length(heading) ||
+           substr($0, length(heading) + 1, 2) == " -") {
+            found=1
+            exit
+        }
+        END { exit !found }
+    ' "$CHANGELOG"; then
+        echo "error: $CHANGELOG already has a [$VERSION] section" >&2
+        exit 1
+    fi
+
+    bullets="$(awk '
+        $0 == "## [Unreleased]" { inside=1; next }
+        inside && /^## \[/ { inside=0 }
+        inside && /^[[:space:]]*[-*] / { count += 1 }
+        END { print count + 0 }
+    ' "$CHANGELOG")"
+    if [[ "$bullets" -eq 0 ]]; then
+        echo "error: [Unreleased] has no bullet entries; write release notes first" >&2
+        exit 1
+    fi
+
+    today="$(date -u +%Y-%m-%d)"
+    tmp="$(mktemp "${CHANGELOG}.tmp.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+
+    awk -v version="$VERSION" -v date="$today" '
+        $0 == "## [Unreleased]" {
+            print
+            print ""
+            print "## [" version "] - " date
+            next
+        }
+        { print }
+    ' "$CHANGELOG" > "$tmp"
+
+    target="## [$VERSION] - $today"
+    if ! awk -v target="$target" '$0 == target { found=1 } END { exit !found }' "$tmp"; then
+        echo "error: changelog rewrite failed validation; file untouched" >&2
+        exit 1
+    fi
+
+    mv "$tmp" "$CHANGELOG"
+    trap - EXIT
+
+    echo "Prepared $CHANGELOG for v$VERSION. Review and commit it, then merge the PR."
+    echo "After merging, tag the resulting main commit:"
+    echo "  git tag -a v$VERSION -m \"v$VERSION\""
+    echo "  git push origin v$VERSION"
 
 
 # --- tokscale canonical commands ---
