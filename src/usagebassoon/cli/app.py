@@ -12,7 +12,7 @@ from usagebassoon.cli.export import export
 from usagebassoon.cli.init import init
 from usagebassoon.cli.note import note_app
 from usagebassoon.cli.query import query
-from usagebassoon.cli.report import report
+from usagebassoon.cli.report import report_app
 from usagebassoon.cli.restore import restore
 from usagebassoon.cli.schedule import schedule_app
 from usagebassoon.cli.snapshot import snapshot
@@ -37,7 +37,7 @@ app.command(name="init")(init)
 app.add_typer(tag_app, name="tag")
 app.add_typer(note_app, name="note")
 app.command(name="query")(query)
-app.command(name="report")(report)
+app.add_typer(report_app, name="report")
 app.command(name="restore")(restore)
 app.command(name="audit")(audit)
 app.command(name="snapshot")(snapshot)

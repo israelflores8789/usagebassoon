@@ -17,6 +17,7 @@ from usagebassoon import collector
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.ingest import RawCollection
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
+from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 from usagebassoon.merge import PersistSummary
 from usagebassoon.normalizer import (
     CollectionBundle,
@@ -384,6 +385,7 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fail the run when its required graph command is unavailable."""
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     configuration = _config(tmp_path / "config.toml")
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
@@ -404,6 +406,7 @@ def test_unexpected_graph_failure_aborts_cycle_and_logs_to_operational_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Propagate unexpected required graph failures after recording context."""
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     configuration = _config(tmp_path / "config.toml")
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:

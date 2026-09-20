@@ -48,13 +48,65 @@ GROUP BY source_id, client, session_id, model;
 CREATE OR REPLACE VIEW session_model_stats_current AS
 SELECT * FROM session_model_stats;
 
+-- Report source views preserve filter dimensions; terminal commands aggregate
+-- them after applying source, client, model, workspace, and effective-tag filters.
+CREATE OR REPLACE VIEW report_daily_usage AS
+SELECT
+    daily_cost.source_id,
+    daily_cost.day,
+    daily_cost.client,
+    daily_cost.session_id,
+    daily_cost.model,
+    sessions.workspace,
+    daily_cost.input_tokens,
+    daily_cost.output_tokens,
+    daily_cost.cache_read,
+    daily_cost.cache_write,
+    daily_cost.reasoning,
+    daily_cost.total_tokens,
+    daily_cost.cost_usd,
+    daily_cost.tokscale_cost_usd
+FROM daily_cost
+LEFT JOIN sessions
+    ON sessions.source_id = daily_cost.source_id
+    AND sessions.client = daily_cost.client
+    AND sessions.session_id = daily_cost.session_id;
+
+CREATE OR REPLACE VIEW report_session_models AS
+SELECT
+    session_model_stats.source_id,
+    session_model_stats.client,
+    session_model_stats.session_id,
+    session_model_stats.model,
+    sessions.workspace,
+    sessions.last_active,
+    session_model_stats.input_tokens,
+    session_model_stats.output_tokens,
+    session_model_stats.cache_read,
+    session_model_stats.cache_write,
+    session_model_stats.reasoning,
+    session_model_stats.total_tokens,
+    session_model_stats.cost_usd,
+    session_model_stats.tokscale_cost_usd
+FROM session_model_stats
+LEFT JOIN sessions
+    ON sessions.source_id = session_model_stats.source_id
+    AND sessions.client = session_model_stats.client
+    AND sessions.session_id = session_model_stats.session_id;
+
+-- Retained public relations for the query API and doctor checks. The terminal
+-- summary command now uses report_session_models directly.
 CREATE OR REPLACE VIEW report_summary AS
 SELECT
     COUNT(*) AS sessions,
     COALESCE(SUM(cost_usd), 0) AS cost_usd
 FROM (
-    SELECT source_id, client, session_id, SUM(cost_usd) AS cost_usd
-    FROM session_model_stats
+    SELECT
+        source_id,
+        client,
+        session_id,
+        CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS cost_usd
+    FROM report_session_models
     GROUP BY source_id, client, session_id
 ) AS session_costs;
 
@@ -63,7 +115,7 @@ SELECT
     model,
     COALESCE(SUM(total_tokens), 0) AS total_tokens,
     COALESCE(SUM(cost_usd), 0) AS cost_usd
-FROM session_model_stats
+FROM report_session_models
 GROUP BY model
 ORDER BY cost_usd DESC, model;
 

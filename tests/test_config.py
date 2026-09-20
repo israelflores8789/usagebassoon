@@ -18,7 +18,7 @@ from usagebassoon.config import (
     ConfigurationManager,
     update_schedule_interval,
 )
-from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR, LOGGER_NAME
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +28,7 @@ def isolate_config_error_logs(
 ) -> Iterator[None]:
     """Keep invalid-config log files inside each test's temporary directory."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     logger = logging.getLogger(LOGGER_NAME)
     existing_handlers = tuple(logger.handlers)
     yield

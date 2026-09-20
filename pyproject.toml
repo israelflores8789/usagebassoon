@@ -67,6 +67,9 @@ fallback-version = "0.1.0"
 [tool.hatch.build.targets.wheel]
 packages = ["src/usagebassoon"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"tests/fixtures" = "usagebassoon/cli/reports/_fixtures"
+
 [tool.ruff]
 target-version = "py312"
 line-length = 88

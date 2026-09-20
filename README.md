@@ -114,9 +114,13 @@ bassoon tag important --client codex --session ses_123
 bassoon note "Investigate cache miss" --client codex --session ses_123
 ```
 
+## Terminal Reports
+
+`bassoon report` lists terminal-first reports over the configured warehouse. `bassoon report daily` shows the newest daily usage and cost rows (16 by default), while `bassoon report sessions` shows the newest sessions (use `--by-model` for session/model detail). `bassoon report graph` renders up to 31 days of daily bars, showing USD cost by default; select token metrics with `--metric`. Token values use one-decimal `K`, `M`, and `T` units; daily USD values use three decimal places and session USD values use cents. All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only. `--width 100` is the default bounded layout, `--width max` disables truncation, and `--test` renders deterministic output from the packaged sanitized golden fixtures without reading a backend. Use `--sanitize` before sharing or `--save PATH` to write a text artifact.
+
 ## Privacy and sharing
 
-Reports are raw by default for personal terminal use; run `bassoon report --sanitize` before sharing one. `bassoon doctor` is the shareable diagnostics command and sanitizes configuration locations and credentials by default. Its `--raw` mode prints a warning not to paste raw output into public GitHub issues.
+Reports are raw by default for personal terminal use; run `bassoon report <name> --sanitize` before sharing one. `bassoon doctor` is the shareable diagnostics command and sanitizes configuration locations and credentials by default. Its `--raw` mode prints a warning not to paste raw output into public GitHub issues.
 
 `bassoon query` intentionally returns raw values, accepts only one read-only SELECT or WITH query, and always warns on stderr not to share its output publicly. Use `bassoon doctor` for issue-ready diagnostics instead.
 

@@ -52,7 +52,10 @@ spell-fix:
     typos --write-changes
 
 test *args:
-    {{pytest}} -v -s {{args}}
+    #!/usr/bin/env bash
+    test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
+    trap 'rm -rf "$test_log_directory"' EXIT
+    USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{pytest}} -v -s {{args}}
 
 test-bq-live test-name reset="0":
     @mkdir -p .test_logs

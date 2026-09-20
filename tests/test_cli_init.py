@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import CONFIG_PATH_ENV_VAR, ConfigurationManager
+from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 
 
 def test_init_creates_source_config_and_local_schema(
@@ -63,8 +64,10 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
 
 def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Report an invalid preserved config without exposing a traceback."""
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     config_path = tmp_path / "config.toml"
     log_directory = tmp_path / "logs"
     config_path.write_text(
