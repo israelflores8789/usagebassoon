@@ -46,6 +46,42 @@ jobs:
     - name: Pyrefly type check
       run: just typecheck
 
+  sql-parity:
+    name: Live SQL dialect parity
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Run SQL dialect parity tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: just test
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: Live SQL dialect parity
+        custom-arguments: >-
+          -m sql_parity --junitxml=junit-live-sql-parity.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-live-sql-parity
+        path: junit-live-sql-parity.xml
+        if-no-files-found: warn
+        retention-days: 14
+
   unit:
     name: Live unit + local DuckDB (py ${{ matrix.python }})
     runs-on: ubuntu-26.04
@@ -69,14 +105,14 @@ jobs:
     - name: Run unit and local DuckDB tests
       uses: pavelzw/pytest-action@v2
       with:
-        custom-pytest: just test
+        custom-pytest: just test-unit
         verbose: false
         emoji: true
         job-summary: true
         click-to-expand: true
         report-title: Live unit + local DuckDB (Python ${{ matrix.python }})
         custom-arguments: >-
-          -m "not (bigquery_live or gcs_live)" --junitxml=junit-live-unit-${{ matrix.python }}.xml -q
+          --junitxml=junit-live-unit-${{ matrix.python }}.xml -q
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v6
@@ -233,19 +269,20 @@ jobs:
     name: CI Live gate
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [lint, unit, build, bigquery-live, gcs-live]
+    needs: [lint, sql-parity, unit, build, bigquery-live, gcs-live]
     if: always()
     steps:
     - name: Evaluate results
       env:
         LINT: ${{ needs.lint.result }}
+        SQL_PARITY: ${{ needs.sql-parity.result }}
         UNIT: ${{ needs.unit.result }}
         BUILD: ${{ needs.build.result }}
         BQ: ${{ needs.bigquery-live.result }}
         GCS: ${{ needs.gcs-live.result }}
       run: |
         set -euo pipefail
-        echo "lint=$LINT unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS"
-        for result in "$LINT" "$UNIT" "$BUILD" "$BQ" "$GCS"; do
+        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS"
+        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD" "$BQ" "$GCS"; do
           [ "$result" = "success" ] || exit 1
         done

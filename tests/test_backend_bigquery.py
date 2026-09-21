@@ -459,6 +459,20 @@ def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     assert f"FROM `{table_prefix}.sessions` AS sessions" in qualified
     assert f"JOIN `{table_prefix}.tags` AS tags" in qualified
 
+    qualified_reports = backend._qualify_view_sql(
+        "CREATE OR REPLACE VIEW report_summary AS "
+        "SELECT * FROM report_session_models "
+        "JOIN report_daily_usage ON TRUE"
+    )
+    assert (
+        f"FROM `{table_prefix}.report_session_models` AS report_session_models"
+        in qualified_reports
+    )
+    assert (
+        f"JOIN `{table_prefix}.report_daily_usage` AS report_daily_usage"
+        in qualified_reports
+    )
+
 
 def test_bigquery_classifies_only_concurrent_transaction_aborts_as_retryable() -> None:
     """Retry the documented transaction-conflict response and no other bad request."""

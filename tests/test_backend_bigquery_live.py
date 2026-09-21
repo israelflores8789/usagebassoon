@@ -27,6 +27,7 @@ from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from typer.testing import CliRunner
 
+from tests._sql_parity import assert_view_results_match, seed_synthetic_data
 from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_DAYS,
@@ -230,6 +231,21 @@ def _stage_tables(
         for item in client.list_tables(dataset_id)
         if item.table_id.startswith("_stage_") and item.table_id.endswith(suffix)
     )
+
+
+def test_live_synthetic_views_match_duckdb(live_settings: LiveSettings) -> None:
+    """Compare every view using purpose-built rows in native BigQuery."""
+    duckdb_backend = DuckDBBackend(":memory:")
+    bigquery_backend = _backend(live_settings)
+    try:
+        duckdb_backend.apply_ddl()
+        bigquery_backend.apply_ddl()
+        seed_synthetic_data(duckdb_backend)
+        seed_synthetic_data(bigquery_backend)
+        assert_view_results_match(duckdb_backend, bigquery_backend)
+    finally:
+        duckdb_backend.close()
+        bigquery_backend.close()
 
 
 def test_live_batch_matches_duckdb_and_retries_idempotently(

@@ -39,6 +39,7 @@ from usagebassoon.backends.base import (
     UpsertResult,
     is_simple_identifier,
 )
+from usagebassoon.schema_assets import RUNTIME_SCHEMA_ASSETS
 
 _PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
@@ -49,6 +50,8 @@ _JOB_WAIT_SECONDS = 120.0
 _VIEW_RELATIONS = (
     "report_summary",
     "report_models",
+    "report_daily_usage",
+    "report_session_models",
     "session_model_stats_current",
     "daily_cost",
     "tagged_sessions",
@@ -363,7 +366,7 @@ class BigQueryBackend(AbstractStorageBackend):
             )
         package = resources.files("usagebassoon.sql.bigquery")
         try:
-            for filename in ("ddl.sql", "views.sql"):
+            for filename in RUNTIME_SCHEMA_ASSETS:
                 sql = package.joinpath(filename).read_text()
                 if filename == "views.sql":
                     sql = self._qualify_view_sql(sql)

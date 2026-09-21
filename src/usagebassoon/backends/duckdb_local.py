@@ -24,6 +24,7 @@ from usagebassoon.backends.base import (
     UpsertResult,
     is_simple_identifier,
 )
+from usagebassoon.schema_assets import RUNTIME_SCHEMA_ASSETS
 
 
 def _identifier(value: str) -> str:
@@ -60,7 +61,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def apply_ddl(self) -> None:
         """Apply the shared DuckDB and MotherDuck DDL plus views."""
         package = resources.files("usagebassoon.sql.duckdb")
-        for filename in ("ddl.sql", "views.sql"):
+        for filename in RUNTIME_SCHEMA_ASSETS:
             self.connection.execute(package.joinpath(filename).read_text())
 
     @override

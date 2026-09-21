@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
-
 # UsageBassoon justfile recipes
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
@@ -18,9 +17,7 @@ install-motherduck:
     @echo "Installing motherduck 🦆..."
     @curl -s https://install.motherduck.com | sh
 
-
 # ---- build & publish ----
-
 # Remember to set the UV_PUBLISH_TOKEN environment variable.
 
 build:
@@ -37,8 +34,7 @@ publish-test: check-dist
         --publish-url https://test.pypi.org/legacy/
 
 publish *args: check-dist
-    uv publish {{args}}
-
+    uv publish {{ args }}
 
 # ---- hygiene ----
 
@@ -55,7 +51,14 @@ test *args:
     #!/usr/bin/env bash
     test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
     trap 'rm -rf "$test_log_directory"' EXIT
-    USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{pytest}} -v -s {{args}}
+    USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{ pytest }} -v -s {{ args }}
+
+test-unit *args:
+    #!/usr/bin/env bash
+    test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
+    trap 'rm -rf "$test_log_directory"' EXIT
+    USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{ pytest }} -v -s \
+        -m "not (bigquery_live or gcs_live or sql_parity)" {{ args }}
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
 test-bq-live test-name reset="0":
@@ -65,11 +68,11 @@ test-bq-live test-name reset="0":
     test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
     trap 'rm -rf "$test_log_directory"' EXIT
     {
-        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"
-        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{reset}} {{pytest}} -vv \
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{ test-name }}"
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{ reset }} {{ pytest }} -vv \
         --tb=short \
         --color=no \
-        "{{test-name}}" < /dev/null
+        "{{ test-name }}" < /dev/null
     } 2>&1 | tee .test_logs/pytest-bq-live.log
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
@@ -80,40 +83,40 @@ test-gcs-live test-name:
     test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
     trap 'rm -rf "$test_log_directory"' EXIT
     {
-        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"
-        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_GCS_LIVE=1 {{pytest}} -vv \
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{ test-name }}"
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_GCS_LIVE=1 {{ pytest }} -vv \
         --tb=short \
         --color=no \
-        "{{test-name}}" < /dev/null
+        "{{ test-name }}" < /dev/null
     } 2>&1 | tee .test_logs/pytest-gcs-live.log
 
 # Run tests with coverage reporting
 coverage *args:
-    {{pytest}} --cov=src --cov-report=term-missing {{args}}
+    {{ pytest }} --cov=src --cov-report=term-missing {{ args }}
 
 lint:
     #!/usr/bin/env bash
     set -u
     status=0
 
-    uv run ruff check {{src_dir}} {{test_dir}} || status=1
-    uv run ruff format --check {{src_dir}} {{test_dir}} || status=1
+    uv run ruff check {{ src_dir }} {{ test_dir }} || status=1
+    uv run ruff format --check {{ src_dir }} {{ test_dir }} || status=1
 
     exit "$status"
 
 lint-fix:
-    uv run ruff check --fix {{src_dir}} {{test_dir}}
-    uv run ruff format {{src_dir}} {{test_dir}}
+    uv run ruff check --fix {{ src_dir }} {{ test_dir }}
+    uv run ruff format {{ src_dir }} {{ test_dir }}
 
 typecheck:
-    uv run pyrefly check {{src_dir}} {{test_dir}}
+    uv run pyrefly check {{ src_dir }} {{ test_dir }}
 
 clean:
     rm -rf dist/ build/ .pytest_cache/ .mypy_cache/ .ruff_cache/
     find . -type d -name __pycache__ -prune -exec rm -rf {} +
 
 check-justfile:
-    just --fmt --check
+    just --unstable --fmt --check
 
 check-license:
     #!/usr/bin/env bash
@@ -125,10 +128,9 @@ check-license:
         echo "LICENSES/AGPL-3.0-only.txt present."
     fi
 
-
 # ---- full CI gate ----
 
-ci: test lint typecheck
+ci: test-unit lint typecheck
 
 # --- CD / release ---
 
@@ -222,9 +224,7 @@ release version:
     echo "  git tag -a v$VERSION -m \"v$VERSION\""
     echo "  git push origin v$VERSION"
 
-
 # --- tokscale canonical commands ---
-
 # Canonical tokscale commands for raw JSON data input.
 # These commands are the raw interface for usagebassoon.
 # Use the versioned golden JSON fixtures in tests/fixtures/ for testing.
