@@ -13,9 +13,24 @@ from typer.testing import CliRunner
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.cli.reports.graph import _tick_positions
+from usagebassoon.cli.reports.sessions import _model_label
 
 LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 REMOTE_SOURCE_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def test_gemini_flash_model_labels_preserve_the_version_when_width_allows() -> None:
+    """Keep Gemini Flash versions identifiable in the bounded session table."""
+    assert _model_label("gemini-3.8-flash", True, 94) == "gemin…-flash"
+    assert _model_label("gemini-3.8-flash", True, 100) == "ge…3.8-flash"
+    assert _model_label("gemini-3.8-flash", True, 101) == "gem…3.8-flash"
+    assert _model_label("gemini-3.8-flash", True, None) == "gemini-3.8-flash"
+    assert _model_label("gpt-5.6-terra", True, 100) == "gpt-5…-terra"
+    assert (
+        _model_label("gemini-3.8-flash, gemini-3.7-flash", False, 100)
+        == "ge…3.8-flash+1"
+    )
+    assert _model_label("gpt-5.6-luna, gpt-5.6-terra", False, 100) == "gpt-5.6-luna+1"
 
 
 def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
@@ -216,7 +231,7 @@ def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
     )
 
     assert result.exit_code == 0
-    assert "$1.234" in result.output
+    assert "$1.23" in result.output
     assert "$6,670.270" in result.output
 
 
@@ -266,12 +281,37 @@ def test_sessions_report_defaults_to_session_and_can_split_models(
     assert "Model" in session_result.output
     assert "Cost/1M" in session_result.output
     assert "$0.00" in session_result.output
-    assert " +1" in session_result.output
+    assert "+1" in session_result.output
     assert "…" in session_result.output
     assert model_result.exit_code == 0
     assert "Session Token Usage by Model" in model_result.output
     assert "gpt-test" in model_result.output
     assert "gpt-mini" in model_result.output
+
+
+def test_session_values_and_model_counts_remain_whole_at_eighty_columns() -> None:
+    """Protect numeric values and aggregate-model counts at the minimum width."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "sessions",
+            "--test",
+            "--width",
+            "80",
+            "--limit",
+            "8",
+            "--sanitize",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "25.1K" in result.output
+    assert "178.2K" in result.output
+    assert "$0.11" in result.output
+    assert "$0.535" in result.output
+    assert "luna+1" in result.output
+    assert "flash+1" in result.output
 
 
 def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
@@ -300,6 +340,18 @@ def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
     assert "10" in result.output
 
 
+def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
+    """Render graph currency labels with the same two-decimal precision as Cost."""
+    result = CliRunner().invoke(
+        app,
+        ["report", "graph", "--test", "--days", "3", "--sanitize"],
+    )
+
+    assert result.exit_code == 0
+    assert "$6.99" in result.output
+    assert "$6.990" not in result.output
+
+
 def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     """Render the newest golden daily totals with their unit and cost formatting."""
     result = CliRunner().invoke(
@@ -318,7 +370,7 @@ def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     assert "2026-09-10" in result.output
     assert "391.5K" in result.output
     assert "6.7M" in result.output
-    assert "$1.119" in result.output
+    assert "$1.12" in result.output
 
 
 def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:

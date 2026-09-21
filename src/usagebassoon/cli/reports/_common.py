@@ -513,7 +513,19 @@ def render_tables(
             show_header=True,
         )
         for header, justify in columns:
-            table.add_column(header, justify=justify, no_wrap=True, overflow="ellipsis")
+            protected_width = (
+                max(len(header), *(len(row[header]) for row in rows))
+                if width is None
+                or (width >= 80 and (justify == "right" or header == "Model"))
+                else None
+            )
+            table.add_column(
+                header,
+                justify=justify,
+                min_width=protected_width,
+                no_wrap=True,
+                overflow="ellipsis",
+            )
         if rows:
             for row in rows:
                 table.add_row(*(row[header] for header, _ in columns))

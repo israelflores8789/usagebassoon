@@ -146,7 +146,29 @@ def sessions(
 def _model_label(value: object, by_model: bool, width: int | None) -> str:
     """Render one model, adding the count of additional session models when needed."""
     models = str(value).split(", ")
-    label = (
-        models[0] if by_model or len(models) == 1 else f"{models[0]} +{len(models) - 1}"
-    )
-    return truncate_middle(label, width, 12)
+    model = models[0]
+    additional = "" if by_model or len(models) == 1 else f"+{len(models) - 1}"
+    if width is None:
+        return f"{model}{additional}"
+
+    gemini_label = _gemini_flash_label(model, width) if width >= 95 else None
+    maximum = 12 if width >= 95 else max(1, 12 - len(additional))
+    identifier = gemini_label or truncate_middle(model, width, maximum)
+    return f"{identifier}{additional}"
+
+
+def _gemini_flash_label(model: str, width: int) -> str | None:
+    """Preserve the version of a bounded Gemini Flash model label when possible."""
+    prefix = "gemini-"
+    suffix = "-flash"
+    if not model.startswith(prefix) or not model.endswith(suffix):
+        return None
+
+    version = model.removeprefix(prefix).removesuffix(suffix)
+    if not version:
+        return None
+
+    visible_prefix = min(len("gemini"), 2 + max(0, width - 100))
+    if visible_prefix == len("gemini"):
+        return model
+    return f"{model[:visible_prefix]}…{version}{suffix}"
