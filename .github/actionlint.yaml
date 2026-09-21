@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+    - 'label "ubuntu-26\.04" is unknown'

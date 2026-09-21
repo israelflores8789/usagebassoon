@@ -1,0 +1,247 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: CI Live
+
+on:
+  push:
+    branches: [main, dev]
+
+concurrency:
+  group: ci-live-${{ github.ref }}
+  cancel-in-progress: false
+
+# Environment-scoped variables are intentionally used only by the two cloud
+# jobs below. The ci-live environment should be restricted to main and dev.
+# Live tests use fixed, protected, pre-provisioned resources:
+#   BigQuery dataset: usagebassoon_it
+#   GCS bucket: gs://usagebassoon-test-snapshots-gen-lang-client-0670612427
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Live lint and type check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Ruff lint and format checks
+      run: just lint
+    - name: Pyrefly type check
+      run: just typecheck
+
+  unit:
+    name: Live unit + local DuckDB (py ${{ matrix.python }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python ${{ matrix.python }}
+      run: uv python install ${{ matrix.python }}
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python ${{ matrix.python }}
+    - name: Run unit and local DuckDB tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: Live unit + local DuckDB (Python ${{ matrix.python }})
+        custom-arguments: >-
+          -m "not (bigquery_live or gcs_live)" --junitxml=junit-live-unit-${{ matrix.python }}.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-live-unit-py-${{ matrix.python }}
+        path: junit-live-unit-${{ matrix.python }}.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  build:
+    name: Live build and validate distributions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Build distributions
+      run: uv build --no-sources
+    - name: Validate distributions
+      run: uv run twine check dist/*
+
+  bigquery-live:
+    name: Live BigQuery (WIF)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    environment:
+      name: ci-live
+    concurrency:
+      # These tests reset the shared dedicated dataset at module setup.
+      group: usagebassoon-bigquery-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USAGEBASSOON_BIGQUERY_LIVE: "1"
+      USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
+      USAGEBASSOON_BIGQUERY_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      USAGEBASSOON_BIGQUERY_DATASET: usagebassoon_it
+      USAGEBASSOON_BIGQUERY_LOCATION: US
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Verify dedicated CI dataset
+      env:
+        GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      run: |
+        set -euo pipefail
+        test -n "$GCP_PROJECT_ID"
+        bq show --project_id "$GCP_PROJECT_ID" \
+          "$GCP_PROJECT_ID:usagebassoon_it" >/dev/null
+    - name: Run bigquery_live tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: BigQuery live tests
+        custom-arguments: >-
+          -m bigquery_live --junitxml=junit-bigquery-live.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-bigquery-live
+        path: junit-bigquery-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  gcs-live:
+    name: Live GCS snapshots (WIF)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    environment:
+      name: ci-live
+    concurrency:
+      # The tests use the shared dedicated bucket and must not overlap.
+      group: usagebassoon-gcs-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USAGEBASSOON_GCS_LIVE: "1"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Run gcs_live tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: uv run pytest
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: GCS live tests
+        custom-arguments: >-
+          -m gcs_live --junitxml=junit-gcs-live.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-gcs-live
+        path: junit-gcs-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  gate:
+    name: CI Live gate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    needs: [lint, unit, build, bigquery-live, gcs-live]
+    if: always()
+    steps:
+    - name: Evaluate results
+      env:
+        LINT: ${{ needs.lint.result }}
+        UNIT: ${{ needs.unit.result }}
+        BUILD: ${{ needs.build.result }}
+        BQ: ${{ needs.bigquery-live.result }}
+        GCS: ${{ needs.gcs-live.result }}
+      run: |
+        set -euo pipefail
+        echo "lint=$LINT unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS"
+        for result in "$LINT" "$UNIT" "$BUILD" "$BQ" "$GCS"; do
+          [ "$result" = "success" ] || exit 1
+        done
