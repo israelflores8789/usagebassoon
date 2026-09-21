@@ -232,14 +232,14 @@ release version:
 # Use the versioned golden JSON fixtures in tests/fixtures/ for testing.
 # Updating the golden fixtures requires a dedicated PR.
 
-tokscale-report:
-    tokscale report --json --no-summarize
+tokscale-report since until:
+    tokscale report --json --no-summarize --since {{ since }} --until {{ until }}
 
-tokscale-models:
-    tokscale models --json --group-by client,session,model --merge-worktrees
+tokscale-models since until:
+    tokscale models --json --group-by client,session,model --since {{ since }} --until {{ until }}
 
 tokscale-graph:
     tokscale graph
 
-tokscale-pricing:
-    tokscale pricing <model-id> --json
+tokscale-pricing model-id:
+    tokscale pricing {{ model-id }} --json
