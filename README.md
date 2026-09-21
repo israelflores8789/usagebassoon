@@ -6,6 +6,44 @@ SPDX-License-Identifier: AGPL-3.0-only
 <h1 align="center">UsageBassoon</h1>
 <p align="center"><strong>Persistent AI token usage statistics no matter where your agents live</strong></p>
 
+<p align="center">
+  <a href="https://github.com/israelflores8789/usagebassoon/actions/workflows/ci.yml"><img src="https://github.com/israelflores8789/usagebassoon/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://pypi.org/project/usagebassoon/"><img src="https://img.shields.io/pypi/v/usagebassoon.svg" alt="PyPI"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-%E2%89%A53.12-blue.svg" alt="Python >=3.12"></a>
+  <a href="https://github.com/israelflores8789/usagebassoon/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg" alt="License - AGPL-3.0-only"></a>
+</p>
+
+UsageBassoon turns [tokscale](https://github.com/junhoyeo/tokscale)'s stateless JSON output into durable, queryable token-usage history. It is designed for ephemeral containers, rotating VMs, laptops, and scheduled collection jobs.
+
+It supports local DuckDB, MotherDuck, and BigQuery storage, with optional local or Google Cloud Storage snapshots. Everything is available through the `bassoon` CLI and an importable Python API.
+
+> [!NOTE]
+> **Data disclaimer.** UsageBassoon is a personal, local-first telemetry tool. It reads token-usage statistics from the user's local tokscale environment and persists them to a local DuckDB database controlled by the user, the user's own MotherDuck account, or the user's own BigQuery project and optional GCS bucket when configured. UsageBassoon does not transmit telemetry to a UsageBassoon-operated service, aggregate user telemetry, sell telemetry, or provide a cross-user analytics platform.
+
+> [!WARNING]
+> UsageBassoon stores raw operational data at rest. Session IDs, workspace and project names, paths, notes, tags, and collector-host metadata may be present in the configured database or snapshots. Treat those locations as private, and review every artifact before sharing it.
+
+## Overview
+
+- Collects daily, per-session, and per-model token statistics, costs, pricing versions, session metadata, and collection-host metadata.
+- Merges new and changed facts idempotently without deleting history.
+- Provides terminal reports, bounded relation queries, user-managed tags and notes, diagnostics, exports, and portable snapshots.
+- Keeps cloud storage optional: a local DuckDB installation needs no cloud account.
+
+## Table of Contents
+
+- [Start](#start)
+- [Getting Started](#getting-started)
+- [Config.toml](#configtoml)
+- [Automated Scheduling](#automated-scheduling)
+- [Source identity and curation](#source-identity-and-curation)
+- [Terminal Reports](#terminal-reports)
+- [Python API](#python-api)
+- [Privacy and sharing](#privacy-and-sharing)
+- [Google Cloud permissions](#google-cloud-permissions)
+- [Snapshots](#snapshots)
+- [License & Disclaimers](#license--disclaimers)
+
 ## Start
 
 ```bash
@@ -13,6 +51,32 @@ bassoon init
 ```
 
 This creates `~/.config/usagebassoon/config.toml` when absent, generates a stable `source_id`, and initializes a local DuckDB warehouse. Use `--config` to select another configuration file. Existing configuration is never overwritten.
+
+## Getting Started
+
+🚀 UsageBassoon requires Python 3.12 or newer and a working tokscale installation. Install the optional extras when you plan to use BigQuery, GCS snapshots, or Polars:
+
+```bash
+pipx install "usagebassoon[full]"
+# or, from a checkout:
+uv tool install ".[full]"
+```
+
+Install tokscale separately using its trusted upstream instructions. UsageBassoon executes the configured tokscale command; it does not install, audit, or verify that executable.
+
+> [!WARNING]
+> You are responsible for obtaining tokscale from a trusted source. Verify the exact version with `tokscale --version` and verify a publisher-provided checksum or signature when one is available. Review `[tokscale].bin` or `TOKSCALE_BIN` before running collection, especially when it invokes a package runner such as `bunx`, `npx`, or `deno`.
+
+Initialize the local store, collect one run, and inspect the result:
+
+```bash
+bassoon init
+bassoon collect
+bassoon report summary
+bassoon doctor
+```
+
+Use `bassoon init` after configuring a remote backend as well; it creates the configured schema and does not overwrite an existing configuration file. Run `bassoon --help` or `bassoon <command> --help` for the complete command reference.
 
 ## Config.toml
 
@@ -116,15 +180,67 @@ bassoon note "Investigate cache miss" --client codex --session ses_123
 
 ## Terminal Reports
 
-`bassoon report` lists terminal-first reports over the configured warehouse. `bassoon report daily` shows the newest daily usage and cost rows (16 by default), while `bassoon report sessions` shows the newest sessions (use `--by-model` for session/model detail). `bassoon report graph` renders up to 31 days of daily bars, showing USD cost by default; select token metrics with `--metric`. Token values use one-decimal `K`, `M`, and `T` units; daily USD values use three decimal places and session USD values use cents. All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only. `--width 100` is the default bounded layout, `--width max` disables truncation, and `--test` renders deterministic output from the packaged sanitized golden fixtures without reading a backend. Use `--sanitize` before sharing or `--save PATH` to write a text artifact.
+Reports are terminal-first and personal by default:
+
+- `bassoon report daily` shows the newest daily usage and cost rows (16 by default).
+- `bassoon report sessions` shows the newest sessions; add `--by-model` for session/model detail.
+- `bassoon report graph` renders up to 31 days of daily bars, showing USD cost by default; select token metrics with `--metric`.
+- `bassoon report summary` shows the configured summary report.
+
+Token values use one-decimal `K`, `M`, and `T` units; daily USD values use three decimal places and session USD values use cents. All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only. `--width 100` is the default bounded layout, `--width max` disables truncation, and `--test` renders deterministic output from the packaged sanitized golden fixtures without reading a backend. Reports are raw by default; use `--sanitize` before sharing or `--save PATH` to write a text artifact.
+
+## Python API
+
+The same configured backend is available from Python. Results are pandas DataFrames by default; request Polars explicitly or use Arrow when you need the raw table:
+
+```python
+import usagebassoon
+
+daily = usagebassoon.query("SELECT * FROM daily_cost")
+polars_daily = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")
+arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost")
+```
 
 ## Privacy and sharing
 
-Reports are raw by default for personal terminal use; run `bassoon report <name> --sanitize` before sharing one. `bassoon doctor` is the shareable diagnostics command and sanitizes configuration locations and credentials by default. Its `--raw` mode prints a warning not to paste raw output into public GitHub issues.
+> [!WARNING]
+> 🔒 Obfuscation reduces exposure; it is not a guarantee that an artifact is safe for every audience. Review output for sensitive values before uploading it anywhere.
 
-`bassoon query` intentionally returns raw values, accepts only one read-only SELECT or WITH query, and always warns on stderr not to share its output publicly. Use `bassoon doctor` for issue-ready diagnostics instead.
+The commands have deliberately different sharing behavior:
 
-`bassoon export` obfuscates potentially identifying fields and redacts notes by default. Hostnames and machine identifiers are pseudonymized consistently within one output (for example, `host-alpha`), and embedded filesystem paths or common credential forms are redacted from shareable text. Collector system metadata such as OS, CPU, architecture, memory, and shell remains raw by design. It announces this behavior on stderr; use `--raw` only for intentional personal backup or data-management exports. Snapshots are raw restoration artifacts and should be kept private.
+| Command | Default output | Sharing guidance |
+| --- | --- | --- |
+| `bassoon report ...` | Raw personal report | Add `--sanitize` before sharing. |
+| `bassoon export ...` / `usagebassoon export ...` | Obfuscated export; notes are redacted | Safe defaults still require review. Add `--raw` only for an intentional private backup or data-management export. `--obfuscate` is an alias for the default behavior. |
+| `bassoon doctor` | Sanitized diagnostic paths and credentials | Prefer this for issue reports, but review it: diagnostics may expose host metadata such as OS, OS version, architecture, CPU, memory, and shell. Add `--raw` only for private troubleshooting. |
+| `bassoon query ...` | Raw relation data | It always warns on stderr and may contain session IDs, workspaces, tags, notes, paths, and host metadata. Do not share it publicly. |
+| `bassoon snapshot` | Raw restoration archive | Keep local and GCS snapshots private; they are not shareable exports. |
+
+`bassoon export` pseudonymizes fields such as session IDs, workspaces, tags, and host identifiers consistently within one output, and redacts notes, embedded filesystem paths, and common credential forms. Collector system metadata remains raw by design. No command can infer the sensitivity of your downstream environment, so inspect sanitized output before sharing it.
+
+## Google Cloud permissions
+
+Use a dedicated service account or user identity scoped to your own project, dataset, and bucket. Avoid broad project-owner permissions. The permissions below describe the operations performed by UsageBassoon; grant only the subset required by the backend and commands you use.
+
+For GCS snapshots, grant these permissions at the archive bucket (or a narrower custom-role scope):
+
+- `storage.buckets.get` — bucket metadata and lifecycle checks used by diagnostics.
+- `storage.objects.get` — read manifests, Parquet tables, and object metadata.
+- `storage.objects.list` — discover catalog and retained snapshots.
+- `storage.objects.create` — publish snapshot tables, manifests, and catalogs.
+- `storage.objects.delete` — rotate old snapshots and clean up staged objects.
+
+A restore-only identity needs only the bucket metadata and object read/list permissions. A writer/retention identity also needs create and delete. `roles/storage.objectAdmin` is the usual predefined role for object operations; add a narrowly scoped bucket-metadata permission if `storage.buckets.get` is not otherwise granted. Prefer a custom role when you need tighter control. Use the `STANDARD` storage class for an active snapshot archive: UsageBassoon writes, lists, restores, and rotates snapshots, so colder archival classes are a poor default. See Google's [Cloud Storage IAM permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage) and [storage classes](https://docs.cloud.google.com/storage/docs/storage-classes).
+
+For the BigQuery backend, the identity generally needs:
+
+- Project-level `bigquery.jobs.create` to run schema, query, load, and merge jobs.
+- Project-level `bigquery.datasets.create` only when `bassoon init` should create the dataset.
+- Dataset-level `bigquery.datasets.get` to validate the configured dataset and location.
+- Dataset-level `bigquery.tables.create`, `bigquery.tables.get`, `bigquery.tables.getData`, `bigquery.tables.updateData`, and `bigquery.tables.delete` to initialize the schema, read data, merge facts, and remove temporary staging tables.
+- BigQuery Storage Read API permissions `bigquery.readsessions.create`, `bigquery.readsessions.getData`, and `bigquery.readsessions.update` to return query results as Arrow.
+
+The common predefined-role arrangement is `roles/bigquery.jobUser` on the project and `roles/bigquery.dataEditor` on the dataset, with dataset-creation and Storage Read API permissions added only when required by your organization. Verify the effective permissions in your project because predefined roles can change. See Google's [BigQuery IAM documentation](https://docs.cloud.google.com/iam/docs/roles-permissions/bigquery) and [dataset access controls](https://docs.cloud.google.com/bigquery/docs/access-control).
 
 ## Snapshots
 
