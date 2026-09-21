@@ -8,6 +8,7 @@ repos:
   rev: v1.50.0
   hooks:
   - id: typos
+    args: [--force-exclude]
 
 - repo: https://github.com/google/yamlfmt
   rev: v0.21.0
