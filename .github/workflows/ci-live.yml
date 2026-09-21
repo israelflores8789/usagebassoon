@@ -61,6 +61,7 @@ jobs:
     - uses: astral-sh/setup-uv@v10.1.0
       with:
         enable-cache: true
+    - uses: extractions/setup-just@v4
     - name: Install Python ${{ matrix.python }}
       run: uv python install ${{ matrix.python }}
     - name: Sync environment
@@ -68,7 +69,7 @@ jobs:
     - name: Run unit and local DuckDB tests
       uses: pavelzw/pytest-action@v2
       with:
-        custom-pytest: uv run pytest
+        custom-pytest: just test
         verbose: false
         emoji: true
         job-summary: true
@@ -119,8 +120,6 @@ jobs:
       contents: read
       id-token: write
     env:
-      USAGEBASSOON_BIGQUERY_LIVE: "1"
-      USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
       USAGEBASSOON_BIGQUERY_PROJECT: ${{ vars.GCP_PROJECT_ID }}
       USAGEBASSOON_BIGQUERY_DATASET: usagebassoon_it
       USAGEBASSOON_BIGQUERY_LOCATION: US
@@ -131,6 +130,7 @@ jobs:
     - uses: astral-sh/setup-uv@v10.1.0
       with:
         enable-cache: true
+    - uses: extractions/setup-just@v4
     - name: Install Python 3.12
       run: uv python install 3.12
     - name: Sync environment
@@ -153,8 +153,11 @@ jobs:
           "$GCP_PROJECT_ID:usagebassoon_it" >/dev/null
     - name: Run bigquery_live tests
       uses: pavelzw/pytest-action@v2
+      env:
+        USAGEBASSOON_BIGQUERY_LIVE: "1"
+        USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
       with:
-        custom-pytest: uv run pytest
+        custom-pytest: just test
         verbose: false
         emoji: true
         job-summary: true
@@ -184,8 +187,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      USAGEBASSOON_GCS_LIVE: "1"
     steps:
     - uses: actions/checkout@v7
       with:
@@ -193,6 +194,7 @@ jobs:
     - uses: astral-sh/setup-uv@v10.1.0
       with:
         enable-cache: true
+    - uses: extractions/setup-just@v4
     - name: Install Python 3.12
       run: uv python install 3.12
     - name: Sync environment
@@ -207,8 +209,10 @@ jobs:
     - uses: google-github-actions/setup-gcloud@v3
     - name: Run gcs_live tests
       uses: pavelzw/pytest-action@v2
+      env:
+        USAGEBASSOON_GCS_LIVE: "1"
       with:
-        custom-pytest: uv run pytest
+        custom-pytest: just test
         verbose: false
         emoji: true
         job-summary: true

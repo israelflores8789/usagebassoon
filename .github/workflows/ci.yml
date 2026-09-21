@@ -56,6 +56,7 @@ jobs:
     - uses: astral-sh/setup-uv@v10.1.0
       with:
         enable-cache: true
+    - uses: extractions/setup-just@v4
     - name: Install Python ${{ matrix.python }}
       run: uv python install ${{ matrix.python }}
     - name: Sync environment
@@ -63,7 +64,7 @@ jobs:
     - name: Run unit and local DuckDB tests
       uses: pavelzw/pytest-action@v2
       with:
-        custom-pytest: uv run pytest
+        custom-pytest: just test
         verbose: false
         emoji: true
         job-summary: true

@@ -57,25 +57,35 @@ test *args:
     trap 'rm -rf "$test_log_directory"' EXIT
     USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{pytest}} -v -s {{args}}
 
+# Fallback for long cloud runs: persist partial failure output for restricted shells.
 test-bq-live test-name reset="0":
-    @mkdir -p .test_logs
-    @bash -o pipefail -c '{ \
-        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"; \
-        PYTHONUNBUFFERED=1 USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{reset}} uv run pytest -vv \
+    #!/usr/bin/env bash
+    set -o pipefail
+    mkdir -p .test_logs
+    test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
+    trap 'rm -rf "$test_log_directory"' EXIT
+    {
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{reset}} {{pytest}} -vv \
         --tb=short \
         --color=no \
-        "{{test-name}}" < /dev/null; \
-    } 2>&1 | tee .test_logs/pytest-bq-live.log'
+        "{{test-name}}" < /dev/null
+    } 2>&1 | tee .test_logs/pytest-bq-live.log
 
+# Fallback for long cloud runs: persist partial failure output for restricted shells.
 test-gcs-live test-name:
-    @mkdir -p .test_logs
-    @bash -o pipefail -c '{ \
-        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"; \
-        PYTHONUNBUFFERED=1 USAGEBASSOON_GCS_LIVE=1 uv run pytest -vv \
+    #!/usr/bin/env bash
+    set -o pipefail
+    mkdir -p .test_logs
+    test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
+    trap 'rm -rf "$test_log_directory"' EXIT
+    {
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{test-name}}"
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_GCS_LIVE=1 {{pytest}} -vv \
         --tb=short \
         --color=no \
-        "{{test-name}}" < /dev/null; \
-    } 2>&1 | tee .test_logs/pytest-gcs-live.log'
+        "{{test-name}}" < /dev/null
+    } 2>&1 | tee .test_logs/pytest-gcs-live.log
 
 # Run tests with coverage reporting
 coverage *args:
