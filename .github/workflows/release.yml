@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: false # never cancel a publish halfway
 
 permissions:
+  actions: read
   contents: read
 
 defaults:
@@ -20,9 +21,40 @@ defaults:
     shell: bash
 
 jobs:
+  verify-ci-live:
+    name: Verify CI Live for tagged commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+    - name: Require a successful CI Live run for this commit
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        run_id="$(gh run list \
+          --repo "$GITHUB_REPOSITORY" \
+          --workflow ci-live.yml \
+          --event push \
+          --branch main \
+          --commit "$TAG_SHA" \
+          --status completed \
+          --json databaseId,conclusion \
+          --jq 'map(select(.conclusion == "success")) | .[0].databaseId // empty')"
+
+        if [[ -z "$run_id" ]]; then
+          echo "No successful CI Live run found for commit $TAG_SHA." >&2
+          echo "Run CI Live on main or dev before tagging a release." >&2
+          exit 1
+        fi
+
+        echo "Verified successful CI Live run $run_id for commit $TAG_SHA."
+
   prepare:
     name: Verify, test, and build
-    runs-on: ubuntu-latest
+    needs: verify-ci-live
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -95,8 +127,8 @@ jobs:
 
     - name: Run test suite (pre-publish gate)
       run: |
-        # Live GCP tests already ran on the PR; re-run the hermetic suite
-        # so a tag on a stale main can still be caught.
+        # CI Live was verified for this exact tag SHA above; re-run the
+        # hermetic suite so release preparation has its own local check.
         uv run pytest -m "not (bigquery_live or gcs_live)" -q
 
     - name: Build distributions
@@ -145,7 +177,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     # GitHub "pypi" environment: add protection rules (e.g. required
     # reviewers) here so a tag push alone can't ship unattended, and point
@@ -177,7 +209,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: [prepare, publish-pypi] # only announce what actually shipped
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
