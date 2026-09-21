@@ -35,7 +35,7 @@ def test_rotating_log_sink_writes_under_the_configured_state_directory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Persist operational errors without requiring a console or cloud service."""
-    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR)
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     logger = configure(LoggingConfig(directory=tmp_path, max_files=2, max_bytes=128))
     logger.error("warehouse cycle failed")
     for handler in logger.handlers:
@@ -49,7 +49,7 @@ def test_unavailable_log_directory_falls_back_to_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep error reporting alive when the configured log path is unusable."""
-    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR)
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     target = tmp_path / "not-a-directory"
     target.write_text("occupied")
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.merge import PersistSummary
@@ -46,14 +47,19 @@ def test_collect_reports_the_delegated_merge_summary(
     assert result.output == "Collected run run-123: 4 inserted, 2 updated.\n"
 
 
-def test_collect_formats_configuration_errors_as_cli_errors(tmp_path: Path) -> None:
+def test_collect_formats_configuration_errors_as_cli_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Avoid exposing a traceback when the requested configuration is absent."""
     missing = tmp_path / "missing.toml"
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
 
     result = CliRunner().invoke(app, ["collect", "--config", str(missing)])
 
     assert result.exit_code != 0
-    assert "--config" in result.output
+    assert "--config" in plain_cli_output(result.output)
 
 
 def test_collect_formats_unexpected_errors_without_a_traceback(

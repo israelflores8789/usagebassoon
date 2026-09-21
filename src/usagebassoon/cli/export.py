@@ -13,9 +13,9 @@ from typing import Annotated, Literal
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 import typer
-from rich.console import Console
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.cli._output import output_console
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.privacy import sanitize_table
 
@@ -86,7 +86,7 @@ def export(
             param_hint="target",
         )
     if not raw:
-        Console(stderr=True).print(
+        output_console(stderr=True).print(
             "Export output is obfuscated by default. Use --raw to export original "
             "values for personal backup or data-management use.",
             style="yellow",

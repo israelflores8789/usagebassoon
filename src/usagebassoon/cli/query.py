@@ -14,10 +14,10 @@ from typing import Annotated, Literal
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.cli._output import output_console
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.sql_safety import (
@@ -57,7 +57,7 @@ def _render_table(rows: list[dict[str, object]], columns: list[str]) -> None:
         rendered.add_column(sanitize_display(column))
     for row in rows:
         rendered.add_row(*(sanitize_display(row.get(column, "")) for column in columns))
-    Console(markup=False, highlight=False).print(rendered)
+    output_console().print(rendered)
 
 
 def _filters(values: tuple[str, ...]) -> dict[str, str]:
@@ -111,7 +111,7 @@ def query(
     ] = None,
 ) -> None:
     """Run one bounded allowlisted relation query and warn before output."""
-    Console(stderr=True).print(_RAW_QUERY_WARNING, style="yellow")
+    output_console(stderr=True).print(_RAW_QUERY_WARNING, style="yellow")
     try:
         configuration = ConfigurationManager(config).load()
         dialect = dialect_for_backend(configuration.backend)

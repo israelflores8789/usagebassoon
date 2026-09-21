@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.text import Text
 
+from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import snapshot_store
 from usagebassoon.config import (
     ConfigurationError,
@@ -38,7 +38,7 @@ def _print_report(
     database: str | None,
 ) -> None:
     """Render a structured doctor report with Rich."""
-    console = Console(markup=False, highlight=False)
+    console = output_console()
     styles = {"ok": "green", "warning": "yellow", "error": "red"}
     for check in report.checks:
         line = Text(f"{check.status.upper()} ", style=styles[check.status])
@@ -139,7 +139,7 @@ def doctor(
     report = DoctorReport((*report.checks, schedule_doctor_check(configuration)))
     try:
         if raw:
-            Console(stderr=True).print(
+            output_console(stderr=True).print(
                 "WARNING: raw doctor output may contain identifiers, paths, host "
                 "metadata, and other private information. Do not paste it into a "
                 "public GitHub issue. Use bassoon doctor without --raw for shareable "

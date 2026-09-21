@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
+from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import configured_backend
 
 
@@ -40,4 +40,4 @@ def audit(
         table.add_column(column)
     for row in data.to_pylist():
         table.add_row(*(str(row[column]) for column in data.column_names))
-    Console().print(table)
+    output_console().print(table)

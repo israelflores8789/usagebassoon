@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 
@@ -166,11 +168,16 @@ def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
     assert pq.read_table(parquet_path).num_rows == 1
 
 
-def test_query_requires_output_only_for_file_formats(tmp_path: Path) -> None:
+def test_query_requires_output_only_for_file_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Reject incompatible output combinations before they can surprise users."""
     config, backend = _configured_store(tmp_path)
     backend.close()
     runner = CliRunner()
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
 
     table_output = runner.invoke(
         app,
@@ -196,6 +203,10 @@ def test_query_requires_output_only_for_file_formats(tmp_path: Path) -> None:
     )
 
     assert table_output.exit_code != 0
-    assert "--output requires csv, json, or parquet" in table_output.output
+    assert "--output requires csv, json, or parquet" in plain_cli_output(
+        table_output.output
+    )
     assert parquet_without_output.exit_code != 0
-    assert "--output is required for parquet format" in parquet_without_output.output
+    assert "--output is required for parquet format" in plain_cli_output(
+        parquet_without_output.output
+    )

@@ -20,10 +20,10 @@ from uuid import UUID
 import pyarrow as pa
 import typer
 from rich import box
-from rich.console import Console
 from rich.table import Table
 
 from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import configured_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonValue
@@ -498,11 +498,9 @@ def render_tables(
         save: Optional destination for captured plain text.
         sanitize: Whether identifiers have been intentionally obfuscated.
     """
-    console = Console(
+    console = output_console(
         width=width if width is not None else 10_000,
         record=save is not None,
-        markup=False,
-        highlight=False,
     )
     for title, columns, rows in tables:
         table = Table(
@@ -545,7 +543,7 @@ def render_graph(
     sanitize: bool,
 ) -> None:
     """Print one pre-rendered terminal graph and optionally save it as text."""
-    console = Console(markup=False, highlight=False)
+    console = output_console()
     console.print(text, end="")
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
