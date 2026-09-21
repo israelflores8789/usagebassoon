@@ -34,6 +34,7 @@ It supports local DuckDB, MotherDuck, and BigQuery storage, with optional local 
 
 - [Start](#start)
 - [Getting Started](#getting-started)
+- [Reports at a glance](#reports-at-a-glance)
 - [Config.toml](#configtoml)
 - [Automated Scheduling](#automated-scheduling)
 - [Source identity and curation](#source-identity-and-curation)
@@ -77,6 +78,107 @@ bassoon doctor
 ```
 
 Use `bassoon init` after configuring a remote backend as well; it creates the configured schema and does not overwrite an existing configuration file. Run `bassoon --help` or `bassoon <command> --help` for the complete command reference.
+
+## Reports at a glance
+
+Terminal reports are one of UsageBassoon's main advantages: costs, tokens, cache efficiency, sessions, models, and daily trends are readable directly in a shell. The examples below come from the packaged deterministic fixtures, so `--test` does not need a configured backend.
+
+### Summary
+
+```text
+$ bassoon report summary --test
+UsageBassoon Summary
+
+ Metric       Value
+ ━━━━━━━━━━━━━━━━━━
+ Sessions        81
+ Cost (USD) $109.48
+
+                  Models
+
+ Model            Total Tokens Cost (USD)
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ gemini-3.7-flash       293.4M     $63.13
+ gemini-3.8-flash       270.9M     $42.58
+ gpt-5.6-terra            9.3M      $3.60
+ gpt-5.6-luna             4.7M      $0.18
+```
+
+### Daily usage
+
+```text
+$ bassoon report daily --test
+                       Daily Token Usage
+
+ Date        Input Output Cache R Cache ×  Total   Cost Cost/1M
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 2026-09-10 391.5K  30.5K    6.2M  15.94×   6.7M  $1.12  $0.168
+ 2026-09-09 353.9K  72.2K    6.9M  19.48×   7.3M  $2.65  $0.362
+ 2026-09-08   5.1M 253.8K   29.4M   5.74×  34.7M  $6.99  $0.201
+ 2026-09-07  14.3M 406.1K   93.5M   6.53× 108.3M $19.27  $0.178
+ 2026-09-06   9.1M 546.5K  131.2M  14.44× 140.9M $18.71  $0.133
+ 2026-09-05   2.7M 142.4K   25.8M   9.42×  28.6M  $4.52  $0.158
+ 2026-09-04   3.1M 226.7K   22.5M   7.26×  25.8M  $4.85  $0.188
+ 2026-09-03  17.1M 696.2K   63.7M   3.72×  81.5M $20.23  $0.248
+ 2026-09-02   1.3M  50.7K    6.5M   4.89×   7.9M  $1.69  $0.212
+ 2026-09-01   2.7M  40.2K   13.1M   4.92×  15.8M  $3.13  $0.198
+ 2026-08-31   3.2M  98.2K   13.2M   4.14×  16.5M  $3.76  $0.227
+ 2026-08-30   5.8M 220.0K   29.2M   5.08×  35.2M  $7.33  $0.208
+ 2026-08-29   7.6M 128.1K   33.8M   4.47×  41.5M  $8.69  $0.209
+ 2026-08-27   1.3M  44.3K    4.1M   3.22×   5.4M  $1.41  $0.264
+ 2026-08-26   2.1M  56.5K    7.2M   3.52×   9.3M  $2.29  $0.246
+ 2026-08-24  56.1K   5.3K   52.6K   0.94× 114.1K  $0.07  $0.579
+```
+
+### Session usage
+
+```text
+$ bassoon report sessions --test
+                                       Session Token Usage
+
+ Session    Client  Model           Input Output Cache R Cache ×  Total  Cost Cost/1M Last Active
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ roll…ad621 codex   gpt-5…-terra    25.1K   2.0K  178.2K   7.10× 205.3K $0.11  $0.535 09-10 03:47
+ roll…1be99 codex   gpt-5.6-luna    45.8K   4.5K  229.9K   5.02× 280.2K $0.02  $0.068 09-10 02:55
+ roll…960fa codex   gpt-5.6-luna+1 374.8K  28.5K    6.2M  16.54×   6.6M $1.01  $0.154 09-10 00:00
+ roll…650cb codex   gpt-5.6-luna+1 299.8K  67.7K    6.5M  21.79×   6.9M $2.63  $0.381 09-09 21:31
+ ses_…3cb44 ope…ode ge…3.8-flash     1.8M  82.1K   12.2M   6.61×  14.1M $2.60  $0.185 09-08 03:52
+ ses_…5b87f ope…ode ge…3.7-flash+1 806.4K  44.7K    4.5M   5.54×   5.3M $1.11  $0.208 09-08 03:21
+ ses_…49afc ope…ode ge…3.7-flash+1   2.7M 169.4K   15.4M   5.74×  18.3M $3.81  $0.208 09-08 02:42
+ ses_…9e714 ope…ode ge…3.7-flash+1   2.4M  48.8K    8.7M   3.60×  11.2M $2.65  $0.237 09-07 22:59
+ ses_…f2c46 ope…ode ge…3.7-flash     3.4M 130.3K   27.7M   8.19×  31.2M $5.11  $0.163 09-07 05:24
+ ses_…5a4d4 ope…ode ge…3.7-flash     1.8M  14.5K   14.2M   8.06×  16.0M $2.44  $0.153 09-07 04:12
+ ses_…0fed7 ope…ode ge…3.7-flash     4.7M 128.9K   23.2M   4.93×  28.0M $5.75  $0.205 09-07 03:45
+ ses_…aeea9 ope…ode ge…3.8-flash    63.3K   1.4K  170.2K   2.69× 234.9K $0.07  $0.279 09-07 01:23
+ ses_…2cbea ope…ode ge…3.8-flash     3.0M 120.0K   34.9M  11.64×  38.0M $5.31  $0.140 09-07 00:44
+ ses_…7c07c ope…ode ge…3.8-flash     2.9M 172.0K   55.7M  19.43×  58.7M $6.97  $0.119 09-06 22:56
+ ses_…c7cee ope…ode ge…3.8-flash     1.5M  60.4K   16.8M  11.40×  18.4M $2.60  $0.141 09-06 05:10
+ ses_…1232c ope…ode ge…3.8-flash     1.6M  67.6K   13.9M   8.83×  15.5M $2.47  $0.159 09-06 03:59
+```
+
+### Cost graph
+
+```text
+$ bassoon report graph --test
+                       Cost (USD): 2026-09-01 to 2026-09-10
+      ┌────────────────────────────────────────────────────────────────────────┐
+$20.23┤               ███████                                                  │
+      │               ███████              ██████████████                      │
+      │               ███████              ██████████████                      │
+$15.17┤               ███████              ██████████████                      │
+      │               ███████              ██████████████                      │
+      │               ███████              ██████████████                      │
+      │               ███████              ██████████████                      │
+$10.12┤               ███████              ██████████████                      │
+      │               ███████              ██████████████                      │
+      │               ███████              █████████████████████               │
+ $5.06┤               ██████████████████████████████████████████               │
+      │ ██████        ██████████████████████████████████████████ ██████        │
+      │ ██████ ██████ ██████████████████████████████████████████ ██████ ██████ │
+ $0.00┤ ██████ ██████ ██████████████████████████████████████████ ██████ ██████ │
+      └────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬────┘
+           01     02     03     04     05     06     07     08     09     10
+```
 
 ## Config.toml
 
