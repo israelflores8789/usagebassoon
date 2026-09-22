@@ -21,8 +21,9 @@ from usagebassoon.curation import (
     rename_tag,
     set_note,
 )
-from usagebassoon.merge import persist_run
-from usagebassoon.normalizer import CollectionBundle, normalize
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import normalize
+from usagebassoon.persistence import persist_run
 
 
 def test_effective_tags_inherit_from_client_and_workspace(

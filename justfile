@@ -61,7 +61,7 @@ test-unit *args:
         -m "not (bigquery_live or gcs_live or sql_parity)" {{ args }}
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
-test-bq-live test-name reset="0":
+test-bq-live test-name="tests/test_backend_bigquery_live.py" reset="0":
     #!/usr/bin/env bash
     set -o pipefail
     mkdir -p .test_logs
@@ -76,7 +76,7 @@ test-bq-live test-name reset="0":
     } 2>&1 | tee .test_logs/pytest-bq-live.log
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
-test-gcs-live test-name:
+test-gcs-live test-name="tests/test_backend_gcs_live.py":
     #!/usr/bin/env bash
     set -o pipefail
     mkdir -p .test_logs

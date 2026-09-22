@@ -11,9 +11,9 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.collector import collect as collect_run
 from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.orchestrator import collect as collect_run
 
 _LOG = logging.getLogger(LOGGER_NAME)
 

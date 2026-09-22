@@ -18,8 +18,9 @@ from tests.conftest import (
     EXPECTED_REPORT_ROWS,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.merge import persist_run
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, CollectionBundle, normalize
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.persistence import persist_run
 from usagebassoon.system_metadata import SystemMetadata
 
 

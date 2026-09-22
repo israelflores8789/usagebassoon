@@ -8,37 +8,22 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
 import shlex
 import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
 from queue import Empty, Queue
-from socket import gethostname
 from threading import Thread
 from typing import BinaryIO, cast
-from uuid import uuid4
 
-from usagebassoon.backends.base import StorageBackend, close_backend
-from usagebassoon.config import UsageBassoonConfig, open_backend
+from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.display import sanitize_display
-from usagebassoon.ingest import RawCollection, build_collection_bundle
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
-from usagebassoon.logger import configure as configure_logging
-from usagebassoon.merge import PersistSummary, persist_run
-from usagebassoon.normalizer import (
-    IngestStatus,
-    IngestTarget,
-    NormalizedBundle,
-    normalize,
-)
-from usagebassoon.parsers.daily import parse_daily
-from usagebassoon.parsers.graph import parse_graph
-from usagebassoon.snapshots import SnapshotStore
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
@@ -62,28 +47,18 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
 _LOG = logging.getLogger(LOGGER_NAME)
 
 
-def _snapshot_after_collect(
-    config: UsageBassoonConfig,
-    run_id: str,
-    logger: logging.Logger,
-) -> None:
-    """Attempt a due optional snapshot without invalidating persisted usage data."""
-    settings = config.snapshots
-    if settings is None or settings.interval is None:
-        return
-    backend: StorageBackend | None = None
-    try:
-        backend = open_backend(config)
-        SnapshotStore.from_config(config).write(backend, run_id=run_id)
-    except Exception:
-        logger.exception("snapshot after collection run %s failed", run_id)
-    finally:
-        if backend is not None:
-            close_backend(
-                backend,
-                context=f"snapshot after collection run {run_id}",
-                logger=logger,
-            )
+@dataclass(frozen=True, slots=True)
+class RawCollection:
+    """Raw JSON payloads collected from tokscale for one collection cycle.
+
+    This type deliberately contains only source payloads. Planning evidence,
+    contract results, and parsed data belong to ingest and orchestration.
+    """
+
+    graph: JsonObject
+    daily_models: Mapping[date, JsonObject]
+    report_by_day: Mapping[date, JsonArray]
+    pricing_by_day: Mapping[date, Mapping[str, JsonObject]]
 
 
 def resolve_tokscale_command(config: UsageBassoonConfig) -> tuple[str, ...]:
@@ -352,159 +327,6 @@ def _array(payload: JsonValue, command: str) -> JsonArray:
     return payload
 
 
-def _source_literal(source_id: str) -> str:
-    """Return a safely quoted source id for fixed internal state queries."""
-    return "'" + source_id.replace("'", "''") + "'"
-
-
-def _load_ingest_status(
-    config: UsageBassoonConfig,
-) -> tuple[
-    dict[IngestTarget, IngestStatus], dict[date, set[str]], dict[date, set[str]]
-]:
-    """Load retry status plus persisted daily model and price coverage.
-
-    Args:
-        config: Active source and storage configuration.
-
-    Returns:
-        Retry-ledger rows, persisted usage models, and persisted price models.
-    """
-    backend = open_backend(config)
-    source = _source_literal(config.source_id)
-    try:
-        backend.apply_ddl()
-        status_rows = backend.query(
-            "SELECT day, domain, status, expected_count, succeeded_count, "
-            "last_attempted_run, last_succeeded_run, failure_code "
-            f"FROM ingest_status WHERE source_id = {source}"
-        ).to_pylist()
-        statuses: dict[IngestTarget, IngestStatus] = {}
-        for row in status_rows:
-            day = row["day"]
-            domain = row["domain"]
-            status = row["status"]
-            attempted = row["last_attempted_run"]
-            succeeded = row["last_succeeded_run"]
-            failure_code = row["failure_code"]
-            expected_count = row["expected_count"]
-            succeeded_count = row["succeeded_count"]
-            if (
-                not isinstance(day, date)
-                or not isinstance(domain, str)
-                or not isinstance(status, str)
-                or not isinstance(attempted, str)
-                or (succeeded is not None and not isinstance(succeeded, str))
-                or (failure_code is not None and not isinstance(failure_code, str))
-                or (expected_count is not None and not isinstance(expected_count, int))
-                or (
-                    succeeded_count is not None and not isinstance(succeeded_count, int)
-                )
-            ):
-                raise RuntimeError("ingest_status contains an invalid row")
-            statuses[(day, domain)] = IngestStatus(
-                day=day,
-                domain=domain,
-                status=status,
-                expected_count=expected_count,
-                succeeded_count=succeeded_count,
-                last_attempted_run=attempted,
-                last_succeeded_run=succeeded,
-                failure_code=failure_code,
-            )
-        model_rows = backend.query(
-            f"SELECT DISTINCT day, model FROM daily_stats WHERE source_id = {source}"
-        ).to_pylist()
-        models_by_day: dict[date, set[str]] = {}
-        for row in model_rows:
-            day = row["day"]
-            model = row["model"]
-            if not isinstance(day, date) or not isinstance(model, str):
-                raise RuntimeError("daily_stats contains an invalid daily model key")
-            models_by_day.setdefault(day, set()).add(model)
-        price_rows = backend.query(
-            f"SELECT DISTINCT day, model FROM price_versions WHERE source_id = {source}"
-        ).to_pylist()
-        prices_by_day: dict[date, set[str]] = {}
-        for row in price_rows:
-            day = row["day"]
-            model = row["model"]
-            if not isinstance(day, date) or not isinstance(model, str):
-                raise RuntimeError("price_versions contains an invalid daily model key")
-            prices_by_day.setdefault(day, set()).add(model)
-        return statuses, models_by_day, prices_by_day
-    finally:
-        close_backend(backend, context="loading ingest status", logger=_LOG)
-
-
-def _persist_with_retries(
-    config: UsageBassoonConfig,
-    bundle: NormalizedBundle,
-    logger: logging.Logger,
-) -> PersistSummary:
-    """Persist one normalized cycle with bounded conflict-aware retries."""
-    schema_backend: StorageBackend | None = None
-    try:
-        schema_backend = open_backend(config)
-        schema_backend.apply_ddl()
-    except Exception:
-        logger.exception(
-            "collection run %s could not initialize the schema", bundle.run_id
-        )
-        raise
-    finally:
-        if schema_backend is not None:
-            close_backend(
-                schema_backend,
-                context=f"schema initialization for {bundle.run_id}",
-                logger=logger,
-            )
-    attempts = config.collection.max_retries + 1
-    for attempt in range(1, attempts + 1):
-        backend: StorageBackend | None = None
-        try:
-            backend = open_backend(config)
-            return persist_run(backend, bundle)
-        except Exception as error:
-            try:
-                retryable = backend is not None and backend.is_retryable_error(error)
-            except Exception:
-                logger.exception(
-                    "could not classify collection run %s failure for retry",
-                    bundle.run_id,
-                )
-                retryable = False
-            if not retryable or attempt == attempts:
-                logger.exception(
-                    "collection run %s failed%s",
-                    bundle.run_id,
-                    f" after {attempts} attempts" if retryable else " without retry",
-                )
-                raise
-            maximum_delay = min(
-                _MAX_TRANSACTION_RETRY_SECONDS,
-                config.collection.retry_initial_seconds * (2 ** (attempt - 1)),
-            )
-            delay = random.uniform(0, maximum_delay)
-            logger.exception(
-                "collection run %s had a retryable transaction conflict on attempt "
-                "%s of %s; retrying in %.1fs",
-                bundle.run_id,
-                attempt,
-                attempts,
-                delay,
-            )
-            time.sleep(delay)
-        finally:
-            if backend is not None:
-                close_backend(
-                    backend,
-                    context=f"persistence attempt {attempt}",
-                    logger=logger,
-                )
-    raise RuntimeError("collection persistence exhausted without an exception")
-
-
 def _fetch_daily_models(
     config: UsageBassoonConfig,
     prefix: Sequence[str],
@@ -607,126 +429,3 @@ def _fetch_reports(
         else:
             reports[day] = report
     return reports, frozenset(failures)
-
-
-def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
-    """Collect, validate, normalize, and persist one daily tokscale state.
-
-    Graph supplies candidate days and daily activity. Date-filtered models
-    supplies token facts. Completed historical targets are skipped while a
-    candidate for the current UTC day is always refreshed.
-    """
-    try:
-        logger = configure_logging(config.logging)
-    except Exception:
-        logger = _LOG
-        logger.exception("could not configure collection logging")
-    started_at = datetime.now(UTC)
-    run_id = str(uuid4())
-    try:
-        prefix = _prefix(config)
-        deadline = None
-        if config.collection.timeout is not None:
-            from usagebassoon.snapshots import parse_interval
-
-            timeout = parse_interval(config.collection.timeout)
-            if timeout is None:
-                raise RuntimeError("collection timeout must be configured")
-            deadline = time.monotonic() + max(
-                0.0,
-                timeout.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
-            )
-        graph_raw = _object(
-            _json_command(
-                config,
-                prefix,
-                "graph",
-                deadline=deadline,
-                max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
-            ),
-            "graph",
-        )
-        graph = parse_graph(graph_raw)
-        statuses, persisted_models, persisted_prices = _load_ingest_status(config)
-        completed = {
-            target for target, status in statuses.items() if status.status == "complete"
-        }
-        today = datetime.now(UTC).date()
-        candidate_days = tuple(
-            sorted({contribution.date for contribution in graph.contributions})
-        )
-        daily_days = tuple(
-            day
-            for day in candidate_days
-            if day == today or (day, _MODELS_DOMAIN) not in completed
-        )
-        requested_price_days = tuple(
-            day
-            for day in candidate_days
-            if day == today or (day, _PRICING_DOMAIN) not in completed
-        )
-        daily_models = _fetch_daily_models(
-            config,
-            prefix,
-            daily_days,
-            deadline=deadline,
-        )
-        pricing_expected_models: dict[date, frozenset[str]] = {}
-        pricing_requests: dict[date, set[str]] = {}
-        for day in requested_price_days:
-            if day in daily_models:
-                daily_payload = parse_daily(daily_models[day], day=day)
-                models = {row.stats.model for row in daily_payload.entries}
-            elif (day, _MODELS_DOMAIN) in completed:
-                models = persisted_models.get(day, set())
-            else:
-                raise RuntimeError(
-                    f"pricing for {day.isoformat()} has no completed models status"
-                )
-            pricing_expected_models[day] = frozenset(models)
-            pricing_requests[day] = (
-                models if day == today else models - persisted_prices.get(day, set())
-            )
-        pricing_by_day, pricing_failures = _fetch_pricing(
-            config,
-            prefix,
-            pricing_requests,
-            logger,
-            deadline=deadline,
-        )
-        report_by_day, report_fetch_failures = _fetch_reports(
-            config,
-            prefix,
-            candidate_days,
-            deadline=deadline,
-            logger=logger,
-        )
-        raw = RawCollection(
-            daily_models=daily_models,
-            report_by_day=report_by_day,
-            report_days=frozenset(candidate_days),
-            report_fetch_failures=report_fetch_failures,
-            graph=graph_raw,
-            pricing_by_day=pricing_by_day,
-            pricing_expected_models=pricing_expected_models,
-            pricing_existing_models={
-                day: frozenset(persisted_prices.get(day, set()))
-                for day in requested_price_days
-            },
-            pricing_fetch_failures=pricing_failures,
-            prior_statuses=statuses,
-        )
-        bundle = build_collection_bundle(
-            raw,
-            run_id=run_id,
-            source_id=config.source_id,
-            started_at=started_at,
-            finished_at=datetime.now(UTC),
-            host=gethostname(),
-        )
-        summary = _persist_with_retries(config, normalize(bundle), logger)
-        _snapshot_after_collect(config, run_id, logger)
-    except Exception:
-        logger.exception("collection cycle failed before completion")
-        raise
-    return run_id, summary

@@ -7,19 +7,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
-from usagebassoon.contracts import ContractDrift
-from usagebassoon.parsers.daily import DailyModelsPayload
-from usagebassoon.parsers.graph import GraphPayload
-from usagebassoon.parsers.pricing import PricingRow
 from usagebassoon.parsers.report import SessionRow, make_session_label
-from usagebassoon.reconcile import ReconciliationResult
-from usagebassoon.system_metadata import SystemMetadata
+
+if TYPE_CHECKING:
+    from usagebassoon.ingest import CollectionBundle, IngestStatus
+    from usagebassoon.parsers.daily import DailyModelsPayload
+    from usagebassoon.parsers.graph import GraphPayload
+    from usagebassoon.parsers.pricing import PricingRow
 
 type ColumnarData = dict[str, list[object | None]]
-type IngestTarget = tuple[date, str]
 
 _TIMESTAMP = pa.timestamp("us", tz="UTC")
 
@@ -164,67 +164,11 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
 
 
 @dataclass(frozen=True, slots=True)
-class CollectionBundle:
-    """All data produced by one successful collector invocation.
-
-    Attributes:
-        run_id: Identifier for this collection run.
-        source_id: Stable namespace of the collector that observed this data.
-        started_at: When the collector began invoking tokscale.
-        finished_at: When parsing finished and facts were observed.
-        host: Hostname or container id, if known.
-        daily_models: Daily session and model statistics keyed by requested day.
-        report_rows: Stable session metadata from tokscale report.
-        graph: Activity dates and graph telemetry.
-        pricing_by_day: Rate cards keyed by their associated usage day.
-        ingest_status: Domain status rows that control daily retry eligibility.
-        reconciliation: Non-fatal collection consistency observations.
-        contract_drift: Schema contract deviations observed this run.
-        fetch_summary: Rows-in counts for the ingest audit.
-        system_metadata: Best-effort collector host metadata.
-    """
-
-    run_id: str
-    source_id: str
-    started_at: datetime
-    finished_at: datetime
-    host: str | None
-    daily_models: dict[date, DailyModelsPayload]
-    report_rows: list[SessionRow]
-    graph: GraphPayload
-    pricing_by_day: dict[date, dict[str, PricingRow]]
-    ingest_status: tuple[IngestStatus, ...]
-    reconciliation: ReconciliationResult
-    contract_drift: tuple[ContractDrift, ...] = ()
-    fetch_summary: dict[str, int] | None = None
-    drift_fatal: bool = False
-    system_metadata: SystemMetadata | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class NormalizedBundle:
     """Canonical Arrow tables keyed by table name, run-stamped."""
 
     run_id: str
     tables: dict[str, pa.Table]
-
-
-@dataclass(frozen=True, slots=True)
-class IngestStatus:
-    """One domain-level daily collection status.
-
-    ``expected_count`` and ``succeeded_count`` measure processing units rather
-    than output rows. For pricing, they represent expected and covered models.
-    """
-
-    day: date
-    domain: str
-    status: str
-    expected_count: int | None
-    succeeded_count: int | None
-    last_attempted_run: str
-    last_succeeded_run: str | None
-    failure_code: str | None = None
 
 
 def _col_major[T](records: list[dict[str, T]]) -> ColumnarData:

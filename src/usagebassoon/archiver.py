@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""snapshots.py — Catalog-published portable Parquet restoration snapshots."""
+"""archiver.py — Catalog-published portable Parquet snapshot publication and restore."""
 
 from __future__ import annotations
 
@@ -10,19 +10,26 @@ import io
 import json
 import logging
 import re
-import shutil
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from usagebassoon.backends.base import StorageBackend
-from usagebassoon.backends.gcs import GcsObject, validate_relative_name
+from usagebassoon.buckets.base import (
+    SnapshotBucket,
+    SnapshotObject,
+    SnapshotPreconditionError,
+    SnapshotVersion,
+    validate_relative_name,
+)
+from usagebassoon.buckets.local import LocalSnapshotBucket
+from usagebassoon.config import parse_interval
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -43,87 +50,9 @@ SNAPSHOT_TABLES: tuple[str, ...] = (
 _CATALOG_NAME = "catalog.json"
 _FORMAT_VERSION = 1
 _LEASE_SECONDS = 300
-_DURATION = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])\Z", re.I)
 _SNAPSHOT_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LOG = logging.getLogger("usagebassoon")
-
-
-class GcsArchive(Protocol):
-    """The GCS object operations used by a snapshot archive."""
-
-    def read_json(
-        self, relative_name: str
-    ) -> tuple[dict[str, object] | None, int | None]:
-        """Read JSON and its generation."""
-        ...
-
-    def write_json_cas(
-        self,
-        relative_name: str,
-        payload: dict[str, object],
-        *,
-        generation: int | None,
-    ) -> GcsObject:
-        """Write JSON conditionally."""
-        ...
-
-    def write_bytes(
-        self,
-        relative_name: str,
-        payload: bytes,
-        *,
-        if_generation_match: int | None = None,
-        content_type: str = "application/octet-stream",
-    ) -> GcsObject:
-        """Write bytes and return immutable metadata."""
-        ...
-
-    def read_bytes(self, relative_name: str, *, generation: int) -> bytes:
-        """Read an exact object generation."""
-        ...
-
-    def delete(self, relative_name: str, *, generation: int) -> None:
-        """Delete an exact object generation."""
-        ...
-
-    def list(self, relative_prefix: str) -> tuple[GcsObject, ...]:
-        """List immutable object metadata under an archive-relative prefix."""
-        ...
-
-    def relative(self, object_name: str) -> str:
-        """Make an object name relative to the archive root."""
-        ...
-
-    def lifecycle_delete_warnings(self) -> tuple[str, ...]:
-        """Inspect lifecycle rules for matching deletes."""
-        ...
-
-
-def parse_interval(value: str | None) -> timedelta | None:
-    """Parse a positive compact snapshot cadence duration.
-
-    Args:
-        value: ``<number><s|m|h|d|w>`` duration, or ``None``.
-
-    Returns:
-        Parsed duration, or ``None`` when cadence is disabled.
-
-    Raises:
-        ValueError: If the value is not a positive supported duration.
-    """
-    if value is None:
-        return None
-    match = _DURATION.fullmatch(value.strip())
-    if match is None:
-        raise ValueError("snapshots.interval must be like 30m, 12h, or 7d")
-    amount = float(match["value"])
-    if amount <= 0:
-        raise ValueError("snapshots.interval must be positive")
-    return timedelta(
-        seconds=amount
-        * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match["unit"].lower()]
-    )
 
 
 def _now() -> datetime:
@@ -168,7 +97,7 @@ def _validate_snapshot_id(value: object) -> str:
 
 def _reference_metadata(
     reference: object, *, expected_name: str
-) -> tuple[str, int, int, str]:
+) -> tuple[str, SnapshotVersion, int, str]:
     """Validate one checksum-protected archive object reference.
 
     Args:
@@ -184,15 +113,16 @@ def _reference_metadata(
     if not isinstance(reference, dict):
         raise ValueError("snapshot object reference must be an object")
     name = reference.get("name")
-    generation = reference.get("generation")
+    version = reference.get("version")
     size = reference.get("size")
     sha256 = reference.get("sha256")
     if (
         not isinstance(name, str)
         or validate_relative_name(name) != expected_name
-        or not isinstance(generation, int)
-        or isinstance(generation, bool)
-        or generation < 0
+        or not isinstance(version, (int, str))
+        or isinstance(version, bool)
+        or (isinstance(version, int) and version < 0)
+        or (isinstance(version, str) and not version)
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size < 0
@@ -200,146 +130,7 @@ def _reference_metadata(
         or _SHA256.fullmatch(sha256) is None
     ):
         raise ValueError("snapshot object reference is invalid")
-    return name, generation, size, sha256
-
-
-class _SnapshotArchive:
-    """Uniform object and catalog operations for one snapshot destination."""
-
-    def __init__(self, uri: str, gcs_archive: GcsArchive | None = None) -> None:
-        """Open a local or GCS archive destination."""
-        self.uri = uri.rstrip("/")
-        self.gcs: GcsArchive | None = None
-        self.local: Path | None = None
-        if self.uri.startswith("gs://"):
-            if gcs_archive is None:
-                from usagebassoon.backends.gcs import GcsArchive as RealGcsArchive
-
-                gcs_archive = RealGcsArchive(self.uri)
-            self.gcs = gcs_archive
-            self.local = None
-        else:
-            self.gcs = None
-            self.local = Path(self.uri.removeprefix("file://")).expanduser().resolve()
-
-    def _local_path(self, relative_name: str) -> Path:
-        """Resolve one validated local archive object below its root.
-
-        Args:
-            relative_name: Archive-relative object name.
-
-        Returns:
-            Resolved path confined to the archive root.
-
-        Raises:
-            ValueError: If the resolved path escapes the archive root.
-        """
-        assert self.local is not None
-        relative = validate_relative_name(relative_name)
-        root = self.local.resolve()
-        candidate = (root / relative).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError as error:
-            raise ValueError(
-                f"archive object escapes local root: {relative!r}"
-            ) from error
-        return candidate
-
-    @property
-    def is_gcs(self) -> bool:
-        """Return whether this destination uses Google Cloud Storage."""
-        return self.gcs is not None
-
-    def read_catalog(self) -> tuple[dict[str, object], int | None]:
-        """Read the destination catalog and its optional generation."""
-        if self.gcs is not None:
-            catalog, generation = self.gcs.read_json(_CATALOG_NAME)
-            return _empty_catalog() if catalog is None else catalog, generation
-        path = self._local_path(_CATALOG_NAME)
-        if not path.exists():
-            return _empty_catalog(), None
-        payload = json.loads(path.read_text())
-        if not isinstance(payload, dict):
-            raise ValueError("snapshot catalog must be a JSON object")
-        return payload, None
-
-    def write_catalog(self, catalog: dict[str, object], generation: int | None) -> None:
-        """Persist the destination catalog atomically or with GCS CAS."""
-        if self.gcs is not None:
-            self.gcs.write_json_cas(_CATALOG_NAME, catalog, generation=generation)
-            return
-        assert self.local is not None
-        self.local.mkdir(parents=True, exist_ok=True)
-        path = self._local_path(_CATALOG_NAME)
-        temporary = path.with_name(f".{_CATALOG_NAME}.{uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
-        temporary.replace(path)
-
-    def write_bytes(
-        self,
-        relative_name: str,
-        payload: bytes,
-        *,
-        content_type: str = "application/octet-stream",
-    ) -> GcsObject:
-        """Write one snapshot object."""
-        relative = validate_relative_name(relative_name)
-        if self.gcs is not None:
-            return self.gcs.write_bytes(
-                relative,
-                payload,
-                content_type=content_type,
-            )
-        del content_type
-        path = self._local_path(relative)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
-        return GcsObject(
-            name=relative,
-            generation=0,
-            size=len(payload),
-            checksum=hashlib.sha256(payload).hexdigest(),
-        )
-
-    def read_bytes(self, relative_name: str, *, generation: int) -> bytes:
-        """Read one exact snapshot object."""
-        relative = validate_relative_name(relative_name)
-        if self.gcs is not None:
-            return self.gcs.read_bytes(relative, generation=generation)
-        del generation
-        return self._local_path(relative).read_bytes()
-
-    def delete(self, relative_name: str, *, generation: int) -> None:
-        """Delete one snapshot object without crossing a GCS generation."""
-        relative = validate_relative_name(relative_name)
-        if self.gcs is not None:
-            self.gcs.delete(relative, generation=generation)
-            return
-        del generation
-        self._local_path(relative).unlink(missing_ok=True)
-
-    def relative(self, object_name: str) -> str:
-        """Return a destination-relative object name."""
-        relative = (
-            self.gcs.relative(object_name) if self.gcs is not None else object_name
-        )
-        return validate_relative_name(relative)
-
-    def lifecycle_warnings(self) -> tuple[str, ...]:
-        """Return advisory lifecycle warnings for this destination."""
-        return () if self.gcs is None else self.gcs.lifecycle_delete_warnings()
-
-    def remove_snapshot_tree(self, snapshot_id: str) -> None:
-        """Remove a local snapshot prefix during retention or rollback."""
-        if self.local is not None:
-            path = self._local_path(_validate_snapshot_id(snapshot_id))
-            if path.is_symlink():
-                raise ValueError(
-                    f"snapshot cleanup target is a symlink: {snapshot_id!r}"
-                )
-            if path.exists():
-                shutil.rmtree(path)
+    return name, version, size, sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,8 +144,12 @@ class _CapturedTable:
     payload: bytes | None
 
 
-class SnapshotStore:
-    """A catalog-backed local, GCS, or dual-destination snapshot archive."""
+class SnapshotArchiver:
+    """Publish and restore complete catalog-backed normalized-table snapshots.
+
+    The archiver owns snapshot format, publication, retention, and restore
+    semantics. Snapshot buckets only provide version-aware object storage.
+    """
 
     def __init__(
         self,
@@ -364,29 +159,29 @@ class SnapshotStore:
         gcs_archive_uri: str | None = None,
         max_snapshots: int = 3,
         interval: str | None = None,
-        gcs_archive: GcsArchive | None = None,
+        gcs_bucket: SnapshotBucket | None = None,
     ) -> None:
         """Configure one or two snapshot destinations.
 
         Args:
-            uri: Backward-compatible single local or GCS archive URI.
+            uri: Single local or cloud snapshot archive URI.
             file_uri: Optional local archive URI.
             gcs_archive_uri: Optional GCS archive URI.
             max_snapshots: Positive published-snapshot retention ceiling.
             interval: Optional publication cadence.
-            gcs_archive: Injectable GCS adapter for isolated tests.
+            gcs_bucket: Injectable cloud bucket for isolated tests.
         """
         if max_snapshots < 1:
             raise ValueError("max_snapshots must be positive")
         if uri is not None and (file_uri is not None or gcs_archive_uri is not None):
             raise ValueError("uri cannot be combined with file_uri or gcs_archive_uri")
         locations = (
-            [(uri, gcs_archive)]
+            [(uri, gcs_bucket)]
             if uri is not None
             else [
                 *([(file_uri, None)] if file_uri is not None else []),
                 *(
-                    [(gcs_archive_uri, gcs_archive)]
+                    [(gcs_archive_uri, gcs_bucket)]
                     if gcs_archive_uri is not None
                     else []
                 ),
@@ -399,7 +194,8 @@ class SnapshotStore:
         if gcs_archive_uri is not None and not gcs_archive_uri.startswith("gs://"):
             raise ValueError("gcs_archive_uri must be a gs:// URI")
         self._archives = tuple(
-            _SnapshotArchive(location, archive) for location, archive in locations
+            archive if archive is not None else LocalSnapshotBucket(location)
+            for location, archive in locations
         )
         self._primary = self._archives[0]
         self.uri = self._primary.uri
@@ -407,16 +203,16 @@ class SnapshotStore:
         self.interval = parse_interval(interval)
 
     @classmethod
-    def from_config(cls, configuration: UsageBassoonConfig) -> SnapshotStore:
-        """Create a snapshot store from validated application configuration."""
-        from usagebassoon.backends.gcs import GcsArchive
+    def from_config(cls, configuration: UsageBassoonConfig) -> SnapshotArchiver:
+        """Create an archiver from validated application configuration."""
+        from usagebassoon.buckets.gcs import GcsSnapshotBucket
 
         settings = configuration.snapshots
         gcs = configuration.gcs
         file_uri = settings.file_uri if settings is not None else None
         gcs_archive_uri = gcs.uri if gcs is not None else None
-        gcs_archive = (
-            GcsArchive(
+        gcs_bucket = (
+            GcsSnapshotBucket(
                 gcs.uri,
                 project=gcs.project,
                 location=gcs.location,
@@ -432,13 +228,13 @@ class SnapshotStore:
             gcs_archive_uri=gcs_archive_uri,
             max_snapshots=settings.max_snapshots if settings else 3,
             interval=settings.interval if settings else None,
-            gcs_archive=gcs_archive,
+            gcs_bucket=gcs_bucket,
         )
 
     @property
     def is_gcs(self) -> bool:
         """Return whether any configured destination uses GCS."""
-        return any(archive.is_gcs for archive in self._archives)
+        return any(archive.uri.startswith("gs://") for archive in self._archives)
 
     @property
     def destination_uris(self) -> tuple[str, ...]:
@@ -454,26 +250,27 @@ class SnapshotStore:
         )
 
     def _read_catalog_for(
-        self, archive: _SnapshotArchive
-    ) -> tuple[dict[str, object], int | None]:
+        self, archive: SnapshotBucket
+    ) -> tuple[dict[str, object], SnapshotVersion | None]:
         """Read one destination catalog."""
-        return archive.read_catalog()
+        catalog, version = archive.read_json(_CATALOG_NAME)
+        return _empty_catalog() if catalog is None else catalog, version
 
-    def _read_catalog(self) -> tuple[dict[str, object], int | None]:
+    def _read_catalog(self) -> tuple[dict[str, object], SnapshotVersion | None]:
         """Read the primary destination catalog."""
         return self._read_catalog_for(self._primary)
 
     def _write_catalog_for(
         self,
-        archive: _SnapshotArchive,
+        archive: SnapshotBucket,
         catalog: dict[str, object],
-        generation: int | None,
+        generation: SnapshotVersion | None,
     ) -> None:
         """Write one destination catalog."""
-        archive.write_catalog(catalog, generation)
+        archive.write_json_cas(_CATALOG_NAME, catalog, expected_version=generation)
 
     def _write_catalog(
-        self, catalog: dict[str, object], generation: int | None
+        self, catalog: dict[str, object], generation: SnapshotVersion | None
     ) -> None:
         """Write the primary destination catalog."""
         self._write_catalog_for(self._primary, catalog, generation)
@@ -514,7 +311,7 @@ class SnapshotStore:
 
     def _claim_for(
         self,
-        archive: _SnapshotArchive,
+        archive: SnapshotBucket,
         now: datetime,
         owner: str,
     ) -> int | None:
@@ -540,9 +337,7 @@ class SnapshotStore:
             }
             try:
                 self._write_catalog_for(archive, catalog, generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "snapshot reservation claim raced with another writer for %s",
                     archive.uri,
@@ -560,10 +355,10 @@ class SnapshotStore:
 
     def _claim_all(
         self, now: datetime
-    ) -> tuple[str, tuple[tuple[_SnapshotArchive, int], ...]] | None:
+    ) -> tuple[str, tuple[tuple[SnapshotBucket, int], ...]] | None:
         """Reserve every configured destination before capturing any data."""
         owner = uuid4().hex
-        claims: list[tuple[_SnapshotArchive, int]] = []
+        claims: list[tuple[SnapshotBucket, int]] = []
         try:
             for archive in self._archives:
                 fence = self._claim_for(archive, now, owner)
@@ -577,7 +372,7 @@ class SnapshotStore:
         return owner, tuple(claims)
 
     def _release_claims(
-        self, owner: str, claims: list[tuple[_SnapshotArchive, int]]
+        self, owner: str, claims: list[tuple[SnapshotBucket, int]]
     ) -> None:
         """Release reservations still owned by one failed capture."""
         for archive, fence in claims:
@@ -591,9 +386,7 @@ class SnapshotStore:
                 ):
                     catalog["reservation"] = None
                     self._write_catalog_for(archive, catalog, generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "snapshot reservation release raced with another writer for %s",
                     archive.uri,
@@ -632,19 +425,19 @@ class SnapshotStore:
 
     @staticmethod
     def _object_reference(
-        archive: _SnapshotArchive, object_ref: GcsObject, payload: bytes
+        archive: SnapshotBucket, object_ref: SnapshotObject, payload: bytes
     ) -> dict[str, object]:
         """Convert one archive object to a manifest reference."""
         return {
-            "name": archive.relative(object_ref.name),
-            "generation": object_ref.generation,
+            "name": object_ref.name,
+            "version": object_ref.version,
             "size": object_ref.size,
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
 
     def _write_target(
         self,
-        archive: _SnapshotArchive,
+        archive: SnapshotBucket,
         snapshot_id: str,
         captures: dict[str, _CapturedTable],
         manifest_base: dict[str, object],
@@ -696,17 +489,15 @@ class SnapshotStore:
             raise
 
     def _delete_objects(
-        self, archive: _SnapshotArchive, objects: list[dict[str, object]]
+        self, archive: SnapshotBucket, objects: list[dict[str, object]]
     ) -> None:
         """Delete newly written objects without crossing generations."""
         for object_ref in objects:
-            name, generation = object_ref.get("name"), object_ref.get("generation")
-            if isinstance(name, str) and isinstance(generation, int):
+            name, version = object_ref.get("name"), object_ref.get("version")
+            if isinstance(name, str) and isinstance(version, (int, str)):
                 try:
-                    archive.delete(name, generation=generation)
-                except RuntimeError as error:
-                    if error.__class__.__name__ != "GcsPreconditionError":
-                        raise
+                    archive.delete(name, version=version)
+                except SnapshotPreconditionError:
                     _LOG.warning(
                         "snapshot object cleanup raced with another writer for %s",
                         archive.uri,
@@ -715,7 +506,7 @@ class SnapshotStore:
 
     def _publish_for(
         self,
-        archive: _SnapshotArchive,
+        archive: SnapshotBucket,
         entry: dict[str, object],
         *,
         owner: str,
@@ -745,9 +536,7 @@ class SnapshotStore:
             catalog["reservation"] = None
             try:
                 self._write_catalog_for(archive, catalog, generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "snapshot publication raced with another writer for %s",
                     archive.uri,
@@ -757,7 +546,7 @@ class SnapshotStore:
             return True
         return None
 
-    def _rotate_for(self, archive: _SnapshotArchive) -> list[dict[str, object]]:
+    def _rotate_for(self, archive: SnapshotBucket) -> list[dict[str, object]]:
         """Apply retention after every destination has published."""
         for _ in range(5):
             catalog, generation = self._read_catalog_for(archive)
@@ -768,9 +557,7 @@ class SnapshotStore:
             catalog["entries"] = entries[-self.max_snapshots :]
             try:
                 self._write_catalog_for(archive, catalog, generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "snapshot retention update raced with another writer for %s",
                     archive.uri,
@@ -793,7 +580,7 @@ class SnapshotStore:
         )
         return None if published is None else self._rotate_for(self._primary)
 
-    def _remove_entry(self, archive: _SnapshotArchive, snapshot_id: str) -> None:
+    def _remove_entry(self, archive: SnapshotBucket, snapshot_id: str) -> None:
         """Remove one just-published entry during dual-publication rollback."""
         for _ in range(5):
             catalog, generation = self._read_catalog_for(archive)
@@ -806,9 +593,7 @@ class SnapshotStore:
             catalog["entries"] = filtered
             try:
                 self._write_catalog_for(archive, catalog, generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "snapshot rollback raced with another writer for %s",
                     archive.uri,
@@ -818,7 +603,7 @@ class SnapshotStore:
             return
 
     def _load_manifest(
-        self, entry: dict[str, object], archive: _SnapshotArchive | None = None
+        self, entry: dict[str, object], archive: SnapshotBucket | None = None
     ) -> dict[str, object]:
         """Load an exact catalog-referenced manifest and validate completeness."""
         destination = self._primary if archive is None else archive
@@ -854,7 +639,7 @@ class SnapshotStore:
 
     @staticmethod
     def _read_verified_reference(
-        archive: _SnapshotArchive,
+        archive: SnapshotBucket,
         reference: object,
         *,
         expected_name: str,
@@ -872,11 +657,11 @@ class SnapshotStore:
         Raises:
             ValueError: If metadata, size, or SHA-256 verification fails.
         """
-        name, generation, size, sha256 = _reference_metadata(
+        name, version, size, sha256 = _reference_metadata(
             reference,
             expected_name=expected_name,
         )
-        raw = archive.read_bytes(name, generation=generation)
+        raw = archive.read_bytes(name, version=version)
         if len(raw) != size:
             raise ValueError(f"snapshot object size does not match: {name!r}")
         if hashlib.sha256(raw).hexdigest() != sha256:
@@ -884,7 +669,7 @@ class SnapshotStore:
         return raw
 
     def _cleanup_entry(
-        self, entry: dict[str, object], archive: _SnapshotArchive | None = None
+        self, entry: dict[str, object], archive: SnapshotBucket | None = None
     ) -> None:
         """Remove unretained published objects without crossing generations."""
         destination = self._primary if archive is None else archive
@@ -896,9 +681,6 @@ class SnapshotStore:
             entry.get("manifest"),
             expected_name=f"{validated_snapshot_id}/manifest.json",
         )
-        if not destination.is_gcs:
-            destination.remove_snapshot_tree(validated_snapshot_id)
-            return
         manifest = self._load_manifest(entry, destination)
         tables = manifest["tables"]
         assert isinstance(tables, dict)
@@ -914,11 +696,9 @@ class SnapshotStore:
         self._delete_objects(destination, objects)
 
     def _cleanup_stale_gcs_staging(
-        self, archive: _SnapshotArchive, now: datetime
+        self, archive: SnapshotBucket, now: datetime
     ) -> None:
         """Retry safe deletion of expired unreferenced GCS staging prefixes."""
-        if archive.gcs is None:
-            return
         catalog, _ = self._read_catalog_for(archive)
         retained = frozenset(
             entry.get("snapshot_id")
@@ -926,8 +706,8 @@ class SnapshotStore:
             if isinstance(entry.get("snapshot_id"), str)
         )
         cutoff = now - timedelta(seconds=_LEASE_SECONDS)
-        for object_ref in archive.gcs.list(""):
-            relative = validate_relative_name(archive.gcs.relative(object_ref.name))
+        for object_ref in archive.list(""):
+            relative = validate_relative_name(object_ref.name)
             snapshot_id = relative.split("/", 1)[0]
             if (
                 _SNAPSHOT_ID.fullmatch(snapshot_id) is None
@@ -950,10 +730,8 @@ class SnapshotStore:
             if created >= cutoff:
                 continue
             try:
-                archive.gcs.delete(relative, generation=object_ref.generation)
-            except RuntimeError as error:
-                if error.__class__.__name__ != "GcsPreconditionError":
-                    raise
+                archive.delete(relative, version=object_ref.version)
+            except SnapshotPreconditionError:
                 _LOG.warning(
                     "stale GCS snapshot cleanup raced with another writer for %s",
                     archive.uri,
@@ -968,9 +746,9 @@ class SnapshotStore:
             return None
         owner, claims = claimed
         snapshot_id = f"{created.strftime('%Y-%m-%dT%H%M%SZ')}_{uuid4().hex}"
-        written: dict[_SnapshotArchive, list[dict[str, object]]] = {}
-        entries: dict[_SnapshotArchive, dict[str, object]] = {}
-        published: list[_SnapshotArchive] = []
+        written: dict[SnapshotBucket, list[dict[str, object]]] = {}
+        entries: dict[SnapshotBucket, dict[str, object]] = {}
+        published: list[SnapshotBucket] = []
         try:
             captures = {
                 table: self._capture_table(backend, table) for table in SNAPSHOT_TABLES
@@ -1034,9 +812,7 @@ class SnapshotStore:
             values.append(_validate_snapshot_id(entry.get("snapshot_id")))
         return values
 
-    def _restore_entry(
-        self, snapshot: str
-    ) -> tuple[_SnapshotArchive, dict[str, object]]:
+    def _restore_entry(self, snapshot: str) -> tuple[SnapshotBucket, dict[str, object]]:
         """Select the first destination containing the requested publication."""
         if snapshot != "latest":
             _validate_snapshot_id(snapshot)

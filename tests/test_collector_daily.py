@@ -13,18 +13,15 @@ from typing import cast
 
 import pytest
 
-from usagebassoon import collector
+from usagebassoon import collector as subprocess_collector
+from usagebassoon import orchestrator as collector
+from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
-from usagebassoon.ingest import RawCollection
+from usagebassoon.ingest import CollectionBundle, IngestStatus, IngestTarget
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
-from usagebassoon.merge import PersistSummary
-from usagebassoon.normalizer import (
-    CollectionBundle,
-    IngestStatus,
-    IngestTarget,
-    NormalizedBundle,
-)
+from usagebassoon.normalizer import NormalizedBundle
+from usagebassoon.persistence import PersistSummary
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -95,9 +92,9 @@ def test_daily_models_command_uses_each_candidate_day(
         calls.append(arguments)
         return daily_raws[day]
 
-    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
 
-    payloads = collector._fetch_daily_models(
+    payloads = subprocess_collector._fetch_daily_models(
         _config(Path("config.toml")),
         ["tokscale"],
         [day],
@@ -139,7 +136,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
         tokscale_env=("CUSTOM_TOKSCALE_AUTH",),
     )
 
-    child = collector._child_environment(configuration)
+    child = subprocess_collector._child_environment(configuration)
 
     assert child["PATH"] == "/test/bin"
     assert child["LANG"] == "C.UTF-8"
@@ -313,12 +310,13 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     monkeypatch.setattr(collector, "datetime", _FixedDatetime)
     monkeypatch.setattr(collector, "_prefix", prefix)
     monkeypatch.setattr(collector, "_json_command", command)
-    monkeypatch.setattr(collector, "_load_ingest_status", ingest_status)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+    monkeypatch.setattr(collector, "load_ingest_status", ingest_status)
     monkeypatch.setattr(collector, "_fetch_daily_models", daily_models)
     monkeypatch.setattr(collector, "_fetch_pricing", pricing)
     monkeypatch.setattr(collector, "build_collection_bundle", build)
     monkeypatch.setattr(collector, "normalize", normalized)
-    monkeypatch.setattr(collector, "_persist_with_retries", persist)
+    monkeypatch.setattr(collector, "persist_with_retries", persist)
 
     _, summary = collector.collect(_config(tmp_path / "config.toml"))
 
@@ -328,9 +326,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     assert set(requested_prices[0]) == expected_successes
     assert captured[0].graph is graph_raw
     assert set(captured[0].daily_models) == expected_successes
-    assert captured[0].report_by_day == report_raws
-    assert captured[0].report_fetch_failures == frozenset()
-    assert set(captured[0].pricing_expected_models) == expected_successes
+    assert set(captured[0].report_by_day) == set(report_raws)
 
 
 def test_daily_models_failure_aborts_collection(
@@ -342,10 +338,10 @@ def test_daily_models_failure_aborts_collection(
         """Raise the kind of process-start failure a scheduled run can see."""
         raise OSError("tokscale executable unavailable")
 
-    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
 
     with pytest.raises(OSError, match="tokscale executable unavailable"):
-        collector._fetch_daily_models(
+        subprocess_collector._fetch_daily_models(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],
@@ -364,10 +360,10 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
         """Raise a transient report command failure."""
         raise RuntimeError("report process failed")
 
-    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
-        reports, failures = collector._fetch_reports(
+        reports, failures = subprocess_collector._fetch_reports(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],

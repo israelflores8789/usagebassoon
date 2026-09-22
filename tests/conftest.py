@@ -17,8 +17,8 @@ from uuid import uuid4
 
 import pytest
 
+from usagebassoon.ingest import CollectionBundle, IngestStatus
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
-from usagebassoon.normalizer import CollectionBundle, IngestStatus
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing

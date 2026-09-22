@@ -1,4 +1,4 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""backends — Provider-neutral backend data warehouse adapters."""
+"""buckets — Provider-neutral snapshot object storage adapters."""

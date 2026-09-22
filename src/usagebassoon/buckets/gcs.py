@@ -1,57 +1,29 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""gcs.py — Generation-safe Google Cloud Storage archive access."""
+"""gcs.py — Google Cloud Storage implementation of the snapshot bucket contract."""
 
 from __future__ import annotations
 
 import json
 import logging
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
+from usagebassoon.buckets.base import (
+    SnapshotObject,
+    SnapshotPreconditionError,
+    SnapshotVersion,
+    validate_relative_name,
+)
+
 _LOG = logging.getLogger("usagebassoon")
 
 
-def validate_relative_name(value: str, *, allow_empty: bool = False) -> str:
-    """Validate a portable archive-relative object name.
-
-    Args:
-        value: POSIX-style object name relative to an archive root.
-        allow_empty: Whether an empty name is valid for prefix listing.
-
-    Returns:
-        The validated object name.
-
-    Raises:
-        ValueError: If the name is absolute, empty when disallowed, or has a
-            traversal, backslash, or NUL component.
-    """
-    if not isinstance(value, str):
-        raise ValueError("archive object name must be a string")
-    if not value:
-        if allow_empty:
-            return value
-        raise ValueError("archive object name must not be empty")
-    if value.startswith(("/", "\\\\")) or "\\" in value or "\x00" in value:
-        raise ValueError(f"archive object name is not relative: {value!r}")
-    components = value.split("/")
-    if any(component in {"", ".", ".."} for component in components):
-        raise ValueError(f"archive object name has an unsafe component: {value!r}")
-    if len(value) >= 2 and value[0].isalpha() and value[1] == ":":
-        raise ValueError(f"archive object name is not relative: {value!r}")
-    return value
-
-
-class GcsPreconditionError(RuntimeError):
-    """Raised when a generation-conditional GCS operation loses a race."""
-
-
 class GcsBlob(Protocol):
-    """The subset of the official Blob API used by the archive adapter."""
+    """Internal testable seam for the subset of the Google Blob SDK we use."""
 
     name: str
     generation: int | str | None
@@ -90,7 +62,7 @@ class GcsBlob(Protocol):
 
 
 class GcsBucket(Protocol):
-    """The bucket operations needed by :class:`GcsArchive`."""
+    """Internal testable seam for the Google Bucket SDK used by this adapter."""
 
     lifecycle_rules: Iterable[Mapping[str, Mapping[str, object]]]
 
@@ -104,7 +76,7 @@ class GcsBucket(Protocol):
 
 
 class GcsClient(Protocol):
-    """The client operations needed by :class:`GcsArchive`."""
+    """Internal testable seam for the Google storage client used by this adapter."""
 
     def bucket(self, bucket_name: str) -> GcsBucket:
         """Return a bucket handle."""
@@ -113,23 +85,6 @@ class GcsClient(Protocol):
     def list_blobs(self, bucket: GcsBucket, *, prefix: str) -> Iterable[GcsBlob]:
         """List blob handles below one prefix."""
         ...
-
-
-@dataclass(frozen=True, slots=True)
-class GcsObject:
-    """Immutable metadata required to read or remove one GCS object safely.
-
-    Attributes:
-        name: Bucket-relative object name.
-        generation: Object generation at publication time.
-        size: Object size in bytes.
-        checksum: Server-provided CRC32C checksum when available.
-    """
-
-    name: str
-    generation: int
-    size: int
-    checksum: str | None
 
 
 def parse_gcs_uri(uri: str) -> tuple[str, str]:
@@ -151,8 +106,13 @@ def parse_gcs_uri(uri: str) -> tuple[str, str]:
     return parsed.netloc, validate_relative_name(prefix, allow_empty=True)
 
 
-class GcsArchive:
-    """Small adapter for generation-aware archive object operations."""
+class GcsSnapshotBucket:
+    """Implement the provider-neutral ``SnapshotBucket`` contract over GCS.
+
+    GCS generations supply immutable object versions and compare-and-swap
+    publication. The GCS SDK protocols above are private adapter seams, not
+    extension contracts; new providers implement ``SnapshotBucket`` directly.
+    """
 
     def __init__(
         self,
@@ -242,16 +202,15 @@ class GcsArchive:
             raise ValueError(f"object lies outside archive root: {object_name!r}")
         return validate_relative_name(object_name.removeprefix(expected))
 
-    @staticmethod
-    def _object(blob: GcsBlob) -> GcsObject:
+    def _object(self, blob: GcsBlob) -> SnapshotObject:
         """Materialize stable metadata from a loaded cloud blob."""
         if blob.generation is None or blob.size is None:
             blob.reload()
         if blob.generation is None or blob.size is None:
             raise RuntimeError(f"GCS did not return metadata for {blob.name!r}")
-        return GcsObject(
-            name=blob.name,
-            generation=int(blob.generation),
+        return SnapshotObject(
+            name=self.relative(blob.name),
+            version=int(blob.generation),
             size=blob.size,
             checksum=blob.crc32c,
         )
@@ -264,16 +223,17 @@ class GcsArchive:
         if error.__class__.__name__ in {"PreconditionFailed", "Conflict"} or (
             exact_generation and error.__class__.__name__ == "NotFound"
         ):
-            raise GcsPreconditionError("GCS object generation changed") from error
+            raise SnapshotPreconditionError("GCS object generation changed") from error
         raise error
 
-    def read_bytes(self, relative_name: str, *, generation: int | None = None) -> bytes:
-        """Read one object, optionally requiring its published generation."""
+    def read_bytes(self, relative_name: str, *, version: SnapshotVersion) -> bytes:
+        """Read one object at its exact published GCS generation."""
+        generation = self._generation(version)
         blob = self.bucket.blob(self.key(relative_name), generation=generation)
         try:
             return blob.download_as_bytes(if_generation_match=generation)
         except Exception as error:
-            self._raise_precondition(error, exact_generation=generation is not None)
+            self._raise_precondition(error, exact_generation=True)
         raise AssertionError("unreachable")
 
     def write_bytes(
@@ -283,8 +243,8 @@ class GcsArchive:
         *,
         if_generation_match: int | None = None,
         content_type: str = "application/octet-stream",
-    ) -> GcsObject:
-        """Write an object, optionally with a generation compare-and-swap guard."""
+    ) -> SnapshotObject:
+        """Write an object and return immutable generation metadata."""
         blob = self.bucket.blob(self.key(relative_name))
         try:
             blob.upload_from_string(
@@ -299,7 +259,7 @@ class GcsArchive:
 
     def read_json(
         self, relative_name: str
-    ) -> tuple[dict[str, object] | None, int | None]:
+    ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
         """Read a JSON object and its generation, returning absent for a missing key."""
         blob = self.bucket.blob(self.key(relative_name))
         payload: object = None
@@ -321,17 +281,26 @@ class GcsArchive:
         relative_name: str,
         payload: dict[str, object],
         *,
-        generation: int | None,
-    ) -> GcsObject:
+        expected_version: SnapshotVersion | None,
+    ) -> SnapshotObject:
         """Atomically create or replace JSON using a GCS generation precondition."""
         return self.write_bytes(
             relative_name,
             (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(),
-            if_generation_match=0 if generation is None else generation,
+            if_generation_match=(
+                0 if expected_version is None else self._generation(expected_version)
+            ),
             content_type="application/json",
         )
 
-    def list(self, relative_prefix: str) -> tuple[GcsObject, ...]:
+    @staticmethod
+    def _generation(version: SnapshotVersion) -> int:
+        """Require a numeric generation from a generic snapshot version."""
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError("GCS object versions must be integer generations")
+        return version
+
+    def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List loaded object metadata under an archive-relative prefix."""
         prefix = self.key(relative_prefix)
         return tuple(
@@ -339,16 +308,16 @@ class GcsArchive:
             for blob in self.client.list_blobs(self.bucket, prefix=prefix)
         )
 
-    def delete(self, relative_name: str, *, generation: int) -> None:
+    def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
         """Delete exactly the published generation of an object."""
         try:
             self.bucket.blob(self.key(relative_name)).delete(
-                if_generation_match=generation
+                if_generation_match=self._generation(version)
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
 
-    def lifecycle_delete_warnings(self) -> tuple[str, ...]:
+    def lifecycle_warnings(self) -> tuple[str, ...]:
         """Report lifecycle delete rules that could apply to this archive root."""
         try:
             self.bucket.reload()

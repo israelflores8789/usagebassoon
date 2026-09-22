@@ -32,6 +32,7 @@ DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
 DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
+_INTERVAL = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])\Z", re.I)
 _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -285,16 +286,34 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     if interval is not None:
         if interval != interval.strip():
             raise ConfigurationError("snapshots.interval must be like 30m, 12h, or 7d")
-        from usagebassoon.snapshots import parse_interval
-
         try:
             parse_interval(interval)
         except ValueError as error:
-            raise ConfigurationError(str(error)) from error
+            raise ConfigurationError(f"snapshots.interval {error}") from error
     return SnapshotConfig(
         file_uri=file_uri,
         max_snapshots=max_snapshots,
         interval=interval,
+    )
+
+
+def parse_interval(value: str | None) -> timedelta | None:
+    """Parse a positive configured interval in compact ``<number><unit>`` form.
+
+    This common parser serves collection timeout, scheduling, and snapshot
+    cadence settings; callers provide setting-specific error context.
+    """
+    if value is None:
+        return None
+    match = _INTERVAL.fullmatch(value.strip())
+    if match is None:
+        raise ValueError("interval must be like 30m, 12h, or 7d")
+    amount = float(match["value"])
+    if amount <= 0:
+        raise ValueError("interval must be positive")
+    return timedelta(
+        seconds=amount
+        * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match["unit"].lower()]
     )
 
 
@@ -306,8 +325,6 @@ def _duration(value: object | None, name: str) -> tuple[str | None, timedelta | 
     message = f"{name} must be a positive duration in minutes or hours"
     if text != text.strip() or re.fullmatch(r"\d+(?:\.\d+)?[mh]", text, re.I) is None:
         raise ConfigurationError(message)
-    from usagebassoon.snapshots import parse_interval
-
     try:
         parsed = parse_interval(text)
     except ValueError as error:
@@ -477,7 +494,7 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
     credentials_file = _string(table.get("credentials_file"), "gcs.credentials_file")
     if uri is None or project is None or location is None:
         raise ConfigurationError("gcs.uri, gcs.project, and gcs.location are required")
-    from usagebassoon.backends.gcs import parse_gcs_uri
+    from usagebassoon.buckets.gcs import parse_gcs_uri
 
     try:
         parse_gcs_uri(uri)

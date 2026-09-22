@@ -14,9 +14,10 @@ from uuid import uuid4
 import pyarrow as pa
 import pytest
 
+from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.backends.gcs import GcsArchive, GcsPreconditionError
-from usagebassoon.snapshots import SnapshotStore
+from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
+from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 
 _TEST_BUCKET = "usagebassoon-test-snapshots-gen-lang-client-0670612427"
 
@@ -31,9 +32,7 @@ def live_archive() -> Generator[GcsArchive]:
         yield archive
     finally:
         for object_ref in archive.list(""):
-            archive.delete(
-                archive.relative(object_ref.name), generation=object_ref.generation
-            )
+            archive.delete(object_ref.name, version=object_ref.version)
 
 
 def _backend() -> DuckDBBackend:
@@ -63,23 +62,23 @@ def _append_note(backend: DuckDBBackend) -> None:
 
 def _store(archive: GcsArchive) -> SnapshotStore:
     """Create a snapshot store backed by one live archive."""
-    return SnapshotStore(archive.uri, gcs_archive=archive)
+    return SnapshotStore(archive.uri, gcs_bucket=archive)
 
 
 def test_live_gcs_generation_operations(live_archive: GcsArchive) -> None:
     """Verify official-client conditional object and catalog operations."""
     first = live_archive.write_bytes("probe", b"one", if_generation_match=0)
-    assert live_archive.read_bytes("probe", generation=first.generation) == b"one"
+    assert live_archive.read_bytes("probe", version=first.version) == b"one"
     with pytest.raises(GcsPreconditionError):
         live_archive.write_bytes("probe", b"two", if_generation_match=0)
     catalog = live_archive.write_json_cas(
-        "catalog.json", {"entries": []}, generation=None
+        "catalog.json", {"entries": []}, expected_version=None
     )
     assert live_archive.read_json("catalog.json") == (
         {"entries": []},
-        catalog.generation,
+        catalog.version,
     )
-    live_archive.lifecycle_delete_warnings()
+    live_archive.lifecycle_warnings()
 
 
 def test_live_gcs_snapshot_round_trip_verifies_downloaded_references(

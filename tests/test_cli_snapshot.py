@@ -11,9 +11,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from usagebassoon.archiver import SNAPSHOT_TABLES
+from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
-from usagebassoon.snapshots import SNAPSHOT_TABLES, SnapshotStore
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 

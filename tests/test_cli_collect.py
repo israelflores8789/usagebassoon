@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 from usagebassoon.config import UsageBassoonConfig
-from usagebassoon.merge import PersistSummary
+from usagebassoon.persistence import PersistSummary
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 

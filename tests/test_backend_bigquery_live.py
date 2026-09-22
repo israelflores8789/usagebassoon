@@ -33,15 +33,15 @@ from tests.conftest import (
     EXPECTED_DAYS,
     EXPECTED_REPORT_ROWS,
 )
+from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
 from usagebassoon.backends.bigquery import BigQueryBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
-from usagebassoon.collector import _persist_with_retries
 from usagebassoon.config import ConfigurationManager
-from usagebassoon.merge import PersistSummary, persist_run
-from usagebassoon.normalizer import CollectionBundle, NormalizedBundle, normalize
-from usagebassoon.snapshots import SnapshotStore
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import NormalizedBundle, normalize
+from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 
 pytestmark = pytest.mark.bigquery_live
 
@@ -268,7 +268,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         duckdb_backend.apply_ddl()
         bigquery_backend.apply_ddl()
         expected = persist_run(duckdb_backend, normalized)
-        actual = _persist_with_retries(
+        actual = persist_with_retries(
             configuration,
             normalized,
             logging.getLogger("usagebassoon-bigquery-live"),
@@ -316,7 +316,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             f"WHERE source_id = '{live_settings.source_id}'"
         ).to_pylist() == [{"n": price_count}]
 
-        retried = _persist_with_retries(
+        retried = persist_with_retries(
             configuration,
             normalized,
             logging.getLogger("usagebassoon-bigquery-live"),
@@ -453,7 +453,7 @@ def test_live_concurrent_sources_use_distinct_stages_and_retry(
 
     def persist(normalized: NormalizedBundle) -> PersistSummary:
         """Persist one run through the same bounded retry path as collection."""
-        return _persist_with_retries(
+        return persist_with_retries(
             configuration,
             normalized,
             logging.getLogger("usagebassoon-bigquery-live"),
@@ -487,7 +487,7 @@ def test_live_cli_commands_except_report(
     """Exercise configured BigQuery CLI commands other than out-of-scope report."""
     normalized = _normalized_bundle(live_settings, collection_bundle)
     configuration = ConfigurationManager(live_settings.config_path).load()
-    _persist_with_retries(
+    persist_with_retries(
         configuration,
         normalized,
         logging.getLogger("usagebassoon-bigquery-live"),

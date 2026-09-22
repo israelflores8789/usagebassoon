@@ -15,10 +15,10 @@ import pytest
 
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.collector import _persist_with_retries
 from usagebassoon.config import UsageBassoonConfig
-from usagebassoon.merge import PersistSummary, persist_run
-from usagebassoon.normalizer import CollectionBundle, NormalizedBundle, normalize
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import NormalizedBundle, normalize
+from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 
 
 def test_replaying_a_committed_run_is_an_idempotent_no_op(
@@ -119,7 +119,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
         """Return the controlled retry target instead of a real backend."""
         return _Backend()
 
-    monkeypatch.setattr("usagebassoon.collector.open_backend", open_backend)
+    monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
 
     def persist(_: object, bundle: NormalizedBundle) -> PersistSummary:
         """Fail once, then record the same normalized bundle run identity."""
@@ -129,7 +129,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
             raise RuntimeError("transient warehouse error")
         return PersistSummary(inserted=1, updated=0, per_table={})
 
-    monkeypatch.setattr("usagebassoon.collector.persist_run", persist)
+    monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
 
     def sleep(_: float) -> None:
         """Avoid a real retry delay in this deterministic unit test."""
@@ -138,10 +138,10 @@ def test_persistence_retries_one_normalized_run_without_recollection(
         """Use the upper backoff bound in this deterministic unit test."""
         return maximum
 
-    monkeypatch.setattr("usagebassoon.collector.time.sleep", sleep)
-    monkeypatch.setattr("usagebassoon.collector.random.uniform", uniform)
+    monkeypatch.setattr("usagebassoon.persistence.time.sleep", sleep)
+    monkeypatch.setattr("usagebassoon.persistence.random.uniform", uniform)
     normalized = normalize(collection_bundle)
-    result = _persist_with_retries(
+    result = persist_with_retries(
         config,
         normalized,
         logging.getLogger("usagebassoon-test"),

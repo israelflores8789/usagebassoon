@@ -13,7 +13,7 @@ import typer
 from rich.text import Text
 
 from usagebassoon.cli._output import output_console
-from usagebassoon.cli._utils import snapshot_store
+from usagebassoon.cli._utils import snapshot_archiver
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -165,7 +165,7 @@ def doctor(
 def _snapshot_warnings(configuration: UsageBassoonConfig) -> tuple[str, ...]:
     """Inspect configured GCS lifecycle rules without failing doctor outright."""
     try:
-        return snapshot_store(configuration).lifecycle_warnings()
+        return snapshot_archiver(configuration).lifecycle_warnings()
     except Exception as error:
         _LOG.exception("GCS lifecycle inspection failed")
         return (f"GCS lifecycle inspection unavailable: {error}",)

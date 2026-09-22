@@ -14,15 +14,18 @@ from typing import cast
 import pyarrow as pa
 import pytest
 
+from usagebassoon.archiver import SNAPSHOT_TABLES
+from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.backends.gcs import (
-    GcsArchive,
-    GcsClient,
-    GcsObject,
-    GcsPreconditionError,
+from usagebassoon.buckets.base import (
+    SnapshotObject as GcsObject,
 )
-from usagebassoon.snapshots import SNAPSHOT_TABLES, SnapshotStore
+from usagebassoon.buckets.base import (
+    SnapshotPreconditionError as GcsPreconditionError,
+)
+from usagebassoon.buckets.gcs import GcsClient
+from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 
 
 class MemoryGcsArchive:
@@ -30,6 +33,7 @@ class MemoryGcsArchive:
 
     def __init__(self) -> None:
         """Create an empty bucket-relative object store."""
+        self.uri = "gs://bucket/archive"
         self.objects: dict[str, tuple[int, bytes]] = {}
         self.next_generation = 1
         self.catalog_writes = 0
@@ -39,10 +43,10 @@ class MemoryGcsArchive:
         """Return the archive-relative object name."""
         return object_name.removeprefix("archive/")
 
-    def read_bytes(self, relative_name: str, *, generation: int) -> bytes:
+    def read_bytes(self, relative_name: str, *, version: int | str) -> bytes:
         """Read an exact object generation."""
         current_generation, data = self.objects[f"archive/{relative_name}"]
-        if current_generation != generation:
+        if current_generation != version:
             raise GcsPreconditionError("generation changed")
         return data
 
@@ -69,7 +73,7 @@ class MemoryGcsArchive:
         generation = self.next_generation
         self.next_generation += 1
         self.objects[name] = (generation, payload)
-        return GcsObject(name, generation, len(payload), None)
+        return GcsObject(relative_name, generation, len(payload), None)
 
     def read_json(
         self, relative_name: str
@@ -88,7 +92,7 @@ class MemoryGcsArchive:
         relative_name: str,
         payload: dict[str, object],
         *,
-        generation: int | None,
+        expected_version: int | str | None,
     ) -> GcsObject:
         """Write a JSON document with a generation compare-and-swap guard."""
         if relative_name == "catalog.json":
@@ -98,15 +102,17 @@ class MemoryGcsArchive:
         return self.write_bytes(
             relative_name,
             json.dumps(payload).encode(),
-            if_generation_match=0 if generation is None else generation,
+            if_generation_match=(
+                0 if expected_version is None else cast(int, expected_version)
+            ),
             content_type="application/json",
         )
 
-    def delete(self, relative_name: str, *, generation: int) -> None:
+    def delete(self, relative_name: str, *, version: int | str) -> None:
         """Delete an exact object generation."""
         name = f"archive/{relative_name}"
         current = self.objects.get(name)
-        if current is None or current[0] != generation:
+        if current is None or current[0] != version:
             raise GcsPreconditionError("generation changed")
         del self.objects[name]
 
@@ -114,12 +120,12 @@ class MemoryGcsArchive:
         """List immutable object metadata below a relative prefix."""
         prefix = f"archive/{relative_prefix}"
         return tuple(
-            GcsObject(name, generation, len(data), None)
+            GcsObject(name.removeprefix("archive/"), generation, len(data), None)
             for name, (generation, data) in self.objects.items()
             if name.startswith(prefix)
         )
 
-    def lifecycle_delete_warnings(self) -> tuple[str, ...]:
+    def lifecycle_warnings(self) -> tuple[str, ...]:
         """Return an injectable lifecycle warning."""
         return ("a GCS Delete lifecycle rule could match the snapshot archive",)
 
@@ -407,17 +413,17 @@ def test_gcs_archive_rejects_unsafe_names_before_provider_calls(
     with pytest.raises(ValueError):
         archive.relative(unsafe_name)
     with pytest.raises(ValueError):
-        archive.read_bytes(unsafe_name, generation=1)
+        archive.read_bytes(unsafe_name, version=1)
     with pytest.raises(ValueError):
         archive.write_bytes(unsafe_name, b"payload")
     with pytest.raises(ValueError):
         archive.read_json(unsafe_name)
     with pytest.raises(ValueError):
-        archive.write_json_cas(unsafe_name, {}, generation=None)
+        archive.write_json_cas(unsafe_name, {}, expected_version=None)
     with pytest.raises(ValueError):
         archive.list(unsafe_name)
     with pytest.raises(ValueError):
-        archive.delete(unsafe_name, generation=1)
+        archive.delete(unsafe_name, version=1)
 
     assert client.recording_bucket.blob_calls == 0
     assert client.list_calls == 0
@@ -431,7 +437,7 @@ def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:
         assert store.write(backend, run_id="first") is not None
         assert store.write(backend, run_id="second") is None
         catalog, generation = store._read_catalog()
-        assert generation is None
+        assert isinstance(generation, str)
         now = datetime.now(UTC)
         catalog["reservation"] = {
             "owner": "missing",
@@ -461,7 +467,7 @@ def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
     """Keep only catalog-published snapshots while conditionally cleaning GCS data."""
     archive = MemoryGcsArchive()
     backend = TableBackend()
-    store = SnapshotStore("gs://bucket/archive", max_snapshots=1, gcs_archive=archive)
+    store = SnapshotStore("gs://bucket/archive", max_snapshots=1, gcs_bucket=archive)
     assert store.lifecycle_warnings()
     first = store.write(cast(StorageBackend, backend), run_id="one")
     second = store.write(cast(StorageBackend, backend), run_id="two")
@@ -479,7 +485,7 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
     store = SnapshotStore(
         file_uri=f"file://{tmp_path}/local",
         gcs_archive_uri="gs://bucket/archive",
-        gcs_archive=archive,
+        gcs_bucket=archive,
     )
 
     local_uri = store.write(cast(StorageBackend, backend), run_id="dual")
@@ -500,9 +506,9 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
     )
     gcs_manifest_ref = cast(dict[str, object], gcs_entries[0]["manifest"])
     gcs_manifest_name = cast(str, gcs_manifest_ref["name"])
-    gcs_manifest_generation = cast(int, gcs_manifest_ref["generation"])
+    gcs_manifest_generation = cast(int, gcs_manifest_ref["version"])
     gcs_manifest = json.loads(
-        archive.read_bytes(gcs_manifest_name, generation=gcs_manifest_generation)
+        archive.read_bytes(gcs_manifest_name, version=gcs_manifest_generation)
     )
     assert local_manifest["snapshot_id"] == gcs_manifest["snapshot_id"]
     assert local_manifest["schema_fingerprint"] == gcs_manifest["schema_fingerprint"]
@@ -517,9 +523,7 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
         ):
             assert local_object["name"] == gcs_object["name"]
             assert (tmp_path / "local" / local_object["name"]).read_bytes() == (
-                archive.read_bytes(
-                    gcs_object["name"], generation=gcs_object["generation"]
-                )
+                archive.read_bytes(gcs_object["name"], version=gcs_object["version"])
             )
 
 
@@ -532,7 +536,7 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
     store = SnapshotStore(
         file_uri=f"file://{tmp_path}/local",
         gcs_archive_uri="gs://bucket/archive",
-        gcs_archive=archive,
+        gcs_bucket=archive,
         max_snapshots=1,
     )
 

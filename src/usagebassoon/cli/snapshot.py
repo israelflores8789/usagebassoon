@@ -11,7 +11,7 @@ from typing import Annotated
 import typer
 
 from usagebassoon.backends.base import close_backend
-from usagebassoon.cli._utils import configured_backend, snapshot_store
+from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 
 
 def snapshot(
@@ -23,11 +23,11 @@ def snapshot(
     """Write a raw private restoration snapshot of the configured warehouse."""
     configuration, backend = configured_backend(config)
     try:
-        store = snapshot_store(configuration)
+        archiver = snapshot_archiver(configuration)
         latest = backend.query(
             "SELECT run_id FROM ingest_runs ORDER BY finished_at DESC LIMIT 1"
         ).to_pylist()
-        uri = store.write(
+        uri = archiver.write(
             backend,
             run_id=str(latest[0]["run_id"]) if latest else "manual",
         )
@@ -38,5 +38,5 @@ def snapshot(
             "Snapshot skipped: the configured interval is not due or is reserved."
         )
     else:
-        destinations = ", ".join(store.destination_uris)
+        destinations = ", ".join(archiver.destination_uris)
         typer.echo(f"Created private raw snapshot at {destinations}.")

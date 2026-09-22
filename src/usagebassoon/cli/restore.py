@@ -10,8 +10,8 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.cli._utils import configured_backend, snapshot_store
-from usagebassoon.snapshots import SNAPSHOT_TABLES
+from usagebassoon.archiver import SNAPSHOT_TABLES
+from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 
 
 def restore(
@@ -39,7 +39,7 @@ def restore(
                 "restore requires an empty warehouse; populated tables: "
                 + ", ".join(populated)
             )
-        restored = snapshot_store(configuration).restore(backend, snapshot)
+        restored = snapshot_archiver(configuration).restore(backend, snapshot)
     finally:
         backend.close()
     details = ", ".join(f"{table}={count}" for table, count in restored.items())

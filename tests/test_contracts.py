@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.collector import RawCollection
 from usagebassoon.contracts import (
     ContractValidationError,
     build_contract,
@@ -19,10 +20,10 @@ from usagebassoon.contracts import (
     load_shipped_contracts,
     validate_payloads,
 )
-from usagebassoon.ingest import RawCollection, build_collection_bundle
+from usagebassoon.ingest import build_collection_bundle
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
-from usagebassoon.merge import persist_run
 from usagebassoon.normalizer import normalize
+from usagebassoon.persistence import persist_run
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -54,14 +55,8 @@ def _raw_collection(
     return RawCollection(
         daily_models=daily_models,
         report_by_day={day: report},
-        report_days=frozenset({day}),
-        report_fetch_failures=frozenset(),
         graph=graph,
         pricing_by_day={day: {"gemini-3.8-flash": pricing}},
-        pricing_expected_models={day: frozenset({"gemini-3.8-flash"})},
-        pricing_existing_models={},
-        pricing_fetch_failures={},
-        prior_statuses={},
     )
 
 

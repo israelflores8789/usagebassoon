@@ -9,6 +9,7 @@ from pathlib import Path
 
 import typer
 
+from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.config import (
     ConfigurationError,
@@ -16,7 +17,6 @@ from usagebassoon.config import (
     UsageBassoonConfig,
     open_backend,
 )
-from usagebassoon.snapshots import SnapshotStore
 
 
 def configured_backend(
@@ -43,7 +43,7 @@ def configured_backend(
     return configuration, backend
 
 
-def snapshot_store(configuration: UsageBassoonConfig) -> SnapshotStore:
+def snapshot_archiver(configuration: UsageBassoonConfig) -> SnapshotArchiver:
     """Create the configured snapshot archive destinations.
 
     Args:
@@ -52,4 +52,4 @@ def snapshot_store(configuration: UsageBassoonConfig) -> SnapshotStore:
     Returns:
         Snapshot archive with configured retention and destinations.
     """
-    return SnapshotStore.from_config(configuration)
+    return SnapshotArchiver.from_config(configuration)

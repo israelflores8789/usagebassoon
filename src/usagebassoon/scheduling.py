@@ -23,16 +23,16 @@ from pathlib import Path
 from threading import Event
 from typing import Literal
 
-from usagebassoon.collector import collect as collect_run
 from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationManager,
     UsageBassoonConfig,
+    parse_interval,
     update_schedule_interval,
 )
 from usagebassoon.drift import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
-from usagebassoon.snapshots import parse_interval
+from usagebassoon.orchestrator import collect as collect_run
 
 Platform = Literal["linux", "darwin"]
 SYSTEMD_SERVICE_NAME = "usagebassoon.service"
