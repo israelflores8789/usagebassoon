@@ -63,24 +63,39 @@ VS Code users should open the repository root and accept the recommended extensi
 
 ## Repository map
 
-The repository is organized around a small, explicit ingest pipeline:
+The repository is organized around an explicit collection, ingest, normalization, persistence, and archival pipeline:
 
-```text
-usagebassoon/
-├── src/usagebassoon/       # CLI, collection, validation, normalization, and library API
-│   ├── cli/                # Typer commands and terminal reports
-│   ├── parsers/            # Typed tokscale payload parsers
-│   ├── contracts/          # Versioned JSON schema contracts
-│   ├── backends/           # DuckDB, MotherDuck, BigQuery, and GCS adapters
-│   └── sql/                # Paired DuckDB and BigQuery DDL and views
-├── tests/                  # Sanitized fixtures and automated coverage
-├── .github/                # CI, release automation, and issue forms
-├── .vscode/                # Recommended extensions and workspace settings
-├── pyproject.toml          # Packaging, tooling, dependencies, and Hatch version configuration
-└── justfile                # Development, test, and release commands
-```
+  ```text
+  usagebassoon/
+  ├── src/usagebassoon/
+  │   ├── cli/                # Typer commands and terminal-facing presentation
+  │   ├── parsers/            # Typed parsers for individual tokscale payload kinds
+  │   ├── contracts/          # Versioned JSON schema contracts
+  │   ├── backends/           # StorageBackend protocol + data warehouse adapters
+  │   ├── buckets/            # SnapshotBucket protocol + object storage adapters
+  │   ├── sql/                # Dialect-specific DDLs and views
+  │   ├── collector.py        # tokscale subprocess management
+  │   ├── orchestrator.py     # Top-level data shuttler
+  │   ├── ingest.py           # Contract validation and parsing coordinator
+  │   ├── contracts.py        # Raw payload validation and schema-drift detection
+  │   ├── normalizer.py       # Parsed payload to canonical Arrow-table normalization
+  │   ├── persistence.py      # Normalized batch transactions to data warehouses
+  │   ├── archiver.py         # Portable Parquet snapshot and restore coordination
+  │   ├── config.py           # config.toml manager
+  │   ├── scheduling.py       # Scheduled collection execution
+  │   ├── api.py              # Public Python query and connection API
+  │   └── frames.py           # Arrow conversion to pandas or polars frames
+  ├── tests/                  # Test suite and regression coverage
+  │   └── fixtures/           # Sanitized golden fixtures; do NOT modify
+  ├── .github/                # CI, release automation, and issue forms
+  ├── .vscode/                # Recommended extensions and workspace settings
+  ├── .pre-commit-config.yaml # Convenient formatting, spell check, and yaml lint enforcement
+  ├── config.schema.json      # Official schema for user's config.toml
+  ├── pyproject.toml          # Hatchling, Twine, Pytest, & project configurations
+  └── justfile                # Convenient command runner
+  ```
 
-Keep changes within these boundaries. New persistence behavior should use the `StorageBackend` abstraction and canonical Arrow tables. CLI commands should consume dialect-specific views and *never* embed non-portable SQL.
+Keep changes within these boundaries. New collection behavior should preserve the separation between acquisition, ingest validation/parsing, normalization, persistence, and archival. New persistence behavior should use the `StorageBackend` abstraction and canonical Arrow tables. New snapshot storage providers should implement `SnapshotBucket`. CLI commands should consume dialect-specific views and *never* embed non-portable SQL.
 
 ## Canonical data flow
 
@@ -91,41 +106,69 @@ Presently, four **canonical `tokscale` commands** supply the collection pipeline
 3. `tokscale graph` is authoritative for daily activity and candidate dates. Its totals are not reconciled against daily model totals.
 4. `tokscale pricing <model-id> --json` is authoritative for the pricing rates observed for each active model on each processed day.
 
-The `collector.py` module:
-- resolves and invokes `tokscale`,
-- uses graph candidate dates to request daily models,
-- fetches pricing for models present in those facts, and
-- collects report metadata for the same period.
+`orchestrator.py` owns the collection workflow, and it:
+- resolves collection configuration and bounds,
+- coordinates raw payload acquisition through `collector.py`, and
+- uses ingest planning results to request date-filtered models, pricing, and report payloads.
 
-The raw JSON payload is validated against a versioned contract and parsed into typed objects.
+`collector.py` is the sole interface to the `tokscale` subprocess, and it:
+- returns raw acquisition outcomes but
+- does not parse or persist them.
+
+`ingest.py` validates each payload against its versioned contract before parsing it into typed objects, and it:
+- produces `GraphPlan` and `ModelsPlan` to guide subsequent acquisition,
+- constructs `IngestEvidence` from those acquisition outcomes, and
+- returns a validated `CollectionBundle`.
+
+Required `graph` and `models` payloads must be valid for collection to proceed. Token usage is prioritized, so `report` and `pricing` failures are conditionally tolerated when doing so preserves otherwise valid token facts.
 
 ```mermaid
 flowchart TD
-    T[Canonical tokscale commands\ncollector.py] --> N[Arrow normalization\nnormalizer.py]
-    I[Payload Parsing\ningest.py] --> T
-    T --> I
-    T -. additive or cardinality drift .-> D[(schema_drift)]
-    N --> S[Staged batch and transaction\nStorageBackend Protocol]
-    S --> IMPLS
-    subgraph IMPLS[Backend implementations]
-        direction TD
-        LCK[(Local DuckDB)]
-        MDK[(MotherDuck)]
-        BQ[(BigQuery dataset)]
-    end
-    IMPLS --> W[Dialect-specific views]
-    W --> O[Reports, query, export, and Python API]
-    IMPLS --> SNP
-    subgraph SNP[Parquet-based SnapshotStore]
-      direction TD
-      LCL[(Local Archive)]
-      GCS[(Google Cloud Storage)]
-    end
+      SCH[scheduling.py] -. bassoon collect .-> ORCH[orchestrator.py]
+      CFG[config.py] --> ORCH
+
+      ORCH --> COL[collector.py<br/>tokscale subprocess]
+      COL -->|raw payload| ORCH
+      ORCH -->|RawCollection| ING[ingest.py<br/>parse orchestrator]
+
+      ING -->|GraphPlan / ModelsPlan| ORCH
+      ING -->|IngestEvidence + CollectionBundle| NORM[normalizer.py<br/>canonical Arrow tables]
+
+      ING --> CON[contracts.py<br/>payload validation &<br/>drift detection]
+      CON -->|ContractDrift events| ING
+
+      NORM -->|NormalizedBundle| PERSIST[persistence.py<br/>batched transactions]
+      PERSIST --> BACKEND[StorageBackend Protocol]
+
+      subgraph WAREHOUSE[Data warehouses]
+          direction TD
+          DUCK[(DuckDBBackend)]
+          MD[(MotherDuckBackend)]
+          BQ[(BigQueryBackend)]
+      end
+      BACKEND -. implemented by .-> WAREHOUSE
+      SQL[Dialect-specific DDL and views] --> WAREHOUSE
+
+      ORCH --> ARCH[archiver.py<br/>SnapshotArchiver]
+      ARCH --> BUCKET[SnapshotBucket Protocol]
+
+      subgraph BUCKETS[Snapshot bucket implementations]
+          direction TD
+          LOCAL[(LocalSnapshotBucket)]
+          GCS[(GcsSnapshotBucket)]
+      end
+      BUCKET -. implemented by .-> BUCKETS
+
+      WAREHOUSE --> OUT[CLI reports, query, export,<br/>Python API]
 ```
 
-Required-field absence from the tokscale payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as schema-drift events and surfaced to users while the tolerant reader continues where safe, prioritizing token persistence where possible.
+Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as schema-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
 
-The normalizer computes canonical derived columns and produces Arrow tables. The storage backend stages the batch and applies one current-state upsert or `MERGE` per collection run; absent later rows are *never* deleted. Views calculate derived costs and report data in the selected SQL dialect.
+`normalizer.py` computes canonical derived columns and produces Arrow tables.
+
+`persistence.py` stages the normalized batch and delegates one transactional current-state upsert or `MERGE` per collection run to the configured `StorageBackend`; absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report/query data.
+
+`archiver.py` independently coordinates portable Parquet snapshots through a configured `SnapshotBucket`.
 
 ## Architectural mandates
 
@@ -168,9 +211,9 @@ The project separates local tests from SQL dialect-parity tests:
 |:--------------------------|:-------------------------------------------------------------|
 | `just test-unit`          | Runs the local unit and DuckDB test suite, excluding `sql_parity` |
 | `just test -m sql_parity` | Runs the SQLGlot dialect-parity and replay tests separately  |
-| `just ci`                 | Runs the project’s standard hermetic CI gate                 |
 | `just lint`               | Runs Ruff lint and format checks                             |
 | `just typecheck`          | Runs strict Pyrefly checks                                   |
+| `just ci`                 | Runs the project’s standard hermetic CI gate                 |
 | `just spell`              | Runs the Typos spelling check                                |
 | `just check-dist`         | Builds distributions and validates them with Twine           |
 
@@ -204,7 +247,7 @@ Python contributions must
 - use complete type annotations,
 - follow **Google-style docstrings**, and
 - pass the project’s **Ruff** and **Pyrefly** configuration.
-Prefer PEP 695 syntax for new generic declarations and type aliases. Do *not* suppress diagnostics, introduce implicit `Any`, or add bare generic types to make a check pass.
+Prefer PEP 695 syntax for new generic declarations and type aliases. Do *not* suppress diagnostics, introduce implicit `Any`, or add bare generic types.
 
 Use the existing package boundaries and public API conventions. User-facing CLI or Python API changes need tests and documentation. Schema, DDL, or view changes need corresponding updates for both SQL dialects and the separate `sql_parity` tests. Keep comments concise and document the invariant or design decision they protect.
 
@@ -228,12 +271,17 @@ UsageBassoon is intentionally modular, and contributions are welcome with key ne
   - RedHat-native `.rpm` packages,
   - a Windows installer, and
   - a macOS `.dmg`.
+- **Extend automated collection** to more environments including:
+  - Windows Task Scheduler,
+  - non-systemd-based Linux environments, and
+  - others.
+  - *Current support includes* macOS, Debian-based Linux with systemd, and podman/docker containers with `bassoon schedule worker`.
 - **Improve collection resilience:**
   - Add a local cache that allows UsageBassoon to be resilient against network hiccups maintaining the idempotency and atomicity standards.
   - Investigate and harden against tokscale hangs when LiteLLM calls do not resolve; improve timeouts, cancellation, diagnostics, and recovery behavior.
 - **Support CSV report output** as first-class with a `--csv` flag, and maintain support for the `--sanitize` flag consistent with UsageBassoon’s privacy and obfuscation rules.
 - **UsageBassoon-Native token usage collection:**
-  - Pricing data is currently snapshot over time from Tokscale which uses LiteLLM. A downstream major version should bring this in-house with an API call to either LiteLLM or Models.dev.
+  - Pricing data is currently snapshot over time from Tokscale which uses LiteLLM. A downstream major version should bring this in-house with scheduled API calls to either LiteLLM or Models.dev.
   - UsageBassoon v1 currently relies on Tokscale for token usage aggregation. A downstream major version should make this native to UsageBassoon with a schema we can control more closely. One option is to investigate porting Tokscale’s MIT-licensed Rust binary making it a native tool call. Token aggregation itself should always be driven by a compiled, memory-safe language like Rust to limit execution time. The user-facing project remains in Python which aligns with the data science utility and expectations.
 - **Formalize documentation** with a static GitHub.io site as the CLI, library API, storage backends, and reporting capabilities grow.
 
@@ -313,7 +361,7 @@ The pull request description should include:
 > [!IMPORTANT]
 > Before requesting review, **confirm that the CLA Assistant check passes**, the pull request targets `main`, required local checks are green, and no private data or credentials are included. Respond to review feedback with focused commits and keep the branch up to date with `main`.
 >
-> As a reminder, you can read the [Contributor License Agreement](CLA.md) here.
+> As a reminder, you can read the [Contributor License Agreement](cla.md) here.
 
 ## Release process (maintainers)
 
