@@ -3,9 +3,10 @@
 
 -- usagebassoon warehouse DDL for DuckDB and MotherDuck.
 -- Arrow owns cross-backend normalization. Usage facts are current-state
--- upserts: new natural keys are inserted, changed keys update in place, and
--- absent observations are never deleted.
+-- upserts: new natural keys are inserted, changed keys update in place,
+-- and payload absent observations are never deleted.
 
+-- Metadata about each ingest information about the collection environment.
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL,
@@ -27,6 +28,8 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     drift_events INTEGER
 );
 
+-- Artifacts of tokscale payload drift events from the expected tokscale schema.
+-- Reported in `bassoon doctor`.
 CREATE TABLE IF NOT EXISTS schema_drift (
     drift_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
@@ -40,6 +43,7 @@ CREATE TABLE IF NOT EXISTS schema_drift (
     resolved BOOLEAN DEFAULT FALSE
 );
 
+-- Holds metadata about each usage session typically from `tokscale report`.
 CREATE TABLE IF NOT EXISTS sessions (
     source_id TEXT NOT NULL,
     client TEXT NOT NULL,
@@ -59,7 +63,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     PRIMARY KEY (source_id, client, session_id)
 );
 
--- Date-filtered tokscale models facts at session and model granularity.
+-- Date-filtered usage facts from `tokscale models` at the session×model grain.
 CREATE TABLE IF NOT EXISTS daily_stats (
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
@@ -79,7 +83,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     PRIMARY KEY (source_id, day, client, session_id, model)
 );
 
--- Graph contributions supply activity only and identify candidate days.
+-- Activity reported by `tokscale graph`.
+-- Used to identify candidate days for usage history collection.
 CREATE TABLE IF NOT EXISTS daily_activity (
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
@@ -89,7 +94,8 @@ CREATE TABLE IF NOT EXISTS daily_activity (
     PRIMARY KEY (source_id, day)
 );
 
--- Rates tokscale resolved while processing usage for each day.
+-- Snapshots of rates for models in use at the daily grain, typically
+-- from `tokscale pricing`. Allows for historical cost accuracy.
 CREATE TABLE IF NOT EXISTS price_versions (
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
@@ -106,12 +112,11 @@ CREATE TABLE IF NOT EXISTS price_versions (
     PRIMARY KEY (source_id, day, model)
 );
 
--- ingest_status is the current daily retry ledger, not an ingest-run audit.
--- day is the UTC usage day. expected_count and succeeded_count count work
--- units rather than output rows; pricing counts expected and covered models.
--- last_attempted_run and last_succeeded_run correlate status to collection
--- runs. updated_at supports chronological inspection without changing
--- ingest_runs, which remains the environment and run-metadata audit.
+-- A ledger of days where token usage history has already been collected and
+-- a status of the collection's success state. This table allows for tolerant
+-- collection that prioritizes token usage data over metadata. It also makes
+-- collection calls more efficient by providing the intelligence to not have
+-- to ask tokscale for all usage history every call.
 CREATE TABLE IF NOT EXISTS ingest_status (
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
@@ -139,6 +144,8 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     graph_session_count INTEGER
 );
 
+-- Artifacts of unexpected math errors when performing reconciliation checks on
+-- the usage data. Reported in `bassoon doctor`.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
@@ -147,6 +154,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
     message TEXT
 );
 
+-- Table of user-curated tags across usage data.
 CREATE TABLE IF NOT EXISTS tags (
     scope TEXT NOT NULL CHECK (scope IN ('client', 'workspace', 'session')),
     source_id TEXT NOT NULL,
@@ -164,6 +172,7 @@ CREATE TABLE IF NOT EXISTS tags (
     )
 );
 
+-- Table of user-curated notes across usage data.
 CREATE TABLE IF NOT EXISTS notes (
     source_id TEXT NOT NULL,
     client TEXT NOT NULL,

@@ -3,7 +3,8 @@
 
 -- usagebassoon warehouse DDL for BigQuery Standard SQL.
 -- Arrow owns cross-backend normalization. Current-state facts use MERGE;
--- absent observations are never deleted.
+-- payload absent observations are never deleted.
+-- See sql/duckdb/ for comments on the purpose of each table.
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id STRING NOT NULL,
@@ -98,12 +99,6 @@ CREATE TABLE IF NOT EXISTS price_versions (
     updated_at TIMESTAMP NOT NULL
 );
 
--- ingest_status is the current daily retry ledger, not an ingest-run audit.
--- day is the UTC usage day. expected_count and succeeded_count count work
--- units rather than output rows; pricing counts expected and covered models.
--- last_attempted_run and last_succeeded_run correlate status to collection
--- runs. updated_at supports chronological inspection without changing
--- ingest_runs, which remains the environment and run-metadata audit.
 CREATE TABLE IF NOT EXISTS ingest_status (
     source_id STRING NOT NULL,
     day DATE NOT NULL,

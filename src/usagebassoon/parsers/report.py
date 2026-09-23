@@ -1,13 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""report.py — Parser for `tokscale report --json --no-summarize`.
-
-Design-doc rule: only stable structural fields enter the curated layer.
-tokscale-generated summary fields (title, task_category, task_group,
-description, complexity, summarized_at, fm_version) are dropped at this
-boundary; they remain recoverable from raw_exports.
-"""
+"""report.py — Parser for `tokscale report --no-summarize` output."""
 
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
 -- SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 -- SPDX-License-Identifier: AGPL-3.0-only
 
+-- See sql/duckdb/views.sql for canonical comments on the purpose of each view.
+
 -- Reasoning tokens use the output rate, as tokscale's pricing semantics do.
 CREATE OR REPLACE VIEW daily_cost AS
 SELECT
