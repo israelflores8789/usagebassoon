@@ -35,3 +35,4 @@ repos:
   - id: check-yaml
     args: [--unsafe, --allow-multiple-documents]
   - id: check-added-large-files
+    exclude: ^media/usagebassoon_readme_banner.*\.(png|jpg|jpeg)$

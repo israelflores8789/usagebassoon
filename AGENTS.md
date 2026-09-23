@@ -142,6 +142,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
 - NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).
 - Do NOT wrap lines when generating markdown text.
+- USE Keep a Changelog standards in `CHANGELOG.md`; preserve release heading and bullet formatting because `just release` and the GitHub release workflow extract release notes from it.
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
 - ALWAYS use the `gs://usagebassoon-test-snapshots-gen-lang-client-0670612427` Google Cloud Storage bucket for GCS testing. NEVER perform tests on any other GCS bucket.
 - ALL CLI commands MUST use a dialect-specific SQL view; NEVER hardcode SQL queries that are not dialect agnostic.
