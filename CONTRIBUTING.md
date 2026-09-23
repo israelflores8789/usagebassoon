@@ -275,7 +275,7 @@ UsageBassoon is intentionally modular, and contributions are welcome with key ne
   - Windows Task Scheduler,
   - non-systemd-based Linux environments, and
   - others.
-  - *Current support includes* macOS, Debian-based Linux with systemd, and podman/docker containers with `bassoon schedule worker`.
+  - *Current support includes* macOS (launchd), Linux (systemd), and podman/docker containers with `bassoon schedule worker`.
 - **Improve collection resilience:**
   - Add a local cache that allows UsageBassoon to be resilient against network hiccups maintaining the idempotency and atomicity standards.
   - Investigate and harden against tokscale hangs when LiteLLM calls do not resolve; improve timeouts, cancellation, diagnostics, and recovery behavior.

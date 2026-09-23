@@ -18,7 +18,7 @@ SPDX-License-Identifier: AGPL-3.0-only
   <a href="https://github.com/israelflores8789/usagebassoon/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg" alt="License - AGPL-3.0-only"></a>
 </p>
 
-UsageBassoon turns [`tokscale`](https://github.com/junhoyeo/tokscale)'s stateless JSON output into durable, queryable token-usage history. It is designed for ephemeral containers, rotating VMs, laptops, anywhere you want to track and save your token usage history. It can be run as a scheduled job in macOS, Debian-based Linux, and container environments.
+UsageBassoon turns [`tokscale`](https://github.com/junhoyeo/tokscale)'s stateless JSON output into durable, queryable token-usage history. It is designed for ephemeral containers, rotating VMs, laptops, anywhere you want to track and save your token usage history. It can be run as a scheduled job in macOS, Linux, and container environments.
 
 UsageBassoon supports local DuckDB, MotherDuck, and BigQuery storage, with optional local or Google Cloud Storage snapshots. We recommend BigQuery for persisting token data across environments due to GCP's generous free-tier and easy integration with Google Colab.
 
@@ -275,7 +275,7 @@ If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the c
 
 ## Automated Scheduling
 
-`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Debian-based Linux (systemd), and container environments (worker script). Windows is not supported at this time. Consider contributing!
+`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows is not supported at this time. Consider contributing!
 
 ```bash
 bassoon schedule install --interval 15m
