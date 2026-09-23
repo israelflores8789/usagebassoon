@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -63,67 +63,25 @@ class Contribution(BaseModel):
         raise ValueError("contribution date must be an ISO date")
 
 
-class GraphSummary(BaseModel):
-    """Graph-level totals used for reconciliation and run metrics."""
-
-    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
-
-    total_tokens: NonNegativeInt = Field(alias="totalTokens")
-    total_cost: NonNegativeFloat = Field(alias="totalCost")
-    active_days: NonNegativeInt = Field(alias="activeDays")
-
-
-class TimeMetrics(BaseModel):
-    """Session-activity telemetry for one graph payload."""
-
-    model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
-
-    total_active_time_ms: NonNegativeInt = Field(alias="totalActiveTimeMs")
-    longest_continuous_ms: NonNegativeInt = Field(alias="longestContinuousMs")
-    max_concurrent_sessions: NonNegativeInt = Field(alias="maxConcurrentSessions")
-    session_count: NonNegativeInt = Field(alias="sessionCount")
-
-
 class GraphMeta(BaseModel):
-    """Payload provenance: generation timestamp + tokscale version."""
+    """Payload provenance used to identify the tokscale version."""
 
     model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
-    generated_at: datetime = Field(alias="generatedAt")
     version: Identifier
-
-    @field_validator("generated_at", mode="before")
-    @classmethod
-    def _iso(cls, value: Any) -> datetime:
-        """Parse tokscale's precise ISO 8601 timestamp.
-
-        Args:
-            value: The raw generatedAt string.
-
-        Returns:
-            A timezone-aware datetime.
-
-        Raises:
-            ValueError: If the value is not an ISO timestamp string.
-        """
-        if isinstance(value, str):
-            return datetime.fromisoformat(value)
-        raise ValueError("meta.generatedAt must be an ISO timestamp")
 
 
 class GraphPayload(BaseModel):
-    """The complete graph payload."""
+    """Graph payload fields used for daily activity collection."""
 
     model_config = ConfigDict(strict=True, extra="ignore", populate_by_name=True)
 
     meta: GraphMeta
-    summary: GraphSummary
-    time_metrics: TimeMetrics = Field(alias="timeMetrics")
     contributions: list[Contribution]
 
 
 def parse_graph(payload: JsonValue) -> GraphPayload:
-    """Parse graph JSON into validated daily facts and telemetry.
+    """Parse graph JSON into validated daily activity facts.
 
     Args:
         payload: Decoded stdout from `tokscale graph`.

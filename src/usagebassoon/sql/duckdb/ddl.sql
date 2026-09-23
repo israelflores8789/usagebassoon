@@ -131,19 +131,6 @@ CREATE TABLE IF NOT EXISTS ingest_status (
     PRIMARY KEY (source_id, day, domain)
 );
 
-CREATE TABLE IF NOT EXISTS run_metrics (
-    run_id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL,
-    captured_at TIMESTAMPTZ NOT NULL,
-    total_tokens BIGINT,
-    tokscale_total_cost_usd DOUBLE,
-    active_days INTEGER,
-    total_active_time_ms BIGINT,
-    longest_continuous_ms BIGINT,
-    max_concurrent_sessions INTEGER,
-    graph_session_count INTEGER
-);
-
 -- Artifacts of unexpected math errors when performing reconciliation checks on
 -- the usage data. Reported in `bassoon doctor`.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (

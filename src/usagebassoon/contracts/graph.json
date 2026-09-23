@@ -218,7 +218,7 @@
       "types": [
         "str"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "meta.version",
@@ -232,98 +232,98 @@
       "types": [
         "object"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.activeDays",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.averagePerDay",
       "types": [
         "float"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.clients",
       "types": [
         "array"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.maxCostInSingleDay",
       "types": [
         "float"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.models",
       "types": [
         "array"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.totalCost",
       "types": [
         "float"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.totalDays",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "summary.totalTokens",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "timeMetrics",
       "types": [
         "object"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "timeMetrics.longestContinuousMs",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "timeMetrics.maxConcurrentSessions",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "timeMetrics.sessionCount",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "timeMetrics.totalActiveTimeMs",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "years",

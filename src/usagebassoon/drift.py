@@ -26,7 +26,6 @@ REQUIRED_RELATIONS: tuple[str, ...] = (
     "daily_activity",
     "price_versions",
     "ingest_status",
-    "run_metrics",
     "reconciliation_issues",
     "tags",
     "notes",

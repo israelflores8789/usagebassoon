@@ -112,19 +112,6 @@ CREATE TABLE IF NOT EXISTS ingest_status (
     updated_at TIMESTAMP NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS run_metrics (
-    run_id STRING NOT NULL,
-    source_id STRING NOT NULL,
-    captured_at TIMESTAMP NOT NULL,
-    total_tokens INT64,
-    tokscale_total_cost_usd FLOAT64,
-    active_days INT64,
-    total_active_time_ms INT64,
-    longest_continuous_ms INT64,
-    max_concurrent_sessions INT64,
-    graph_session_count INT64
-);
-
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id STRING NOT NULL,
     source_id STRING NOT NULL,

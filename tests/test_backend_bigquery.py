@@ -136,7 +136,7 @@ class _BatchClient:
     def get_table(self, _: str) -> bigquery.Table:
         """Return a table with required fields for direct-append testing."""
         return bigquery.Table(
-            "usagebassoon-test.usagebassoon_emulated.run_metrics",
+            "usagebassoon-test.usagebassoon_emulated.ingest_runs",
             schema=[
                 bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
                 bigquery.SchemaField("source_id", "STRING", mode="REQUIRED"),
@@ -420,7 +420,9 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
             ),
         ),
         append_only={
-            "run_metrics": pa.table({"run_id": [run_id], "source_id": ["source"]})
+            "reconciliation_issues": pa.table(
+                {"run_id": [run_id], "source_id": ["source"]}
+            )
         },
         ingest_runs=pa.table(
             {"run_id": [run_id], "rows_inserted": [0], "rows_updated": [0]}
@@ -428,7 +430,7 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
     )
     stages = {
         "daily_activity": backend._stage_ref("daily_activity", run_id),
-        "run_metrics": backend._stage_ref("run_metrics", run_id),
+        "reconciliation_issues": backend._stage_ref("reconciliation_issues", run_id),
         "ingest_runs": backend._stage_ref("ingest_runs", run_id),
     }
     script = backend._batch_script(batch, stages)
@@ -606,7 +608,9 @@ def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
             ),
         ),
         append_only={
-            "run_metrics": pa.table({"run_id": [run_id], "source_id": ["source"]})
+            "reconciliation_issues": pa.table(
+                {"run_id": [run_id], "source_id": ["source"]}
+            )
         },
         ingest_runs=pa.table(
             {"run_id": [run_id], "rows_inserted": [0], "rows_updated": [0]}
@@ -632,7 +636,7 @@ def test_direct_append_uses_the_existing_required_schema() -> None:
     )
 
     backend.append(
-        "run_metrics",
+        "ingest_runs",
         pa.table({"run_id": ["run"], "source_id": ["source"]}),
     )
 

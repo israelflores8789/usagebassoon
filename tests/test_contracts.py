@@ -15,6 +15,7 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.contracts import (
     ContractValidationError,
+    PayloadContract,
     build_contract,
     diff_contract,
     load_shipped_contracts,
@@ -72,6 +73,44 @@ def test_shipped_contracts_accept_the_golden_payloads(
         run_id=str(uuid4()),
     )
     assert result == type(result)(events=(), fatal=False)
+
+
+def test_unused_graph_fields_are_optional_in_the_shipped_contract() -> None:
+    """Graph aggregates and capture time are not ingestion requirements."""
+    graph_contract = load_shipped_contracts()["graph"]
+    optional_paths = frozenset(
+        {
+            "meta.generatedAt",
+            "summary",
+            "summary.activeDays",
+            "summary.averagePerDay",
+            "summary.clients",
+            "summary.maxCostInSingleDay",
+            "summary.models",
+            "summary.totalCost",
+            "summary.totalDays",
+            "summary.totalTokens",
+            "timeMetrics",
+            "timeMetrics.longestContinuousMs",
+            "timeMetrics.maxConcurrentSessions",
+            "timeMetrics.sessionCount",
+            "timeMetrics.totalActiveTimeMs",
+        }
+    )
+    entries = {entry.path: entry for entry in graph_contract.entries}
+    assert optional_paths <= frozenset(entries)
+    optional_entries = tuple(entries[path] for path in sorted(optional_paths))
+    assert all(not entry.required for entry in optional_entries)
+
+    focused_contract = PayloadContract(
+        payload_kind=graph_contract.payload_kind,
+        tokscale_version=graph_contract.tokscale_version,
+        entries=optional_entries,
+    )
+    validation = diff_contract(focused_contract, {}, run_id=str(uuid4()))
+
+    assert validation.events == ()
+    assert validation.fatal is False
 
 
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(

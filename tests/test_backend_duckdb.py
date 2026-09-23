@@ -43,7 +43,6 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             "report_models",
             "report_session_models",
             "report_summary",
-            "run_metrics",
             "schema_drift",
             "session_model_stats",
             "session_model_stats_current",

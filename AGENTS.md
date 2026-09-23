@@ -229,6 +229,8 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift` rows and a user-facing warning and asks for a bug report:
 
+  - Contract requiredness describes what UsageBassoon needs from a payload to execute ingestion, not every field present in a golden fixture. Mark unused graph aggregates and capture metadata optional when their absence does not affect ingestion; their omission should not produce missing-field drift or fail collection. Optional fields that are present with an unexpected type still produce non-fatal type-change drift; omit a field from the contract entirely only when its type drift should not be monitored.
+
 ```
 $ bassoon collect
 ⚠ schema drift detected (tokscale 4.15.2 vs contract 4.15.1):
@@ -301,7 +303,7 @@ The installed command is `bassoon`. The commands below are implemented; report v
 | `bassoon restore` | recreate normalized state/views from a snapshot and optionally re-collect current tokscale state |
 | `bassoon snapshot` / `bassoon restore` | write/read rotating GCS Parquet snapshots |
 | `bassoon export` | dump a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for intentional raw backup/data management |
-| `bassoon audit` | ingest audit log incl. run_metrics |
+| `bassoon audit` | collection audit log from `ingest_runs` |
 | `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
 
 ### Privacy and sharing policy

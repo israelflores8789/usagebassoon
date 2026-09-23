@@ -101,20 +101,6 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("updated_at", _TIMESTAMP),
         ]
     ),
-    "run_metrics": pa.schema(
-        [
-            pa.field("run_id", pa.string()),
-            pa.field("source_id", pa.string()),
-            pa.field("captured_at", _TIMESTAMP),
-            pa.field("total_tokens", pa.int64()),
-            pa.field("tokscale_total_cost_usd", pa.float64()),
-            pa.field("active_days", pa.int64()),
-            pa.field("total_active_time_ms", pa.int64()),
-            pa.field("longest_continuous_ms", pa.int64()),
-            pa.field("max_concurrent_sessions", pa.int64()),
-            pa.field("graph_session_count", pa.int64()),
-        ]
-    ),
     "ingest_runs": pa.schema(
         [
             pa.field("run_id", pa.string()),
@@ -326,9 +312,7 @@ def _ingest_status_key(status: IngestStatus) -> tuple[date, str]:
 
 
 def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarData]:
-    """Build audit, telemetry, drift, and reconciliation history tables."""
-    graph_summary = bundle.graph.summary
-    time_metrics = bundle.graph.time_metrics
+    """Build audit, drift, and reconciliation history tables."""
     rows_in = (bundle.fetch_summary or {}).get("rows_in") or sum(
         len(payload.entries) for payload in bundle.daily_models.values()
     ) + len(bundle.report_rows) + len(bundle.graph.contributions)
@@ -344,18 +328,6 @@ def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarDa
     else:
         status = "ok"
     tables: dict[str, ColumnarData] = {
-        "run_metrics": {
-            "run_id": [bundle.run_id],
-            "source_id": [bundle.source_id],
-            "captured_at": [bundle.graph.meta.generated_at],
-            "total_tokens": [graph_summary.total_tokens],
-            "tokscale_total_cost_usd": [graph_summary.total_cost],
-            "active_days": [graph_summary.active_days],
-            "total_active_time_ms": [time_metrics.total_active_time_ms],
-            "longest_continuous_ms": [time_metrics.longest_continuous_ms],
-            "max_concurrent_sessions": [time_metrics.max_concurrent_sessions],
-            "graph_session_count": [time_metrics.session_count],
-        },
         "ingest_runs": {
             "run_id": [bundle.run_id],
             "source_id": [bundle.source_id],

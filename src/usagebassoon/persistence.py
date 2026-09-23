@@ -86,7 +86,6 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 APPEND_ONLY_TABLES = frozenset(
     {
         "ingest_runs",
-        "run_metrics",
         "reconciliation_issues",
         "schema_drift",
     }

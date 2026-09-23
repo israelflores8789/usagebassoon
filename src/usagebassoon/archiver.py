@@ -40,7 +40,6 @@ SNAPSHOT_TABLES: tuple[str, ...] = (
     "daily_activity",
     "price_versions",
     "ingest_status",
-    "run_metrics",
     "reconciliation_issues",
     "schema_drift",
     "ingest_runs",
