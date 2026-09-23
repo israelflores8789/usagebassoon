@@ -75,19 +75,20 @@ def test_environment_path_precedes_default(
     assert manager.load().backend == "duckdb"
 
 
-def test_schedule_defaults_and_collection_timeout_are_typed(tmp_path: Path) -> None:
-    """Load the schedule default and the optional collection deadline."""
+def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
+    """Load subprocess, schedule, and logging defaults without TOML sections."""
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "duckdb"\ndatabase = ":memory:"\n'
-        '[collection]\ntimeout = "5m"\n'
     )
 
     configuration = ConfigurationManager(path).load()
 
     assert configuration.schedule.interval == "15m"
-    assert configuration.collection.timeout == "5m"
+    assert configuration.tokscale_timeout_seconds == 180.0
+    assert configuration.logging.max_files == 5
+    assert configuration.logging.max_bytes == 5 * 1024 * 1024
 
 
 def test_duckdb_database_defaults_when_omitted(tmp_path: Path) -> None:
@@ -121,23 +122,28 @@ def test_backend_remains_required(tmp_path: Path) -> None:
         ConfigurationManager(path).load()
 
 
-def test_schedule_interval_must_cover_collection_timeout(tmp_path: Path) -> None:
-    """Reject a schedule that can interrupt its own collection deadline."""
+@pytest.mark.parametrize("interval", ["3m", "2m"])
+def test_schedule_interval_must_exceed_tokscale_timeout(
+    tmp_path: Path, interval: str
+) -> None:
+    """Reject schedules no longer than one permitted tokscale invocation."""
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "duckdb"\ndatabase = ":memory:"\n'
-        '[schedule]\ninterval = "4m"\n'
-        '[collection]\ntimeout = "5m"\n'
+        f'[schedule]\ninterval = "{interval}"\n'
     )
 
-    with pytest.raises(ConfigurationError, match=r"schedule\.interval"):
+    with pytest.raises(
+        ConfigurationError,
+        match=r"schedule\.interval must be greater than tokscale\.timeout",
+    ):
         ConfigurationManager(path).load()
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("schedule", "1d"), ("collection", "1s"), ("schedule", "1w")],
+    [("schedule", "1d"), ("schedule", "1s"), ("schedule", "1w")],
 )
 def test_schedule_durations_are_limited_to_minutes_or_hours(
     tmp_path: Path,
@@ -146,17 +152,65 @@ def test_schedule_durations_are_limited_to_minutes_or_hours(
 ) -> None:
     """Reject day-, week-, and second-granularity scheduler durations."""
     path = tmp_path / "config.toml"
-    setting = (
-        f'[schedule]\ninterval = "{value}"\n'
-        if field == "schedule"
-        else f'[collection]\ntimeout = "{value}"\n'
-    )
+    setting = f'[{field}]\ninterval = "{value}"\n'
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "duckdb"\ndatabase = ":memory:"\n' + setting
     )
 
     with pytest.raises(ConfigurationError, match="minutes or hours"):
+        ConfigurationManager(path).load()
+
+
+@pytest.mark.parametrize(
+    ("section", "setting", "expected"),
+    [
+        ("tokscale", 'timeout = "1h"', "tokscale.timeout"),
+        ("bigquery", 'timeout = "1h"', "bigquery.timeout"),
+        ("gcs", 'timeout = "1h"', "gcs.timeout"),
+        ("snapshots", 'interval = "1s"', "snapshots.interval"),
+        ("snapshots", 'interval = "1w"', "snapshots.interval"),
+    ],
+)
+def test_duration_units_are_setting_specific(
+    tmp_path: Path, section: str, setting: str, expected: str
+) -> None:
+    """Reject duration units outside each setting's supported grain."""
+    path = tmp_path / "config.toml"
+    extras = {
+        "bigquery": 'project = "usagebassoon-test"\n',
+        "gcs": 'uri = "gs://bucket/archive"\nproject = "usagebassoon-test"\n',
+    }
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        f"[{section}]\n{extras.get(section, '')}{setting}\n"
+    )
+
+    with pytest.raises(ConfigurationError, match=expected):
+        ConfigurationManager(path).load()
+
+
+@pytest.mark.parametrize(
+    ("section", "setting"),
+    [
+        ("tokscale", "timeout_seconds = 180"),
+        ("collection", 'timeout = "5m"'),
+        ("gcs", 'location = "US"'),
+    ],
+)
+def test_removed_config_keys_are_rejected(
+    tmp_path: Path, section: str, setting: str
+) -> None:
+    """Surface obsolete keys as configuration errors before collection."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        f"[{section}]\n{setting}\n"
+    )
+
+    with pytest.raises(ConfigurationError, match="unknown key"):
         ConfigurationManager(path).load()
 
 
@@ -306,7 +360,6 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
         'backend = "duckdb"\ndatabase = ":memory:"\n'
         '[gcs]\nuri = "gs://bucket/archive"\n'
         'project = "usagebassoon-test"\n'
-        'location = "us-central1"\n'
         f'credentials_file = "{credentials}"\n'
         "[snapshots]\n"
         f'file_uri = "file://{tmp_path / "snapshots"}"\n'
@@ -318,7 +371,7 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     assert config.gcs is not None
     assert config.gcs.uri == "gs://bucket/archive"
     assert config.gcs.project == "usagebassoon-test"
-    assert config.gcs.location == "us-central1"
+    assert config.gcs.timeout_seconds == 60.0
     assert config.gcs.credentials_file == credentials
     assert config.snapshots is not None
     assert config.snapshots.file_uri == f"file://{tmp_path / 'snapshots'}"

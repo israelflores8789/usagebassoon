@@ -98,7 +98,6 @@ def test_daily_models_command_uses_each_candidate_day(
         _config(Path("config.toml")),
         ["tokscale"],
         [day],
-        deadline=None,
     )
 
     assert payloads == {day: daily_raws[day]}
@@ -238,11 +237,8 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _configuration: UsageBassoonConfig,
         _prefix: object,
         selected_days: tuple[date, ...],
-        *,
-        deadline: float | None,
     ) -> dict[date, JsonObject]:
         """Return all selected mandatory daily facts."""
-        assert deadline is None
         requested_models.append(selected_days)
         return {day: daily_raws[day] for day in selected_days}
 
@@ -251,11 +247,8 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _prefix: object,
         models_by_day: dict[date, set[str]],
         _logger: logging.Logger,
-        *,
-        deadline: float | None,
     ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
         """Record model-day pricing requests and complete the successful targets."""
-        assert deadline is None
         requested_prices.append(models_by_day)
         return ({day: {} for day in models_by_day}, {})
 
@@ -345,7 +338,6 @@ def test_daily_models_failure_aborts_collection(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],
-            deadline=None,
         )
 
 
@@ -367,7 +359,6 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
             _config(Path("config.toml")),
             ["tokscale"],
             [date(2026, 9, 10)],
-            deadline=None,
             logger=logger,
         )
 

@@ -145,8 +145,9 @@ class _RecordingBucket:
         self.blob_calls += 1
         raise AssertionError("unsafe archive names must not reach GCS")
 
-    def reload(self) -> None:
+    def reload(self, *, timeout: float) -> None:
         """Satisfy the GCS bucket protocol."""
+        del timeout
 
 
 class _RecordingClient:
@@ -156,6 +157,7 @@ class _RecordingClient:
         """Create a recording client and its bucket."""
         self.recording_bucket = _RecordingBucket()
         self.list_calls = 0
+        self.list_timeout: float | None = None
 
     def bucket(self, bucket_name: str) -> _RecordingBucket:
         """Return the recording bucket."""
@@ -163,12 +165,13 @@ class _RecordingClient:
         return self.recording_bucket
 
     def list_blobs(
-        self, bucket: _RecordingBucket, *, prefix: str
+        self, bucket: _RecordingBucket, *, prefix: str, timeout: float
     ) -> tuple[object, ...]:
         """Record an attempted listing."""
         del bucket, prefix
         self.list_calls += 1
-        raise AssertionError("unsafe archive prefixes must not reach GCS")
+        self.list_timeout = timeout
+        return ()
 
 
 class TableBackend:
@@ -427,6 +430,17 @@ def test_gcs_archive_rejects_unsafe_names_before_provider_calls(
 
     assert client.recording_bucket.blob_calls == 0
     assert client.list_calls == 0
+
+
+def test_gcs_archive_uses_configured_request_timeout() -> None:
+    """Apply the GCS timeout to a provider listing request."""
+    client = _RecordingClient()
+    archive = GcsArchive(
+        "gs://bucket/archive", timeout_seconds=25.0, client=cast(GcsClient, client)
+    )
+
+    assert archive.list("") == ()
+    assert client.list_timeout == 25.0
 
 
 def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:

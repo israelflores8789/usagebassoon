@@ -41,7 +41,7 @@ def test_init_creates_source_config_and_local_schema(
     assert configuration.backend == "duckdb"
     assert configuration.database == DEFAULT_DUCKDB_DATABASE
     assert configuration.schedule.interval == "15m"
-    assert configuration.logging.max_files == 10
+    assert configuration.logging.max_files == 5
     repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
     assert repeated.exit_code == 0
     assert "Using existing configuration" in repeated.output

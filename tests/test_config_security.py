@@ -23,13 +23,11 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
         'database = "usagebassoon_it"\n'
         "\n[tokscale]\n"
         'env = ["TOKSCALE_CUSTOM_AUTH"]\n'
-        "timeout_seconds = 120\n"
+        'timeout = "120s"\n'
         "max_stdout_bytes = 1024\n"
         "max_stderr_bytes = 512\n"
         "\n[schedule]\n"
         'interval = "30m"\n'
-        "\n[collection]\n"
-        'timeout = "30m"\n'
         "\n[bigquery]\n"
         'project = "usagebassoon-test"\n'
         'location = "us-central1"\n'
@@ -43,9 +41,9 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     assert configuration.tokscale_max_stdout_bytes == 1024
     assert configuration.tokscale_max_stderr_bytes == 512
     assert configuration.schedule.interval == "30m"
-    assert configuration.collection.timeout == "30m"
     assert configuration.bigquery is not None
     assert configuration.bigquery.maximum_bytes_billed == 1_048_576
+    assert configuration.bigquery.timeout_seconds == 120.0
 
 
 @pytest.mark.parametrize(

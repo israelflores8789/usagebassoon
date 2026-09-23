@@ -266,24 +266,10 @@ def _capture_process(
     return bytes(outputs["stdout"]), bytes(outputs["stderr"])
 
 
-def _command_timeout(
-    config: UsageBassoonConfig,
-    deadline: float | None,
-) -> float:
-    """Return a per-command timeout bounded by the active collection deadline."""
-    if deadline is None:
-        return config.tokscale_timeout_seconds
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise RuntimeError("collection timeout elapsed before tokscale completed")
-    return min(config.tokscale_timeout_seconds, remaining)
-
-
 def _json_command(
     config: UsageBassoonConfig,
     prefix: Sequence[str],
     *arguments: str,
-    deadline: float | None = None,
     max_stdout_bytes: int | None = None,
 ) -> JsonValue:
     """Run one bounded tokscale JSON command and decode its standard output."""
@@ -304,7 +290,7 @@ def _json_command(
         raise RuntimeError(f"could not start tokscale {command_name}") from error
     stdout, stderr = _capture_process(
         process,
-        timeout_seconds=_command_timeout(config, deadline),
+        timeout_seconds=config.tokscale_timeout_seconds,
         max_stdout_bytes=min(
             config.tokscale_max_stdout_bytes,
             max_stdout_bytes or config.tokscale_max_stdout_bytes,
@@ -343,8 +329,6 @@ def _fetch_daily_models(
     config: UsageBassoonConfig,
     prefix: Sequence[str],
     days: Sequence[date],
-    *,
-    deadline: float | None,
 ) -> dict[date, JsonObject]:
     """Fetch every required daily models payload or raise on the first failure."""
     payloads: dict[date, JsonObject] = {}
@@ -361,7 +345,6 @@ def _fetch_daily_models(
                 day.isoformat(),
                 "--until",
                 day.isoformat(),
-                deadline=deadline,
             ),
             f"models --since {day.isoformat()} --until {day.isoformat()}",
         )
@@ -373,8 +356,6 @@ def _fetch_pricing(
     prefix: Sequence[str],
     models_by_day: dict[date, set[str]],
     logger: logging.Logger,
-    *,
-    deadline: float | None,
 ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
     """Fetch optional model prices while retaining successful per-model results."""
     pricing_by_day: dict[date, dict[str, JsonObject]] = {}
@@ -391,7 +372,6 @@ def _fetch_pricing(
                         "pricing",
                         model,
                         "--json",
-                        deadline=deadline,
                     ),
                     f"pricing {model}",
                 )
@@ -411,7 +391,6 @@ def _fetch_reports(
     prefix: Sequence[str],
     days: Sequence[date],
     *,
-    deadline: float | None,
     logger: logging.Logger | None = None,
 ) -> tuple[dict[date, JsonArray], frozenset[date]]:
     """Fetch optional daily report payloads while preserving valid empty arrays."""
@@ -431,7 +410,6 @@ def _fetch_reports(
                     day.isoformat(),
                     "--until",
                     day.isoformat(),
-                    deadline=deadline,
                 ),
                 f"report --since {day.isoformat()} --until {day.isoformat()}",
             )

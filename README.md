@@ -225,8 +225,7 @@ $10.12┤               ███████              ███████
 source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically generated with `bassoon init`. Set manually
                                                     # for identical environments (e.g. respawning a crashed container).
 backend = "duckdb"                                  # Required; one of `duckdb`, `motherduck`, or `bigquery`.
-database = "usagebassoon.duckdb"                    # Required; DuckDB file path, MotherDuck database name, or
-                                                    # BigQuery dataset ID.
+database = "usagebassoon.duckdb"                    # Optional for DuckDB (defaults to ~/.local/share/usagebassoon/usagebassoon.duckdb); required for MotherDuck and BigQuery.
 
 [tokscale]                                          # Optional; `bin` overrides `TOKSCALE_BIN` when set.
 bin = "bunx tokscale@latest"                        # Command prefix with runner arguments.
@@ -234,7 +233,7 @@ bin = "bunx tokscale@latest"                        # Command prefix with runner
                                                     #           `bunx tokscale@latest`, or
                                                     #           `deno x npm:tokscale@latest`.
 env = ["YOUR_ENV_VAR"]                              # Optional; additional env-vars for the tokscale subprocess.
-timeout_seconds = 300                               # Optional; max duration of one tokscale call.
+timeout = "180s"                                    # Optional; max duration of one tokscale subprocess call (seconds or minutes).
 max_stdout_bytes = 67108864                         # Optional; max stdout captured from tokscale for one command.
 max_stderr_bytes = 8388608                          # Optional; this and the above prevent memory-leaks and abuse.
 
@@ -243,32 +242,31 @@ project = "my-gcp-project"                          # Required; Google Cloud pro
 location = "US"                                     # Optional dataset and job location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
+timeout = "120s"                                    # Optional; max wait for one BigQuery job or Storage Read request.
 
 [gcs]                                               # Optional; configure GCS snapshots independently of the data backend.
 uri = "gs://my-private-bucket/usagebassoon"         # Required if `gcs` is present; private Google Cloud Storage URI.
 project = "my-gcp-project"                          # Required; Google Cloud project ID.
-location = "US"                                     # Optional configured bucket location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
+timeout = "60s"                                     # Optional; max wait for one GCS request, not the whole snapshot.
 
 [schedule]                                          # Optional automated collection scheduling.
-interval = "15m"                                    # Minutes or hours between collection cycles (`30m`, `2h`).
+interval = "15m"                                    # Minutes or hours between collection cycles; must exceed tokscale.timeout.
 
-[collection]                                        # Optional collection deadline & retry settings.
+[collection]                                        # Optional persistence retry settings.
 max_retries = 3                                     # Additional attempts after the first persistence failure.
 retry_initial_seconds = 1.0                         # Positive initial delay for exponential backoff.
-timeout = "5m"                                      # Optional end-to-end collection deadline (`30m`, `2h`).
 
 [logging]                                           # Optional rotating operational log settings.
 directory = "~/.local/state/usagebassoon/logs"      # Log files directory.
 max_files = 5                                       # Retained files, including the active file.
-max_bytes = 10485760                                # Max size of the active log file before rotation.
+max_bytes = 5242880                                 # Max size of the active log file before rotation (5 MiB).
 
 [snapshots]                                         # Optional retention and automatic snapshot settings.
 file_uri = "file:///var/lib/usagebassoon/snapshots" # Optional local path or `file://` archive;
                                                     # with `gcs.uri`, snapshots go both locally and to GCS.
 max_snapshots = 3                                   # Max number of snapshots to retain.
-interval = "12h"                                    # Optional positive cadence (`30m`, `12h`, `7d`);
-                                                    # enables due-only snapshots after collection when set.
+interval = "12h"                                    # Optional positive cadence in minutes, hours, or days; enables due-only snapshots after collection.
 ```
 
 The `bigquery` table is only required for the BigQuery backend. BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery.

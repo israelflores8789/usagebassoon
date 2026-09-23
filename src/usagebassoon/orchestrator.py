@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from datetime import UTC, date, datetime
 from socket import gethostname
 from uuid import uuid4
@@ -22,7 +21,7 @@ from usagebassoon.collector import (
     _object,
     _prefix,
 )
-from usagebassoon.config import UsageBassoonConfig, open_backend, parse_interval
+from usagebassoon.config import UsageBassoonConfig, open_backend
 from usagebassoon.ingest import (
     build_collection_bundle,
     build_ingest_evidence,
@@ -40,7 +39,6 @@ from usagebassoon.persistence import (
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
-_COLLECTION_DEADLINE_MARGIN_SECONDS = 5.0
 _GRAPH_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 _LOG = logging.getLogger(LOGGER_NAME)
 
@@ -80,21 +78,11 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     run_id = str(uuid4())
     try:
         prefix = _prefix(config)
-        deadline = None
-        if config.collection.timeout is not None:
-            timeout = parse_interval(config.collection.timeout)
-            if timeout is None:
-                raise RuntimeError("collection timeout must be configured")
-            deadline = time.monotonic() + max(
-                0.0,
-                timeout.total_seconds() - _COLLECTION_DEADLINE_MARGIN_SECONDS,
-            )
         graph_raw = _object(
             _json_command(
                 config,
                 prefix,
                 "graph",
-                deadline=deadline,
                 max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
             ),
             "graph",
@@ -116,9 +104,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
             for day in candidate_days
             if day == today or (day, _PRICING_DOMAIN) not in completed
         )
-        daily_models = _fetch_daily_models(
-            config, prefix, daily_days, deadline=deadline
-        )
+        daily_models = _fetch_daily_models(config, prefix, daily_days)
         models_plan = plan_models(
             daily_models, run_id=run_id, detected_at=datetime.now(UTC)
         )
@@ -138,10 +124,10 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
                 models if day == today else models - persisted_prices.get(day, set())
             )
         pricing_by_day, pricing_failures = _fetch_pricing(
-            config, prefix, pricing_requests, logger, deadline=deadline
+            config, prefix, pricing_requests, logger
         )
         report_by_day, report_fetch_failures = _fetch_reports(
-            config, prefix, candidate_days, deadline=deadline, logger=logger
+            config, prefix, candidate_days, logger=logger
         )
         raw = RawCollection(
             graph=graph_raw,

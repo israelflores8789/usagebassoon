@@ -215,8 +215,8 @@ class SnapshotArchiver:
             GcsSnapshotBucket(
                 gcs.uri,
                 project=gcs.project,
-                location=gcs.location,
                 credentials_file=gcs.credentials_file,
+                timeout_seconds=gcs.timeout_seconds,
             )
             if gcs is not None
             else None

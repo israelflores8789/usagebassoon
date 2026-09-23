@@ -64,13 +64,14 @@ class _TimeoutJob:
 
     job_id = "stuck-job"
 
-    def __init__(self) -> None:
+    def __init__(self, expected_timeout: float = 120.0) -> None:
         """Track whether timeout handling canceled the remote job."""
         self.cancelled = False
+        self.expected_timeout = expected_timeout
 
     def result(self, *, timeout: float | None = None) -> None:
         """Raise the same timeout exposed by the BigQuery client."""
-        assert timeout == 120.0
+        assert timeout == self.expected_timeout
         raise FutureTimeoutError
 
     def cancel(self) -> None:
@@ -286,6 +287,22 @@ def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
 
     with pytest.raises(RuntimeError, match="stuck-job exceeded 120 seconds"):
         _backend()._wait_for_job(cast(bigquery.job.QueryJob, job))
+
+    assert job.cancelled
+
+
+def test_bigquery_uses_configured_job_timeout() -> None:
+    """Pass a custom job wait to BigQuery and report it on timeout."""
+    job = _TimeoutJob(expected_timeout=45.0)
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        timeout_seconds=45.0,
+        client=cast(bigquery.Client, _OfflineClient()),
+    )
+
+    with pytest.raises(RuntimeError, match="stuck-job exceeded 45 seconds"):
+        backend._wait_for_job(cast(bigquery.job.QueryJob, job))
 
     assert job.cancelled
 

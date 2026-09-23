@@ -115,11 +115,11 @@
           },
           "description": "Additional parent environment-variable names intentionally copied into the tokscale subprocess. Values are read from the parent process; missing names are ignored. Credentials are never inherited automatically."
         },
-        "timeout_seconds": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "default": 300,
-          "description": "Maximum duration of one tokscale subprocess invocation. Defaults to 300 seconds; also bounded by collection.timeout when configured."
+        "timeout": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
+          "default": "180s",
+          "description": "Maximum duration of one tokscale subprocess invocation, in seconds or minutes. Defaults to `180s`; schedule.interval must be greater than this timeout."
         },
         "max_stdout_bytes": {
           "type": "integer",
@@ -160,6 +160,12 @@
           "minimum": 1,
           "default": 1073741824,
           "description": "Per-job maximum bytes billed for BigQuery queries, including user-facing relation queries. Defaults to 1073741824 bytes."
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
+          "default": "120s",
+          "description": "Maximum wait for one BigQuery job or Storage Read request, in seconds or minutes. Defaults to `120s`."
         }
       }
     },
@@ -181,14 +187,15 @@
           "$ref": "#/$defs/nonEmptyString",
           "description": "Google Cloud project ID used by the Storage client."
         },
-        "location": {
-          "$ref": "#/$defs/nonEmptyString",
-          "default": "US",
-          "description": "Configured GCS bucket location metadata. Defaults to `US`."
-        },
         "credentials_file": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "Optional service-account credentials file path. When omitted, Google Application Default Credentials are used."
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
+          "default": "60s",
+          "description": "Maximum wait for one GCS request, in seconds or minutes. Defaults to `60s`; snapshots have no overall timeout."
         }
       }
     },
@@ -207,11 +214,6 @@
           "exclusiveMinimum": 0,
           "default": 1.0,
           "description": "Initial exponential-backoff delay in seconds. Defaults to 1 second."
-        },
-        "timeout": {
-          "type": "string",
-          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhH]$",
-          "description": "Optional end-to-end collection deadline in minutes or hours. Defaults to no deadline; when present, schedule.interval must be at least this long."
         }
       }
     },
@@ -223,7 +225,7 @@
           "type": "string",
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhH]$",
           "default": "15m",
-          "description": "Interval between scheduled collection attempts in minutes or hours. Defaults to `15m` when [schedule] or this setting is omitted."
+          "description": "Interval between scheduled collection attempts in minutes or hours. Defaults to `15m` when [schedule] or this setting is omitted. Must be greater than tokscale.timeout."
         }
       }
     },
@@ -239,14 +241,14 @@
         "max_files": {
           "type": "integer",
           "minimum": 1,
-          "default": 10,
-          "description": "Number of retained log files, including the active file. Defaults to 10."
+          "default": 5,
+          "description": "Number of retained log files, including the active file. Defaults to 5."
         },
         "max_bytes": {
           "type": "integer",
           "minimum": 1,
-          "default": 10485760,
-          "description": "Maximum active log file size before rotation. Defaults to 10485760 bytes."
+          "default": 5242880,
+          "description": "Maximum active log file size before rotation. Defaults to 5242880 bytes."
         }
       }
     },
@@ -266,8 +268,8 @@
         },
         "interval": {
           "type": "string",
-          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmMhHdDwW]$",
-          "description": "Optional positive snapshot cadence, such as `30m`, `12h`, or `7d`; units are seconds, minutes, hours, days, or weeks."
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhHdD]$",
+          "description": "Optional positive snapshot cadence, such as `30m`, `12h`, or `7d`; units are minutes, hours, or days."
         }
       }
     }

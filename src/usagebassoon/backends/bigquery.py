@@ -46,7 +46,6 @@ _DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
 _LOCATION_ID = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}\Z")
 _LOG = logging.getLogger("usagebassoon")
 _CONCURRENT_TRANSACTION_MESSAGE = "transaction is aborted due to concurrent update"
-_JOB_WAIT_SECONDS = 120.0
 _VIEW_RELATIONS = (
     "report_summary",
     "report_models",
@@ -158,6 +157,7 @@ class BigQueryBackend(AbstractStorageBackend):
         credentials: Credentials | None = None,
         credentials_file: Path | None = None,
         maximum_bytes_billed: int = 1_073_741_824,
+        timeout_seconds: float = 120.0,
         client: bigquery.Client | None = None,
     ) -> None:
         """Create a backend bound to a validated BigQuery dataset.
@@ -169,6 +169,7 @@ class BigQueryBackend(AbstractStorageBackend):
             credentials: Explicit Google credentials, normally for tests.
             credentials_file: Service-account JSON file, preferred over ADC.
             maximum_bytes_billed: Billing cap applied to query jobs.
+            timeout_seconds: Maximum wait for one job or Storage Read request.
             client: Injected client for offline unit tests.
 
         Raises:
@@ -179,6 +180,8 @@ class BigQueryBackend(AbstractStorageBackend):
         _validate_location(location)
         if maximum_bytes_billed < 1:
             raise ValueError("maximum_bytes_billed must be positive")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         if credentials is not None and credentials_file is not None:
             raise ValueError("credentials and credentials_file cannot be combined")
         resolved_credentials = credentials
@@ -197,6 +200,7 @@ class BigQueryBackend(AbstractStorageBackend):
         self.dataset = dataset
         self.location = location
         self.maximum_bytes_billed = maximum_bytes_billed
+        self.timeout_seconds = timeout_seconds
         self.dataset_ref = f"{project}.{dataset}"
         self._credentials = resolved_credentials
         try:
@@ -227,7 +231,7 @@ class BigQueryBackend(AbstractStorageBackend):
         try:
             return cast(
                 Iterable[Mapping[str, object]],
-                job.result(timeout=_JOB_WAIT_SECONDS),
+                job.result(timeout=self.timeout_seconds),
             )
         except FutureTimeoutError as error:
             job_id = job.job_id or "unknown"
@@ -236,7 +240,7 @@ class BigQueryBackend(AbstractStorageBackend):
             except GoogleAPICallError:
                 _LOG.exception("could not cancel timed-out BigQuery job %s", job_id)
             raise RuntimeError(
-                f"BigQuery job {job_id} exceeded {_JOB_WAIT_SECONDS:.0f} seconds "
+                f"BigQuery job {job_id} exceeded {self.timeout_seconds:.0f} seconds "
                 "and was cancelled"
             ) from error
 
@@ -817,7 +821,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     data_format=bigquery_storage_types.DataFormat.ARROW,
                 ),
                 max_stream_count=1,
-                timeout=_JOB_WAIT_SECONDS,
+                timeout=self.timeout_seconds,
             )
             arrow_schema = pa.ipc.read_schema(
                 pa.BufferReader(session.arrow_schema.serialized_schema)
@@ -826,7 +830,7 @@ class BigQueryBackend(AbstractStorageBackend):
             for stream in session.streams:
                 responses = cast(_StorageReadClient, reader).read_rows(
                     stream.name,
-                    timeout=_JOB_WAIT_SECONDS,
+                    timeout=self.timeout_seconds,
                 )
                 batches = [
                     cast(

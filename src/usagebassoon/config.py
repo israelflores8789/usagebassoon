@@ -32,7 +32,7 @@ DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
 DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
-_INTERVAL = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])\Z", re.I)
+_INTERVAL = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhd])\Z", re.I)
 _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -54,17 +54,20 @@ _ROOT_CONFIG_KEYS = frozenset(
     }
 )
 _TOKSCALE_CONFIG_KEYS = frozenset(
-    {"bin", "env", "timeout_seconds", "max_stdout_bytes", "max_stderr_bytes"}
+    {"bin", "env", "timeout", "max_stdout_bytes", "max_stderr_bytes"}
 )
 _BIGQUERY_CONFIG_KEYS = frozenset(
-    {"project", "location", "credentials_file", "maximum_bytes_billed"}
+    {"project", "location", "credentials_file", "maximum_bytes_billed", "timeout"}
 )
-_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds", "timeout"})
+_COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds"})
 _SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
-_GCS_CONFIG_KEYS = frozenset({"uri", "project", "location", "credentials_file"})
+_GCS_CONFIG_KEYS = frozenset({"uri", "project", "credentials_file", "timeout"})
 _SNAPSHOT_CONFIG_KEYS = frozenset({"file_uri", "max_snapshots", "interval"})
 DEFAULT_SCHEDULE_INTERVAL = "15m"
+DEFAULT_TOKSCALE_TIMEOUT = "180s"
+DEFAULT_BIGQUERY_TIMEOUT = "120s"
+DEFAULT_GCS_TIMEOUT = "60s"
 
 
 class ConfigurationError(ValueError):
@@ -102,12 +105,14 @@ class BigQueryConfig:
         location: BigQuery dataset and job location.
         credentials_file: Optional service-account credential file path.
         maximum_bytes_billed: Per-query billing cap for user-facing reads.
+        timeout_seconds: Maximum wait for one BigQuery job or read request.
     """
 
     project: str
     location: str = "US"
     credentials_file: Path | None = None
     maximum_bytes_billed: int = 1_073_741_824
+    timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,14 +122,14 @@ class GcsConfig:
     Attributes:
         uri: GCS archive root used for snapshots.
         project: GCP project identifier used by the Storage client.
-        location: Configured GCS bucket location metadata.
         credentials_file: Optional service-account credential file path.
+        timeout_seconds: Maximum wait for one GCS request.
     """
 
     uri: str
     project: str
-    location: str = "US"
     credentials_file: Path | None = None
+    timeout_seconds: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,12 +139,10 @@ class CollectionConfig:
     Attributes:
         max_retries: Additional persistence attempts after the first failure.
         retry_initial_seconds: Initial exponential-backoff delay.
-        timeout: Optional end-to-end collection deadline.
     """
 
     max_retries: int = 3
     retry_initial_seconds: float = 1.0
-    timeout: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,8 +167,8 @@ class LoggingConfig:
     """
 
     directory: Path = DEFAULT_LOG_DIRECTORY
-    max_files: int = 10
-    max_bytes: int = 10 * 1024 * 1024
+    max_files: int = 5
+    max_bytes: int = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +214,7 @@ class UsageBassoonConfig:
     database: str
     tokscale_bin: str | None = None
     tokscale_env: tuple[str, ...] = ()
-    tokscale_timeout_seconds: float = 300.0
+    tokscale_timeout_seconds: float = 180.0
     tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
     tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
     bigquery: BigQueryConfig | None = None
@@ -271,19 +274,12 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
             raise ConfigurationError(
                 "snapshots.file_uri must be a local path or file:// URI"
             )
-    interval = _string(table.get("interval"), "snapshots.interval")
+    interval, _ = _duration(table.get("interval"), "snapshots.interval", units="mhd")
     max_snapshots = table.get("max_snapshots", 3)
     if not isinstance(max_snapshots, int) or isinstance(max_snapshots, bool):
         raise ConfigurationError("snapshots.max_snapshots must be an integer")
     if max_snapshots < 1:
         raise ConfigurationError("snapshots.max_snapshots must be positive")
-    if interval is not None:
-        if interval != interval.strip():
-            raise ConfigurationError("snapshots.interval must be like 30m, 12h, or 7d")
-        try:
-            parse_interval(interval)
-        except ValueError as error:
-            raise ConfigurationError(f"snapshots.interval {error}") from error
     return SnapshotConfig(
         file_uri=file_uri,
         max_snapshots=max_snapshots,
@@ -291,36 +287,56 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
     )
 
 
-def parse_interval(value: str | None) -> timedelta | None:
-    """Parse a positive configured interval in compact ``<number><unit>`` form.
+def parse_interval(value: str | None, *, units: str = "smhd") -> timedelta | None:
+    """Parse a positive compact duration using the permitted unit letters.
 
-    This common parser serves collection timeout, scheduling, and snapshot
-    cadence settings; callers provide setting-specific error context.
+    Args:
+        value: Duration in compact ``<number><unit>`` form, or None.
+        units: Permitted unit letters from seconds, minutes, hours, and days.
+
+    Returns:
+        The parsed duration, or None when no value is provided.
+
+    Raises:
+        ValueError: If the duration is invalid or uses an unsupported unit.
     """
     if value is None:
         return None
-    match = _INTERVAL.fullmatch(value.strip())
-    if match is None:
-        raise ValueError("interval must be like 30m, 12h, or 7d")
+    match = _INTERVAL.fullmatch(value)
+    if match is None or match["unit"].lower() not in units:
+        raise ValueError("invalid duration or unit")
     amount = float(match["value"])
-    if amount <= 0:
-        raise ValueError("interval must be positive")
-    return timedelta(
-        seconds=amount
-        * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match["unit"].lower()]
-    )
+    if not isfinite(amount) or amount <= 0:
+        raise ValueError("duration must be positive and finite")
+    try:
+        duration = timedelta(
+            seconds=amount
+            * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match["unit"].lower()]
+        )
+    except OverflowError as error:
+        raise ValueError("duration is too large") from error
+    if duration <= timedelta(0):
+        raise ValueError("duration must be positive")
+    return duration
 
 
-def _duration(value: object | None, name: str) -> tuple[str | None, timedelta | None]:
-    """Validate one optional minute/hour duration and return its parsed value."""
+def _duration(
+    value: object | None, name: str, *, units: str
+) -> tuple[str | None, timedelta | None]:
+    """Validate one optional duration against its setting-specific units."""
     text = _string(value, name)
     if text is None:
         return None, None
-    message = f"{name} must be a positive duration in minutes or hours"
-    if text != text.strip() or re.fullmatch(r"\d+(?:\.\d+)?[mh]", text, re.I) is None:
-        raise ConfigurationError(message)
+    labels = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+    names = [labels[unit] for unit in units]
+    allowed = (
+        " or ".join(names)
+        if len(names) == 2
+        else ", ".join(names[:-1]) + f", or {names[-1]}"
+    )
+    message = f"{name} must be a positive duration using {allowed}"
     try:
-        parsed = parse_interval(text)
+        parsed = parse_interval(text, units=units)
     except ValueError as error:
         raise ConfigurationError(message) from error
     if parsed is None:
@@ -332,7 +348,7 @@ def _schedule_config(value: object | None) -> ScheduleConfig:
     """Parse the configured scheduler interval."""
     table = _table(value, "schedule", _SCHEDULE_CONFIG_KEYS)
     raw_interval = table.get("interval", DEFAULT_SCHEDULE_INTERVAL)
-    interval, parsed = _duration(raw_interval, "schedule.interval")
+    interval, parsed = _duration(raw_interval, "schedule.interval", units="mh")
     if interval is None or parsed is None:
         raise ConfigurationError("schedule.interval must be positive")
     return ScheduleConfig(interval=interval)
@@ -372,18 +388,14 @@ def _tokscale_config(
 ) -> tuple[str | None, tuple[str, ...], float, int, int]:
     """Parse restricted tokscale subprocess settings."""
     table = _table(value, "tokscale", _TOKSCALE_CONFIG_KEYS)
-    timeout_seconds = table.get("timeout_seconds", 300.0)
-    if (
-        not isinstance(timeout_seconds, (int, float))
-        or isinstance(timeout_seconds, bool)
-        or not isfinite(timeout_seconds)
-        or timeout_seconds <= 0
-    ):
-        raise ConfigurationError("tokscale.timeout_seconds must be a positive number")
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_TOKSCALE_TIMEOUT), "tokscale.timeout", units="sm"
+    )
+    assert timeout is not None
     return (
         _string(table.get("bin"), "tokscale.bin"),
         _environment_names(table.get("env")),
-        float(timeout_seconds),
+        timeout.total_seconds(),
         _positive_int(
             table.get("max_stdout_bytes", 64 * 1024 * 1024),
             "tokscale.max_stdout_bytes",
@@ -400,7 +412,6 @@ def _collection_config(value: object | None) -> CollectionConfig:
     table = _table(value, "collection", _COLLECTION_CONFIG_KEYS)
     max_retries = table.get("max_retries", 3)
     retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
-    timeout, _ = _duration(table.get("timeout"), "collection.timeout")
     if (
         not isinstance(max_retries, int)
         or isinstance(max_retries, bool)
@@ -421,7 +432,6 @@ def _collection_config(value: object | None) -> CollectionConfig:
     return CollectionConfig(
         max_retries=max_retries,
         retry_initial_seconds=float(retry_initial_seconds),
-        timeout=timeout,
     )
 
 
@@ -429,9 +439,9 @@ def _logging_config(value: object | None) -> LoggingConfig:
     """Parse optional local rotating-log settings."""
     table = _table(value, "logging", _LOGGING_CONFIG_KEYS)
     directory = _string(table.get("directory"), "logging.directory")
-    max_files = _positive_int(table.get("max_files", 10), "logging.max_files")
+    max_files = _positive_int(table.get("max_files", 5), "logging.max_files")
     max_bytes = _positive_int(
-        table.get("max_bytes", 10 * 1024 * 1024), "logging.max_bytes"
+        table.get("max_bytes", 5 * 1024 * 1024), "logging.max_bytes"
     )
     return LoggingConfig(
         directory=Path(directory).expanduser()
@@ -467,6 +477,10 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         table.get("maximum_bytes_billed", 1_073_741_824),
         "bigquery.maximum_bytes_billed",
     )
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_BIGQUERY_TIMEOUT), "bigquery.timeout", units="sm"
+    )
+    assert timeout is not None
     return BigQueryConfig(
         project=project,
         location=location,
@@ -474,6 +488,7 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         if credentials_file
         else None,
         maximum_bytes_billed=maximum_bytes_billed,
+        timeout_seconds=timeout.total_seconds(),
     )
 
 
@@ -484,25 +499,26 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
     table = _table(value, "gcs", _GCS_CONFIG_KEYS)
     uri = _string(table.get("uri"), "gcs.uri", required=True)
     project = _string(table.get("project"), "gcs.project", required=True)
-    location = _string(table.get("location", "US"), "gcs.location", required=True)
     credentials_file = _string(table.get("credentials_file"), "gcs.credentials_file")
-    if uri is None or project is None or location is None:
-        raise ConfigurationError("gcs.uri, gcs.project, and gcs.location are required")
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_GCS_TIMEOUT), "gcs.timeout", units="sm"
+    )
+    assert timeout is not None
+    if uri is None or project is None:
+        raise ConfigurationError("gcs.uri and gcs.project are required")
     from usagebassoon.buckets.gcs import parse_gcs_uri
 
     try:
         parse_gcs_uri(uri)
     except ValueError as error:
         raise ConfigurationError(str(error)) from error
-    if _BIGQUERY_LOCATION_PATTERN.fullmatch(location) is None:
-        raise ConfigurationError("gcs.location must be a canonical location identifier")
     return GcsConfig(
         uri=uri,
         project=project,
-        location=location,
         credentials_file=Path(credentials_file).expanduser()
         if credentials_file
         else None,
+        timeout_seconds=timeout.total_seconds(),
     )
 
 
@@ -552,15 +568,12 @@ def _parse_config(
             schedule_payload = {**schedule_payload, "interval": schedule_interval}
     schedule = _schedule_config(schedule_payload)
     collection = _collection_config(payload.get("collection"))
-    if collection.timeout is not None:
-        _, interval_duration = _duration(schedule.interval, "schedule.interval")
-        _, timeout_duration = _duration(collection.timeout, "collection.timeout")
-        assert interval_duration is not None
-        assert timeout_duration is not None
-        if interval_duration < timeout_duration:
-            raise ConfigurationError(
-                "schedule.interval must be greater than or equal to collection.timeout"
-            )
+    interval_duration = parse_interval(schedule.interval, units="mh")
+    assert interval_duration is not None
+    if interval_duration.total_seconds() <= tokscale_timeout_seconds:
+        raise ConfigurationError(
+            "schedule.interval must be greater than tokscale.timeout"
+        )
     if backend_value == "bigquery" and bigquery is None:
         raise ConfigurationError("[bigquery] is required for the BigQuery backend")
     return UsageBassoonConfig(
@@ -593,10 +606,14 @@ def update_schedule_interval(path: Path, interval: str) -> None:
         OSError: If the configuration cannot be read or atomically replaced.
         ValueError: If the interval contains unsafe TOML text.
     """
-    if not re.fullmatch(r"\d+(?:\.\d+)?[mh]", interval, re.IGNORECASE):
+    try:
+        parsed = parse_interval(interval, units="mh")
+    except ValueError as error:
         raise ValueError(
             "schedule.interval must be a positive duration in minutes or hours"
-        )
+        ) from error
+    if parsed is None:
+        raise ValueError("schedule.interval must be positive")
     original = path.read_text(encoding="utf-8")
     lines = original.splitlines(keepends=True)
     schedule_start: int | None = None
@@ -719,6 +736,7 @@ def open_backend(config: UsageBassoonConfig) -> StorageBackend:
         location=config.bigquery.location,
         credentials_file=config.bigquery.credentials_file,
         maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
+        timeout_seconds=config.bigquery.timeout_seconds,
     )
 
 
