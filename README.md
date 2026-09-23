@@ -4,6 +4,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 
 <h1 align="center">UsageBassoon</h1>
+
+<p align="center">
+  <img src="media/usagebassoon_readme_banner-800px.png" alt="Banner" width=400 />
+</p>
+
 <p align="center"><strong>Persistent AI token usage statistics no matter where your agents live</strong></p>
 
 <p align="center">
@@ -15,13 +20,15 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 UsageBassoon turns [`tokscale`](https://github.com/junhoyeo/tokscale)'s stateless JSON output into durable, queryable token-usage history. It is designed for ephemeral containers, rotating VMs, laptops, anywhere you want to track and save your token usage history. It can be run as a scheduled job in macOS, Debian-based Linux, and container environments.
 
-UsageBassoon supports local DuckDB, MotherDuck, and BigQuery storage, with optional local or Google Cloud Storage snapshots. Everything is available through the `bassoon` CLI and an importable Python API.
+UsageBassoon supports local DuckDB, MotherDuck, and BigQuery storage, with optional local or Google Cloud Storage snapshots. We recommend BigQuery for persisting token data across environments due to GCP's generous free-tier and easy integration with Google Colab.
+
+Get started with `bassoon --help` or import the Python API with `import usagebassoon`.
 
 > [!NOTE]
 > **Data disclaimer.** UsageBassoon is a personal, local-first token usage statistics tool. It reads token-usage statistics from your local `tokscale` environment and persists them to either a configurable local DuckDB database or a remote data analytics warehouse. UsageBassoon does not and will **never** collect, aggregate, or sell your token usage data.
 
 > [!WARNING]
-> UsageBassoon stores raw operational data at rest. Session IDs, workspace and project names, paths, notes, tags, and collector-host metadata may be present in the configured database or snapshots. Treat those locations as private, and **always** review every artifact before sharing it.
+> UsageBassoon stores raw operational data at rest. Session IDs, workspace and project names, paths, notes, tags, and collector-host metadata may be present in the configured database or snapshots. You should always treat your data as private, and **always** review every UsageBassoon artifact before sharing it.
 
 ## Overview
 
@@ -33,15 +40,15 @@ UsageBassoon supports local DuckDB, MotherDuck, and BigQuery storage, with optio
 ## Table of Contents
 
 - [Getting Started](#getting-started)
-- [Reports at a glance](#reports-at-a-glance)
+- [Terminal Reports](#terminal-reports)
 - [Config.toml](#configtoml)
 - [Automated Scheduling](#automated-scheduling)
-- [Source identity and curation](#source-identity-and-curation)
-- [Terminal Reports](#terminal-reports)
+- [Tags and Notes](#tags-and-notes)
 - [Python API](#python-api)
 - [Privacy and sharing](#privacy-and-sharing)
-- [Google Cloud permissions](#google-cloud-permissions)
 - [Snapshots](#snapshots)
+- [Google Cloud permissions](#google-cloud-permissions)
+- [Why AGPL?](#why-agpl)
 - [License & Disclaimers](#license--disclaimers)
 
 ## Getting Started
@@ -383,6 +390,16 @@ For GCS snapshots, UsageBassoon needs only the bucket metadata and object read/l
 Use Google's `STANDARD` storage class for an active snapshot archive. UsageBassoon writes, lists, restores, and rotates snapshots, so colder archival classes are a poor default.
 
 See Google's [Cloud Storage IAM permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage) and [storage classes](https://docs.cloud.google.com/storage/docs/storage-classes).
+
+## Why AGPL?
+
+UsageBassoon exists to record statistics about *your* token usage—data you generated with your own activity and money. We believe that data *belongs to you*, and the ability to persist and inspect your own usage history should never sit behind a paywall or a proprietary service.
+
+> Any agentic user should always be able to inspect their token usage history for FREE and answer questions like:
+>
+> **What did I spend, on which models, and was it worth it?**
+
+The license mirrors that belief. AGPLv3 means that anyone who modifies UsageBassoon and offers it as a network service *must* make their modified source available to its users. That means improvements to the access-layer, the actual mechanic of storing and viewing your token history, remains freely available to everyone that depends on it, and SaaS-based commercial licensing is restricted to genuine value added on top of that access, like dashboards, hosting, and team reporting.
 
 ## License & Disclaimers
 
