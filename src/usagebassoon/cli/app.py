@@ -3,6 +3,8 @@
 
 """app.py — Typer application assembly for the UsageBassoon command line."""
 
+from typing import Annotated
+
 import typer
 
 from usagebassoon.cli.audit import audit
@@ -17,6 +19,7 @@ from usagebassoon.cli.restore import restore
 from usagebassoon.cli.schedule import schedule_app
 from usagebassoon.cli.snapshot import snapshot
 from usagebassoon.cli.tag import tag_app
+from usagebassoon.version import __version__
 
 app = typer.Typer(
     name="usagebassoon",
@@ -25,8 +28,25 @@ app = typer.Typer(
 )
 
 
+def _version_callback(value: bool) -> None:
+    """Print the installed version and exit when requested."""
+    if value:
+        typer.echo(f"usagebassoon {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show the UsageBassoon version and exit.",
+        ),
+    ] = False,
+) -> None:
     """Run the UsageBassoon command-line interface."""
 
 

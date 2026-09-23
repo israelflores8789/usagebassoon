@@ -92,14 +92,14 @@ def _prefix(config: UsageBassoonConfig) -> list[str]:
     return list(resolve_tokscale_command(config))
 
 
-def preflight_tokscale(config: UsageBassoonConfig) -> tuple[str, ...]:
-    """Verify that the effective tokscale command can execute.
+def preflight_tokscale(config: UsageBassoonConfig) -> tuple[tuple[str, ...], str]:
+    """Verify the effective tokscale command and read its reported version.
 
     Args:
         config: Active UsageBassoon configuration.
 
     Returns:
-        The command prefix used by the collector.
+        The command prefix used by the collector and the reported version.
 
     Raises:
         RuntimeError: If tokscale cannot be started, times out, or rejects the
@@ -116,7 +116,7 @@ def preflight_tokscale(config: UsageBassoonConfig) -> tuple[str, ...]:
             shell=False,
             start_new_session=os.name == "posix",
         )
-        _stdout, stderr = _capture_process(
+        stdout, stderr = _capture_process(
             process,
             timeout_seconds=config.tokscale_timeout_seconds,
             max_stdout_bytes=config.tokscale_max_stdout_bytes,
@@ -142,7 +142,19 @@ def preflight_tokscale(config: UsageBassoonConfig) -> tuple[str, ...]:
             "tokscale preflight failed: "
             f"{detail or 'tokscale exited without diagnostics'}"
         )
-    return command
+    output = stdout.decode("utf-8", errors="replace").strip()
+    if not output:
+        raise RuntimeError(
+            "tokscale preflight failed: version probe returned no output"
+        )
+    version = output.splitlines()[0].strip()
+    if version.lower().startswith("tokscale "):
+        version = version.partition(" ")[2].strip()
+    if not version:
+        raise RuntimeError(
+            "tokscale preflight failed: version probe returned no version"
+        )
+    return command, version
 
 
 def _child_environment(config: UsageBassoonConfig) -> dict[str, str]:

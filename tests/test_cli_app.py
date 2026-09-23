@@ -3,9 +3,12 @@
 
 """test_cli_app.py — Typer application registration tests."""
 
+from importlib.metadata import version as distribution_version
+
 import pytest
 from typer.testing import CliRunner
 
+import usagebassoon
 from usagebassoon.cli.app import app
 
 COMMANDS = (
@@ -31,6 +34,17 @@ def test_root_help_lists_every_registered_command() -> None:
     assert result.exit_code == 0
     for command in COMMANDS:
         assert command in result.output
+    assert "--version" in result.output
+
+
+def test_version_matches_the_python_api_and_distribution() -> None:
+    """Report the installed version consistently across CLI and Python API."""
+    result = CliRunner().invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    expected = distribution_version("usagebassoon")
+    assert result.output.strip() == f"usagebassoon {expected}"
+    assert usagebassoon.__version__ == expected
 
 
 @pytest.mark.parametrize("command", COMMANDS)

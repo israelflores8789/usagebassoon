@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 from typing import Annotated
 
@@ -14,6 +15,7 @@ from rich.text import Text
 
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import snapshot_archiver
+from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -21,11 +23,12 @@ from usagebassoon.config import (
     open_backend,
 )
 from usagebassoon.display import sanitize_display
-from usagebassoon.drift import DoctorReport, run_doctor
+from usagebassoon.drift import DoctorCheck, DoctorReport, run_doctor
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.privacy import sanitize_doctor_text
 from usagebassoon.scheduling import schedule_doctor_check
+from usagebassoon.version import __version__
 
 _LOG = logging.getLogger(LOGGER_NAME)
 
@@ -102,8 +105,29 @@ def doctor(
     config_error: str | None = None
     connection_error: str | None = None
     configuration = None
+    tokscale_check = DoctorCheck(
+        "tokscale", "error", "not checked because configuration could not be loaded"
+    )
     try:
         configuration = manager.load()
+        try:
+            command, version = preflight_tokscale(configuration)
+            tokscale_check = DoctorCheck(
+                "tokscale",
+                "ok",
+                f"version {version}",
+                (f"command: {shlex.join(command)}",),
+            )
+        except RuntimeError as error:
+            try:
+                command_detail = (
+                    f"command: {shlex.join(resolve_tokscale_command(configuration))}",
+                )
+            except RuntimeError:
+                command_detail = ()
+            tokscale_check = DoctorCheck(
+                "tokscale", "error", str(error), command_detail
+            )
         try:
             logger = configure_logging(configuration.logging)
         except Exception:
@@ -136,7 +160,14 @@ def doctor(
         limit=limit,
         logger=logger,
     )
-    report = DoctorReport((*report.checks, schedule_doctor_check(configuration)))
+    report = DoctorReport(
+        (
+            DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
+            tokscale_check,
+            *report.checks,
+            schedule_doctor_check(configuration),
+        )
+    )
     try:
         if raw:
             output_console(stderr=True).print(

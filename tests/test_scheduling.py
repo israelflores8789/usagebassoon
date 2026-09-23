@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from pathlib import Path
 from typing import NoReturn
@@ -60,8 +61,10 @@ def test_tokscale_preflight_honors_configured_package_runner(
 
         pid = 12345
         returncode = 0
-        stdout = BytesIO(b"tokscale 4.15.1\n")
-        stderr = BytesIO(b"")
+
+        def __init__(self) -> None:
+            self.stdout = BytesIO(b"tokscale 4.15.1\n")
+            self.stderr = BytesIO(b"")
 
         def poll(self) -> int:
             return self.returncode
@@ -76,8 +79,29 @@ def test_tokscale_preflight_honors_configured_package_runner(
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
 
     assert resolve_tokscale_command(configuration) == ("npx", "tokscale@latest")
-    assert preflight_tokscale(configuration) == ("npx", "tokscale@latest")
+    assert preflight_tokscale(configuration) == (("npx", "tokscale@latest"), "4.15.1")
     assert calls == [["npx", "tokscale@latest", "--version"]]
+
+
+def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:
+    """Include the installed version in both status presentation formats."""
+    from usagebassoon.scheduling import human_status, status_json
+    from usagebassoon.version import __version__
+
+    status = ScheduleStatus(
+        platform="linux",
+        provider="systemd",
+        installed=False,
+        active=None,
+        enabled=None,
+        interval="30m",
+        artifact=tmp_path / "usagebassoon.timer",
+        log_path="journalctl",
+        command=(),
+    )
+
+    assert f"usagebassoon: {__version__}" in human_status(status)
+    assert json.loads(status_json(status))["usagebassoon_version"] == __version__
 
 
 def test_tokscale_preflight_reports_missing_default_install(

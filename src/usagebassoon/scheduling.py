@@ -33,6 +33,7 @@ from usagebassoon.config import (
 from usagebassoon.drift import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.orchestrator import collect as collect_run
+from usagebassoon.version import __version__
 
 Platform = Literal["linux", "darwin"]
 SYSTEMD_SERVICE_NAME = "usagebassoon.service"
@@ -906,6 +907,7 @@ def _launchd_status(
 def status_json(status: ScheduleStatus, worker: WorkerStatus | None = None) -> str:
     """Serialize native and optional worker status as stable JSON."""
     payload = status.as_dict()
+    payload["usagebassoon_version"] = __version__
     if worker is not None:
         payload["worker"] = worker.as_dict()
     return json.dumps(payload, sort_keys=True)
@@ -914,6 +916,7 @@ def status_json(status: ScheduleStatus, worker: WorkerStatus | None = None) -> s
 def human_status(status: ScheduleStatus, worker: WorkerStatus | None = None) -> str:
     """Render native and optional worker status for terminal users."""
     lines = [
+        f"usagebassoon: {__version__}",
         f"provider: {status.provider}",
         f"installed: {'yes' if status.installed else 'no'}",
         f"active: {status.active if status.active is not None else 'unknown'}",

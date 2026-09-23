@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 import pyarrow as pa
+import pytest
 from typer.testing import CliRunner
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -45,7 +47,9 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
     assert "raw doctor output may contain" in raw.stderr
 
 
-def test_doctor_strict_fails_when_unresolved_drift_is_present(tmp_path: Path) -> None:
+def test_doctor_strict_fails_when_unresolved_drift_is_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Treat diagnostic warnings as failures only when strict mode is requested."""
     config, backend = _configured_store(tmp_path)
     backend.append(
@@ -66,6 +70,12 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(tmp_path: Path) ->
         ),
     )
     backend.close()
+
+    def fake_preflight(_config: object) -> tuple[tuple[str, ...], str]:
+        """Return a working Tokscale command for this drift test."""
+        return ("tokscale",), "4.15.1"
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", fake_preflight)
     runner = CliRunner()
 
     regular = runner.invoke(app, ["doctor", "--config", str(config)])
@@ -74,3 +84,69 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(tmp_path: Path) ->
     assert regular.exit_code == 0
     assert "WARNING schema_drift" in regular.output
     assert strict.exit_code == 1
+
+
+def test_doctor_reports_configured_tokscale_command_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe the configured runner and print both versions before backend checks."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    with config.open("a") as stream:
+        stream.write('\n[tokscale]\nbin = "npx tokscale@latest"\n')
+    calls: list[list[str]] = []
+
+    class FakeProcess:
+        """Supply fresh pipes for each Tokscale version probe."""
+
+        pid = 12345
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = BytesIO(b"tokscale 4.15.1\n")
+            self.stderr = BytesIO(b"")
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self) -> int:
+            return self.returncode
+
+    def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+        calls.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+
+    result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [["npx", "tokscale@latest", "--version"]]
+    assert (
+        result.output.index("OK usagebassoon: version")
+        < result.output.index("OK tokscale: version 4.15.1")
+        < result.output.index("OK configuration:")
+    )
+    assert "command: npx tokscale@latest" in result.output
+
+
+def test_doctor_reports_failed_tokscale_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail doctor when the selected Tokscale runner cannot start."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    with config.open("a") as stream:
+        stream.write('\n[tokscale]\nbin = "missing-tokscale"\n')
+
+    def missing_popen(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("missing-tokscale")
+
+    monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", missing_popen)
+
+    result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "ERROR tokscale:" in result.output
+    assert "command: missing-tokscale" in result.output
+    assert "OK configuration:" in result.output
