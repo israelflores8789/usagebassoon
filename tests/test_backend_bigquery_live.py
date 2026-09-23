@@ -4,9 +4,12 @@
 """test_backend_bigquery_live.py — Opt-in live BigQuery integration tests.
 
 Run with ``USAGEBASSOON_BIGQUERY_LIVE=1 uv run pytest -m bigquery_live``.
-The suite accepts only the dedicated ``usagebassoon_it`` dataset. Set
-``USAGEBASSOON_BIGQUERY_LIVE_RESET=1`` to enable the final snapshot/restore
-test, which deletes and recreates tables in that disposable dataset.
+
+The ``bigquery_live`` marker selects these tests, and ``USAGEBASSOON_BIGQUERY_LIVE=1``
+enables access to a preconfigured BigQuery dataset called ``usagebassoon_it``.
+
+Set ``USAGEBASSOON_BIGQUERY_LIVE_RESET=1`` to enable the final snapshot/restore
+test, which deletes and recreates tables in the preconfigured, disposable dataset.
 """
 
 from __future__ import annotations

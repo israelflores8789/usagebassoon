@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_backend_gcs_live.py — Opt-in integration tests for the GCS archive."""
+"""test_backend_gcs_live.py — Opt-in live GCS snapshot integration tests.
+
+Run with ``USAGEBASSOON_GCS_LIVE=1 uv run pytest -m gcs_live``.
+
+The ``gcs_live`` marker selects these tests, and ``USAGEBASSOON_GCS_LIVE=1``
+enables access to a preconfigured GCS test bucket.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,8 @@ from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
+
+pytestmark = pytest.mark.gcs_live
 
 _TEST_BUCKET = "usagebassoon-test-snapshots-gen-lang-client-0670612427"
 
