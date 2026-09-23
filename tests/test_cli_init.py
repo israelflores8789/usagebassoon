@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from uuid import UUID
 
@@ -13,7 +14,11 @@ from typer.testing import CliRunner
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
-from usagebassoon.config import CONFIG_PATH_ENV_VAR, ConfigurationManager
+from usagebassoon.config import (
+    CONFIG_PATH_ENV_VAR,
+    DEFAULT_DUCKDB_DATABASE,
+    ConfigurationManager,
+)
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 
 
@@ -29,9 +34,18 @@ def test_init_creates_source_config_and_local_schema(
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
 
     assert result.exit_code == 0
+    original = config_path.read_bytes()
+    assert set(tomllib.loads(original.decode())) == {"source_id", "backend"}
     configuration = ConfigurationManager(config_path).load()
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
+    assert configuration.database == DEFAULT_DUCKDB_DATABASE
+    assert configuration.schedule.interval == "15m"
+    assert configuration.logging.max_files == 10
+    repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
+    assert repeated.exit_code == 0
+    assert "Using existing configuration" in repeated.output
+    assert config_path.read_bytes() == original
     backend = DuckDBBackend(configuration.database)
     try:
         assert backend.query("SELECT count(*) AS n FROM sessions").to_pylist() == [

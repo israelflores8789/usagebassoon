@@ -84,13 +84,7 @@ def write_initial_config(path: Path) -> bool:
         OSError: If the configuration directory cannot be created or written.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        f'source_id = "{uuid4()}"\n'
-        'backend = "duckdb"\n'
-        f'database = "{DEFAULT_DUCKDB_DATABASE}"\n'
-        "\n[schedule]\n"
-        f'interval = "{DEFAULT_SCHEDULE_INTERVAL}"\n'
-    )
+    content = f'source_id = "{uuid4()}"\nbackend = "duckdb"\n'
     try:
         with path.open("x") as handle:
             handle.write(content)
@@ -522,13 +516,19 @@ def _parse_config(
     _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
     source_id = _string(payload.get("source_id"), "source_id", required=True)
     backend_value = _string(payload.get("backend"), "backend", required=True)
-    database = _string(payload.get("database"), "database", required=True)
     if backend_value not in SUPPORTED_BACKENDS:
         raise ConfigurationError(
             f"backend must be one of: {', '.join(sorted(SUPPORTED_BACKENDS))}"
         )
-    if source_id is None or database is None:
-        raise ConfigurationError("source_id and database are required")
+    database = _string(payload.get("database"), "database")
+    if database is None:
+        if backend_value != "duckdb":
+            raise ConfigurationError(
+                f"database is required for the {backend_value} backend"
+            )
+        database = DEFAULT_DUCKDB_DATABASE
+    if source_id is None:
+        raise ConfigurationError("source_id is required")
     if _UUID_PATTERN.fullmatch(source_id) is None:
         raise ConfigurationError("source_id must be a canonical UUID")
     try:

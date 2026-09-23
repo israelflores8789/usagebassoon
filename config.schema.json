@@ -7,8 +7,7 @@
   "additionalProperties": false,
   "required": [
     "source_id",
-    "backend",
-    "database"
+    "backend"
   ],
   "properties": {
     "source_id": {
@@ -24,13 +23,13 @@
         "motherduck",
         "bigquery"
       ],
-      "description": "Storage backend to use. Use `duckdb` for local data persistence."
+      "description": "Storage backend to use. `bassoon init` writes `duckdb` by default; this setting must be present in the file."
     },
     "database": {
       "type": "string",
       "minLength": 1,
       "pattern": "\\S",
-      "description": "DuckDB file path, MotherDuck database name, or BigQuery dataset ID."
+      "description": "DuckDB file path, MotherDuck database name, or BigQuery dataset ID. When omitted for DuckDB, defaults to `~/.local/share/usagebassoon/usagebassoon.duckdb`. Required for MotherDuck and BigQuery."
     },
     "tokscale": {
       "$ref": "#/$defs/tokscale"
@@ -44,6 +43,9 @@
     "collection": {
       "$ref": "#/$defs/collection"
     },
+    "schedule": {
+      "$ref": "#/$defs/schedule"
+    },
     "logging": {
       "$ref": "#/$defs/logging"
     },
@@ -52,6 +54,26 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "backend": {
+            "enum": [
+              "motherduck",
+              "bigquery"
+            ]
+          }
+        },
+        "required": [
+          "backend"
+        ]
+      },
+      "then": {
+        "required": [
+          "database"
+        ]
+      }
+    },
     {
       "if": {
         "properties": {
@@ -97,19 +119,19 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "default": 300,
-          "description": "Maximum duration of one tokscale subprocess invocation, additionally bounded by collection.cadence when configured."
+          "description": "Maximum duration of one tokscale subprocess invocation. Defaults to 300 seconds; also bounded by collection.timeout when configured."
         },
         "max_stdout_bytes": {
           "type": "integer",
           "minimum": 1,
           "default": 67108864,
-          "description": "Maximum tokscale stdout captured for one command. Output exceeding this limit terminates the subprocess."
+          "description": "Maximum tokscale stdout captured for one command. Defaults to 67108864 bytes; output exceeding this limit terminates the subprocess."
         },
         "max_stderr_bytes": {
           "type": "integer",
           "minimum": 1,
           "default": 8388608,
-          "description": "Maximum tokscale stderr captured for one command. Output exceeding this limit terminates the subprocess."
+          "description": "Maximum tokscale stderr captured for one command. Defaults to 8388608 bytes; output exceeding this limit terminates the subprocess."
         }
       }
     },
@@ -137,7 +159,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 1073741824,
-          "description": "Per-job maximum bytes billed for BigQuery queries, including user-facing relation queries."
+          "description": "Per-job maximum bytes billed for BigQuery queries, including user-facing relation queries. Defaults to 1073741824 bytes."
         }
       }
     },
@@ -178,18 +200,30 @@
           "type": "integer",
           "minimum": 0,
           "default": 3,
-          "description": "Additional persistence attempts after the first failure."
+          "description": "Additional persistence attempts after the first failure. Defaults to 3."
         },
         "retry_initial_seconds": {
           "type": "number",
           "exclusiveMinimum": 0,
           "default": 1.0,
-          "description": "Initial exponential-backoff delay in seconds."
+          "description": "Initial exponential-backoff delay in seconds. Defaults to 1 second."
         },
-        "cadence": {
+        "timeout": {
           "type": "string",
-          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmMhH]$",
-          "description": "Optional external collection cadence. When present, tokscale subprocesses share a deadline below this interval."
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhH]$",
+          "description": "Optional end-to-end collection deadline in minutes or hours. Defaults to no deadline; when present, schedule.interval must be at least this long."
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interval": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhH]$",
+          "default": "15m",
+          "description": "Interval between scheduled collection attempts in minutes or hours. Defaults to `15m` when [schedule] or this setting is omitted."
         }
       }
     },
@@ -200,19 +234,19 @@
         "directory": {
           "$ref": "#/$defs/nonEmptyString",
           "default": "~/.local/state/usagebassoon/logs",
-          "description": "Directory for active and rotated operational logs."
+          "description": "Directory for active and rotated operational logs. Defaults to `~/.local/state/usagebassoon/logs`."
         },
         "max_files": {
           "type": "integer",
           "minimum": 1,
-          "default": 5,
-          "description": "Number of retained log files, including the active file."
+          "default": 10,
+          "description": "Number of retained log files, including the active file. Defaults to 10."
         },
         "max_bytes": {
           "type": "integer",
           "minimum": 1,
           "default": 10485760,
-          "description": "Maximum active log file size before rotation."
+          "description": "Maximum active log file size before rotation. Defaults to 10485760 bytes."
         }
       }
     },
@@ -228,7 +262,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 3,
-          "description": "Maximum number of retained snapshots."
+          "description": "Maximum number of retained snapshots. Defaults to 3 when [snapshots] is configured."
         },
         "interval": {
           "type": "string",

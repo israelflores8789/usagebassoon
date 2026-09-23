@@ -13,6 +13,7 @@ import pytest
 
 from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
+    DEFAULT_DUCKDB_DATABASE,
     DEFAULT_LOG_DIRECTORY,
     ConfigurationError,
     ConfigurationManager,
@@ -87,6 +88,37 @@ def test_schedule_defaults_and_collection_timeout_are_typed(tmp_path: Path) -> N
 
     assert configuration.schedule.interval == "15m"
     assert configuration.collection.timeout == "5m"
+
+
+def test_duckdb_database_defaults_when_omitted(tmp_path: Path) -> None:
+    """Use the local database path when a DuckDB config omits database."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "duckdb"\n'
+    )
+
+    assert ConfigurationManager(path).load().database == DEFAULT_DUCKDB_DATABASE
+
+
+@pytest.mark.parametrize("backend", ["motherduck", "bigquery"])
+def test_remote_backend_requires_database(tmp_path: Path, backend: str) -> None:
+    """Require an explicit database for remote storage backends."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "{backend}"\n'
+    )
+
+    with pytest.raises(ConfigurationError, match="database is required"):
+        ConfigurationManager(path).load()
+
+
+def test_backend_remains_required(tmp_path: Path) -> None:
+    """Keep backend explicit so storage selection is clear."""
+    path = tmp_path / "config.toml"
+    path.write_text('source_id = "11111111-1111-4111-8111-111111111111"\n')
+
+    with pytest.raises(ConfigurationError, match="backend is required"):
+        ConfigurationManager(path).load()
 
 
 def test_schedule_interval_must_cover_collection_timeout(tmp_path: Path) -> None:
