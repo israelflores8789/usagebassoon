@@ -485,6 +485,43 @@ def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
     assert "target.`source` = source.`source`" in statement
 
 
+def test_schema_drift_merge_adds_observation_count_once_per_run() -> None:
+    """Keep BigQuery event counts cumulative and safe for run retries."""
+    backend = _backend()
+    drift = pa.table(
+        {
+            "source_id": ["source"],
+            "domain": ["models"],
+            "tokscale_ver": ["4.15.2"],
+            "drift_key": ["unknown_field:future"],
+            "drift_kind": ["unknown_field"],
+            "path": ["future"],
+            "detail": ["types int; tolerated"],
+            "contract_tokscale_ver": ["4.15.1"],
+            "created_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+            "detected_run_id": ["first-run"],
+            "updated_run_id": ["first-run"],
+            "resolved": [False],
+            "observation_count": [2],
+        }
+    )
+    write = CurrentStateWrite(
+        "schema_drift_events",
+        drift,
+        ("source_id", "domain", "tokscale_ver", "drift_key"),
+        ("updated_at", "updated_run_id", "resolved"),
+    )
+
+    statement = backend._merge_from_data(write, "`staged`")
+
+    assert (
+        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
+        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
+        "target.`observation_count` + source.`observation_count` END"
+    ) in statement
+
+
 def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     """Qualify view definitions while retaining portable shipped SQL files."""
     backend = _backend()

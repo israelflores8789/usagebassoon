@@ -194,7 +194,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Data ingest pipeline:** `bassoon collect`:
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
   2. Run `graph`, use its contribution dates to select daily models work, run date-filtered `models` per required day, then fetch prices for each model used on those days and `report --no-summarize`.
-  3. Validate against the schema contract with pydantic strict mode. Required-field absence **fails the run** with a clear error; *unknown* fields or changed cardinalities are **drift events** — recorded in `schema_drift`, surfaced in output, surfaced again on the next `bassoon doctor`, and the run continues (tolerant reader) so collection is never blocked by additive changes. (Be careful! this can cause migration issues if a hotfix is released!)
+  3. Validate against the schema contract with pydantic strict mode. Required-field absence **fails the run** with a clear error; *unknown* fields or changed cardinalities are **drift events** — upserted in `schema_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them. Repeated payload sightings increment `observation_count` while preserving first-detection metadata.
   4. Graph totals are not reconciled with daily models totals; graph is only the activity and candidate-date source.
   5. Normalize to Arrow tables; compute derived columns. Stage each fact table in one batch.
   6. Stage the Arrow batch, match rows by natural key, update changed existing rows, insert new rows, and leave absent rows untouched. Use one transactional upsert/MERGE per collection run; **never** delete.
@@ -215,7 +215,7 @@ The following are out-of-scope and/or antithetical to the design goals:
   - Restore validates catalog membership, complete table coverage, and destination schema compatibility before appending any data. The destination must be initialized and empty; a failed restore can leave partial data and must be retried from a fresh/emptied destination.
   - `interval` is an optional positive minimum publication cadence. It gates both manual and automatic snapshots; only a configured interval enables collection-triggered snapshots. The retention default is 3.
 
-- **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift` rows and a user-facing warning and asks for a bug report:
+- **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift_events` rows and a user-facing warning and asks for a bug report:
 
   - Contract requiredness describes what UsageBassoon needs from a payload to execute ingestion, not every field present in a golden fixture. Mark unused graph aggregates and capture metadata optional when their absence does not affect ingestion; their omission should not produce missing-field drift or fail collection. Optional fields that are present with an unexpected type still produce non-fatal type-change drift; omit a field from the contract entirely only when its type drift should not be monitored.
 
@@ -247,7 +247,7 @@ $ bassoon collect
   - `last_seen_at` is metadata from tokscale's `last_active` or similar.
   - `last_collected_at` is a freshness marker internal to usagebassoon.
 
-- **General storage model:** Usage facts and day/model price versions use current-state upserts. Existing natural keys are overwritten in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Audit, drift, reconciliation, and snapshot artifacts are append-only.
+- **General storage model:** Usage facts, day/model price versions, schema-drift events, and reconciliation issues use current-state upserts. Existing natural keys are updated in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Ingest runs and snapshot artifacts are append-only.
 
 ### Canonical Ingest Commands
 

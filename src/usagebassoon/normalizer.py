@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
 
+from usagebassoon.drift import SchemaDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 
 if TYPE_CHECKING:
@@ -137,18 +138,22 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("resolved_at", _TIMESTAMP),
         ]
     ),
-    "schema_drift": pa.schema(
+    "schema_drift_events": pa.schema(
         [
-            pa.field("drift_id", pa.string()),
-            pa.field("run_id", pa.string()),
             pa.field("source_id", pa.string()),
-            pa.field("detected_at", _TIMESTAMP),
-            pa.field("payload_kind", pa.string()),
+            pa.field("domain", pa.string()),
+            pa.field("tokscale_ver", pa.string()),
+            pa.field("drift_key", pa.string()),
             pa.field("drift_kind", pa.string()),
             pa.field("path", pa.string()),
             pa.field("detail", pa.string()),
-            pa.field("tokscale_ver", pa.string()),
+            pa.field("contract_tokscale_ver", pa.string()),
+            pa.field("created_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
+            pa.field("detected_run_id", pa.string()),
+            pa.field("updated_run_id", pa.string()),
             pa.field("resolved", pa.bool_()),
+            pa.field("observation_count", pa.int64()),
         ]
     ),
 }
@@ -405,24 +410,52 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
                 for check, key in bundle.reconciliation.resolved
             ]
         )
-    if bundle.contract_drift:
-        tables["schema_drift"] = _col_major(
-            [
-                {
-                    "drift_id": drift.drift_id,
-                    "run_id": drift.run_id,
-                    "source_id": bundle.source_id,
-                    "detected_at": drift.detected_at,
-                    "payload_kind": drift.payload_kind,
-                    "drift_kind": drift.drift_kind,
-                    "path": drift.path,
-                    "detail": drift.detail,
-                    "tokscale_ver": drift.tokscale_ver,
-                    "resolved": False,
-                }
-                for drift in bundle.contract_drift
-            ]
-        )
+    event_rows: dict[SchemaDriftIdentity, dict[str, object]] = {}
+    tokscale_ver = bundle.graph.meta.version
+    for drift in bundle.contract_drift:
+        identity = (drift.domain, tokscale_ver, drift.drift_key)
+        row = event_rows.get(identity)
+        if row is None:
+            event_rows[identity] = {
+                "source_id": bundle.source_id,
+                "domain": drift.domain,
+                "tokscale_ver": tokscale_ver,
+                "drift_key": drift.drift_key,
+                "drift_kind": drift.drift_kind,
+                "path": drift.path,
+                "detail": drift.detail,
+                "contract_tokscale_ver": drift.contract_tokscale_ver,
+                "created_at": at,
+                "updated_at": at,
+                "detected_run_id": bundle.run_id,
+                "updated_run_id": bundle.run_id,
+                "resolved": False,
+                "observation_count": 1,
+            }
+        else:
+            row["detail"] = drift.detail
+            row["contract_tokscale_ver"] = drift.contract_tokscale_ver
+            row["observation_count"] = cast(int, row["observation_count"]) + 1
+    for state in bundle.resolved_schema_drift:
+        identity = drift_identity(state)
+        event_rows[identity] = {
+            "source_id": bundle.source_id,
+            "domain": state.domain,
+            "tokscale_ver": state.tokscale_ver,
+            "drift_key": state.drift_key,
+            "drift_kind": state.drift_kind,
+            "path": state.path,
+            "detail": state.detail,
+            "contract_tokscale_ver": state.contract_tokscale_ver,
+            "created_at": state.created_at,
+            "updated_at": at,
+            "detected_run_id": state.detected_run_id,
+            "updated_run_id": bundle.run_id,
+            "resolved": True,
+            "observation_count": 0,
+        }
+    if event_rows:
+        tables["schema_drift_events"] = _col_major(list(event_rows.values()))
     return tables
 
 

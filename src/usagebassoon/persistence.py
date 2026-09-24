@@ -9,7 +9,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from usagebassoon.backends.base import (
     CurrentStateWrite,
@@ -19,6 +19,7 @@ from usagebassoon.backends.base import (
     close_backend,
 )
 from usagebassoon.config import UsageBassoonConfig, open_backend
+from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import IngestStatus, IngestTarget
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
@@ -86,12 +87,23 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("source_id", "check_name", "issue_key"),
         ("message", "updated_at", "updated_run_id", "resolved_at"),
     ),
+    "schema_drift_events": (
+        ("source_id", "domain", "tokscale_ver", "drift_key"),
+        (
+            "drift_kind",
+            "path",
+            "detail",
+            "contract_tokscale_ver",
+            "updated_at",
+            "updated_run_id",
+            "resolved",
+        ),
+    ),
 }
 
 APPEND_ONLY_TABLES = frozenset(
     {
         "ingest_runs",
-        "schema_drift",
     }
 )
 
@@ -123,8 +135,9 @@ def load_ingest_status(
     dict[date, set[str]],
     dict[date, set[str]],
     frozenset[ReconciliationIdentity],
+    tuple[SchemaDriftState, ...],
 ]:
-    """Load retry status, coverage, and unresolved reconciliation identities."""
+    """Load retry status, persisted coverage, and unresolved diagnostics."""
     backend = open_backend(config)
     source = _source_literal(config.source_id)
     try:
@@ -193,7 +206,58 @@ def load_ingest_status(
             if not isinstance(check_name, str) or not isinstance(issue_key, str):
                 raise RuntimeError("reconciliation_issues contains an invalid identity")
             issue_identities.add((check_name, issue_key))
-        return statuses, models_by_day, prices_by_day, frozenset(issue_identities)
+        drift_rows = backend.query(
+            "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
+            "contract_tokscale_ver, created_at, detected_run_id, observation_count "
+            "FROM schema_drift_events "
+            f"WHERE source_id = {source} AND COALESCE(resolved, FALSE) = FALSE"
+        ).to_pylist()
+        schema_drift: list[SchemaDriftState] = []
+        for row in drift_rows:
+            domain = row["domain"]
+            tokscale_ver = row["tokscale_ver"]
+            drift_key = row["drift_key"]
+            drift_kind = row["drift_kind"]
+            path = row["path"]
+            detail = row["detail"]
+            contract_tokscale_ver = row["contract_tokscale_ver"]
+            created_at = row["created_at"]
+            detected_run_id = row["detected_run_id"]
+            observation_count = row["observation_count"]
+            if (
+                not isinstance(domain, str)
+                or not isinstance(tokscale_ver, str)
+                or not isinstance(drift_key, str)
+                or not isinstance(drift_kind, str)
+                or not isinstance(path, str)
+                or not isinstance(detail, str)
+                or not isinstance(contract_tokscale_ver, str)
+                or not isinstance(created_at, datetime)
+                or not isinstance(detected_run_id, str)
+                or not isinstance(observation_count, int)
+            ):
+                raise RuntimeError("schema_drift_events contains an invalid row")
+            schema_drift.append(
+                SchemaDriftState(
+                    domain=domain,
+                    tokscale_ver=tokscale_ver,
+                    drift_key=drift_key,
+                    drift_kind=drift_kind,
+                    path=path,
+                    detail=detail,
+                    contract_tokscale_ver=contract_tokscale_ver,
+                    created_at=created_at,
+                    detected_run_id=detected_run_id,
+                    observation_count=observation_count,
+                )
+            )
+        return (
+            statuses,
+            models_by_day,
+            prices_by_day,
+            frozenset(issue_identities),
+            tuple(schema_drift),
+        )
     finally:
         close_backend(backend, context="loading ingest status", logger=_LOG)
 

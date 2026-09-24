@@ -20,7 +20,7 @@ _LOG = logging.getLogger("usagebassoon")
 
 REQUIRED_RELATIONS: tuple[str, ...] = (
     "ingest_runs",
-    "schema_drift",
+    "schema_drift_events",
     "sessions",
     "session_model_stats",
     "daily_stats",
@@ -161,6 +161,21 @@ def _as_optional_int(value: object | None) -> int | None:
     raise TypeError(f"expected integer-like value, got {type(value).__name__}")
 
 
+def _as_required_datetime(value: object | None) -> datetime:
+    """Convert a required database value to a datetime."""
+    if not isinstance(value, datetime):
+        raise TypeError("required diagnostic timestamp was null or invalid")
+    return value
+
+
+def _as_required_int(value: object | None) -> int:
+    """Convert a required database value to an integer."""
+    result = _as_optional_int(value)
+    if result is None:
+        raise TypeError("required diagnostic count was null")
+    return result
+
+
 def _materialized_rows(backend: StorageBackend, sql: str) -> list[dict[str, object]]:
     """Execute a query and normalize its rows for diagnostic parsing."""
     return [cast(dict[str, object], row) for row in backend.query(sql).to_pylist()]
@@ -171,14 +186,14 @@ def unresolved_schema_drift(
     *,
     limit: int = 20,
 ) -> tuple[SchemaDriftRecord, ...]:
-    """Load unresolved schema-drift events from a backend.
+    """Load unresolved current schema-drift events from a backend.
 
     Args:
-        backend: Backend containing the append-only drift log.
+        backend: Backend containing current schema-drift events.
         limit: Maximum number of newest events to load.
 
     Returns:
-        Newest unresolved drift events first.
+        Most recently updated unresolved events first.
 
     Raises:
         ValueError: If ``limit`` is not positive.
@@ -188,22 +203,28 @@ def unresolved_schema_drift(
         raise ValueError("limit must be positive")
     rows = _materialized_rows(
         backend,
-        "SELECT drift_id, run_id, detected_at, payload_kind, drift_kind, "
-        "path, detail, tokscale_ver "
-        "FROM schema_drift "
-        "WHERE COALESCE(resolved, FALSE) = FALSE "
-        f"ORDER BY detected_at DESC LIMIT {limit}",
+        "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
+        "contract_tokscale_ver, created_at, updated_at, detected_run_id, "
+        "updated_run_id, observation_count FROM schema_drift_events "
+        "WHERE resolved = FALSE "
+        f"ORDER BY updated_at DESC LIMIT {limit}",
     )
     return tuple(
         SchemaDriftRecord(
-            drift_id=_as_required_string(_row_value(row, "drift_id")),
-            run_id=_as_required_string(_row_value(row, "run_id")),
-            detected_at=_as_optional_datetime(_row_value(row, "detected_at")),
-            payload_kind=_as_optional_string(_row_value(row, "payload_kind")),
-            drift_kind=_as_optional_string(_row_value(row, "drift_kind")),
-            path=_as_optional_string(_row_value(row, "path")),
-            detail=_as_optional_string(_row_value(row, "detail")),
-            tokscale_ver=_as_optional_string(_row_value(row, "tokscale_ver")),
+            domain=_as_required_string(_row_value(row, "domain")),
+            tokscale_ver=_as_required_string(_row_value(row, "tokscale_ver")),
+            drift_key=_as_required_string(_row_value(row, "drift_key")),
+            drift_kind=_as_required_string(_row_value(row, "drift_kind")),
+            path=_as_required_string(_row_value(row, "path")),
+            detail=_as_required_string(_row_value(row, "detail")),
+            contract_tokscale_ver=_as_required_string(
+                _row_value(row, "contract_tokscale_ver")
+            ),
+            created_at=_as_required_datetime(_row_value(row, "created_at")),
+            updated_at=_as_required_datetime(_row_value(row, "updated_at")),
+            detected_run_id=_as_required_string(_row_value(row, "detected_run_id")),
+            updated_run_id=_as_required_string(_row_value(row, "updated_run_id")),
+            observation_count=_as_required_int(_row_value(row, "observation_count")),
         )
         for row in rows
     )

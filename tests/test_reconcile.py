@@ -230,8 +230,8 @@ def test_resolution_requires_all_previous_bad_days_to_be_rechecked(
     later = day + timedelta(days=1)
     now = datetime.now(UTC)
     run_id = str(uuid4())
-    graph_plan = plan_graph(graph_raw, run_id=run_id, detected_at=now)
-    models_plan = plan_models({day: daily_raws[day]}, run_id=run_id, detected_at=now)
+    graph_plan = plan_graph(graph_raw)
+    models_plan = plan_models({day: daily_raws[day]})
     identity = ("models_payload_totals", "total_input_mismatch")
     pending = IngestStatus(
         later, "models", "partial", 1, 0, "old", None, "reconciliation"

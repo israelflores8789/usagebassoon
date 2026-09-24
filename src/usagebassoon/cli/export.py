@@ -31,7 +31,7 @@ _EXPORTABLE_RELATIONS = frozenset(
         "noted_sessions",
         "price_versions",
         "reconciliation_issues",
-        "schema_drift",
+        "schema_drift_events",
         "session_model_stats",
         "session_model_stats_current",
         "session_tags",

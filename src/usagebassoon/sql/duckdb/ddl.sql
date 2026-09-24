@@ -30,17 +30,22 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
 
 -- Artifacts of tokscale payload drift events from the expected tokscale schema.
 -- Reported in `bassoon doctor`.
-CREATE TABLE IF NOT EXISTS schema_drift (
-    drift_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS schema_drift_events (
     source_id TEXT NOT NULL,
-    detected_at TIMESTAMPTZ NOT NULL,
-    payload_kind TEXT,
-    drift_kind TEXT,
-    path TEXT,
-    detail TEXT,
-    tokscale_ver TEXT,
-    resolved BOOLEAN DEFAULT FALSE
+    domain TEXT NOT NULL,
+    tokscale_ver TEXT NOT NULL,
+    drift_key TEXT NOT NULL,
+    drift_kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    contract_tokscale_ver TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    detected_run_id TEXT NOT NULL,
+    updated_run_id TEXT NOT NULL,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE,
+    observation_count BIGINT NOT NULL,
+    PRIMARY KEY (source_id, domain, tokscale_ver, drift_key)
 );
 
 -- Holds metadata about each usage session typically from `tokscale report`.
