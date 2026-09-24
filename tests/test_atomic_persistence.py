@@ -96,7 +96,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
         path=tmp_path / "config.toml",
         source_id=collection_bundle.source_id,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
     )
     attempts: list[str] = []
     schema_attempts: list[None] = []

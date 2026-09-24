@@ -13,7 +13,7 @@ import pytest
 
 from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
-    DEFAULT_DUCKDB_DATABASE,
+    DEFAULT_LOCAL_DATABASE,
     DEFAULT_LOG_DIRECTORY,
     ConfigurationError,
     ConfigurationManager,
@@ -45,18 +45,18 @@ def test_explicit_config_path_has_highest_precedence(tmp_path: Path) -> None:
     environment = tmp_path / "environment.toml"
     explicit.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
     )
     environment.write_text(
         'source_id = "22222222-2222-4222-8222-222222222222"\n'
-        'backend = "duckdb"\ndatabase = "other.duckdb"\n'
+        'backend = "duckdb"\nlocal_database = "other.duckdb"\n'
     )
     manager = ConfigurationManager(
         explicit,
         environ={CONFIG_PATH_ENV_VAR: str(environment)},
     )
     assert manager.path == explicit
-    assert manager.load().database == ":memory:"
+    assert manager.load().local_database == Path(":memory:")
 
 
 def test_environment_path_precedes_default(
@@ -67,7 +67,7 @@ def test_environment_path_precedes_default(
     configured = tmp_path / "config.toml"
     configured.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
     )
     monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(configured))
     manager = ConfigurationManager()
@@ -80,7 +80,7 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
     )
 
     configuration = ConfigurationManager(path).load()
@@ -91,25 +91,35 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     assert configuration.logging.max_bytes == 5 * 1024 * 1024
 
 
-def test_duckdb_database_defaults_when_omitted(tmp_path: Path) -> None:
-    """Use the local database path when a DuckDB config omits database."""
+def test_duckdb_local_database_defaults_when_omitted(tmp_path: Path) -> None:
+    """Use the local DuckDB path when a config omits local_database."""
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "duckdb"\n'
     )
 
-    assert ConfigurationManager(path).load().database == DEFAULT_DUCKDB_DATABASE
+    assert (
+        ConfigurationManager(path).load().local_database
+        == DEFAULT_LOCAL_DATABASE.expanduser()
+    )
 
 
-@pytest.mark.parametrize("backend", ["motherduck", "bigquery"])
-def test_remote_backend_requires_database(tmp_path: Path, backend: str) -> None:
-    """Require an explicit database for remote storage backends."""
+@pytest.mark.parametrize(
+    ("backend", "required_section"),
+    [("motherduck", "motherduck"), ("bigquery", "bigquery")],
+)
+def test_remote_backend_requires_its_settings(
+    tmp_path: Path,
+    backend: str,
+    required_section: str,
+) -> None:
+    """Require the selected remote backend's configuration table."""
     path = tmp_path / "config.toml"
     path.write_text(
         f'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "{backend}"\n'
     )
 
-    with pytest.raises(ConfigurationError, match="database is required"):
+    with pytest.raises(ConfigurationError, match=f"\\[{required_section}\\].*required"):
         ConfigurationManager(path).load()
 
 
@@ -130,7 +140,7 @@ def test_schedule_interval_must_exceed_tokscale_timeout(
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         f'[schedule]\ninterval = "{interval}"\n'
     )
 
@@ -155,7 +165,7 @@ def test_schedule_durations_are_limited_to_minutes_or_hours(
     setting = f'[{field}]\ninterval = "{value}"\n'
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n' + setting
+        'backend = "duckdb"\nlocal_database = ":memory:"\n' + setting
     )
 
     with pytest.raises(ConfigurationError, match="minutes or hours"):
@@ -178,12 +188,17 @@ def test_duration_units_are_setting_specific(
     """Reject duration units outside each setting's supported grain."""
     path = tmp_path / "config.toml"
     extras = {
-        "bigquery": 'project = "usagebassoon-test"\n',
+        "bigquery": 'project = "usagebassoon-test"\ndataset = "usagebassoon_it"\n',
         "gcs": 'uri = "gs://bucket/archive"\nproject = "usagebassoon-test"\n',
     }
+    backend_settings = (
+        'backend = "bigquery"\n'
+        if section == "bigquery"
+        else 'backend = "duckdb"\nlocal_database = ":memory:"\n'
+    )
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        f"{backend_settings}"
         f"[{section}]\n{extras.get(section, '')}{setting}\n"
     )
 
@@ -206,7 +221,7 @@ def test_removed_config_keys_are_rejected(
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         f"[{section}]\n{setting}\n"
     )
 
@@ -236,8 +251,7 @@ def test_bigquery_requires_its_connection_settings(tmp_path: Path) -> None:
     """Reject a partial configuration before any backend is opened."""
     path = tmp_path / "config.toml"
     path.write_text(
-        'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "bigquery"\ndatabase = "usagebassoon"\n'
+        'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "bigquery"\n'
     )
     with pytest.raises(ConfigurationError, match=r"\[bigquery\]"):
         ConfigurationManager(path).load()
@@ -247,7 +261,7 @@ def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
     """Reject an unparsable source namespace before opening a backend."""
     path = tmp_path / "config.toml"
     path.write_text(
-        'source_id = "not-a-uuid"\nbackend = "duckdb"\ndatabase = ":memory:"\n'
+        'source_id = "not-a-uuid"\nbackend = "duckdb"\nlocal_database = ":memory:"\n'
     )
     with pytest.raises(ConfigurationError, match="source_id must be a canonical UUID"):
         ConfigurationManager(path).load()
@@ -264,10 +278,10 @@ def test_unknown_config_keys_fail_and_are_written_to_the_log(
     content = (
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "duckdb"\n'
-        'database = ":memory:"\n'
+        'local_database = ":memory:"\n'
     )
     if scope == "root":
-        content += "unknown_option = true\n"
+        content += 'database = "usagebassoon"\n'
     content += f'\n[logging]\ndirectory = "{log_directory}"\n'
     if scope == "tokscale":
         content += '\n[tokscale]\ncommand = "bunx tokscale@latest"\n'
@@ -294,7 +308,7 @@ def test_invalid_logging_settings_use_the_default_error_log(
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         "[logging]\nmax_files = 0\n"
     )
 
@@ -314,8 +328,9 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
     credentials = tmp_path / "service-account.json"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "bigquery"\ndatabase = "usagebassoon"\n'
+        'backend = "bigquery"\n'
         '[bigquery]\nproject = "usagebassoon-test"\n'
+        'dataset = "usagebassoon_it"\n'
         'location = "us-central1"\n'
         f'credentials_file = "{credentials}"\n'
         "[collection]\nmax_retries = 4\nretry_initial_seconds = 0.5\n"
@@ -337,7 +352,7 @@ def test_snapshot_defaults_and_interval_validation_are_consistent(
     valid = tmp_path / "valid.toml"
     valid.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         '[snapshots]\ninterval = "12h"\n'
     )
     snapshots = ConfigurationManager(valid).load().snapshots
@@ -357,7 +372,7 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     credentials = tmp_path / "service-account.json"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         '[gcs]\nuri = "gs://bucket/archive"\n'
         'project = "usagebassoon-test"\n'
         f'credentials_file = "{credentials}"\n'
@@ -383,7 +398,7 @@ def test_snapshots_gcs_uri_is_removed(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         '[snapshots]\ngcs_uri = "gs://bucket/archive"\n'
     )
 

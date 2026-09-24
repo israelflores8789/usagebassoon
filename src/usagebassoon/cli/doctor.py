@@ -70,6 +70,23 @@ def _print_report(
     console.print(f"\nOverall status: {report.status}")
 
 
+def _configured_target(configuration: UsageBassoonConfig) -> str | None:
+    """Return the selected backend's target for doctor diagnostics."""
+    if configuration.backend == "duckdb":
+        return (
+            str(configuration.local_database) if configuration.local_database else None
+        )
+    if configuration.backend == "motherduck":
+        return (
+            configuration.motherduck.database
+            if configuration.motherduck is not None
+            else None
+        )
+    return (
+        configuration.bigquery.dataset if configuration.bigquery is not None else None
+    )
+
+
 def doctor(
     config: Annotated[
         Path | None,
@@ -143,7 +160,7 @@ def doctor(
     report = run_doctor(
         opened,
         backend_name=configuration.backend if configuration else "",
-        database=configuration.database if configuration else None,
+        database=_configured_target(configuration) if configuration else None,
         config_path=str(manager.path),
         config_error=config_error,
         connection_error=connection_error,
@@ -181,7 +198,7 @@ def doctor(
             report,
             raw=raw,
             config_path=str(manager.path),
-            database=configuration.database if configuration else None,
+            database=_configured_target(configuration) if configuration else None,
         )
     finally:
         if opened is not None:

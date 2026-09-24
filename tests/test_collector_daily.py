@@ -42,7 +42,7 @@ def _config(path: Path) -> UsageBassoonConfig:
         path=path,
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         logging=LoggingConfig(directory=path.parent / "logs"),
     )
 
@@ -65,7 +65,7 @@ def test_package_runner_commands_are_passed_to_tokscale(
         path=Path("config.toml"),
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         tokscale_bin=command,
     )
     monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
@@ -131,7 +131,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
         path=tmp_path / "config.toml",
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         tokscale_env=("CUSTOM_TOKSCALE_AUTH",),
     )
 
@@ -152,7 +152,7 @@ def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
         path=tmp_path / "config.toml",
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         tokscale_timeout_seconds=0.05,
     )
 
@@ -170,7 +170,7 @@ def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
         path=tmp_path / "config.toml",
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         tokscale_max_stdout_bytes=128,
     )
 
@@ -189,7 +189,7 @@ def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
         path=tmp_path / "config.toml",
         source_id=SOURCE_ID,
         backend="duckdb",
-        database=":memory:",
+        local_database=Path(":memory:"),
         tokscale_max_stderr_bytes=128,
     )
 

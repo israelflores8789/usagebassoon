@@ -28,7 +28,7 @@ _LOG = logging.getLogger("usagebassoon")
 
 BackendName = Literal["duckdb", "motherduck", "bigquery"]
 DEFAULT_CONFIG_PATH = Path("~/.config/usagebassoon/config.toml")
-DEFAULT_DUCKDB_DATABASE = "~/.local/share/usagebassoon/usagebassoon.duckdb"
+DEFAULT_LOCAL_DATABASE = Path("~/.local/share/usagebassoon/usagebassoon.duckdb")
 DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
@@ -43,9 +43,10 @@ _ROOT_CONFIG_KEYS = frozenset(
     {
         "source_id",
         "backend",
-        "database",
+        "local_database",
         "tokscale",
         "bigquery",
+        "motherduck",
         "gcs",
         "collection",
         "schedule",
@@ -57,8 +58,16 @@ _TOKSCALE_CONFIG_KEYS = frozenset(
     {"bin", "env", "timeout", "max_stdout_bytes", "max_stderr_bytes"}
 )
 _BIGQUERY_CONFIG_KEYS = frozenset(
-    {"project", "location", "credentials_file", "maximum_bytes_billed", "timeout"}
+    {
+        "project",
+        "dataset",
+        "location",
+        "credentials_file",
+        "maximum_bytes_billed",
+        "timeout",
+    }
 )
+_MOTHERDUCK_CONFIG_KEYS = frozenset({"database"})
 _COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds"})
 _SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
@@ -102,6 +111,7 @@ class BigQueryConfig:
 
     Attributes:
         project: GCP project identifier.
+        dataset: BigQuery dataset identifier.
         location: BigQuery dataset and job location.
         credentials_file: Optional service-account credential file path.
         maximum_bytes_billed: Per-query billing cap for user-facing reads.
@@ -109,6 +119,7 @@ class BigQueryConfig:
     """
 
     project: str
+    dataset: str
     location: str = "US"
     credentials_file: Path | None = None
     maximum_bytes_billed: int = 1_073_741_824
@@ -130,6 +141,17 @@ class GcsConfig:
     project: str
     credentials_file: Path | None = None
     timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class MotherDuckConfig:
+    """MotherDuck connection settings.
+
+    Attributes:
+        database: MotherDuck database name without the ``md:`` prefix.
+    """
+
+    database: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,13 +216,14 @@ class UsageBassoonConfig:
         path: Configuration file from which these values were loaded.
         source_id: Stable UUID namespace for one intentional collection source.
         backend: Selected storage backend.
-        database: Backend database, dataset, or local file path.
+        local_database: Local DuckDB file path, when DuckDB is selected.
+        motherduck: MotherDuck settings when that backend is selected.
+        bigquery: BigQuery settings when that backend is selected.
         tokscale_bin: Optional tokscale executable override.
         tokscale_env: Explicit parent environment variables passed to tokscale.
         tokscale_timeout_seconds: Maximum duration for one tokscale command.
         tokscale_max_stdout_bytes: Maximum captured tokscale standard output.
         tokscale_max_stderr_bytes: Maximum captured tokscale standard error.
-        bigquery: BigQuery settings when that backend is selected.
         gcs: Google Cloud Storage settings when GCS snapshots are configured.
         schedule: Scheduler interval settings.
         collection: Collection retry settings.
@@ -211,13 +234,14 @@ class UsageBassoonConfig:
     path: Path
     source_id: str
     backend: BackendName
-    database: str
+    local_database: Path | None = None
+    motherduck: MotherDuckConfig | None = None
+    bigquery: BigQueryConfig | None = None
     tokscale_bin: str | None = None
     tokscale_env: tuple[str, ...] = ()
     tokscale_timeout_seconds: float = 180.0
     tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
     tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
-    bigquery: BigQueryConfig | None = None
     gcs: GcsConfig | None = None
     schedule: ScheduleConfig = ScheduleConfig()
     collection: CollectionConfig = CollectionConfig()
@@ -458,6 +482,7 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         return None
     table = _table(value, "bigquery", _BIGQUERY_CONFIG_KEYS)
     project = _string(table.get("project"), "bigquery.project", required=True)
+    dataset = _string(table.get("dataset"), "bigquery.dataset", required=True)
     location = _string(
         table.get("location", "US"),
         "bigquery.location",
@@ -467,8 +492,10 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         table.get("credentials_file"),
         "bigquery.credentials_file",
     )
-    if project is None or location is None:
-        raise ConfigurationError("bigquery.project and bigquery.location are required")
+    if project is None or dataset is None or location is None:
+        raise ConfigurationError(
+            "bigquery.project, bigquery.dataset, and bigquery.location are required"
+        )
     if _BIGQUERY_LOCATION_PATTERN.fullmatch(location) is None:
         raise ConfigurationError(
             "bigquery.location must be a canonical location identifier"
@@ -483,6 +510,7 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
     assert timeout is not None
     return BigQueryConfig(
         project=project,
+        dataset=dataset,
         location=location,
         credentials_file=Path(credentials_file).expanduser()
         if credentials_file
@@ -490,6 +518,52 @@ def _bigquery_config(value: object | None) -> BigQueryConfig | None:
         maximum_bytes_billed=maximum_bytes_billed,
         timeout_seconds=timeout.total_seconds(),
     )
+
+
+def _motherduck_config(value: object | None) -> MotherDuckConfig | None:
+    """Parse optional MotherDuck connection settings."""
+    if value is None:
+        return None
+    table = _table(value, "motherduck", _MOTHERDUCK_CONFIG_KEYS)
+    database = _string(
+        table.get("database"),
+        "motherduck.database",
+        required=True,
+    )
+    if database is None:
+        raise ConfigurationError("motherduck.database is required")
+    return MotherDuckConfig(database=database)
+
+
+def _local_database_config(
+    value: object | None,
+) -> Path:
+    """Resolve the optional local DuckDB path, using its default when omitted."""
+    local_database = _string(value, "local_database")
+    path = (
+        Path(local_database) if local_database is not None else DEFAULT_LOCAL_DATABASE
+    )
+    return path.expanduser()
+
+
+def _storage_config(
+    backend: BackendName,
+    payload: Mapping[str, object],
+) -> tuple[Path | None, MotherDuckConfig | None, BigQueryConfig | None]:
+    """Parse backend-specific target settings and enforce active-backend needs."""
+    if backend == "duckdb":
+        return _local_database_config(payload.get("local_database")), None, None
+    if backend == "motherduck":
+        motherduck = _motherduck_config(payload.get("motherduck"))
+        if motherduck is None:
+            raise ConfigurationError(
+                "[motherduck] is required for the MotherDuck backend"
+            )
+        return None, motherduck, None
+    bigquery = _bigquery_config(payload.get("bigquery"))
+    if bigquery is None:
+        raise ConfigurationError("[bigquery] is required for the BigQuery backend")
+    return None, None, bigquery
 
 
 def _gcs_config(value: object | None) -> GcsConfig | None:
@@ -536,13 +610,6 @@ def _parse_config(
         raise ConfigurationError(
             f"backend must be one of: {', '.join(sorted(SUPPORTED_BACKENDS))}"
         )
-    database = _string(payload.get("database"), "database")
-    if database is None:
-        if backend_value != "duckdb":
-            raise ConfigurationError(
-                f"database is required for the {backend_value} backend"
-            )
-        database = DEFAULT_DUCKDB_DATABASE
     if source_id is None:
         raise ConfigurationError("source_id is required")
     if _UUID_PATTERN.fullmatch(source_id) is None:
@@ -551,6 +618,8 @@ def _parse_config(
         canonical_source_id = str(UUID(source_id))
     except ValueError as error:
         raise ConfigurationError("source_id must be a UUID") from error
+    backend = cast(BackendName, backend_value)
+    local_database, motherduck, bigquery = _storage_config(backend, payload)
     (
         tokscale_bin,
         tokscale_env,
@@ -558,7 +627,6 @@ def _parse_config(
         tokscale_max_stdout_bytes,
         tokscale_max_stderr_bytes,
     ) = _tokscale_config(payload.get("tokscale"))
-    bigquery = _bigquery_config(payload.get("bigquery"))
     gcs = _gcs_config(payload.get("gcs"))
     schedule_payload = payload.get("schedule")
     if schedule_interval is not None:
@@ -574,19 +642,18 @@ def _parse_config(
         raise ConfigurationError(
             "schedule.interval must be greater than tokscale.timeout"
         )
-    if backend_value == "bigquery" and bigquery is None:
-        raise ConfigurationError("[bigquery] is required for the BigQuery backend")
     return UsageBassoonConfig(
         path=path,
         source_id=canonical_source_id,
-        backend=cast(BackendName, backend_value),
-        database=database,
+        backend=backend,
+        local_database=local_database,
+        motherduck=motherduck,
+        bigquery=bigquery,
         tokscale_bin=tokscale_bin,
         tokscale_env=tokscale_env,
         tokscale_timeout_seconds=tokscale_timeout_seconds,
         tokscale_max_stdout_bytes=tokscale_max_stdout_bytes,
         tokscale_max_stderr_bytes=tokscale_max_stderr_bytes,
-        bigquery=bigquery,
         gcs=gcs,
         schedule=schedule,
         collection=collection,
@@ -723,16 +790,20 @@ def open_backend(config: UsageBassoonConfig) -> StorageBackend:
         ValueError: If required backend-specific settings are absent.
     """
     if config.backend == "duckdb":
-        return DuckDBBackend(config.database)
+        if config.local_database is None:
+            raise ValueError("Local DuckDB path is missing")
+        return DuckDBBackend(config.local_database)
     if config.backend == "motherduck":
-        return MotherDuckBackend(config.database)
+        if config.motherduck is None:
+            raise ValueError("MotherDuck settings are missing")
+        return MotherDuckBackend(config.motherduck.database)
     if config.bigquery is None:
         raise ValueError("BigQuery settings are missing")
     from usagebassoon.backends.bigquery import BigQueryBackend
 
     return BigQueryBackend(
         config.bigquery.project,
-        config.database,
+        config.bigquery.dataset,
         location=config.bigquery.location,
         credentials_file=config.bigquery.credentials_file,
         maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
@@ -744,8 +815,8 @@ class ConfigurationManager:
     """Resolve and load one immutable UsageBassoon configuration.
 
     Explicit ``--config`` paths take precedence over ``USAGEBASSOON_CONFIG``;
-    otherwise the manager uses ``~/.config/usagebassoon/config.toml``. No
-    No source, backend, or database setting can be overridden independently.
+    otherwise the manager uses ``~/.config/usagebassoon/config.toml``. No source
+    identity, backend choice, or storage target can be overridden independently.
     """
 
     def __init__(

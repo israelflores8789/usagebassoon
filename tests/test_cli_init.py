@@ -16,7 +16,7 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
-    DEFAULT_DUCKDB_DATABASE,
+    DEFAULT_LOCAL_DATABASE,
     ConfigurationManager,
 )
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
@@ -39,14 +39,15 @@ def test_init_creates_source_config_and_local_schema(
     configuration = ConfigurationManager(config_path).load()
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
-    assert configuration.database == DEFAULT_DUCKDB_DATABASE
+    assert configuration.local_database == DEFAULT_LOCAL_DATABASE.expanduser()
     assert configuration.schedule.interval == "15m"
     assert configuration.logging.max_files == 5
     repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
     assert repeated.exit_code == 0
     assert "Using existing configuration" in repeated.output
     assert config_path.read_bytes() == original
-    backend = DuckDBBackend(configuration.database)
+    assert configuration.local_database is not None
+    backend = DuckDBBackend(configuration.local_database)
     try:
         assert backend.query("SELECT count(*) AS n FROM sessions").to_pylist() == [
             {"n": 0}
@@ -61,7 +62,9 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
     database = tmp_path / "custom.duckdb"
     source_id = "11111111-1111-4111-8111-111111111111"
     config_path.write_text(
-        f'source_id = "{source_id}"\nbackend = "duckdb"\ndatabase = "{database}"\n'
+        f'source_id = "{source_id}"\n'
+        'backend = "duckdb"\n'
+        f'local_database = "{database}"\n'
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])

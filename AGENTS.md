@@ -336,15 +336,19 @@ con = usagebassoon.connect()          # duckdb conn, or ibis-style BigQuery sess
 ```toml
 source_id = "018f2d70-0000-4000-8000-000000000000" # UUID source namespace
 backend = "duckdb"            # duckdb | motherduck | bigquery
-database = "usagebassoon"     # duckdb: file path · motherduck: db name · bigquery: dataset
+local_database = "~/.local/share/usagebassoon/usagebassoon.duckdb" # DuckDB file path; ignored for remote backends
 
 [tokscale]
 bin = "bunx tokscale@latest"
 
-[bigquery]                    # only when backend = "bigquery"
+[bigquery]                    # required when backend = "bigquery"
 project = "my-project"
+dataset = "usagebassoon_it"
 location = "us-central1"
 # credentials: GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`
+
+[motherduck]                  # required when backend = "motherduck"
+database = "usagebassoon"     # MotherDuck database name, without `md:`
 
 [snapshots]                   # optional; absent = feature off
 gcs_uri = "gs://my-bucket/usagebassoon/snapshots"
