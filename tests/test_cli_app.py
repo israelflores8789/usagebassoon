@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 import usagebassoon
+from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 
 COMMANDS = (
@@ -32,9 +33,10 @@ def test_root_help_lists_every_registered_command() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
+    plain_output = plain_cli_output(result.output)
     for command in COMMANDS:
-        assert command in result.output
-    assert "--version" in result.output
+        assert command in plain_output
+    assert "--version" in plain_output
 
 
 def test_version_matches_the_python_api_and_distribution() -> None:
@@ -43,7 +45,7 @@ def test_version_matches_the_python_api_and_distribution() -> None:
 
     assert result.exit_code == 0
     expected = distribution_version("usagebassoon")
-    assert result.output.strip() == f"usagebassoon {expected}"
+    assert plain_cli_output(result.output).strip() == f"usagebassoon {expected}"
     assert usagebassoon.__version__ == expected
 
 

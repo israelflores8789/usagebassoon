@@ -125,6 +125,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
 - ALWAYS use the `gs://usagebassoon-test-snapshots-gen-lang-client-0670612427` Google Cloud Storage bucket for GCS testing. NEVER perform tests on any other GCS bucket.
 - ALL CLI commands MUST use a dialect-specific SQL view; NEVER hardcode SQL queries that are not dialect agnostic.
+- FOR CLI output assertions in *tests*, normalize captured stdout or stderr with `tests._cli.plain_cli_output(...)` before comparing text. GitHub Actions color output can insert ANSI escapes inside visible tokens such as `--version`, causing raw substring assertions to fail. Reproduce this environment with `CI=true GITHUB_ACTIONS=true TERM=xterm-256color just test <test>` when diagnosing this failure.
 
 ### Prohibitions
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:

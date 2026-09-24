@@ -496,6 +496,14 @@ def test_live_cli_commands_except_report(
         logging.getLogger("usagebassoon-bigquery-live"),
     )
 
+    def fake_tokscale_preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Keep BigQuery CLI coverage independent of an installed tokscale binary."""
+        return ("tokscale",), "4.15.1"
+
+    monkeypatch.setattr(
+        "usagebassoon.cli.doctor.preflight_tokscale", fake_tokscale_preflight
+    )
+
     session = collection_bundle.report_rows[0]
     runner = CliRunner()
     export_path = tmp_path / "sessions.json"

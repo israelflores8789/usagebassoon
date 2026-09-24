@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
+from usagebassoon.diagnostics import DoctorCheck
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -118,6 +119,14 @@ def test_doctor_reports_configured_tokscale_command_and_version(
         return FakeProcess()
 
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+
+    def fake_schedule_check(_configuration: object) -> DoctorCheck:
+        """Keep scheduler subprocesses outside the tokscale probe test."""
+        return DoctorCheck("scheduling", "ok", "scheduler inspection skipped")
+
+    monkeypatch.setattr(
+        "usagebassoon.cli.doctor.schedule_doctor_check", fake_schedule_check
+    )
 
     result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
 
