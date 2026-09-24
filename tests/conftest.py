@@ -216,9 +216,6 @@ def collection_bundle(
     graph_payload: GraphPayload,
     pricing_row: PricingRow,
     daily_models: dict[date, DailyModelsPayload],
-    report_raw: JsonArray,
-    graph_raw: JsonObject,
-    pricing_raw: JsonObject,
     recon_result: ReconciliationResult,
 ) -> CollectionBundle:
     """Build a complete, validated CollectionBundle from the fixtures."""

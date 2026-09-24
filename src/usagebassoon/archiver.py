@@ -506,7 +506,7 @@ class SnapshotArchiver:
 
     @staticmethod
     def _object_reference(
-        archive: SnapshotBucket, object_ref: SnapshotObject, payload: bytes
+        object_ref: SnapshotObject, payload: bytes
     ) -> dict[str, object]:
         """Convert one archive object to a manifest reference."""
         return {
@@ -536,7 +536,6 @@ class SnapshotArchiver:
                         captured.payload,
                     )
                     object_value = self._object_reference(
-                        archive,
                         object_ref,
                         captured.payload,
                     )
@@ -558,7 +557,7 @@ class SnapshotArchiver:
                 raw,
                 content_type="application/json",
             )
-            manifest_value = self._object_reference(archive, manifest_ref, raw)
+            manifest_value = self._object_reference(manifest_ref, raw)
             written.append(manifest_value)
             return {
                 "snapshot_id": snapshot_id,

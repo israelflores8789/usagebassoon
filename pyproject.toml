@@ -75,7 +75,7 @@ target-version = "py312"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "ANN", "PGH"]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "ANN", "PGH", "ARG"]
 ignore = [
     "D100",    # missing docstring in public module (SQL-only modules)
     "D104",    # missing docstring in public package (__init__.py)

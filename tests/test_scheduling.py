@@ -72,7 +72,7 @@ def test_tokscale_preflight_honors_configured_package_runner(
         def wait(self) -> int:
             return self.returncode
 
-    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+    def fake_popen(command: list[str], **_: object) -> FakeProcess:
         calls.append(command)
         return FakeProcess()
 

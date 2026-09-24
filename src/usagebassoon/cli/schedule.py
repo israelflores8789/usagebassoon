@@ -177,7 +177,9 @@ def remove() -> None:
     typer.echo("Removed collection schedule artifacts.")
 
 
-@schedule_app.command()
+@schedule_app.command(
+    help="Run `bassoon schedule worker --foreground` as the container's main process."
+)
 def worker(
     interval: Annotated[
         str | None,

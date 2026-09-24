@@ -317,7 +317,7 @@ def _ingest_status_key(status: IngestStatus) -> tuple[date, str]:
     return (status.day, status.domain)
 
 
-def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarData]:
+def _append_only(bundle: CollectionBundle) -> dict[str, ColumnarData]:
     """Build audit, drift, and reconciliation history tables."""
     rows_in = (bundle.fetch_summary or {}).get("rows_in") or sum(
         len(payload.entries) for payload in bundle.daily_models.values()
@@ -440,7 +440,7 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
     tables.update(
         {
             name: _table(name, columns)
-            for name, columns in _append_only(bundle, at).items()
+            for name, columns in _append_only(bundle).items()
             if columns
         }
     )

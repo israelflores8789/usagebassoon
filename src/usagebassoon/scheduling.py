@@ -276,7 +276,7 @@ def _systemd_path() -> str:
     return f"{home / '.local' / 'bin'}:{home / '.bun' / 'bin'}{_PATH_SUFFIX}"
 
 
-def _systemd_service(config: UsageBassoonConfig, command: tuple[str, ...]) -> str:
+def _systemd_service(command: tuple[str, ...]) -> str:
     """Render the native systemd collection service."""
     return "\n".join(
         (
@@ -360,7 +360,7 @@ def _install_systemd(
     unit_dir = _systemd_unit_dir()
     _write_atomic(
         unit_dir / SYSTEMD_SERVICE_NAME,
-        _systemd_service(config, command).encode(),
+        _systemd_service(command).encode(),
     )
     _write_atomic(
         unit_dir / SYSTEMD_TIMER_NAME,
@@ -939,8 +939,3 @@ def human_status(status: ScheduleStatus, worker: WorkerStatus | None = None) -> 
             )
         )
     return "\n".join(lines)
-
-
-def worker_command_help() -> str:
-    """Return the container-worker entrypoint guidance."""
-    return "Run `bassoon schedule worker --foreground` as the container's main process."
