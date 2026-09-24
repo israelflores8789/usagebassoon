@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""ingest.py — Raw tokscale payload validation and collection bundle assembly."""
+"""ingest.py — Payload validation, collection assembly, and ingest records."""
 
 from __future__ import annotations
 
@@ -54,6 +54,23 @@ class IngestStatus:
     last_attempted_run: str
     last_succeeded_run: str | None
     failure_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IngestIssue:
+    """A collection run whose persisted status needs attention.
+
+    Attributes:
+        run_id: Collection run identifier.
+        finished_at: Collection completion time, when available.
+        status: Persisted collection status.
+        drift_events: Number of drift events recorded for the run.
+    """
+
+    run_id: str
+    finished_at: datetime | None
+    status: str | None
+    drift_events: int | None
 
 
 @dataclass(frozen=True, slots=True)

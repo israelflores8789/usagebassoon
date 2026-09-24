@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
 
+from usagebassoon import ingest, reconcile
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.drift import SchemaDriftRecord, format_drift
 
@@ -51,36 +52,6 @@ class DoctorCheck:
     status: CheckStatus
     message: str
     details: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class IngestIssue:
-    """A collection run whose persisted status needs attention.
-
-    Attributes:
-        run_id: Collection run identifier.
-        finished_at: Collection completion time, when available.
-        status: Persisted collection status.
-        drift_events: Number of drift events recorded for the run.
-    """
-
-    run_id: str
-    finished_at: datetime | None
-    status: str | None
-    drift_events: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class ReconciliationIssueRecord:
-    """One persisted assertion failure and its first and latest detection."""
-
-    check_name: str
-    issue_key: str
-    message: str | None
-    created_at: datetime | None
-    updated_at: datetime | None
-    detected_run_id: str | None
-    updated_run_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +182,7 @@ def unresolved_schema_drift(
 
 def reconciliation_issues(
     backend: StorageBackend, *, limit: int = 20
-) -> tuple[ReconciliationIssueRecord, ...]:
+) -> tuple[reconcile.ReconciliationIssueRecord, ...]:
     """Load the latest distinct reconciliation assertion failures.
 
     Args:
@@ -231,7 +202,7 @@ def reconciliation_issues(
         f"ORDER BY updated_at DESC NULLS LAST LIMIT {limit}",
     )
     return tuple(
-        ReconciliationIssueRecord(
+        reconcile.ReconciliationIssueRecord(
             check_name=_as_required_string(row.get("check_name")),
             issue_key=_as_required_string(row.get("issue_key")),
             message=_as_optional_string(row.get("message")),
@@ -248,7 +219,7 @@ def ingest_issues(
     backend: StorageBackend,
     *,
     limit: int = 20,
-) -> tuple[IngestIssue, ...]:
+) -> tuple[ingest.IngestIssue, ...]:
     """Load recent collection runs with non-success statuses.
 
     Args:
@@ -272,7 +243,7 @@ def ingest_issues(
         f"LIMIT {limit}",
     )
     return tuple(
-        IngestIssue(
+        ingest.IngestIssue(
             run_id=_as_required_string(_row_value(row, "run_id")),
             finished_at=_as_optional_datetime(_row_value(row, "finished_at")),
             status=_as_optional_string(_row_value(row, "status")),

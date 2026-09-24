@@ -31,18 +31,18 @@ usagebassoon/
 │   ├── config.py             # Configuration loading, intervals, and backend construction
 │   ├── contracts.py          # Contract validation and schema drift detection
 │   ├── curation.py           # User-owned tags and notes
-│   ├── diagnostics.py        # read-only health queries + checks
+│   ├── diagnostics.py        # Doctor checks and read-only diagnostic queries
 │   ├── display.py            # Safe terminal rendering of untrusted values
-│   ├── drift.py              # Persisted schema drift and health diagnostics
+│   ├── drift.py              # Persisted schema drift records and formatting
 │   ├── frames.py             # Arrow query results to pandas or Polars DataFrames
-│   ├── ingest.py             # Validated plans, IngestEvidence, and CollectionBundle
+│   ├── ingest.py             # Validated plans, collection bundles, and ingest records
 │   ├── json_types.py         # Recursive JSON value types
 │   ├── logger.py             # Privacy-conscious rotating operational logging
 │   ├── normalizer.py         # CollectionBundle to canonical Arrow tables
 │   ├── orchestrator.py       # Top-level collection and data shuttling
 │   ├── persistence.py        # Transactional batch persistence and retries
 │   ├── privacy.py            # Output-time obfuscation for shared artifacts
-│   ├── reconcile.py          # Collection reconciliation result types
+│   ├── reconcile.py          # Collection reconciliation and issue record types
 │   ├── scheduling.py         # Native schedulers and collection worker loop
 │   ├── schema_assets.py      # Ordered packaged SQL for schema initialization
 │   ├── sql_safety.py         # Public relation query validation and generation
@@ -91,6 +91,18 @@ orchestrator.py → archiver.py         SnapshotArchiver
 ```
 
 `SnapshotArchiver` owns capture, Parquet format, catalog publication, retention, and restore semantics. `SnapshotBucket` implementations own version-aware object storage and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`.
+
+Diagnostic inspection is a separate read-only path:
+
+```text
+cli/doctor.py → config.py           load configuration and open a StorageBackend
+              → diagnostics.py      inspect connectivity, schema, transactions, and persisted issues
+              → backends/base.py    StorageBackend → DuckDB / MotherDuck / BigQuery
+              → diagnostics.py      assemble DoctorReport
+              → cli/doctor.py       render checks and exit status
+```
+
+`diagnostics.py` owns doctor-specific backend queries for ingest runs, reconciliation issues, and unresolved schema drift, along with health-check coordination and `DoctorReport`. The query results use `IngestIssue` from `ingest.py`, `ReconciliationIssueRecord` from `reconcile.py`, and `SchemaDriftRecord` from `drift.py`. `ingest.py` and `reconcile.py` operate on data passed through the collection pipeline; `persistence.py` handles collection state reads and batch persistence. Diagnostic queries use the backend opened by `cli/doctor.py`.
 
 ## Commands
 

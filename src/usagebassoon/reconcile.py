@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""reconcile.py — Bounded consistency observations for collection diagnostics."""
+"""reconcile.py — Collection consistency checks and issue records."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from usagebassoon.parsers.daily import DailyModelsPayload
@@ -27,6 +27,29 @@ class ReconciliationIssue:
     check: str
     key: str
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationIssueRecord:
+    """One persisted assertion failure and its detection history.
+
+    Attributes:
+        check_name: Stable reconciliation check name.
+        issue_key: Stable key for the failed assertion.
+        message: Detail from the latest detection, when available.
+        created_at: First detection time, when available.
+        updated_at: Latest detection time, when available.
+        detected_run_id: Run that first detected the issue, when available.
+        updated_run_id: Run that last detected the issue, when available.
+    """
+
+    check_name: str
+    issue_key: str
+    message: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+    detected_run_id: str | None
+    updated_run_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
