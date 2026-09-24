@@ -175,7 +175,9 @@ def _table(name: str, columns: ColumnarData) -> pa.Table:
     return pa.Table.from_pydict(columns, schema=schema)
 
 
-def _session_rows(rows: list[SessionRow], at: datetime, source_id: str) -> ColumnarData:
+def _session_rows(
+    rows: list[SessionRow], at: datetime, source_id: str, *, freshness_at: datetime
+) -> ColumnarData:
     """Build the stable session dimension rows for one collection run."""
     records = [
         {
@@ -193,7 +195,7 @@ def _session_rows(rows: list[SessionRow], at: datetime, source_id: str) -> Colum
             "session_label": make_session_label(row),
             "first_seen_at": at,
             "last_seen_at": row.last_active or at,
-            "updated_at": at,
+            "updated_at": freshness_at,
         }
         for row in rows
     ]
@@ -252,7 +254,11 @@ def _activity_rows(graph: GraphPayload, at: datetime, source_id: str) -> Columna
 
 
 def _price_version_rows(
-    pricing_by_day: dict[date, dict[str, PricingRow]], at: datetime, source_id: str
+    pricing_by_day: dict[date, dict[str, PricingRow]],
+    at: datetime,
+    source_id: str,
+    *,
+    freshness_at: datetime,
 ) -> ColumnarData:
     """Build point-in-time rates associated with each processed usage day."""
     records: list[dict[str, object]] = []
@@ -278,7 +284,7 @@ def _price_version_rows(
                         else 0.0
                     ),
                     "observed_at": at,
-                    "updated_at": at,
+                    "updated_at": freshness_at,
                 }
             )
     return _col_major(records) if records else {}
@@ -396,19 +402,36 @@ def _append_only(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarDa
 
 
 def normalize(bundle: CollectionBundle) -> NormalizedBundle:
-    """Convert a validated bundle into canonical Arrow tables."""
+    """Convert a validated bundle into canonical Arrow tables.
+
+    Uses collection start to order current-state updates.
+    """
     at = bundle.finished_at
+    freshness_at = bundle.started_at
     columns_by_table = (
-        ("sessions", _session_rows(bundle.report_rows, at, bundle.source_id)),
-        ("daily_stats", _daily_stats_rows(bundle.daily_models, at, bundle.source_id)),
-        ("daily_activity", _activity_rows(bundle.graph, at, bundle.source_id)),
+        (
+            "sessions",
+            _session_rows(
+                bundle.report_rows, at, bundle.source_id, freshness_at=freshness_at
+            ),
+        ),
+        (
+            "daily_stats",
+            _daily_stats_rows(bundle.daily_models, freshness_at, bundle.source_id),
+        ),
+        (
+            "daily_activity",
+            _activity_rows(bundle.graph, freshness_at, bundle.source_id),
+        ),
         (
             "price_versions",
-            _price_version_rows(bundle.pricing_by_day, at, bundle.source_id),
+            _price_version_rows(
+                bundle.pricing_by_day, at, bundle.source_id, freshness_at=freshness_at
+            ),
         ),
         (
             "ingest_status",
-            _ingest_status_rows(bundle.ingest_status, at, bundle.source_id),
+            _ingest_status_rows(bundle.ingest_status, freshness_at, bundle.source_id),
         ),
     )
     tables = {

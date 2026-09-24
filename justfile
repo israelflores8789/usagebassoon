@@ -76,7 +76,7 @@ test-bq-live test-name="tests/test_backend_bigquery_live.py" reset="0":
     } 2>&1 | tee .test_logs/pytest-bq-live.log
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
-test-gcs-live test-name="tests/test_backend_gcs_live.py":
+test-gcs-live test-name="tests/test_bucket_gcs_live.py":
     #!/usr/bin/env bash
     set -o pipefail
     mkdir -p .test_logs

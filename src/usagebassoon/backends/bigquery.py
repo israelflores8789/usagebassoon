@@ -503,7 +503,11 @@ class BigQueryBackend(AbstractStorageBackend):
         repeated_fields = frozenset(
             field.name for field in table_schema if field.mode == "REPEATED"
         )
-        changes = self._change_sql(change_fields, repeated_fields)
+        changes = self._update_condition_sql(
+            change_fields,
+            repeated_fields,
+            frozenset(field.name for field in table_schema),
+        )
         key = self._column(natural_keys[0])
         row = next(
             iter(
@@ -559,6 +563,19 @@ class BigQueryBackend(AbstractStorageBackend):
             or "FALSE"
         )
 
+    def _update_condition_sql(
+        self,
+        change_fields: Sequence[str],
+        repeated_fields: frozenset[str],
+        columns: frozenset[str],
+    ) -> str:
+        """Require a newer observation before applying a material update."""
+        changes = self._change_sql(change_fields, repeated_fields)
+        if "updated_at" not in columns:
+            return changes
+        stamp = self._column("updated_at")
+        return f"source.{stamp} >= target.{stamp} AND ({changes})"
+
     def _merge_sql(
         self,
         table: str,
@@ -583,10 +600,13 @@ class BigQueryBackend(AbstractStorageBackend):
         source_values = ", ".join(
             f"source.{self._column(column)}" for column in columns
         )
+        changes = self._update_condition_sql(
+            change_fields, repeated_fields, frozenset(columns)
+        )
         return (
             f"MERGE {self._table_ref(table)} AS target USING {stage} AS source "
             f"ON {self._join_sql(natural_keys)} "
-            f"WHEN MATCHED AND ({self._change_sql(change_fields, repeated_fields)}) "
+            f"WHEN MATCHED AND ({changes}) "
             "THEN UPDATE SET "
             f"{', '.join(assignments)} "
             f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values})"
@@ -689,7 +709,11 @@ class BigQueryBackend(AbstractStorageBackend):
                 for field in write.data.schema
                 if pa.types.is_list(field.type)
             )
-            changes = self._change_sql(write.change_fields, repeated_fields)
+            changes = self._update_condition_sql(
+                write.change_fields,
+                repeated_fields,
+                frozenset(write.data.column_names),
+            )
             key = self._column(write.natural_keys[0])
             target = self._table_ref(write.table)
             stage = stages[write.table]
@@ -762,11 +786,13 @@ class BigQueryBackend(AbstractStorageBackend):
         source_values = ", ".join(
             f"source.{self._column(column)}" for column in columns
         )
+        changes = self._update_condition_sql(
+            write.change_fields, repeated_fields, frozenset(columns)
+        )
         return (
             f"MERGE {self._table_ref(write.table)} AS target USING {stage} AS source "
             f"ON {self._join_sql(write.natural_keys)} "
-            f"WHEN MATCHED AND ("
-            f"{self._change_sql(write.change_fields, repeated_fields)}) "
+            f"WHEN MATCHED AND ({changes}) "
             f"THEN UPDATE SET {', '.join(assignments)} "
             f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) VALUES ({source_values});"
         )

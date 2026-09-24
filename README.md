@@ -24,12 +24,6 @@ UsageBassoon supports local DuckDB, MotherDuck, and BigQuery storage, with optio
 
 Get started with `bassoon --help` or import the Python API with `import usagebassoon`.
 
-> [!NOTE]
-> **Data disclaimer.** UsageBassoon is a personal, local-first token usage statistics tool. It reads token-usage statistics from your local `tokscale` environment and persists them to either a configurable local DuckDB database or a remote data analytics warehouse. UsageBassoon does not and will **never** collect, aggregate, or sell your token usage data.
-
-> [!WARNING]
-> UsageBassoon stores raw operational data at rest. Session IDs, workspace and project names, paths, notes, tags, and collector-host metadata may be present in the configured database or snapshots. You should always treat your data as private, and **always** review every UsageBassoon artifact before sharing it.
-
 ## Overview
 
 - Collects daily, per-session, and per-model token statistics, costs, pricing versions, session metadata, and collection-host metadata.
@@ -310,6 +304,9 @@ bassoon schedule worker --foreground --interval 15m
 > [!TIP]
 > If you set `source_id` manually, you can reuse it for ephemeral environments that you want to namespace token usage. For example, if you have a container that should be considered the same as previous container builds for token statistics purposes.
 
+> [!WARNING]
+> Do **not** set multiple environments with the same `source_id`. This can cause unpredictable behavior if more than one environment attempts to persist to the same remote data warehouse. You can reuse a `source_id` for *unique* environments that should be considered identical. For example, a container crashes and has to be rebuilt. When that container is reborn, you can set the `source_id` to be the same and preserve how your data was organized. However, you can **not** have multiple containers with the same `source_id`.
+
 ## Tags and Notes
 
 You can group token usage statistics together by `tag`ging all agentic sessions in a project workspace directory, all session for an agentic client (e.g. Codex), or for individual sessions, and you can generate reports across environments based on your tags!
@@ -340,9 +337,12 @@ arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost")
 
 ## Privacy and sharing
 
+> [!WARNING]
+> UsageBassoon stores raw operational data at rest. Session IDs, workspace and project names, paths, notes, tags, and collector-host metadata may be present in the configured database or snapshots. You should always treat your data as private, and **always** review every UsageBassoon artifact before sharing it.
+
 Your token usage data can contain private information including session IDs, workspace paths, cost information, etc, and UsageBassoon takes that seriously. Some commands are obfuscated by default while others offer a `--sanitize` flag. **Always** use `bassoon doctor` when submitting a bug report, and **always** sanitize your token usage data before sharing it publicly!
 
-> [!WARNING]
+> [!IMPORTANT]
 > 🔒 Obfuscation reduces exposure, but it is *not* a guarantee that an artifact is safe for every audience. Review any `bassoon`output for sensitive values before uploading it anywhere.
 
 The commands have deliberately different sharing behavior:
@@ -400,5 +400,10 @@ UsageBassoon exists to record statistics about *your* token usage—data you gen
 The license mirrors that belief. AGPLv3 means that anyone who modifies UsageBassoon and offers it as a network service *must* make their modified source available to its users. That means improvements to the access-layer, the actual mechanic of storing and viewing your token history, remains freely available to everyone that depends on it, and SaaS-based commercial licensing is restricted to genuine value added on top of that access, like dashboards, hosting, and team reporting.
 
 ## License & Disclaimers
+
+> [!NOTE]
+> **Data disclaimer.** UsageBassoon is a personal, local-first token usage statistics tool. It reads token-usage statistics from your local `tokscale` environment and persists them to either a configurable local DuckDB database or a remote data analytics warehouse. UsageBassoon does not and will **never** collect, aggregate, or sell your token usage data.
+
+---
 
 UsageBassoon is copyright © 2026 Israel Flores-Arbolay and licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See LICENSE for the full text.

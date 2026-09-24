@@ -67,6 +67,26 @@ def test_normalize_preserves_canonical_nullable_types(
     assert set(normalized.tables["price_versions"].column("model").to_pylist())
 
 
+def test_current_state_freshness_uses_collection_start(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Order overlapping runs by collection start while retaining audit times."""
+    normalized = normalize(collection_bundle)
+    for name in (
+        "sessions",
+        "daily_stats",
+        "daily_activity",
+        "price_versions",
+        "ingest_status",
+    ):
+        assert set(normalized.tables[name].column("updated_at").to_pylist()) == {
+            collection_bundle.started_at
+        }
+    assert set(
+        normalized.tables["price_versions"].column("observed_at").to_pylist()
+    ) == {collection_bundle.finished_at}
+
+
 def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -172,6 +192,127 @@ def test_ingest_status_is_unchanged_when_no_domains_are_refreshed(
         ).to_pylist()[0]["stamp"]
         assert (summary.inserted, summary.updated) == (0, 0)
         assert after == before
+    finally:
+        backend.close()
+
+
+def test_older_same_source_run_cannot_regress_completed_status(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Keep a completed target when an older overlapping run commits last."""
+    status = next(
+        item for item in collection_bundle.ingest_status if item.domain == "pricing"
+    )
+    older_run = str(uuid4())
+    newer_run = str(uuid4())
+    older = replace(
+        collection_bundle,
+        daily_models={},
+        report_rows=[],
+        pricing_by_day={},
+        run_id=older_run,
+        started_at=collection_bundle.started_at + timedelta(minutes=1),
+        finished_at=collection_bundle.finished_at + timedelta(minutes=4),
+        ingest_status=(
+            replace(
+                status,
+                status="partial",
+                succeeded_count=0,
+                last_attempted_run=older_run,
+                last_succeeded_run=None,
+                failure_code="fetch",
+            ),
+        ),
+    )
+    newer = replace(
+        collection_bundle,
+        daily_models={},
+        report_rows=[],
+        pricing_by_day={},
+        run_id=newer_run,
+        started_at=collection_bundle.started_at + timedelta(minutes=2),
+        finished_at=collection_bundle.finished_at + timedelta(minutes=3),
+        ingest_status=(
+            replace(
+                status,
+                last_attempted_run=newer_run,
+                last_succeeded_run=newer_run,
+            ),
+        ),
+    )
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(newer))
+        persist_run(backend, normalize(older))
+        rows = backend.query(
+            "SELECT day, domain, status, last_succeeded_run FROM ingest_status"
+        ).to_pylist()
+        target = next(
+            row
+            for row in rows
+            if row["day"] == status.day and row["domain"] == status.domain
+        )
+        assert (target["status"], target["last_succeeded_run"]) == (
+            "complete",
+            newer_run,
+        )
+    finally:
+        backend.close()
+
+
+def test_older_same_source_run_cannot_regress_daily_facts(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Keep fresher token counts when an older overlapping run commits last."""
+    older_run = str(uuid4())
+    newer_run = str(uuid4())
+    older = normalize(
+        replace(
+            collection_bundle,
+            run_id=older_run,
+            started_at=collection_bundle.started_at + timedelta(minutes=1),
+            finished_at=collection_bundle.finished_at + timedelta(minutes=4),
+        )
+    )
+    newer = normalize(
+        replace(
+            collection_bundle,
+            run_id=newer_run,
+            started_at=collection_bundle.started_at + timedelta(minutes=2),
+            finished_at=collection_bundle.finished_at + timedelta(minutes=3),
+        )
+    )
+    daily = newer.tables["daily_stats"]
+    tokens = daily.column("input_tokens").to_pylist()
+    assert isinstance(tokens[0], int)
+    refreshed_tokens = [tokens[0] + 1, *tokens[1:]]
+    index = daily.schema.get_field_index("input_tokens")
+    newer_daily = daily.set_column(
+        index,
+        daily.schema.field(index),
+        pa.array(refreshed_tokens, type=daily.schema.field(index).type),
+    )
+    newer = replace(newer, tables={**newer.tables, "daily_stats": newer_daily})
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, newer)
+        persist_run(backend, older)
+        rows = backend.query(
+            "SELECT source_id, day, client, session_id, model, input_tokens "
+            "FROM daily_stats"
+        ).to_pylist()
+        original = daily.slice(0, 1).to_pylist()[0]
+        target = next(
+            row
+            for row in rows
+            if all(
+                row[key] == original[key]
+                for key in ("source_id", "day", "client", "session_id", "model")
+            )
+        )
+        assert target["input_tokens"] == refreshed_tokens[0]
     finally:
         backend.close()
 

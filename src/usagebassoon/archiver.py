@@ -14,6 +14,7 @@ from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, Thread
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -141,6 +142,49 @@ class _CapturedTable:
     schema_ipc: str
     completed_at: str
     payload: bytes | None
+
+
+class _ReservationHeartbeat:
+    """Keep snapshot reservations valid while a capture is in progress."""
+
+    def __init__(
+        self,
+        archiver: SnapshotArchiver,
+        owner: str,
+        claims: tuple[tuple[SnapshotBucket, int], ...],
+    ) -> None:
+        """Prepare periodic renewal for all claimed destinations."""
+        self._archiver = archiver
+        self._owner = owner
+        self._claims = claims
+        self._stop = Event()
+        self._failure: Exception | None = None
+        self._thread = Thread(target=self._run, name="snapshot-lease", daemon=True)
+
+    def _run(self) -> None:
+        """Renew reservations until stopped or a claim is lost."""
+        while not self._stop.wait(_LEASE_SECONDS / 3):
+            try:
+                if not self._archiver._renew_claims(self._owner, self._claims, _now()):
+                    raise RuntimeError("snapshot publication reservation was lost")
+            except Exception as error:
+                self._failure = error
+                self._stop.set()
+                return
+
+    def start(self) -> None:
+        """Start the background renewal loop."""
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop renewal before catalog publication or failure cleanup."""
+        self._stop.set()
+        self._thread.join()
+
+    def check(self) -> None:
+        """Raise if renewal failed during the capture."""
+        if self._failure is not None:
+            raise RuntimeError("snapshot reservation renewal failed") from self._failure
 
 
 class SnapshotArchiver:
@@ -345,6 +389,44 @@ class SnapshotArchiver:
                 continue
             return fence
         return None
+
+    def _renew_for(
+        self, archive: SnapshotBucket, owner: str, fence: int, now: datetime
+    ) -> bool:
+        """Extend one unexpired reservation without changing its fence."""
+        for _ in range(5):
+            catalog, generation = self._read_catalog_for(archive)
+            reservation = catalog.get("reservation")
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("owner") != owner
+                or reservation.get("fence") != fence
+            ):
+                return False
+            expires = reservation.get("expires_at")
+            if not isinstance(expires, str) or _timestamp(expires) <= now:
+                return False
+            catalog["reservation"] = {
+                **reservation,
+                "expires_at": (now + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
+            }
+            try:
+                self._write_catalog_for(archive, catalog, generation)
+            except SnapshotPreconditionError:
+                continue
+            return True
+        return False
+
+    def _renew_claims(
+        self,
+        owner: str,
+        claims: tuple[tuple[SnapshotBucket, int], ...],
+        now: datetime,
+    ) -> bool:
+        """Extend every destination reservation held by this capture."""
+        return all(
+            self._renew_for(archive, owner, fence, now) for archive, fence in claims
+        )
 
     def _claim(self, now: datetime) -> tuple[str, int] | None:
         """Acquire a primary destination reservation for compatibility."""
@@ -744,6 +826,8 @@ class SnapshotArchiver:
         if claimed is None:
             return None
         owner, claims = claimed
+        heartbeat = _ReservationHeartbeat(self, owner, claims)
+        heartbeat.start()
         snapshot_id = f"{created.strftime('%Y-%m-%dT%H%M%SZ')}_{uuid4().hex}"
         written: dict[SnapshotBucket, list[dict[str, object]]] = {}
         entries: dict[SnapshotBucket, dict[str, object]] = {}
@@ -775,7 +859,11 @@ class SnapshotArchiver:
                 )
                 entries[archive] = entry
                 written[archive] = objects
+            heartbeat.stop()
+            heartbeat.check()
             published_at = _now()
+            if not self._renew_claims(owner, claims, published_at):
+                raise RuntimeError("snapshot publication reservation was lost")
             for archive, fence in claims:
                 published_target = self._publish_for(
                     archive,
@@ -790,12 +878,15 @@ class SnapshotArchiver:
                     )
                 published.append(archive)
         except Exception:
+            heartbeat.stop()
             for archive in published:
                 self._remove_entry(archive, snapshot_id)
             self._release_claims(owner, list(claims))
             for archive, objects in written.items():
                 self._delete_objects(archive, objects)
             raise
+        finally:
+            heartbeat.stop()
         for archive in published:
             retired = self._rotate_for(archive)
             for old in retired:

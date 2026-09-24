@@ -101,6 +101,10 @@ class _DuckDBStorage(AbstractStorageBackend):
             )
             or "FALSE"
         )
+        if "updated_at" in columns:
+            change_predicate = (
+                f"source.updated_at >= target.updated_at AND ({change_predicate})"
+            )
         assignments: list[str] = []
         for column in columns:
             quoted_column = _identifier(column)

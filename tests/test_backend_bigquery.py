@@ -438,6 +438,7 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
     assert "COMMIT TRANSACTION;" in script
     assert "IF NOT already_committed THEN" in script
     assert "WHERE `run_id` = @run_id" in script
+    assert "source.`updated_at` >= target.`updated_at`" in script
     assert run_id.replace("-", "") in stages["daily_activity"]
     assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
 

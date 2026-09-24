@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +19,34 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
+
+
+@contextmanager
+def _catalog_lock(path: Path) -> Generator[None]:
+    """Hold an OS lock on one local catalog across processes and threads.
+
+    Yields:
+        No value while the lock is held.
+    """
+    with path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class LocalSnapshotBucket:
@@ -65,22 +96,32 @@ class LocalSnapshotBucket:
         *,
         expected_version: SnapshotVersion | None,
     ) -> SnapshotObject:
-        """Atomically write JSON after verifying the local content version."""
+        """Atomically compare and replace JSON.
+
+        Verifies the local content version and writes under a
+        process-shared filesystem lock.
+        """
         path = self._path(relative_name)
-        current = path.read_bytes() if path.exists() else None
-        actual_version = None if current is None else self._version(current)
-        if actual_version != expected_version:
-            raise SnapshotPreconditionError("local snapshot object version changed")
-        raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        temporary.write_bytes(raw)
-        temporary.replace(path)
+        lock_path = path.with_name(f".{path.name}.lock")
+        with _catalog_lock(lock_path):
+            current = path.read_bytes() if path.exists() else None
+            actual_version = None if current is None else self._version(current)
+            if actual_version != expected_version:
+                raise SnapshotPreconditionError("local snapshot object version changed")
+            raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+            try:
+                temporary.write_bytes(raw)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        version = self._version(raw)
         return SnapshotObject(
             name=validate_relative_name(relative_name),
-            version=self._version(raw),
+            version=version,
             size=len(raw),
-            checksum=self._version(raw),
+            checksum=version,
         )
 
     def write_bytes(
