@@ -27,7 +27,7 @@
     },
     "local_database": {
       "default": "~/.local/share/usagebassoon/usagebassoon.duckdb",
-      "description": "Optional local DuckDB file path. Used only when `backend` is `duckdb`; otherwise ignored. `~` expands to the home directory, and relative paths resolve from the process working directory. When omitted for DuckDB, defaults to `~/.local/share/usagebassoon/usagebassoon.duckdb`."
+      "description": "Optional local DuckDB file path. Used only when `backend` is `duckdb`; otherwise ignored. `~` expands to the home directory, and relative paths resolve from the process working directory. The Linux default is `~/.local/share/usagebassoon/usagebassoon.duckdb`; other platforms use their standard user data directory."
     },
     "tokscale": {
       "$ref": "#/$defs/tokscale"
@@ -281,7 +281,7 @@
         "directory": {
           "$ref": "#/$defs/nonEmptyString",
           "default": "~/.local/state/usagebassoon/logs",
-          "description": "Directory for active and rotated operational logs. Defaults to `~/.local/state/usagebassoon/logs`."
+          "description": "Directory for active and rotated operational logs. The Linux default is `~/.local/state/usagebassoon/logs`; other platforms use their standard user log directory."
         },
         "max_files": {
           "type": "integer",
@@ -303,7 +303,8 @@
       "properties": {
         "file_uri": {
           "$ref": "#/$defs/nonEmptyString",
-          "description": "Optional local path or `file://` snapshot archive URI. When omitted, the conventional local archive is used unless `gcs.uri` is configured."
+          "default": "~/.local/share/usagebassoon/snapshots",
+          "description": "Optional local path or `file://` snapshot archive URI. On Linux, snapshots default to `~/.local/share/usagebassoon/snapshots`."
         },
         "max_snapshots": {
           "type": "integer",

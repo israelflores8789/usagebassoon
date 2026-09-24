@@ -6,17 +6,20 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
+import usagebassoon.config as config_module
 from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
-    DEFAULT_LOCAL_DATABASE,
-    DEFAULT_LOG_DIRECTORY,
     ConfigurationError,
     ConfigurationManager,
+    default_config_path,
+    default_local_database_path,
+    default_log_directory,
+    default_snapshot_directory,
     update_schedule_interval,
 )
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR, LOGGER_NAME
@@ -29,6 +32,10 @@ def isolate_config_error_logs(
 ) -> Iterator[None]:
     """Keep invalid-config log files inside each test's temporary directory."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / ".local" / "state"))
     monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     logger = logging.getLogger(LOGGER_NAME)
     existing_handlers = tuple(logger.handlers)
@@ -75,6 +82,11 @@ def test_environment_path_precedes_default(
     assert manager.load().backend == "duckdb"
 
 
+def test_default_configuration_path_uses_platformdirs() -> None:
+    """Resolve the implicit configuration file through platformdirs."""
+    assert ConfigurationManager().path == default_config_path()
+
+
 def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     """Load subprocess, schedule, and logging defaults without TOML sections."""
     path = tmp_path / "config.toml"
@@ -100,7 +112,7 @@ def test_duckdb_local_database_defaults_when_omitted(tmp_path: Path) -> None:
 
     assert (
         ConfigurationManager(path).load().local_database
-        == DEFAULT_LOCAL_DATABASE.expanduser()
+        == default_local_database_path()
     )
 
 
@@ -234,7 +246,7 @@ def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) 
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\ndatabase = ":memory:"\n'
+        'backend = "duckdb"\nlocal_database = ":memory:"\n'
         '[schedule]\ninterval = "15m"\n'
         "[logging]\nmax_files = 4\n"
     )
@@ -341,7 +353,7 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
     assert config.bigquery.credentials_file == credentials
     assert config.collection.max_retries == 4
     assert config.collection.retry_initial_seconds == 0.5
-    assert config.logging.directory == DEFAULT_LOG_DIRECTORY.expanduser()
+    assert config.logging.directory == default_log_directory()
     assert (config.logging.max_files, config.logging.max_bytes) == (5, 4096)
 
 
@@ -362,6 +374,68 @@ def test_snapshot_defaults_and_interval_validation_are_consistent(
     invalid.write_text(valid.read_text().replace('"12h"', '"zero"'))
     with pytest.raises(ConfigurationError, match=r"snapshots\.interval"):
         ConfigurationManager(invalid).load()
+
+
+@pytest.mark.parametrize(
+    ("platform", "app_name"),
+    [("linux", "usagebassoon"), ("darwin", "UsageBassoon"), ("win32", "UsageBassoon")],
+)
+def test_platform_default_directories_use_platformdirs_and_app_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+    app_name: str,
+) -> None:
+    """Use platformdirs with stable app names and flat Windows directories."""
+    calls: list[tuple[str, str, bool]] = []
+
+    def fake_path_factory(kind: str) -> Callable[..., Path]:
+        def get_path(appname: str, *, appauthor: bool) -> Path:
+            calls.append((kind, appname, appauthor))
+            return tmp_path / kind / appname
+
+        return get_path
+
+    monkeypatch.setattr(config_module.sys, "platform", platform)
+    monkeypatch.setattr(config_module, "user_config_path", fake_path_factory("config"))
+    monkeypatch.setattr(config_module, "user_data_path", fake_path_factory("data"))
+    monkeypatch.setattr(config_module, "user_log_path", fake_path_factory("log"))
+    monkeypatch.setattr(config_module, "user_state_path", fake_path_factory("state"))
+
+    assert default_config_path() == tmp_path / "config" / app_name / "config.toml"
+    assert default_local_database_path() == (
+        tmp_path / "data" / app_name / "usagebassoon.duckdb"
+    )
+    assert default_snapshot_directory() == tmp_path / "data" / app_name / "snapshots"
+    if platform == "linux":
+        assert default_log_directory() == tmp_path / "state" / app_name / "logs"
+        assert calls[-1] == ("state", app_name, False)
+    else:
+        assert default_log_directory() == tmp_path / "log" / app_name
+        assert calls[-1] == ("log", app_name, False)
+    assert all(name == app_name and author is False for _, name, author in calls)
+
+
+def test_linux_default_paths_follow_xdg_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Honor XDG config, data, and state roots when resolving Linux defaults."""
+    if config_module.sys.platform != "linux":
+        pytest.skip("XDG defaults are Linux-specific in this test")
+    config_root = tmp_path / "xdg-config"
+    data_root = tmp_path / "xdg-data"
+    state_root = tmp_path / "xdg-state"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_root))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_root))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
+
+    assert default_config_path() == config_root / "usagebassoon" / "config.toml"
+    assert default_local_database_path() == (
+        data_root / "usagebassoon" / "usagebassoon.duckdb"
+    )
+    assert default_snapshot_directory() == data_root / "usagebassoon" / "snapshots"
+    assert default_log_directory() == state_root / "usagebassoon" / "logs"
 
 
 def test_gcs_and_local_snapshot_destinations_are_typed(

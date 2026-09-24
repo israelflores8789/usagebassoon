@@ -20,6 +20,7 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.0",
     "plotext>=5.2",
+    "platformdirs>=4.3",
     "pyarrow>=25.0.1",
     "sqlglot>=30.18.0",
 ]

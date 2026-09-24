@@ -16,8 +16,8 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
-    DEFAULT_LOCAL_DATABASE,
     ConfigurationManager,
+    default_local_database_path,
 )
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 
@@ -29,6 +29,8 @@ def test_init_creates_source_config_and_local_schema(
     """Create a stable source namespace and the default DuckDB schema."""
     config_path = tmp_path / "config.toml"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
     monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
@@ -39,7 +41,7 @@ def test_init_creates_source_config_and_local_schema(
     configuration = ConfigurationManager(config_path).load()
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
-    assert configuration.local_database == DEFAULT_LOCAL_DATABASE.expanduser()
+    assert configuration.local_database == default_local_database_path()
     assert configuration.schedule.interval == "15m"
     assert configuration.logging.max_files == 5
     repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
@@ -90,7 +92,7 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     config_path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend = "unsupported"\n'
-        'database = "usagebassoon"\n'
+        'local_database = "usagebassoon"\n'
         f'\n[logging]\ndirectory = "{log_directory}"\n'
     )
 

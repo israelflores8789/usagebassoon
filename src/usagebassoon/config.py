@@ -9,16 +9,24 @@ import logging
 import os
 import re
 import stat
+import sys
 import tempfile
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
+
+from platformdirs import (
+    user_config_path,
+    user_data_path,
+    user_log_path,
+    user_state_path,
+)
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -27,9 +35,6 @@ from usagebassoon.backends.motherduck import MotherDuckBackend
 _LOG = logging.getLogger("usagebassoon")
 
 BackendName = Literal["duckdb", "motherduck", "bigquery"]
-DEFAULT_CONFIG_PATH = Path("~/.config/usagebassoon/config.toml")
-DEFAULT_LOCAL_DATABASE = Path("~/.local/share/usagebassoon/usagebassoon.duckdb")
-DEFAULT_LOG_DIRECTORY = Path("~/.local/state/usagebassoon/logs")
 CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
 SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
 _INTERVAL = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhd])\Z", re.I)
@@ -77,6 +82,39 @@ DEFAULT_SCHEDULE_INTERVAL = "15m"
 DEFAULT_TOKSCALE_TIMEOUT = "180s"
 DEFAULT_BIGQUERY_TIMEOUT = "120s"
 DEFAULT_GCS_TIMEOUT = "60s"
+
+
+def _application_directory_name() -> str:
+    """Return the conventional app directory name for the current platform."""
+    return "UsageBassoon" if sys.platform in {"darwin", "win32"} else "usagebassoon"
+
+
+def default_config_path() -> Path:
+    """Return the platform-specific default TOML configuration path."""
+    return (
+        user_config_path(_application_directory_name(), appauthor=False) / "config.toml"
+    )
+
+
+def default_local_database_path() -> Path:
+    """Return the platform-specific default DuckDB file path."""
+    return (
+        user_data_path(_application_directory_name(), appauthor=False)
+        / "usagebassoon.duckdb"
+    )
+
+
+def default_log_directory() -> Path:
+    """Return the platform-specific directory for operational logs."""
+    app_name = _application_directory_name()
+    if sys.platform == "linux":
+        return user_state_path(app_name, appauthor=False) / "logs"
+    return user_log_path(app_name, appauthor=False)
+
+
+def default_snapshot_directory() -> Path:
+    """Return the platform-specific directory for local snapshots."""
+    return user_data_path(_application_directory_name(), appauthor=False) / "snapshots"
 
 
 class ConfigurationError(ValueError):
@@ -188,7 +226,7 @@ class LoggingConfig:
         max_bytes: Maximum size of the active file before rotation.
     """
 
-    directory: Path = DEFAULT_LOG_DIRECTORY
+    directory: Path = field(default_factory=default_log_directory)
     max_files: int = 5
     max_bytes: int = 5 * 1024 * 1024
 
@@ -470,7 +508,7 @@ def _logging_config(value: object | None) -> LoggingConfig:
     return LoggingConfig(
         directory=Path(directory).expanduser()
         if directory
-        else DEFAULT_LOG_DIRECTORY.expanduser(),
+        else default_log_directory(),
         max_files=max_files,
         max_bytes=max_bytes,
     )
@@ -541,7 +579,9 @@ def _local_database_config(
     """Resolve the optional local DuckDB path, using its default when omitted."""
     local_database = _string(value, "local_database")
     path = (
-        Path(local_database) if local_database is not None else DEFAULT_LOCAL_DATABASE
+        Path(local_database)
+        if local_database is not None
+        else default_local_database_path()
     )
     return path.expanduser()
 
@@ -736,7 +776,8 @@ def _configuration_error_with_log(
     payload: object | None,
 ) -> ConfigurationError:
     """Log one configuration error and add the log location to its message."""
-    log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
+    default_directory = default_log_directory()
+    log_config = LoggingConfig(directory=default_directory)
     if isinstance(payload, Mapping):
         try:
             log_config = _logging_config(payload.get("logging"))
@@ -745,7 +786,7 @@ def _configuration_error_with_log(
                 "configuration logging settings are invalid; using the default log"
             )
 
-    default_log_config = LoggingConfig(directory=DEFAULT_LOG_DIRECTORY.expanduser())
+    default_log_config = LoggingConfig(directory=default_directory)
     candidates = [log_config]
     if log_config != default_log_config:
         candidates.append(default_log_config)
@@ -753,7 +794,7 @@ def _configuration_error_with_log(
     from usagebassoon.logger import log_configuration_error
 
     last_error: Exception | None = None
-    attempted_path = DEFAULT_LOG_DIRECTORY.expanduser() / "usagebassoon.log"
+    attempted_path = default_directory / "usagebassoon.log"
     for candidate in candidates:
         attempted_path = candidate.directory.expanduser() / "usagebassoon.log"
         try:
@@ -815,8 +856,9 @@ class ConfigurationManager:
     """Resolve and load one immutable UsageBassoon configuration.
 
     Explicit ``--config`` paths take precedence over ``USAGEBASSOON_CONFIG``;
-    otherwise the manager uses ``~/.config/usagebassoon/config.toml``. No source
-    identity, backend choice, or storage target can be overridden independently.
+    otherwise the manager uses the platform-specific user configuration path.
+    No source identity, backend choice, or storage target can be overridden
+    independently.
     """
 
     def __init__(
@@ -845,7 +887,7 @@ class ConfigurationManager:
         configured = environ.get(CONFIG_PATH_ENV_VAR)
         if configured:
             return Path(configured).expanduser()
-        return DEFAULT_CONFIG_PATH.expanduser()
+        return default_config_path()
 
     def load(self, *, schedule_interval: str | None = None) -> UsageBassoonConfig:
         """Load and validate the resolved configuration file.

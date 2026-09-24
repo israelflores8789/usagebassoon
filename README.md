@@ -220,6 +220,7 @@ $10.12┤               ███████              ███████
 > - Linux: `~/.config/usagebassoon/config.toml`
 > - macOS: `~/Library/Application Support/UsageBassoon/config.toml`
 > - Windows: `%LOCALAPPDATA%\UsageBassoon\config.toml`
+>
 > Override by setting the `USAGEBASSOON_CONFIG` environment variable.
 
 ```toml
@@ -230,10 +231,9 @@ source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically genera
                                                     # for identical environments (e.g. respawning a crashed container).
 backend = "duckdb"                                  # Required; one of `duckdb`, `motherduck`, or `bigquery`.
 local_database = "path/to/your/database.duckdb"     # Optional; local DuckDB file path.
-                                                    # Default database name: usagebassoon.duckdb
-                                                    # Default: Linux: ~/.local/share/usagebassoon/
-                                                    #          macOS: ~/Library/Application Support/UsageBassoon/
-                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\
+                                                    # Default: Linux: ~/.local/share/usagebassoon/usagebassoon.duckdb
+                                                    #          macOS: ~/Library/Application Support/UsageBassoon/usagebassoon.duckdb
+                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\usagebassoon.duckdb
 
 [tokscale]                                          # Optional; `bin` overrides `TOKSCALE_BIN` when set.
 bin = "bunx tokscale@latest"                        # Command prefix with runner arguments.
@@ -288,13 +288,16 @@ file_uri = "file:///path/to/your/snapshots/"        # Optional local path or `fi
                                                     #          Windows: %LOCALAPPDATA%\UsageBassoon\snapshots\
 ```
 
+> [!TIP]
+> On Linux, default path locations follow `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME` when those variables are set. UsageBassoon also supports XDG overrides on macOS.
+
 BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery.
 
-If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the conventional local archive at `~/.usagebassoon/snapshots/`. If `gcs.uri` and `snapshots.file_uri` are both present, snapshots will archive both locally *and* to GCS.
+If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the platform-specific local archive documented above. If only `gcs.uri` is configured, snapshots go to GCS; if both are configured, snapshots go to both destinations. On Linux, the default archive follows `XDG_DATA_HOME` when set; the default is `~/.local/share/usagebassoon/snapshots/`.
 
 ## Automated Scheduling
 
-`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows is not supported at this time. Consider contributing!
+`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows Task Scheduler integration is not supported at this time.
 
 ```bash
 bassoon schedule install --interval 15m
