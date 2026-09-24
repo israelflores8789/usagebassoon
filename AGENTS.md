@@ -25,32 +25,33 @@ usagebassoon/
 │   ├── sql/                  # Dialect-specific packaged SQL assets
 │   │   ├── duckdb/{ddl.sql, migrations.sql, views.sql}  # Also serves motherduck
 │   │   └── bigquery/{ddl.sql, migrations.sql, views.sql}
-│   ├── api.py               # Public Python query and connection API
-│   ├── archiver.py          # SnapshotArchiver publication, retention, and restore
-│   ├── collector.py         # tokscale subprocess acquisition and RawCollection
-│   ├── config.py            # Configuration loading, intervals, and backend construction
-│   ├── contracts.py         # Contract validation and schema drift detection
-│   ├── curation.py          # User-owned tags and notes
-│   ├── display.py           # Safe terminal rendering of untrusted values
-│   ├── drift.py             # Persisted schema drift and health diagnostics
-│   ├── frames.py            # Arrow query results to pandas or Polars DataFrames
-│   ├── ingest.py            # Validated plans, IngestEvidence, and CollectionBundle
-│   ├── json_types.py        # Recursive JSON value types
-│   ├── logger.py            # Privacy-conscious rotating operational logging
-│   ├── normalizer.py        # CollectionBundle to canonical Arrow tables
-│   ├── orchestrator.py      # Top-level collection and data shuttling
-│   ├── persistence.py       # Transactional batch persistence and retries
-│   ├── privacy.py           # Output-time obfuscation for shared artifacts
-│   ├── reconcile.py         # Collection reconciliation result types
-│   ├── scheduling.py        # Native schedulers and collection worker loop
-│   ├── schema_assets.py     # Ordered packaged SQL for schema initialization
-│   ├── sql_safety.py        # Public relation query validation and generation
-│   ├── system_metadata.py   # Best-effort collector-host metadata
-│   └── version.py           # Installed distribution version lookup
-├── tests/                   # Unit, integration, CLI, backend, bucket, and SQL parity coverage
-│   └── fixtures/            # Sanitized tokscale payload captures; treat as immutable
-├── .github/workflows/       # CI, dialect parity, and release workflows
-└── justfile                 # Development, test, and maintenance tasks
+│   ├── api.py                # Public Python query and connection API
+│   ├── archiver.py           # SnapshotArchiver publication, retention, and restore
+│   ├── collector.py          # tokscale subprocess acquisition and RawCollection
+│   ├── config.py             # Configuration loading, intervals, and backend construction
+│   ├── contracts.py          # Contract validation and schema drift detection
+│   ├── curation.py           # User-owned tags and notes
+│   ├── diagnostics.py        # read-only health queries + checks
+│   ├── display.py            # Safe terminal rendering of untrusted values
+│   ├── drift.py              # Persisted schema drift and health diagnostics
+│   ├── frames.py             # Arrow query results to pandas or Polars DataFrames
+│   ├── ingest.py             # Validated plans, IngestEvidence, and CollectionBundle
+│   ├── json_types.py         # Recursive JSON value types
+│   ├── logger.py             # Privacy-conscious rotating operational logging
+│   ├── normalizer.py         # CollectionBundle to canonical Arrow tables
+│   ├── orchestrator.py       # Top-level collection and data shuttling
+│   ├── persistence.py        # Transactional batch persistence and retries
+│   ├── privacy.py            # Output-time obfuscation for shared artifacts
+│   ├── reconcile.py          # Collection reconciliation result types
+│   ├── scheduling.py         # Native schedulers and collection worker loop
+│   ├── schema_assets.py      # Ordered packaged SQL for schema initialization
+│   ├── sql_safety.py         # Public relation query validation and generation
+│   ├── system_metadata.py    # Best-effort collector-host metadata
+│   └── version.py            # Installed distribution version lookup
+├── tests/                    # Unit, integration, CLI, backend, bucket, and SQL parity coverage
+│   └── fixtures/             # Sanitized tokscale payload captures; treat as immutable
+├── .github/workflows/        # CI, dialect parity, and release workflows
+└── justfile                  # Development, test, and maintenance tasks
 ```
 
 Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-10-tokscale-4.15.1.graph.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
@@ -255,48 +256,44 @@ These are the `tokscale` commands used to generate ingest data. Each command is 
 - `tokscale graph` — authoritative for daily activity statistics.
 - `tokscale pricing <model-id> --json` — authoritative for the rate observed while processing a daily usage fact.
 
-### Shipped views (per-dialect: `sql/{duckdb,bigquery}/views.sql`)
+### Implemented SQL views (per-dialect: `sql/{duckdb,bigquery}/views.sql`)
 
-- `daily_cost`, `session_model_stats`, `session_model_stats_current` — calculated token and cost views
-- `report_summary`, `report_models` — terminal report inputs
-- `session_tags`, `tagged_sessions`, `noted_sessions` — source-aware curation
+The DuckDB/MotherDuck and BigQuery assets implement the same 11 views:
 
-### Planned views (not yet implemented)
+- `daily_cost` applies the observed source/day/model rates to daily token facts. It returns `NULL` cost when a nonzero token category has no matching rate; reasoning uses the output rate.
+- `session_model_stats` aggregates daily facts across time at source/client/session/model grain. Its cost is `NULL` unless every contributing daily fact has a known cost. `session_model_stats_current` is an alias with identical rows and no current-time filter.
+- `report_daily_usage` exposes daily facts with workspace metadata. `report_session_models` exposes session/model totals with workspace and last-active metadata. These are the filterable report inputs; CLI reporting applies source, client, model, workspace, and effective-tag filters before aggregating.
+- `report_summary` and `report_models` provide global session and model aggregates. They omit source/client/workspace dimensions, and their `SUM(cost_usd)` ignores `NULL` inputs, so totals may be partial when pricing is incomplete.
+- `session_tags` resolves source-scoped client, workspace, and session tags while preserving tag scope. `tagged_sessions` joins those effective tags to session metadata.
+- `noted_sessions` joins notes to sessions, while `session_notes` exposes the stable notes projection used by curation commands.
 
-- `cost_by_model` — lifetime cost/tokens per model and client
-- `cost_by_workspace` — cost and duration per project
-- `cache_efficiency` — cache_read hit ratios per model
-- `burn_rate` — trailing 7/30-day daily averages
-- `session_leaderboard` — top sessions by cost
-  (`lag()` over `collected_at`), no longer depending on detection
-- `price_drift` — rate changes per model over time
-- `throughput` — ms_per_1k_tokens distributions per model
-- `tagged_sessions`, `cost_by_tag`, `tokens_by_tag` — curation views
+The report source views retain the dimensions needed for filtering; the pre-aggregated summary views do not. Consumers that need to distinguish incomplete pricing should use the detailed views or explicitly check cost completeness before aggregating.
 
 ### CLI
 
-The installed command is `bassoon`. The commands below are implemented; report views and diagnostics continue to grow incrementally.
+The installed command is `bassoon`. The commands below are implemented.
 
 | Command | Purpose |
 |---|---|
 | `bassoon init` | create config + configured DDL + views |
 | `bassoon collect` | one delta-ingest cycle (designed for cron) |
-| `bassoon query "<sql>"` | one read-only SELECT/WITH query → raw output; `--format csv\|json\|parquet`; unavoidable sharing warning |
-| `bassoon report` | terminal summary; raw personal-use output by default; `--sanitize/--obfuscate` for sharing |
-| `bassoon report --save out.txt` | render incl. charts to text |
-| `bassoon tag` / `note` | source-aware user curation |
-| `bassoon restore` | recreate normalized state/views from a snapshot and optionally re-collect current tokscale state |
-| `bassoon snapshot` / `bassoon restore` | write/read rotating GCS Parquet snapshots |
-| `bassoon export` | dump a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for intentional raw backup/data management |
+| `bassoon query <relation>` | bounded query of a supported relation; raw output with sharing warning |
+| `bassoon report summary/sessions/daily/graph` | terminal reports; `--sanitize/--obfuscate` for sharing |
+| `bassoon tag add/rename/remove` | source-aware user curation |
+| `bassoon note set/edit/remove` | source-aware user curation |
+| `bassoon restore` | restore a snapshot into an initialized, empty warehouse |
+| `bassoon snapshot` | write a private snapshot to configured destinations |
+| `bassoon export <relation> <path>` | export a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for raw data |
 | `bassoon audit` | collection audit log from `ingest_runs` |
 | `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
+| `bassoon schedule install/status/start/stop/logs/remove/worker` | install or manage native scheduling, or run the container worker |
 
 ### Privacy and sharing policy
 
 - UsageBassoon stores raw operational data so collection, merge, curation, restore, and personal reports retain full fidelity.
-- `bassoon report` is raw by default because it is a user-facing terminal experience. Its interactive terminal rendering reminds users to run `--sanitize` before sharing; saved reports omit that reminder.
+- `bassoon report` subcommands are raw by default because they are user-facing terminal experiences. Interactive output reminds users to run the selected subcommand with `--sanitize` before sharing; saved reports omit that reminder.
 - `bassoon doctor` is the shareable diagnostic path and sanitizes configuration paths, database locations, and connection credentials by default. `bassoon doctor --raw` always warns that raw output must not be pasted into public GitHub issues.
-- `bassoon query` returns raw results and accepts exactly one read-only SELECT or WITH query. It always prints an unsuppressible sharing warning to stderr and directs issue reporters to `bassoon doctor`.
+- `bassoon query` returns raw results from an allowlisted relation and always prints an unsuppressible sharing warning to stderr; it directs issue reporters to `bassoon doctor`.
 - `bassoon export` obfuscates `session_id`, workspace fields, host names, free-form tags, and session-bearing reconciliation keys by default; notes are redacted. It prints a stderr reminder that `--raw` is available for intentional personal backup or data-management output.
 - Schema-drift identifiers, paths, detail, versions, exact timestamps, and reconciliation messages remain unchanged in sanitized doctor/export output because they are generated structural diagnostics required for actionable bug reports. `client` values (for example `codex` and `opencode`) remain unchanged.
 - Snapshots are raw restoration artifacts, not shareable exports. Treat snapshot storage as private.
@@ -308,31 +305,77 @@ The installed command is `bassoon`. The commands below are implemented; report v
 ```python
 import usagebassoon
 
-df  = usagebassoon.query("SELECT * FROM cost_by_model")                   # pandas
+df  = usagebassoon.query("SELECT * FROM report_models")                   # pandas
 df  = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")     # polars
 tbl = usagebassoon.query_arrow("SELECT * FROM sessions")                  # raw Arrow
 con = usagebassoon.connect()          # duckdb conn, or ibis-style BigQuery session
 ```
 
-### Proposed Configuration Schema
-
-`~/.config/usagebassoon/config.toml` (user-global):
+### Default Configuration
 
 ```toml
-source_id = "018f2d70-0000-4000-8000-000000000000" # UUID source namespace
-backend = "duckdb"            # duckdb | motherduck | bigquery
-database = "usagebassoon"     # duckdb: file path · motherduck: db name · bigquery: dataset
+# ~/.config/usagebassoon/config.toml; override the path with USAGEBASSOON_CONFIG.
+source_id = "018f2d70-0000-4000-8000-000000000000" # UUID source namespace; generated by `bassoon init`
+backend = "duckdb" # duckdb | motherduck | bigquery
+database = "~/.local/share/usagebassoon/usagebassoon.duckdb" # duckdb: file path · motherduck: db name · bigquery: dataset
 
 [tokscale]
-bin = "bunx tokscale@latest"
+# bin omitted: TOKSCALE_BIN, then tokscale on PATH, then bunx tokscale@latest.
+env = []
+timeout = "180s"
+max_stdout_bytes = 67108864
+max_stderr_bytes = 8388608
 
-[bigquery]                    # only when backend = "bigquery"
-project = "my-project"
-location = "us-central1"
+# [bigquery] # only when backend = "bigquery"
+# project = "my-project" # required; no default
+# location = "US"
 # credentials: GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`
+# credentials_file = "/path/to/service-account.json" # optional; default unset
+# maximum_bytes_billed = 1073741824
+# timeout = "120s"
 
-[snapshots]                   # optional; absent = feature off
-gcs_uri = "gs://my-bucket/usagebassoon/snapshots"
-max_snapshots = 10            # rotating retention
-interval = "12h"              # taken during collect when elapsed
+# [gcs] # optional GCS snapshot destination
+# uri = "gs://my-bucket/usagebassoon/snapshots"
+# project = "my-project" # required when GCS is configured
+# credentials_file = "/path/to/service-account.json" # optional; default unset
+# timeout = "60s"
+
+[schedule]
+interval = "15m" # default interval; scheduling is not installed by default
+
+[collection]
+max_retries = 3
+retry_initial_seconds = 1.0
+
+[logging]
+directory = "~/.local/state/usagebassoon/logs"
+max_files = 5
+max_bytes = 5242880
+
+# [snapshots] # optional; absent = feature off
+# file_uri = "/path/to/local/snapshots" # optional local archive; default unset
+# max_snapshots = 3 # rotating retention
+# interval = "12h" # taken during collect when elapsed; unset by default
 ```
+
+Default directories leverage XDG, macOS XDG equivalents, and Windows support through `platformdirs` by the following:
+
+- for the config file, the defaults will go to:
+  - Linux: `~/.config/usagebassoon/config.toml`
+  - macOS: `~/Library/Application Support/UsageBassoon/config.toml`
+  - Windows: `%LOCALAPPDATA%\UsageBassoon\config.toml`
+
+- for the local database, the defaults will go to:
+  - Linux: `~/.local/share/usagebassoon/usagebassoon.duckdb`
+  - macOS: `~/Library/Application Support/UsageBassoon/usagebassoon.duckdb`
+  - Windows: `%LOCALAPPDATA%\UsageBassoon\usagebassoon.duckdb`
+
+- for the logs, the defaults will go to:
+  - Linux: `~/.local/state/usagebassoon/logs/`
+  - macOS: `~/Library/Logs/UsageBassoon/`
+  - Windows: `%LOCALAPPDATA%\UsageBassoon\Logs\`
+
+- for the snapshots, the defaults will go to:
+  - Linux: `~/.local/share/usagebassoon/snapshots/`
+  - macOS: `~/Library/Application Support/UsageBassoon/snapshots/`
+  - Windows: `%LOCALAPPDATA%\UsageBassoon\snapshots\`
