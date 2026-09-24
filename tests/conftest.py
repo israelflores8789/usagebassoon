@@ -205,9 +205,9 @@ def pricing_row(pricing_raw: JsonObject) -> PricingRow:
 
 
 @pytest.fixture(scope="session")
-def recon_result() -> ReconciliationResult:
+def recon_result(daily_models: dict[date, DailyModelsPayload]) -> ReconciliationResult:
     """Run full reconciliation over the golden fixture set."""
-    return reconcile_all()
+    return reconcile_all(daily_models)
 
 
 @pytest.fixture

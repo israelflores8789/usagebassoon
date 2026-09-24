@@ -267,6 +267,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         dict[IngestTarget, IngestStatus],
         dict[date, set[str]],
         dict[date, set[str]],
+        frozenset[tuple[str, str]],
     ]:
         """Return one completed historical day and one refreshable current day."""
         return (
@@ -286,6 +287,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
             },
             {},
             {},
+            frozenset(),
         )
 
     def normalized(_bundle: CollectionBundle) -> NormalizedBundle:

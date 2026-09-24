@@ -133,12 +133,19 @@ CREATE TABLE IF NOT EXISTS ingest_status (
 
 -- Artifacts of unexpected math errors when performing reconciliation checks on
 -- the usage data. Reported in `bassoon doctor`.
+-- `check_name` is the name of the reconciliation check that failed.
+-- `issue_key` is the specific issue that was detected within that check.
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    check_name TEXT,
-    issue_key TEXT,
-    message TEXT
+    check_name TEXT NOT NULL,
+    issue_key TEXT NOT NULL,
+    message TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    detected_run_id TEXT,
+    updated_run_id TEXT,
+    resolved_at TIMESTAMPTZ
 );
 
 -- Table of user-curated tags across usage data.

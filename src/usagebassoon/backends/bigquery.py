@@ -576,7 +576,12 @@ class BigQueryBackend(AbstractStorageBackend):
         for column in columns:
             quoted = self._column(column)
             value = f"source.{quoted}"
-            if column in {"created_at", "first_seen_at"}:
+            if table == "reconciliation_issues" and column == "message":
+                value = (
+                    "CASE WHEN source.`resolved_at` IS NOT NULL "
+                    f"THEN target.{quoted} ELSE {value} END"
+                )
+            elif column in {"created_at", "first_seen_at", "detected_run_id", "run_id"}:
                 value = f"COALESCE(target.{quoted}, {value})"
             assignments.append(f"target.{quoted} = {value}")
         quoted_columns = ", ".join(self._column(column) for column in columns)
@@ -755,7 +760,12 @@ class BigQueryBackend(AbstractStorageBackend):
         for column in columns:
             quoted = self._column(column)
             value = f"source.{quoted}"
-            if column in {"created_at", "first_seen_at"}:
+            if write.table == "reconciliation_issues" and column == "message":
+                value = (
+                    "CASE WHEN source.`resolved_at` IS NOT NULL "
+                    f"THEN target.{quoted} ELSE {value} END"
+                )
+            elif column in {"created_at", "first_seen_at", "detected_run_id", "run_id"}:
                 value = f"COALESCE(target.{quoted}, {value})"
             assignments.append(f"target.{quoted} = {value}")
         quoted_columns = ", ".join(self._column(column) for column in columns)

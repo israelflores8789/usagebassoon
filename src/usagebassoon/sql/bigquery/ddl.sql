@@ -115,9 +115,14 @@ CREATE TABLE IF NOT EXISTS ingest_status (
 CREATE TABLE IF NOT EXISTS reconciliation_issues (
     run_id STRING NOT NULL,
     source_id STRING NOT NULL,
-    check_name STRING,
-    issue_key STRING,
-    message STRING
+    check_name STRING NOT NULL,
+    issue_key STRING NOT NULL,
+    message STRING,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    detected_run_id STRING,
+    updated_run_id STRING,
+    resolved_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tags (

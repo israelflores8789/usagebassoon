@@ -22,8 +22,8 @@ from usagebassoon.config import (
     UsageBassoonConfig,
     open_backend,
 )
+from usagebassoon.diagnostics import DoctorCheck, DoctorReport, run_doctor
 from usagebassoon.display import sanitize_display
-from usagebassoon.drift import DoctorCheck, DoctorReport, run_doctor
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.privacy import sanitize_doctor_text

@@ -21,7 +21,8 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 def _write_config(path: Path, database: Path) -> None:
     """Write a local-DuckDB configuration for CLI integration tests."""
     path.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\nlocal_database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
+        f'local_database = "{database}"\n'
     )
 
 

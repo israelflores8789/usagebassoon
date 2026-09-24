@@ -30,7 +30,7 @@ from usagebassoon.config import (
     parse_interval,
     update_schedule_interval,
 )
-from usagebassoon.drift import DoctorCheck
+from usagebassoon.diagnostics import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.orchestrator import collect as collect_run
 from usagebassoon.version import __version__

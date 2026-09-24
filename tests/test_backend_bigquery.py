@@ -418,12 +418,27 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
                 ("source_id", "day"),
                 ("intensity", "active_time_ms"),
             ),
+            CurrentStateWrite(
+                "reconciliation_issues",
+                pa.table(
+                    {
+                        "run_id": [run_id],
+                        "source_id": ["source"],
+                        "check_name": ["models_payload_totals"],
+                        "issue_key": ["total_input_mismatch"],
+                        "message": ["mismatch"],
+                        "created_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+                        "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
+                        "detected_run_id": [run_id],
+                        "updated_run_id": [run_id],
+                        "resolved_at": [None],
+                    }
+                ),
+                ("source_id", "check_name", "issue_key"),
+                ("message", "updated_at", "updated_run_id", "resolved_at"),
+            ),
         ),
-        append_only={
-            "reconciliation_issues": pa.table(
-                {"run_id": [run_id], "source_id": ["source"]}
-            )
-        },
+        append_only={},
         ingest_runs=pa.table(
             {"run_id": [run_id], "rows_inserted": [0], "rows_updated": [0]}
         ),
@@ -440,6 +455,11 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
     assert "WHERE `run_id` = @run_id" in script
     assert run_id.replace("-", "") in stages["daily_activity"]
     assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
+    assert (
+        "MERGE `usagebassoon-test.usagebassoon_emulated.reconciliation_issues`"
+        in script
+    )
+    assert "COALESCE(target.`detected_run_id`, source.`detected_run_id`)" in script
 
 
 def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
