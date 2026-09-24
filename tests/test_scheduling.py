@@ -35,7 +35,14 @@ def _configuration(
 ) -> UsageBassoonConfig:
     """Create a minimal typed configuration for scheduler tests."""
     path = tmp_path / "config.toml"
-    content = f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\ndatabase = ":memory:"\n'
+    content = "\n".join(
+        (
+            f'source_id = "{SOURCE_ID}"',
+            'backend = "duckdb"',
+            'local_database = ":memory:"',
+            "",
+        )
+    )
     if tokscale_bin is not None:
         content += f'\n[tokscale]\nbin = "{tokscale_bin}"\n'
     path.write_text(content)

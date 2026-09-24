@@ -275,11 +275,10 @@ UsageBassoon is intentionally modular, and contributions are welcome with key ne
   - Windows Task Scheduler,
   - non-systemd-based Linux environments, and
   - others.
-  - *Current support includes* macOS, Debian-based Linux with systemd, and podman/docker containers with `bassoon schedule worker`.
+  - *Current support includes* macOS (launchd), Linux (systemd), and podman/docker containers with `bassoon schedule worker`.
 - **Improve collection resilience:**
   - Add a local cache that allows UsageBassoon to be resilient against network hiccups maintaining the idempotency and atomicity standards.
   - Investigate and harden against tokscale hangs when LiteLLM calls do not resolve; improve timeouts, cancellation, diagnostics, and recovery behavior.
-- **Support CSV report output** as first-class with a `--csv` flag, and maintain support for the `--sanitize` flag consistent with UsageBassoon’s privacy and obfuscation rules.
 - **UsageBassoon-Native token usage collection:**
   - Pricing data is currently snapshot over time from Tokscale which uses LiteLLM. A downstream major version should bring this in-house with scheduled API calls to either LiteLLM or Models.dev.
   - UsageBassoon v1 currently relies on Tokscale for token usage aggregation. A downstream major version should make this native to UsageBassoon with a schema we can control more closely. One option is to investigate porting Tokscale’s MIT-licensed Rust binary making it a native tool call. Token aggregation itself should always be driven by a compiled, memory-safe language like Rust to limit execution time. The user-facing project remains in Python which aligns with the data science utility and expectations.

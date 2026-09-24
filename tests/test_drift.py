@@ -13,7 +13,7 @@ import pyarrow as pa
 
 from usagebassoon.backends.base import ActiveTransaction
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.drift import (
+from usagebassoon.diagnostics import (
     format_checks,
     ingest_issues,
     run_doctor,

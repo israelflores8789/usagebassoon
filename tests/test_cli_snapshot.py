@@ -15,6 +15,7 @@ from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
+from usagebassoon.config import default_snapshot_directory
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -25,10 +26,13 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
 ) -> None:
     """Use the documented manual marker before any collection run exists."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\ndatabase = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        f'backend = "duckdb"\nlocal_database = "{database}"\n'
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -42,11 +46,10 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
 
     result = CliRunner().invoke(app, ["snapshot", "--config", str(config)])
 
-    store = SnapshotStore(f"file://{tmp_path}/.usagebassoon/snapshots")
+    snapshot_directory = default_snapshot_directory()
+    store = SnapshotStore(str(snapshot_directory))
     stamps = store.list_snapshots()
-    with (
-        tmp_path / ".usagebassoon" / "snapshots" / stamps[0] / "manifest.json"
-    ).open() as handle:
+    with (snapshot_directory / stamps[0] / "manifest.json").open() as handle:
         manifest = json.load(handle)
     assert result.exit_code == 0
     assert "Created private raw snapshot at" in result.output

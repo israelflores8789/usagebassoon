@@ -20,7 +20,6 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     path.write_text(
         f'source_id = "{SOURCE_ID}"\n'
         'backend = "bigquery"\n'
-        'database = "usagebassoon_it"\n'
         "\n[tokscale]\n"
         'env = ["TOKSCALE_CUSTOM_AUTH"]\n'
         'timeout = "120s"\n'
@@ -30,6 +29,7 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
         'interval = "30m"\n'
         "\n[bigquery]\n"
         'project = "usagebassoon-test"\n'
+        'dataset = "usagebassoon_it"\n'
         'location = "us-central1"\n'
         "maximum_bytes_billed = 1048576\n"
     )
@@ -50,7 +50,11 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     "table, message",
     [
         ('[tokscale]\nenv = ["BAD-NAME"]\n', "invalid variable name"),
-        ('[bigquery]\nproject = "usagebassoon-test"\nlocation = "US`"\n', "location"),
+        (
+            '[bigquery]\nproject = "usagebassoon-test"\n'
+            'dataset = "usagebassoon_it"\nlocation = "US`"\n',
+            "location",
+        ),
     ],
 )
 def test_security_configuration_rejects_unsafe_values(
@@ -60,11 +64,15 @@ def test_security_configuration_rejects_unsafe_values(
 ) -> None:
     """Reject malformed environment names and SQL-interpolated locations."""
     path = tmp_path / "config.toml"
+    valid_bigquery_settings = (
+        ""
+        if "[bigquery]" in table
+        else '\n[bigquery]\nproject = "usagebassoon-test"\n'
+        'dataset = "usagebassoon_it"\n'
+    )
     path.write_text(
-        f'source_id = "{SOURCE_ID}"\n'
-        'backend = "bigquery"\n'
-        'database = "usagebassoon_it"\n'
-        f"\n{table}"
+        f'source_id = "{SOURCE_ID}"\nbackend = "bigquery"\n'
+        f"{valid_bigquery_settings}\n{table}"
     )
 
     with pytest.raises(ConfigurationError, match=message):

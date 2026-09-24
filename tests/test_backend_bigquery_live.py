@@ -141,9 +141,9 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
         config_path.write_text(
             f'source_id = "{source_id}"\n'
             'backend = "bigquery"\n'
-            f'database = "{_DATASET}"\n'
             "[bigquery]\n"
             f'project = "{project}"\n'
+            f'dataset = "{_DATASET}"\n'
             f'location = "{location}"\n'
             "[collection]\n"
             "max_retries = 3\n"
@@ -593,7 +593,7 @@ def test_live_cli_commands_except_report(
     assert removed_tag.exit_code == 0
     assert removed_note.exit_code == 0
     assert export_path.is_file()
-    snapshots = SnapshotStore(f"file://{tmp_path}/.usagebassoon/snapshots")
+    snapshots = SnapshotStore.from_config(configuration)
     assert snapshots.list_snapshots()
 
 

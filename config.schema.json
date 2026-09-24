@@ -25,17 +25,18 @@
       ],
       "description": "Storage backend to use. `bassoon init` writes `duckdb` by default; this setting must be present in the file."
     },
-    "database": {
-      "type": "string",
-      "minLength": 1,
-      "pattern": "\\S",
-      "description": "DuckDB file path, MotherDuck database name, or BigQuery dataset ID. When omitted for DuckDB, defaults to `~/.local/share/usagebassoon/usagebassoon.duckdb`. Required for MotherDuck and BigQuery."
+    "local_database": {
+      "default": "~/.local/share/usagebassoon/usagebassoon.duckdb",
+      "description": "Optional local DuckDB file path. Used only when `backend` is `duckdb`; otherwise ignored. `~` expands to the home directory, and relative paths resolve from the process working directory. The Linux default is `~/.local/share/usagebassoon/usagebassoon.duckdb`; other platforms use their standard user data directory."
     },
     "tokscale": {
       "$ref": "#/$defs/tokscale"
     },
     "bigquery": {
-      "$ref": "#/$defs/bigquery"
+      "description": "BigQuery connection settings, used when `backend` is `bigquery`."
+    },
+    "motherduck": {
+      "description": "MotherDuck connection settings, used when `backend` is `motherduck`."
     },
     "gcs": {
       "$ref": "#/$defs/gcs"
@@ -58,10 +59,7 @@
       "if": {
         "properties": {
           "backend": {
-            "enum": [
-              "motherduck",
-              "bigquery"
-            ]
+            "const": "duckdb"
           }
         },
         "required": [
@@ -69,9 +67,11 @@
         ]
       },
       "then": {
-        "required": [
-          "database"
-        ]
+        "properties": {
+          "local_database": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
       }
     },
     {
@@ -88,7 +88,34 @@
       "then": {
         "required": [
           "bigquery"
+        ],
+        "properties": {
+          "bigquery": {
+            "$ref": "#/$defs/bigquery"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "backend": {
+            "const": "motherduck"
+          }
+        },
+        "required": [
+          "backend"
         ]
+      },
+      "then": {
+        "required": [
+          "motherduck"
+        ],
+        "properties": {
+          "motherduck": {
+            "$ref": "#/$defs/motherduck"
+          }
+        }
       }
     }
   ],
@@ -139,12 +166,17 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "project"
+        "project",
+        "dataset"
       ],
       "properties": {
         "project": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "Google Cloud project ID."
+        },
+        "dataset": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "BigQuery dataset ID to use with the configured project. Required when `backend` is `bigquery`."
         },
         "location": {
           "$ref": "#/$defs/nonEmptyString",
@@ -166,6 +198,19 @@
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
           "default": "120s",
           "description": "Maximum wait for one BigQuery job or Storage Read request, in seconds or minutes. Defaults to `120s`."
+        }
+      }
+    },
+    "motherduck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "database"
+      ],
+      "properties": {
+        "database": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "MotherDuck database name without the `md:` prefix. Required when `backend` is `motherduck`."
         }
       }
     },
@@ -236,7 +281,7 @@
         "directory": {
           "$ref": "#/$defs/nonEmptyString",
           "default": "~/.local/state/usagebassoon/logs",
-          "description": "Directory for active and rotated operational logs. Defaults to `~/.local/state/usagebassoon/logs`."
+          "description": "Directory for active and rotated operational logs. The Linux default is `~/.local/state/usagebassoon/logs`; other platforms use their standard user log directory."
         },
         "max_files": {
           "type": "integer",
@@ -258,7 +303,8 @@
       "properties": {
         "file_uri": {
           "$ref": "#/$defs/nonEmptyString",
-          "description": "Optional local path or `file://` snapshot archive URI. When omitted, the conventional local archive is used unless `gcs.uri` is configured."
+          "default": "~/.local/share/usagebassoon/snapshots",
+          "description": "Optional local path or `file://` snapshot archive URI. On Linux, snapshots default to `~/.local/share/usagebassoon/snapshots`."
         },
         "max_snapshots": {
           "type": "integer",

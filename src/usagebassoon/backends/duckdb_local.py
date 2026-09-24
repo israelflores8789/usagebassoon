@@ -109,7 +109,12 @@ class _DuckDBStorage(AbstractStorageBackend):
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if column in {"created_at", "first_seen_at"}:
+            if table == "reconciliation_issues" and column == "message":
+                value = (
+                    'CASE WHEN source."resolved_at" IS NOT NULL '
+                    f"THEN target.{quoted_column} ELSE {value} END"
+                )
+            elif column in {"created_at", "first_seen_at", "detected_run_id", "run_id"}:
                 value = f"COALESCE(target.{quoted_column}, {value})"
             assignments.append(f"{quoted_column} = {value}")
         source_values = ", ".join(f"source.{_identifier(column)}" for column in columns)

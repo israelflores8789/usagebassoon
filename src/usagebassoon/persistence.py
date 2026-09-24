@@ -22,6 +22,7 @@ from usagebassoon.config import UsageBassoonConfig, open_backend
 from usagebassoon.ingest import IngestStatus, IngestTarget
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
+from usagebassoon.reconcile import ReconciliationIdentity
 
 _MAX_TRANSACTION_RETRY_SECONDS = 30.0
 _LOG = logging.getLogger(LOGGER_NAME)
@@ -81,12 +82,15 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "failure_code",
         ),
     ),
+    "reconciliation_issues": (
+        ("source_id", "check_name", "issue_key"),
+        ("message", "updated_at", "updated_run_id", "resolved_at"),
+    ),
 }
 
 APPEND_ONLY_TABLES = frozenset(
     {
         "ingest_runs",
-        "reconciliation_issues",
         "schema_drift",
     }
 )
@@ -115,9 +119,12 @@ def _source_literal(source_id: str) -> str:
 def load_ingest_status(
     config: UsageBassoonConfig,
 ) -> tuple[
-    dict[IngestTarget, IngestStatus], dict[date, set[str]], dict[date, set[str]]
+    dict[IngestTarget, IngestStatus],
+    dict[date, set[str]],
+    dict[date, set[str]],
+    frozenset[ReconciliationIdentity],
 ]:
-    """Load retry status plus persisted daily model and price coverage."""
+    """Load retry status, coverage, and unresolved reconciliation identities."""
     backend = open_backend(config)
     source = _source_literal(config.source_id)
     try:
@@ -176,7 +183,17 @@ def load_ingest_status(
             if not isinstance(day, date) or not isinstance(model, str):
                 raise RuntimeError("price_versions contains an invalid daily model key")
             prices_by_day.setdefault(day, set()).add(model)
-        return statuses, models_by_day, prices_by_day
+        issue_rows = backend.query(
+            "SELECT check_name, issue_key FROM reconciliation_issues "
+            f"WHERE source_id = {source} AND resolved_at IS NULL"
+        ).to_pylist()
+        issue_identities: set[ReconciliationIdentity] = set()
+        for row in issue_rows:
+            check_name, issue_key = row["check_name"], row["issue_key"]
+            if not isinstance(check_name, str) or not isinstance(issue_key, str):
+                raise RuntimeError("reconciliation_issues contains an invalid identity")
+            issue_identities.add((check_name, issue_key))
+        return statuses, models_by_day, prices_by_day, frozenset(issue_identities)
     finally:
         close_backend(backend, context="loading ingest status", logger=_LOG)
 

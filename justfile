@@ -101,6 +101,14 @@ lint:
 
     uv run ruff check {{ src_dir }} {{ test_dir }} || status=1
     uv run ruff format --check {{ src_dir }} {{ test_dir }} || status=1
+
+    exit "$status"
+
+lint-yaml:
+    #!/usr/bin/env bash
+    set -u
+    status=0
+
     uv run pre-commit run --all-files actionlint || status=1
     uv run pre-commit run --all-files check-yaml || status=1
 

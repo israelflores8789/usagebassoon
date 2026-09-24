@@ -150,10 +150,12 @@ class DailyModelsPayload:
     Attributes:
         day: Requested date passed to tokscale.
         entries: Per-session and model statistics associated with that date.
+        totals: The response's own aggregate values for consistency checks.
     """
 
     day: date
     entries: tuple[DailyModelStatsRow, ...]
+    totals: ModelsPayload
 
 
 def parse_daily(payload: JsonValue, *, day: date) -> DailyModelsPayload:
@@ -170,4 +172,5 @@ def parse_daily(payload: JsonValue, *, day: date) -> DailyModelsPayload:
     return DailyModelsPayload(
         day=day,
         entries=tuple(DailyModelStatsRow(day=day, stats=row) for row in models.entries),
+        totals=models,
     )

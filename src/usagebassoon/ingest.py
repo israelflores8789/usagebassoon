@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -26,7 +26,11 @@ from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, parse_report
-from usagebassoon.reconcile import ReconciliationResult, reconcile_all
+from usagebassoon.reconcile import (
+    ReconciliationIdentity,
+    ReconciliationResult,
+    reconcile_all,
+)
 from usagebassoon.system_metadata import SystemMetadata, capture_system_metadata
 
 if TYPE_CHECKING:
@@ -82,6 +86,7 @@ class IngestEvidence:
     pricing_existing_models: Mapping[date, frozenset[str]]
     pricing_fetch_failures: Mapping[date, frozenset[str]]
     prior_statuses: Mapping[IngestTarget, IngestStatus]
+    prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +175,7 @@ def build_ingest_evidence(
     report_fetch_failures: frozenset[date],
     pricing_fetch_failures: Mapping[date, frozenset[str]],
     prior_statuses: Mapping[IngestTarget, IngestStatus],
+    prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset(),
 ) -> IngestEvidence:
     """Construct ingest evidence from validated plans and acquisition outcomes."""
     expected_models = {
@@ -189,6 +195,7 @@ def build_ingest_evidence(
         },
         pricing_fetch_failures=pricing_fetch_failures,
         prior_statuses=prior_statuses,
+        prior_reconciliation_issues=prior_reconciliation_issues,
     )
 
 
@@ -384,18 +391,40 @@ def build_collection_bundle(
         if parsed_prices:
             pricing_by_day[day] = parsed_prices
 
+    reconciliation = reconcile_all(daily_models)
     statuses = [
         _status(
             evidence.prior_statuses,
             day=day,
             domain="models",
-            status="complete",
+            status="partial" if day in reconciliation.affected_days else "complete",
             expected_count=1,
-            succeeded_count=1,
+            succeeded_count=0 if day in reconciliation.affected_days else 1,
             run_id=run_id,
+            failure_code=(
+                "reconciliation" if day in reconciliation.affected_days else None
+            ),
         )
         for day in sorted(daily_models)
     ]
+    current_models_status = {status.day: status for status in statuses}
+    pending_prior_days = {
+        day
+        for (day, domain), prior in evidence.prior_statuses.items()
+        if domain == "models"
+        and prior.failure_code == "reconciliation"
+        and current_models_status.get(day, prior).status != "complete"
+    }
+    if daily_models and not pending_prior_days:
+        active = {(issue.check, issue.key) for issue in reconciliation.issues}
+        resolved = tuple(
+            sorted(
+                identity
+                for identity in evidence.prior_reconciliation_issues - active
+                if identity[0] in {"models_payload_totals", "models_payload_keys"}
+            )
+        )
+        reconciliation = replace(reconciliation, resolved=resolved)
     statuses.extend(
         _status(
             evidence.prior_statuses,
@@ -423,6 +452,9 @@ def build_collection_bundle(
         else:
             status = "failed"
             failure_code = failure_code or "incomplete"
+        if day in reconciliation.affected_days:
+            status = "partial"
+            failure_code = "reconciliation"
         statuses.append(
             _status(
                 evidence.prior_statuses,
@@ -441,12 +473,16 @@ def build_collection_bundle(
         started_at=started_at,
         finished_at=finished_at,
         host=host,
-        daily_models=daily_models,
+        daily_models={
+            day: payload
+            for day, payload in daily_models.items()
+            if day not in reconciliation.unsafe_days
+        },
         report_rows=report_rows,
         graph=graph_plan.graph,
         pricing_by_day=pricing_by_day,
         ingest_status=tuple(statuses),
-        reconciliation=reconcile_all(),
+        reconciliation=reconciliation,
         contract_drift=tuple(drift_events),
         fetch_summary={
             "rows_in": sum(len(payload.entries) for payload in daily_models.values())

@@ -130,6 +130,11 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("check_name", pa.string()),
             pa.field("issue_key", pa.string()),
             pa.field("message", pa.string()),
+            pa.field("created_at", _TIMESTAMP),
+            pa.field("updated_at", _TIMESTAMP),
+            pa.field("detected_run_id", pa.string()),
+            pa.field("updated_run_id", pa.string()),
+            pa.field("resolved_at", _TIMESTAMP),
         ]
     ),
     "schema_drift": pa.schema(
@@ -317,8 +322,8 @@ def _ingest_status_key(status: IngestStatus) -> tuple[date, str]:
     return (status.day, status.domain)
 
 
-def _append_only(bundle: CollectionBundle) -> dict[str, ColumnarData]:
-    """Build audit, drift, and reconciliation history tables."""
+def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarData]:
+    """Build audit, drift, and current reconciliation issue rows."""
     rows_in = (bundle.fetch_summary or {}).get("rows_in") or sum(
         len(payload.entries) for payload in bundle.daily_models.values()
     ) + len(bundle.report_rows) + len(bundle.graph.contributions)
@@ -367,17 +372,37 @@ def _append_only(bundle: CollectionBundle) -> dict[str, ColumnarData]:
             "drift_events": [len(bundle.contract_drift)],
         },
     }
-    if bundle.reconciliation.issues:
+    if bundle.reconciliation.issues or bundle.reconciliation.resolved:
         tables["reconciliation_issues"] = _col_major(
             [
                 {
                     "run_id": bundle.run_id,
                     "source_id": bundle.source_id,
                     "check_name": issue.check,
-                    "issue_key": issue.key or "",
+                    "issue_key": issue.key,
                     "message": issue.message,
+                    "created_at": at,
+                    "updated_at": at,
+                    "detected_run_id": bundle.run_id,
+                    "updated_run_id": bundle.run_id,
+                    "resolved_at": None,
                 }
                 for issue in bundle.reconciliation.issues
+            ]
+            + [
+                {
+                    "run_id": bundle.run_id,
+                    "source_id": bundle.source_id,
+                    "check_name": check,
+                    "issue_key": key,
+                    "message": None,
+                    "created_at": at,
+                    "updated_at": at,
+                    "detected_run_id": bundle.run_id,
+                    "updated_run_id": bundle.run_id,
+                    "resolved_at": at,
+                }
+                for check, key in bundle.reconciliation.resolved
             ]
         )
     if bundle.contract_drift:
@@ -440,7 +465,7 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
     tables.update(
         {
             name: _table(name, columns)
-            for name, columns in _append_only(bundle).items()
+            for name, columns in _diagnostic_rows(bundle, at).items()
             if columns
         }
     )

@@ -1010,6 +1010,15 @@ wheels = [
 ]
 
 [[package]]
+name = "platformdirs"
+version = "4.11.12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/dd/65804b0c2925a1c821a05502ea57517b69a073ff400d25ab9faa3a2cf012/platformdirs-4.11.12.tar.gz", hash = "sha256:e8dc1cb58f1153fd7f61db1374317770baababec2480b37b8f01c6cc25b45267", size = 40016, upload-time = "2026-09-22T01:02:36.973Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/2b/69de6317fbf48865bb12aa56c9cfcfff46b3add0cd45250725d96146dce0/platformdirs-4.11.12-py3-none-any.whl", hash = "sha256:b1ba966ac76153d9985a0787ffab951e7c18416189873d4e4ddb2c8a04a0a254", size = 24976, upload-time = "2026-09-22T01:02:35.742Z" },
+]
+
+[[package]]
 name = "plotext"
 version = "6.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1617,6 +1626,7 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "pandas" },
+    { name = "platformdirs" },
     { name = "plotext" },
     { name = "pyarrow" },
     { name = "pydantic" },
@@ -1672,6 +1682,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
     { name = "pandas-gbq", marker = "extra == 'bigquery'", specifier = ">=0.35.2" },
     { name = "pandas-gbq", marker = "extra == 'full'", specifier = ">=0.35.2" },
+    { name = "platformdirs", specifier = ">=4.3" },
     { name = "plotext", specifier = ">=5.2" },
     { name = "polars", marker = "extra == 'full'", specifier = ">=1.0" },
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0" },

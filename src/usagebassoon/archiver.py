@@ -13,7 +13,6 @@ import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from threading import Event, Thread
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -30,7 +29,7 @@ from usagebassoon.buckets.base import (
     validate_relative_name,
 )
 from usagebassoon.buckets.local import LocalSnapshotBucket
-from usagebassoon.config import parse_interval
+from usagebassoon.config import default_snapshot_directory, parse_interval
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -265,7 +264,7 @@ class SnapshotArchiver:
             else None
         )
         if file_uri is None and gcs_archive_uri is None:
-            file_uri = f"file://{Path('~/.usagebassoon/snapshots').expanduser()}"
+            file_uri = str(default_snapshot_directory())
         return cls(
             file_uri=file_uri,
             gcs_archive_uri=gcs_archive_uri,
