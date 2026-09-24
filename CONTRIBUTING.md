@@ -131,8 +131,8 @@ flowchart TD
       COL -->|raw payload| ORCH
       ORCH -->|RawCollection| ING[ingest.py<br/>parse orchestrator]
 
-      ING -->|GraphPlan / ModelsPlan| ORCH
-      ING -->|IngestEvidence + CollectionBundle| NORM[normalizer.py<br/>canonical Arrow tables]
+      ING -->|GraphPlan / ModelsPlan<br/>+ IngestEvidence| ORCH
+      ING -->|CollectionBundle| NORM[normalizer.py<br/>canonical Arrow tables]
 
       ING --> CON[contracts.py<br/>payload validation &<br/>drift detection]
       CON -->|ContractDrift events| ING

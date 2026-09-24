@@ -12,106 +12,84 @@ A Python CLI and library (pipx-installable, import usagebassoon) that persists `
 ## Repository Structure
 ```
 usagebassoon/
-├── pyproject.toml            # hatchling; pipx-installable; Python >= 3.12
+├── pyproject.toml            # Hatchling packaging; Python >= 3.12
 ├── src/usagebassoon/
-│   ├── __init__.py
-│   ├── cli/                  # Typer app; one module per CLI command
-│   ├── parsers/              # one module per payload kind
-│   │   ├── __init__.py
-│   │   ├── daily.py          # date-filtered models rows → daily_stats
-│   │   ├── models.py         # grouped tokscale models payload parser
-│   │   ├── report.py         # session metadata       → sessions (no LLM summary fields)
-│   │   ├── graph.py          # activity and candidate dates → daily_activity
-│   │   └── pricing.py        # rates + resolution     → price_versions
-│   ├── contracts/            # JSON schema contracts per payload kind
-│   │   ├── models.json
-│   │   ├── report.json
-│   │   ├── graph.json
-│   │   └── pricing.json
-│   ├── contracts.py          # contract loading, validation, and drift detection
-│   ├── backends/
-│   │   ├── __init__.py
-│   │   ├── base.py           # StorageBackend protocol
-│   │   ├── duckdb_local.py
-│   │   ├── motherduck.py
-│   │   ├── bigquery.py
-│   │   └── gcs.py            # generation-safe GCS archive adapter
-│   ├── reports/              # terminal rich tables + plotext charts; one module per report type
-│   ├── collector.py          # tokscale subprocess + retry
-│   ├── frames.py             # Arrow conversion to pandas or optional polars
-│   ├── ingest.py             # raw payload contract validation and parsing
-│   ├── json_types.py         # recursive types for JSON-decoded payloads
-│   ├── normalizer.py         # daily facts and price versions → Arrow
-│   ├── drift.py              # schema_drift detection + reporting
-│   ├── snapshots.py          # catalog-published local/GCS snapshots + restore
-│   ├── merge.py              # staging + daily current-state upserts
-│   ├── reconcile.py          # report/session consistency checks
-│   ├── curation.py           # tags + notes
-│   ├── system_metadata.py    # best-effort collector-host metadata
-│   ├── obfuscate.py          # export-time pseudonymization
-│   ├── api.py                # usagebassoon.query/connect (pandas default, polars opt-in)
-│   ├── sql/                  # ddl + views, loaded as package data
-│   │   ├── duckdb/{ddl.sql, views.sql}    # also serves motherduck
-│   │   └── bigquery/{ddl.sql, views.sql}
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py           # shared golden-payload fixtures and collection bundle
-│   ├── fixtures/             # sanitized golden captures: daily, models, report, graph, pricing
-│   │   ├── golden-2026-09-10-tokscale-4.15.1.graph.json
-│   │   ├── golden-2026-09-10-tokscale-4.15.1.models.json
-│   │   ├── golden-2026-09-10-tokscale-4.15.1.pricing.json
-│   │   └── golden-2026-09-10-tokscale-4.15.1.report.json
-│   ├── test_backends.py      # StorageBackend integration and DDL checks
-│   ├── test_cli_curation.py  # tag/note command integration
-│   ├── test_cli_init.py      # config and schema initialization
-│   ├── test_cli_restore.py   # snapshot restore command integration
-│   ├── test_cli_snapshot.py  # snapshot command integration
-│   ├── test_collector_daily.py # daily candidate selection and retries
-│   ├── test_contracts.py     # schema-contract and drift validation
-│   ├── test_merge.py         # delta persistence semantics
-│   ├── test_parsers.py       # fixture-derived parser invariants
-│   ├── test_reconcile.py     # cross-payload consistency checks
-│   └── test_snapshots.py     # catalog, retention, cadence, and GCS behavior
-└── .github/workflows/        # ci (ruff, pyrefly, pytest), dialect-parity, release to PyPI
+│   ├── __init__.py           # Public API exports
+│   ├── __main__.py           # python -m usagebassoon entry point
+│   ├── cli/                  # Typer commands and shared CLI helpers; one module per command
+│   │   └── reports/          # Terminal report rendering; one module per report type
+│   ├── parsers/              # Typed tokscale payload parsers; one module per payload kind
+│   ├── contracts/            # Versioned graph, models, pricing, and report JSON contracts
+│   ├── backends/             # StorageBackend and DuckDB, MotherDuck, BigQuery adapters
+│   ├── buckets/              # SnapshotBucket and local/GCS storage adapters
+│   ├── sql/                  # Dialect-specific packaged SQL assets
+│   │   ├── duckdb/{ddl.sql, migrations.sql, views.sql}  # Also serves motherduck
+│   │   └── bigquery/{ddl.sql, migrations.sql, views.sql}
+│   ├── api.py               # Public Python query and connection API
+│   ├── archiver.py          # SnapshotArchiver publication, retention, and restore
+│   ├── collector.py         # tokscale subprocess acquisition and RawCollection
+│   ├── config.py            # Configuration loading, intervals, and backend construction
+│   ├── contracts.py         # Contract validation and schema drift detection
+│   ├── curation.py          # User-owned tags and notes
+│   ├── display.py           # Safe terminal rendering of untrusted values
+│   ├── drift.py             # Persisted schema drift and health diagnostics
+│   ├── frames.py            # Arrow query results to pandas or Polars DataFrames
+│   ├── ingest.py            # Validated plans, IngestEvidence, and CollectionBundle
+│   ├── json_types.py        # Recursive JSON value types
+│   ├── logger.py            # Privacy-conscious rotating operational logging
+│   ├── normalizer.py        # CollectionBundle to canonical Arrow tables
+│   ├── orchestrator.py      # Top-level collection and data shuttling
+│   ├── persistence.py       # Transactional batch persistence and retries
+│   ├── privacy.py           # Output-time obfuscation for shared artifacts
+│   ├── reconcile.py         # Collection reconciliation result types
+│   ├── scheduling.py        # Native schedulers and collection worker loop
+│   ├── schema_assets.py     # Ordered packaged SQL for schema initialization
+│   ├── sql_safety.py        # Public relation query validation and generation
+│   ├── system_metadata.py   # Best-effort collector-host metadata
+│   └── version.py           # Installed distribution version lookup
+├── tests/                   # Unit, integration, CLI, backend, bucket, and SQL parity coverage
+│   └── fixtures/            # Sanitized tokscale payload captures; treat as immutable
+├── .github/workflows/       # CI, dialect parity, and release workflows
+└── justfile                 # Development, test, and maintenance tasks
 ```
 
-Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-10-tokscale-4.15.1.models.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
+Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-10-tokscale-4.15.1.graph.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
 
 ## Architecture
 
 - **Dependencies**: `duckdb`, `pandas`, `pydantic`, `pyarrow`, `typer`, `rich`, `plotext`, `polars` (optional).
 - **Dev Environment**: `uv`, `hatchling`, `twine`, `pyrefly`, `ruff`, `pytest`, `just`, `pre-commit`.
 
-```mermaid
-flowchart TD
-    subgraph ENV[Ephemeral container / VM / laptop]
-        CRON[cron or systemd timer] --> COLLECT[bassoon collect]
-        COLLECT -->|subprocess| TS[tokscale CLI — all JSON on stdout<br/>pricing &lt;model&gt; --json · graph<br/>models --json --group-by client,session,model<br/>report --json --no-summarize]
-        TS --> NORM[graph candidates → date-filtered models<br/>validate against schema contract + drift log]
-        NORM --> ARROW[normalize → Arrow tables<br/>derived columns computed here<br/>total_tokens · session_label]
-    end
+UsageBassoon separates collection, ingest, normalization, warehouse persistence, and snapshot archival. Follow this path when changing collection behavior:
 
-    subgraph BACKEND[StorageBackend protocol — Arrow in, Arrow out]
-        ARROW --> DELTA[delta engine<br/>compare vs current views<br/>append new keys + changed rows only]
-        DELTA --> SQLW[bassoon query / report / doctors]:::noop
-        DELTA --> CUR[(versioned append-mostly tables<br/>per-dialect DDL + views)]
-    end
-
-    subgraph IMPLS[Backend implementations]
-        CUR --> LCK[duckdb — local .duckdb file]
-        CUR --> MDK[motherduck — ATTACH 'md:...']
-        CUR --> BQ[bigquery — dataset + MERGE DML]
-    end
-
-    CUR --> SNAP[bassoon snapshot<br/>Parquet → GCS · rotating · max_snapshots]
-    subgraph SNAPS[Optional snapshot locations]
-      LOC[(Local snapshot archive)]
-      GS[(GCS snapshot archive)]
-    end
-    SNAP --> LOC
-    SNAP --> GS
-    SNAPS -.->|bassoon restore| CUR
+```text
+scheduling.py / CLI
+        → orchestrator.py
+        ↔ collector.py          tokscale subprocess calls and raw acquisition outcomes
+        ↔ ingest.py             validated GraphPlan / ModelsPlan for subsequent requests
+        → RawCollection
+        → ingest.py             contracts.py validation → parsers/ → CollectionBundle
+        → normalizer.py         canonical Arrow tables in NormalizedBundle
+        → persistence.py        batch construction, backend transactions, and retries
+        → backends/base.py      StorageBackend → DuckDB / MotherDuck / BigQuery
+        → sql/                  dialect-specific DDL and views
+        → CLI / Python API
 ```
+
+`orchestrator.py` owns the collection sequence and passes results between stages. `collector.py` owns `tokscale` command resolution, subprocess execution, and raw payload acquisition; `RawCollection` contains source payloads only. The collector does not validate contracts, parse payloads, or persist data.
+
+`ingest.py` owns validation and parsing coordination. It produces `GraphPlan` and `ModelsPlan` to guide further collection, constructs `IngestEvidence` from acquisition outcomes and prior status, and builds `CollectionBundle`. `contracts.py` detects contract violations and schema drift; `parsers/` converts validated payloads into typed data. Ingest decides which report and pricing failures can be tolerated while preserving valid token facts. Graph and models remain required.
+
+`normalizer.py` owns `NormalizedBundle` and converts `CollectionBundle` into canonical Arrow tables, including derived columns. It does not execute backend transactions. `persistence.py` reads prior ingest status, assembles and persists batches, and handles bounded transaction retries. `backends/base.py` defines `StorageBackend` and `AbstractStorageBackend`; backend implementations execute warehouse-specific storage operations. SQL DDL and views remain dialect-specific under `sql/`.
+
+Snapshot archival is a separate path after persistence:
+
+```text
+orchestrator.py → archiver.py         SnapshotArchiver
+                → buckets/base.py     SnapshotBucket → local / GCS
+```
+
+`SnapshotArchiver` owns capture, Parquet format, catalog publication, retention, and restore semantics. `SnapshotBucket` implementations own version-aware object storage and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`.
 
 ## Commands
 
