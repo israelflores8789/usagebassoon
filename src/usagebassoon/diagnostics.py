@@ -72,7 +72,7 @@ class IngestIssue:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationIssueRecord:
-    """One persisted assertion failure and its first and latest detection."""
+    """One persisted assertion failure and its detection history."""
 
     check_name: str
     issue_key: str
@@ -81,6 +81,7 @@ class ReconciliationIssueRecord:
     updated_at: datetime | None
     detected_run_id: str | None
     updated_run_id: str | None
+    observation_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,8 +248,8 @@ def reconciliation_issues(
     rows = _materialized_rows(
         backend,
         "SELECT check_name, issue_key, message, created_at, updated_at, "
-        "detected_run_id, updated_run_id FROM reconciliation_issues "
-        "WHERE resolved_at IS NULL "
+        "detected_run_id, updated_run_id, observation_count "
+        "FROM reconciliation_issues WHERE resolved = FALSE "
         f"ORDER BY updated_at DESC NULLS LAST LIMIT {limit}",
     )
     return tuple(
@@ -260,6 +261,7 @@ def reconciliation_issues(
             updated_at=_as_optional_datetime(row.get("updated_at")),
             detected_run_id=_as_optional_string(row.get("detected_run_id")),
             updated_run_id=_as_optional_string(row.get("updated_run_id")),
+            observation_count=_as_required_int(_row_value(row, "observation_count")),
         )
         for row in rows
     )
@@ -521,7 +523,8 @@ def run_doctor(
                 else "no recorded issues",
                 tuple(
                     f"{item.check_name}/{item.issue_key}: {item.message or ''} "
-                    f"(first {item.created_at or 'unknown'} "
+                    f"({item.observation_count} observation(s); "
+                    f"first {item.created_at or 'unknown'} "
                     f"in run {item.detected_run_id or 'unknown'}; "
                     f"latest {item.updated_at or 'unknown'} "
                     f"in run {item.updated_run_id or 'unknown'})"

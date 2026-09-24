@@ -85,7 +85,7 @@ CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "reconciliation_issues": (
         ("source_id", "check_name", "issue_key"),
-        ("message", "updated_at", "updated_run_id", "resolved_at"),
+        ("message", "updated_at", "updated_run_id", "resolved"),
     ),
     "schema_drift_events": (
         ("source_id", "domain", "tokscale_ver", "drift_key"),
@@ -198,7 +198,7 @@ def load_ingest_status(
             prices_by_day.setdefault(day, set()).add(model)
         issue_rows = backend.query(
             "SELECT check_name, issue_key FROM reconciliation_issues "
-            f"WHERE source_id = {source} AND resolved_at IS NULL"
+            f"WHERE source_id = {source} AND resolved = FALSE"
         ).to_pylist()
         issue_identities: set[ReconciliationIdentity] = set()
         for row in issue_rows:

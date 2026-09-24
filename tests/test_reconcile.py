@@ -88,7 +88,8 @@ def test_repeated_issue_updates_one_row(
         persist_run(backend, normalize(second))
         rows = backend.query(
             "SELECT check_name, issue_key, message, created_at, updated_at, "
-            "detected_run_id, updated_run_id FROM reconciliation_issues"
+            "detected_run_id, updated_run_id, resolved, observation_count "
+            "FROM reconciliation_issues"
         ).to_pylist()
         assert rows == [
             {
@@ -99,6 +100,8 @@ def test_repeated_issue_updates_one_row(
                 "updated_at": second.finished_at,
                 "detected_run_id": first.run_id,
                 "updated_run_id": second.run_id,
+                "resolved": False,
+                "observation_count": 2,
             }
         ]
         report = run_doctor(
@@ -110,6 +113,7 @@ def test_repeated_issue_updates_one_row(
         check = next(item for item in report.checks if item.name == "reconciliation")
         assert check.status == "warning"
         assert "models_payload_totals/total_input_mismatch" in check.details[0]
+        assert "2 observation(s)" in check.details[0]
         assert first.run_id in check.details[0]
         assert second.run_id in check.details[0]
     finally:
@@ -191,14 +195,16 @@ def test_successful_recheck_resolves_persisted_issue(
         persist_run(backend, normalize(first))
         persist_run(backend, normalize(second))
         row = backend.query(
-            "SELECT message, detected_run_id, updated_run_id, resolved_at "
+            "SELECT message, detected_run_id, updated_run_id, resolved, "
+            "observation_count "
             "FROM reconciliation_issues"
         ).to_pylist()[0]
         assert row == {
             "message": issue.message,
             "detected_run_id": first.run_id,
             "updated_run_id": second.run_id,
-            "resolved_at": second.finished_at,
+            "resolved": True,
+            "observation_count": 1,
         }
         doctor = run_doctor(
             backend,
@@ -215,8 +221,9 @@ def test_successful_recheck_resolves_persisted_issue(
         )
         persist_run(backend, normalize(reopened))
         assert backend.query(
-            "SELECT count(*) AS n FROM reconciliation_issues WHERE resolved_at IS NULL"
-        ).to_pylist() == [{"n": 1}]
+            "SELECT resolved, observation_count FROM reconciliation_issues "
+            "WHERE resolved = FALSE"
+        ).to_pylist() == [{"resolved": False, "observation_count": 2}]
     finally:
         backend.close()
 

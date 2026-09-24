@@ -135,7 +135,8 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("updated_at", _TIMESTAMP),
             pa.field("detected_run_id", pa.string()),
             pa.field("updated_run_id", pa.string()),
-            pa.field("resolved_at", _TIMESTAMP),
+            pa.field("resolved", pa.bool_()),
+            pa.field("observation_count", pa.int64()),
         ]
     ),
     "schema_drift_events": pa.schema(
@@ -378,38 +379,38 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
         },
     }
     if bundle.reconciliation.issues or bundle.reconciliation.resolved:
-        tables["reconciliation_issues"] = _col_major(
-            [
-                {
-                    "run_id": bundle.run_id,
-                    "source_id": bundle.source_id,
-                    "check_name": issue.check,
-                    "issue_key": issue.key,
-                    "message": issue.message,
-                    "created_at": at,
-                    "updated_at": at,
-                    "detected_run_id": bundle.run_id,
-                    "updated_run_id": bundle.run_id,
-                    "resolved_at": None,
-                }
-                for issue in bundle.reconciliation.issues
-            ]
-            + [
-                {
-                    "run_id": bundle.run_id,
-                    "source_id": bundle.source_id,
-                    "check_name": check,
-                    "issue_key": key,
-                    "message": None,
-                    "created_at": at,
-                    "updated_at": at,
-                    "detected_run_id": bundle.run_id,
-                    "updated_run_id": bundle.run_id,
-                    "resolved_at": at,
-                }
-                for check, key in bundle.reconciliation.resolved
-            ]
-        )
+        issue_rows: list[dict[str, object]] = [
+            {
+                "run_id": bundle.run_id,
+                "source_id": bundle.source_id,
+                "check_name": issue.check,
+                "issue_key": issue.key,
+                "message": issue.message,
+                "created_at": at,
+                "updated_at": at,
+                "detected_run_id": bundle.run_id,
+                "updated_run_id": bundle.run_id,
+                "resolved": False,
+                "observation_count": 1,
+            }
+            for issue in bundle.reconciliation.issues
+        ] + [
+            {
+                "run_id": bundle.run_id,
+                "source_id": bundle.source_id,
+                "check_name": check,
+                "issue_key": key,
+                "message": None,
+                "created_at": at,
+                "updated_at": at,
+                "detected_run_id": bundle.run_id,
+                "updated_run_id": bundle.run_id,
+                "resolved": True,
+                "observation_count": 0,
+            }
+            for check, key in bundle.reconciliation.resolved
+        ]
+        tables["reconciliation_issues"] = _col_major(issue_rows)
     event_rows: dict[SchemaDriftIdentity, dict[str, object]] = {}
     tokscale_ver = bundle.graph.meta.version
     for drift in bundle.contract_drift:

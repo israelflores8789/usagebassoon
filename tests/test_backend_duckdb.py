@@ -54,6 +54,12 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
         ]
         columns = backend.query("DESCRIBE sessions").column("column_name").to_pylist()
         assert columns[-3:] == ["first_seen_at", "last_seen_at", "updated_at"]
+        reconciliation_columns = (
+            backend.query("DESCRIBE reconciliation_issues")
+            .column("column_name")
+            .to_pylist()
+        )
+        assert reconciliation_columns[-2:] == ["resolved", "observation_count"]
         run_columns = (
             backend.query("DESCRIBE ingest_runs").column("column_name").to_pylist()
         )

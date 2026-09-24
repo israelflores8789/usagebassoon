@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
     updated_at TIMESTAMP,
     detected_run_id STRING,
     updated_run_id STRING,
-    resolved_at TIMESTAMP
+    resolved BOOL NOT NULL DEFAULT FALSE,
+    observation_count INT64 NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tags (

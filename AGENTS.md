@@ -247,7 +247,7 @@ $ bassoon collect
   - `last_seen_at` is metadata from tokscale's `last_active` or similar.
   - `last_collected_at` is a freshness marker internal to usagebassoon.
 
-- **General storage model:** Usage facts, day/model price versions, schema-drift events, and reconciliation issues use current-state upserts. Existing natural keys are updated in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Ingest runs and snapshot artifacts are append-only.
+- **General storage model:** Usage facts, day/model price versions, schema-drift events, and reconciliation issues use current-state upserts. Reconciliation issues are keyed by source, check, and issue, track cumulative `observation_count`, and use a boolean `resolved` state. Existing natural keys are updated in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Ingest runs and snapshot artifacts are append-only.
 
 ### Canonical Ingest Commands
 

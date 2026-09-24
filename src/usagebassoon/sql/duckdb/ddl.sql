@@ -150,7 +150,8 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
     updated_at TIMESTAMPTZ,
     detected_run_id TEXT,
     updated_run_id TEXT,
-    resolved_at TIMESTAMPTZ
+    resolved BOOLEAN NOT NULL DEFAULT FALSE,
+    observation_count BIGINT NOT NULL
 );
 
 -- Table of user-curated tags across usage data.

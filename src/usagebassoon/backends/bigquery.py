@@ -595,10 +595,13 @@ class BigQueryBackend(AbstractStorageBackend):
             value = f"source.{quoted}"
             if table == "reconciliation_issues" and column == "message":
                 value = (
-                    "CASE WHEN source.`resolved_at` IS NOT NULL "
+                    "CASE WHEN source.`resolved` = TRUE "
                     f"THEN target.{quoted} ELSE {value} END"
                 )
-            elif table == "schema_drift_events" and column == "observation_count":
+            elif (
+                table in {"reconciliation_issues", "schema_drift_events"}
+                and column == "observation_count"
+            ):
                 value = (
                     "CASE WHEN source.`updated_run_id` = "
                     "target.`updated_run_id` OR source.`observation_count` = 0 "
@@ -792,10 +795,13 @@ class BigQueryBackend(AbstractStorageBackend):
             value = f"source.{quoted}"
             if write.table == "reconciliation_issues" and column == "message":
                 value = (
-                    "CASE WHEN source.`resolved_at` IS NOT NULL "
+                    "CASE WHEN source.`resolved` = TRUE "
                     f"THEN target.{quoted} ELSE {value} END"
                 )
-            elif write.table == "schema_drift_events" and column == "observation_count":
+            elif (
+                write.table in {"reconciliation_issues", "schema_drift_events"}
+                and column == "observation_count"
+            ):
                 value = (
                     "CASE WHEN source.`updated_run_id` = "
                     "target.`updated_run_id` OR source.`observation_count` = 0 "
