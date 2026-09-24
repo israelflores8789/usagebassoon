@@ -20,6 +20,7 @@ from usagebassoon.contracts import (
     load_shipped_contracts,
     validate_payloads,
 )
+from usagebassoon.drift import SchemaDriftState, drift_identity
 from usagebassoon.json_types import JsonArray, JsonObject
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
@@ -104,6 +105,7 @@ class IngestEvidence:
     pricing_fetch_failures: Mapping[date, frozenset[str]]
     prior_statuses: Mapping[IngestTarget, IngestStatus]
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset()
+    prior_schema_drift: tuple[SchemaDriftState, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,7 @@ class CollectionBundle:
     ingest_status: tuple[IngestStatus, ...]
     reconciliation: ReconciliationResult
     contract_drift: tuple[ContractDrift, ...] = ()
+    resolved_schema_drift: tuple[SchemaDriftState, ...] = ()
     fetch_summary: dict[str, int] | None = None
     drift_fatal: bool = False
     system_metadata: SystemMetadata | None = None
@@ -130,16 +133,12 @@ class CollectionBundle:
 def plan_graph(
     payload: JsonObject,
     *,
-    run_id: str,
-    detected_at: datetime,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
 ) -> GraphPlan:
     """Validate and parse graph before collector planning consumes it."""
     validation = validate_payloads(
         {"graph": (payload,)},
-        run_id=run_id,
         contracts=contracts,
-        detected_at=detected_at,
         required_kinds=frozenset({"graph"}),
     )
     if validation.fatal:
@@ -155,16 +154,12 @@ def plan_graph(
 def plan_models(
     payloads: Mapping[date, JsonObject],
     *,
-    run_id: str,
-    detected_at: datetime,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
 ) -> ModelsPlan:
     """Validate and parse daily models before pricing planning consumes them."""
     validation = validate_payloads(
         {"models": tuple(payloads.values())},
-        run_id=run_id,
         contracts=contracts,
-        detected_at=detected_at,
         required_kinds=frozenset({"models"}) if payloads else frozenset(),
     )
     if validation.fatal:
@@ -193,6 +188,7 @@ def build_ingest_evidence(
     pricing_fetch_failures: Mapping[date, frozenset[str]],
     prior_statuses: Mapping[IngestTarget, IngestStatus],
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset(),
+    prior_schema_drift: tuple[SchemaDriftState, ...] = (),
 ) -> IngestEvidence:
     """Construct ingest evidence from validated plans and acquisition outcomes."""
     expected_models = {
@@ -213,6 +209,7 @@ def build_ingest_evidence(
         pricing_fetch_failures=pricing_fetch_failures,
         prior_statuses=prior_statuses,
         prior_reconciliation_issues=prior_reconciliation_issues,
+        prior_schema_drift=prior_schema_drift,
     )
 
 
@@ -291,17 +288,13 @@ def build_collection_bundle(
     graph_plan = (
         evidence.graph_plan
         if evidence is not None
-        else plan_graph(
-            raw.graph, run_id=run_id, detected_at=finished_at, contracts=contracts
-        )
+        else plan_graph(raw.graph, contracts=contracts)
     )
     models_plan = (
         evidence.models_plan
         if evidence is not None
         else plan_models(
             raw.daily_models,
-            run_id=run_id,
-            detected_at=finished_at,
             contracts=contracts,
         )
     )
@@ -338,9 +331,6 @@ def build_collection_bundle(
         report_validation = diff_contract(
             expected_contracts["report"],
             payload,
-            run_id=run_id,
-            sequence_start=len(drift_events),
-            detected_at=finished_at,
         )
         drift_events.extend(report_validation.events)
         if report_validation.fatal:
@@ -381,9 +371,6 @@ def build_collection_bundle(
             pricing_validation = diff_contract(
                 expected_contracts["pricing"],
                 payload,
-                run_id=run_id,
-                sequence_start=len(drift_events),
-                detected_at=finished_at,
             )
             drift_events.extend(pricing_validation.events)
             if pricing_validation.fatal:
@@ -484,6 +471,39 @@ def build_collection_bundle(
                 failure_code=failure_code,
             )
         )
+    complete_domains = {"graph"}
+    if daily_models:
+        complete_domains.add("models")
+    if (
+        evidence.report_days
+        and not report_failures
+        and evidence.report_days <= valid_reports.keys()
+    ):
+        complete_domains.add("report")
+    expected_price_count = sum(
+        len(models) for models in evidence.pricing_expected_models.values()
+    )
+    if (
+        evidence.pricing_expected_models
+        and expected_price_count > 0
+        and not pricing_failures
+        and all(
+            models <= raw.pricing_by_day.get(day, {}).keys()
+            for day, models in evidence.pricing_expected_models.items()
+        )
+    ):
+        complete_domains.add("pricing")
+    tokscale_ver = graph_plan.graph.meta.version
+    active_drift = {
+        (event.domain, tokscale_ver, event.drift_key) for event in drift_events
+    }
+    resolved_schema_drift = tuple(
+        state
+        for state in evidence.prior_schema_drift
+        if state.tokscale_ver == tokscale_ver
+        and state.domain in complete_domains
+        and drift_identity(state) not in active_drift
+    )
     return CollectionBundle(
         run_id=run_id,
         source_id=source_id,
@@ -501,6 +521,7 @@ def build_collection_bundle(
         ingest_status=tuple(statuses),
         reconciliation=reconciliation,
         contract_drift=tuple(drift_events),
+        resolved_schema_drift=resolved_schema_drift,
         fetch_summary={
             "rows_in": sum(len(payload.entries) for payload in daily_models.values())
             + len(report_rows)

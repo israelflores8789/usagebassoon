@@ -11,27 +11,59 @@ from datetime import datetime
 
 @dataclass(frozen=True, slots=True)
 class SchemaDriftRecord:
-    """An unresolved row from the persisted schema-drift log.
+    """A current schema-drift event returned by diagnostics.
 
     Attributes:
-        drift_id: Stable identifier assigned during collection.
-        run_id: Collection run that observed the deviation.
-        detected_at: Time the deviation was detected.
-        payload_kind: Tokscale payload kind, when available.
-        drift_kind: Contract deviation kind, when available.
-        path: Observed JSON path, when available.
-        detail: Human-readable deviation detail, when available.
-        tokscale_ver: Tokscale version associated with the event.
+        domain: Tokscale command that produced the payload.
+        tokscale_ver: Tokscale version that produced the payload.
+        drift_key: Stable identity of the deviation within its domain.
+        drift_kind: Contract deviation kind.
+        path: JSON path associated with the deviation.
+        detail: Human-readable deviation detail.
+        contract_tokscale_ver: Tokscale version pinned by the contract.
+        created_at: First observation time.
+        updated_at: Most recent observation or resolution time.
+        detected_run_id: First collection run that observed the event.
+        updated_run_id: Most recent collection run that observed the event.
+        observation_count: Number of payload observations while active.
     """
 
-    drift_id: str
-    run_id: str
-    detected_at: datetime | None
-    payload_kind: str | None
-    drift_kind: str | None
-    path: str | None
-    detail: str | None
-    tokscale_ver: str | None
+    domain: str
+    tokscale_ver: str
+    drift_key: str
+    drift_kind: str
+    path: str
+    detail: str
+    contract_tokscale_ver: str
+    created_at: datetime
+    updated_at: datetime
+    detected_run_id: str
+    updated_run_id: str
+    observation_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaDriftState:
+    """Persisted lifecycle fields needed to resolve a drift event."""
+
+    domain: str
+    tokscale_ver: str
+    drift_key: str
+    drift_kind: str
+    path: str
+    detail: str
+    contract_tokscale_ver: str
+    created_at: datetime
+    detected_run_id: str
+    observation_count: int
+
+
+type SchemaDriftIdentity = tuple[str, str, str]
+
+
+def drift_identity(record: SchemaDriftState) -> SchemaDriftIdentity:
+    """Return the natural key for one persisted event state."""
+    return (record.domain, record.tokscale_ver, record.drift_key)
 
 
 def format_drift(record: SchemaDriftRecord) -> str:
@@ -43,8 +75,9 @@ def format_drift(record: SchemaDriftRecord) -> str:
     Returns:
         Compact human-readable event description.
     """
-    payload = record.payload_kind or "unknown payload"
-    path = record.path or "<root>"
-    detail = record.detail or record.drift_kind or "schema drift"
-    version = f"; tokscale {record.tokscale_ver}" if record.tokscale_ver else ""
-    return f"{payload}: {path}: {detail} (run {record.run_id}{version})"
+    return (
+        f"{record.domain}: {record.path}: {record.detail} "
+        f"(tokscale {record.tokscale_ver}; contract "
+        f"{record.contract_tokscale_ver}; observed {record.observation_count} times; "
+        f"runs {record.detected_run_id}..{record.updated_run_id})"
+    )

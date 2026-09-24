@@ -17,6 +17,7 @@ from usagebassoon import collector as subprocess_collector
 from usagebassoon import orchestrator as collector
 from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
+from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import CollectionBundle, IngestStatus, IngestTarget
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
@@ -268,6 +269,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         dict[date, set[str]],
         dict[date, set[str]],
         frozenset[tuple[str, str]],
+        tuple[SchemaDriftState, ...],
     ]:
         """Return one completed historical day and one refreshable current day."""
         return (
@@ -288,6 +290,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
             {},
             {},
             frozenset(),
+            (),
         )
 
     def normalized(_bundle: CollectionBundle) -> NormalizedBundle:

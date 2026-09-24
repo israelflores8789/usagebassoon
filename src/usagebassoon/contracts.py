@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Literal, cast
@@ -45,16 +44,18 @@ class PayloadContract:
 
 @dataclass(frozen=True, slots=True)
 class ContractDrift:
-    """One schema deviation detected on a collection run."""
+    """One schema deviation observed in a tokscale command payload."""
 
-    drift_id: str
-    run_id: str
-    detected_at: datetime
-    payload_kind: PayloadKind
+    domain: PayloadKind
     drift_kind: Literal["unknown_field", "missing_field", "type_change"]
     path: str
     detail: str
-    tokscale_ver: str
+    contract_tokscale_ver: str
+
+    @property
+    def drift_key(self) -> str:
+        """Return the stable identity of this deviation within its domain."""
+        return f"{self.drift_kind}:{self.path}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,10 +227,6 @@ def build_contract(
 def diff_contract(
     contract: PayloadContract,
     observed: JsonValue,
-    *,
-    run_id: str,
-    sequence_start: int = 0,
-    detected_at: datetime | None = None,
 ) -> ContractValidation:
     """Compare one observed raw payload with its pinned contract.
 
@@ -240,9 +237,6 @@ def diff_contract(
     Args:
         contract: Pinned contract for one payload kind.
         observed: Newly decoded payload.
-        run_id: Owning collection run id.
-        sequence_start: Prior event count for globally unique drift ids.
-        detected_at: Shared collection detection timestamp when available.
 
     Returns:
         Drift events and whether a required contract violation occurred.
@@ -251,23 +245,18 @@ def diff_contract(
     expected = {entry.path: entry for entry in contract.entries}
     events: list[ContractDrift] = []
     fatal = False
-    now = detected_at or datetime.now(UTC)
 
     def make_event(
         kind: Literal["unknown_field", "missing_field", "type_change"],
         path: str,
         detail: str,
     ) -> ContractDrift:
-        event_id = sequence_start + len(events) + 1
         return ContractDrift(
-            drift_id=f"{run_id}-d{event_id:04d}",
-            run_id=run_id,
-            detected_at=now,
-            payload_kind=contract.payload_kind,
+            domain=contract.payload_kind,
             drift_kind=kind,
             path=path,
             detail=detail,
-            tokscale_ver=contract.tokscale_version,
+            contract_tokscale_ver=contract.tokscale_version,
         )
 
     for path, entry in expected.items():
@@ -429,9 +418,7 @@ def load_shipped_contracts() -> dict[PayloadKind, PayloadContract]:
 def validate_payloads(
     payloads: Mapping[str, Sequence[JsonValue]],
     *,
-    run_id: str,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
-    detected_at: datetime | None = None,
     required_kinds: frozenset[PayloadKind] | None = None,
 ) -> ContractValidation:
     """Validate every raw collection payload before parser invocation.
@@ -439,9 +426,7 @@ def validate_payloads(
     Args:
         payloads: One or more raw payloads per supported kind. Pricing may
             contain one payload per resolved model.
-        run_id: Owning collection run id.
         contracts: Explicit contracts for tests or custom deployments.
-        detected_at: Shared drift timestamp when available.
         required_kinds: Payload kinds that must be present. All supported kinds
             are required when omitted.
 
@@ -475,9 +460,6 @@ def validate_payloads(
             result = diff_contract(
                 contract,
                 observed,
-                run_id=run_id,
-                sequence_start=len(events),
-                detected_at=detected_at,
             )
             events.extend(result.events)
             fatal = fatal or result.fatal

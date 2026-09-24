@@ -87,12 +87,13 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
             ),
             "graph",
         )
-        graph_plan = plan_graph(graph_raw, run_id=run_id, detected_at=datetime.now(UTC))
+        graph_plan = plan_graph(graph_raw)
         (
             statuses,
             persisted_models,
             persisted_prices,
             prior_reconciliation_issues,
+            prior_schema_drift,
         ) = load_ingest_status(config)
         completed = {
             target for target, status in statuses.items() if status.status == "complete"
@@ -112,9 +113,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
             or (day, _PRICING_DOMAIN) not in completed
         )
         daily_models = _fetch_daily_models(config, prefix, daily_days)
-        models_plan = plan_models(
-            daily_models, run_id=run_id, detected_at=datetime.now(UTC)
-        )
+        models_plan = plan_models(daily_models)
         pricing_expected_models: dict[date, frozenset[str]] = {}
         pricing_requests: dict[date, set[str]] = {}
         for day in requested_price_days:
@@ -152,6 +151,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
             pricing_fetch_failures=pricing_failures,
             prior_statuses=statuses,
             prior_reconciliation_issues=prior_reconciliation_issues,
+            prior_schema_drift=prior_schema_drift,
         )
         bundle = build_collection_bundle(
             raw,

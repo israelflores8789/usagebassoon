@@ -431,11 +431,12 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
                         "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
                         "detected_run_id": [run_id],
                         "updated_run_id": [run_id],
-                        "resolved_at": [None],
+                        "resolved": [False],
+                        "observation_count": [1],
                     }
                 ),
                 ("source_id", "check_name", "issue_key"),
-                ("message", "updated_at", "updated_run_id", "resolved_at"),
+                ("message", "updated_at", "updated_run_id", "resolved"),
             ),
         ),
         append_only={},
@@ -461,6 +462,15 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
         in script
     )
     assert "COALESCE(target.`detected_run_id`, source.`detected_run_id`)" in script
+    assert (
+        "CASE WHEN source.`resolved` = TRUE THEN target.`message` "
+        "ELSE source.`message` END"
+    ) in script
+    assert (
+        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
+        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
+        "target.`observation_count` + source.`observation_count` END"
+    ) in script
 
 
 def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
@@ -483,6 +493,80 @@ def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
     statement = backend._merge_from_data(write, "`staged`")
 
     assert "target.`source` = source.`source`" in statement
+
+
+def test_schema_drift_merge_adds_observation_count_once_per_run() -> None:
+    """Keep BigQuery event counts cumulative and safe for run retries."""
+    backend = _backend()
+    drift = pa.table(
+        {
+            "source_id": ["source"],
+            "domain": ["models"],
+            "tokscale_ver": ["4.15.2"],
+            "drift_key": ["unknown_field:future"],
+            "drift_kind": ["unknown_field"],
+            "path": ["future"],
+            "detail": ["types int; tolerated"],
+            "contract_tokscale_ver": ["4.15.1"],
+            "created_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+            "updated_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+            "detected_run_id": ["first-run"],
+            "updated_run_id": ["first-run"],
+            "resolved": [False],
+            "observation_count": [2],
+        }
+    )
+    write = CurrentStateWrite(
+        "schema_drift_events",
+        drift,
+        ("source_id", "domain", "tokscale_ver", "drift_key"),
+        ("updated_at", "updated_run_id", "resolved"),
+    )
+
+    statement = backend._merge_from_data(write, "`staged`")
+
+    assert (
+        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
+        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
+        "target.`observation_count` + source.`observation_count` END"
+    ) in statement
+
+
+def test_reconciliation_merge_adds_observation_count_once_per_run() -> None:
+    """Keep reconciliation counts cumulative and safe for run retries."""
+    backend = _backend()
+    issue = CurrentStateWrite(
+        "reconciliation_issues",
+        pa.table(
+            {
+                "run_id": ["current-run"],
+                "source_id": ["source"],
+                "check_name": ["models_payload_totals"],
+                "issue_key": ["total_input_mismatch"],
+                "message": ["mismatch"],
+                "created_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+                "updated_at": [datetime(2026, 9, 17, tzinfo=UTC)],
+                "detected_run_id": ["first-run"],
+                "updated_run_id": ["current-run"],
+                "resolved": [False],
+                "observation_count": [1],
+            }
+        ),
+        ("source_id", "check_name", "issue_key"),
+        ("message", "updated_at", "updated_run_id", "resolved"),
+    )
+
+    statement = backend._merge_from_data(issue, "`staged`")
+
+    assert (
+        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
+        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
+        "target.`observation_count` + source.`observation_count` END"
+    ) in statement
+    assert (
+        "CASE WHEN source.`resolved` = TRUE THEN target.`message` "
+        "ELSE source.`message` END"
+    ) in statement
 
 
 def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:

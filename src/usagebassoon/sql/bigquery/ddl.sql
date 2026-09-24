@@ -27,17 +27,21 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     drift_events INT64
 );
 
-CREATE TABLE IF NOT EXISTS schema_drift (
-    drift_id STRING NOT NULL,
-    run_id STRING NOT NULL,
+CREATE TABLE IF NOT EXISTS schema_drift_events (
     source_id STRING NOT NULL,
-    detected_at TIMESTAMP NOT NULL,
-    payload_kind STRING,
-    drift_kind STRING,
-    path STRING,
-    detail STRING,
-    tokscale_ver STRING,
-    resolved BOOL DEFAULT FALSE
+    domain STRING NOT NULL,
+    tokscale_ver STRING NOT NULL,
+    drift_key STRING NOT NULL,
+    drift_kind STRING NOT NULL,
+    path STRING NOT NULL,
+    detail STRING NOT NULL,
+    contract_tokscale_ver STRING NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    detected_run_id STRING NOT NULL,
+    updated_run_id STRING NOT NULL,
+    resolved BOOL NOT NULL DEFAULT FALSE,
+    observation_count INT64 NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -122,7 +126,8 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
     updated_at TIMESTAMP,
     detected_run_id STRING,
     updated_run_id STRING,
-    resolved_at TIMESTAMP
+    resolved BOOL NOT NULL DEFAULT FALSE,
+    observation_count INT64 NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tags (

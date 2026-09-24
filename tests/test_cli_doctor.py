@@ -55,19 +55,23 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     """Treat diagnostic warnings as failures only when strict mode is requested."""
     config, backend = _configured_store(tmp_path)
     backend.append(
-        "schema_drift",
+        "schema_drift_events",
         pa.table(
             {
-                "drift_id": ["drift-1"],
-                "run_id": ["run-1"],
                 "source_id": [SOURCE_ID],
-                "detected_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                "payload_kind": ["models"],
+                "domain": ["models"],
+                "tokscale_ver": ["4.15.1"],
+                "drift_key": ["unknown_field:entries[].extra"],
                 "drift_kind": ["unknown_field"],
                 "path": ["entries[].extra"],
                 "detail": ["unexpected field"],
-                "tokscale_ver": ["4.15.1"],
+                "contract_tokscale_ver": ["4.15.1"],
+                "created_at": [datetime(2026, 9, 15, tzinfo=UTC)],
+                "updated_at": [datetime(2026, 9, 15, tzinfo=UTC)],
+                "detected_run_id": ["run-1"],
+                "updated_run_id": ["run-1"],
                 "resolved": [False],
+                "observation_count": [1],
             }
         ),
     )

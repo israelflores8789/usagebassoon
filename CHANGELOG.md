@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
 - Added support for `tokscale` v4.15.1.
-- Added `tokscale` collection of daily per-session and per-model usage, activity, session metadata, observed pricing, and collector-host metadata, with versioned payload contracts and schema-drift reporting.
+- Added `tokscale` collection of daily per-session and per-model usage, activity, session metadata, observed pricing, and collector-host metadata.
+- Added schema-drift event persistence of tokscale payload differences into version-scoped `schema_drift_events` current-state rows with stable domain/drift identities, first/latest run metadata, resolution state, and observation counts.
 - Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and idempotent transactional upserts that preserve token usage history.
 - Added support for local DuckDB databases using the `StorageBackend` protocol.
 - Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.

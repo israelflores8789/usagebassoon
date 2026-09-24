@@ -111,8 +111,18 @@ class _DuckDBStorage(AbstractStorageBackend):
             value = f"source.{quoted_column}"
             if table == "reconciliation_issues" and column == "message":
                 value = (
-                    'CASE WHEN source."resolved_at" IS NOT NULL '
+                    'CASE WHEN source."resolved" = TRUE '
                     f"THEN target.{quoted_column} ELSE {value} END"
+                )
+            elif (
+                table in {"reconciliation_issues", "schema_drift_events"}
+                and column == "observation_count"
+            ):
+                value = (
+                    'CASE WHEN source."updated_run_id" = '
+                    'target."updated_run_id" OR source."observation_count" = 0 '
+                    f"THEN target.{quoted_column} ELSE "
+                    f"target.{quoted_column} + source.{quoted_column} END"
                 )
             elif column in {"created_at", "first_seen_at", "detected_run_id", "run_id"}:
                 value = f"COALESCE(target.{quoted_column}, {value})"

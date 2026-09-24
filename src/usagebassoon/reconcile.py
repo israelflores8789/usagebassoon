@@ -41,6 +41,7 @@ class ReconciliationIssueRecord:
         updated_at: Latest detection time, when available.
         detected_run_id: Run that first detected the issue, when available.
         updated_run_id: Run that last detected the issue, when available.
+        observation_count: Number of times the issue was observed while active.
     """
 
     check_name: str
@@ -50,6 +51,7 @@ class ReconciliationIssueRecord:
     updated_at: datetime | None
     detected_run_id: str | None
     updated_run_id: str | None
+    observation_count: int
 
 
 @dataclass(frozen=True, slots=True)
