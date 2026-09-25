@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pyarrow as pa
+
+from usagebassoon.backends.base import SnapshotRead
 
 
 class TableBackend:
@@ -26,3 +30,10 @@ class TableBackend:
         if table == self.failed_table:
             raise RuntimeError("capture failed")
         return self.table
+
+    def read_snapshot_tables(self, tables: tuple[str, ...]) -> SnapshotRead:
+        """Return fixed test tables as one materialized capture."""
+        return SnapshotRead(
+            datetime.now(UTC),
+            {table: self.query(f"SELECT * FROM {table}") for table in tables},
+        )

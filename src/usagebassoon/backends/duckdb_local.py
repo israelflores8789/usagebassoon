@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import override
@@ -17,10 +17,13 @@ import duckdb
 import pyarrow as pa
 
 from usagebassoon.backends.base import (
+    SOURCE_LEASE_SECONDS,
     AbstractStorageBackend,
     CuratedIdentity,
     CuratedRenameError,
     CuratedRenameResult,
+    SnapshotRead,
+    SourceLeaseToken,
     UpsertResult,
     is_simple_identifier,
 )
@@ -63,6 +66,92 @@ class _DuckDBStorage(AbstractStorageBackend):
         package = resources.files("usagebassoon.sql.duckdb")
         for filename in RUNTIME_SCHEMA_ASSETS:
             self.connection.execute(package.joinpath(filename).read_text())
+
+    @override
+    def is_retryable_error(self, error: Exception) -> bool:
+        """Retry transaction conflicts caused by another source lease update."""
+        return isinstance(error, duckdb.TransactionException) and (
+            "conflict on update" in str(error).casefold()
+        )
+
+    @override
+    def ensure_source_lease(self, source_id: str) -> None:
+        """Create one source row under DuckDB's enforced primary key."""
+        if not source_id or source_id == "__bootstrap__":
+            raise ValueError("invalid source lease identity")
+        self.connection.execute(
+            "INSERT INTO source_leases "
+            "(source_id, owner_id, run_id, fence, lease_expires_at, last_renewed_at) "
+            "VALUES (?, NULL, NULL, 0, NULL, NULL) "
+            "ON CONFLICT (source_id) DO NOTHING",
+            [source_id],
+        )
+
+    @override
+    def claim_source_lease(
+        self, source_id: str, run_id: str, owner_id: str
+    ) -> SourceLeaseToken | None:
+        """Conditionally claim one expired or unowned source row."""
+        rows = self.connection.execute(
+            "UPDATE source_leases SET owner_id = ?, run_id = ?, fence = fence + 1, "
+            "lease_expires_at = CURRENT_TIMESTAMP + "
+            f"INTERVAL '{SOURCE_LEASE_SECONDS} seconds', "
+            "last_renewed_at = CURRENT_TIMESTAMP "
+            "WHERE source_id = ? AND "
+            "(owner_id IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP) "
+            "RETURNING fence",
+            [owner_id, run_id, source_id],
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("source lease identity is not unique")
+        return SourceLeaseToken(source_id, run_id, owner_id, int(rows[0][0]))
+
+    @override
+    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Extend one owned lease using the database clock."""
+        rows = self.connection.execute(
+            "UPDATE source_leases SET "
+            "lease_expires_at = CURRENT_TIMESTAMP + "
+            f"INTERVAL '{SOURCE_LEASE_SECONDS} seconds', "
+            "last_renewed_at = CURRENT_TIMESTAMP "
+            "WHERE source_id = ? AND owner_id = ? AND run_id = ? AND fence = ? "
+            "AND lease_expires_at > CURRENT_TIMESTAMP RETURNING fence",
+            [lease.source_id, lease.owner_id, lease.run_id, lease.fence],
+        ).fetchall()
+        return len(rows) == 1
+
+    @override
+    def release_source_lease(self, lease: SourceLeaseToken) -> None:
+        """Release only the matching owner and fence."""
+        self.connection.execute(
+            "UPDATE source_leases SET owner_id = NULL, run_id = NULL, "
+            "lease_expires_at = NULL, last_renewed_at = CURRENT_TIMESTAMP "
+            "WHERE source_id = ? AND owner_id = ? AND run_id = ? AND fence = ?",
+            [lease.source_id, lease.owner_id, lease.run_id, lease.fence],
+        )
+
+    @override
+    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Renew the fenced source row in the caller's write transaction."""
+        return self.renew_source_lease(lease)
+
+    @override
+    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
+        """Materialize all requested tables in one DuckDB read transaction."""
+        with self.transaction():
+            row = self.connection.execute(
+                "SELECT epoch_us(CURRENT_TIMESTAMP)"
+            ).fetchone()
+            if row is None or not isinstance(row[0], int):
+                raise RuntimeError("warehouse did not return a snapshot timestamp")
+            captured_at = datetime.fromtimestamp(row[0] / 1_000_000, UTC)
+            captured = {
+                table: self.query(f"SELECT * FROM {_identifier(table)}")
+                for table in tables
+            }
+        return SnapshotRead(captured_at, captured)
 
     @override
     def upsert(

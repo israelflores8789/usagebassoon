@@ -21,6 +21,7 @@ from usagebassoon.backends.base import (
     CuratedIdentity,
     CurrentStateWrite,
     PersistenceBatch,
+    SourceLeaseToken,
 )
 from usagebassoon.backends.bigquery import BigQueryBackend, _schema_from_arrow
 
@@ -441,19 +442,36 @@ def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None
         ),
         append_only={},
         ingest_runs=pa.table(
-            {"run_id": [run_id], "rows_inserted": [0], "rows_updated": [0]}
+            {
+                "run_id": [run_id],
+                "source_id": ["source"],
+                "rows_inserted": [0],
+                "rows_updated": [0],
+            }
         ),
+        lease=SourceLeaseToken("source", run_id, "owner", 1),
     )
     stages = {
         "daily_activity": backend._stage_ref("daily_activity", run_id),
         "reconciliation_issues": backend._stage_ref("reconciliation_issues", run_id),
         "ingest_runs": backend._stage_ref("ingest_runs", run_id),
     }
-    script = backend._batch_script(batch, stages)
+    script = backend._batch_script(
+        batch, stages, SourceLeaseToken("source", run_id, "owner", 1)
+    )
     assert "BEGIN TRANSACTION;" in script
     assert "COMMIT TRANSACTION;" in script
     assert "IF NOT already_committed THEN" in script
     assert "WHERE `run_id` = @run_id" in script
+    assert script.index("BEGIN TRANSACTION;") < script.index(
+        "SET already_committed = EXISTS("
+    )
+    assert script.index(
+        "UPDATE `usagebassoon-test.usagebassoon_emulated.source_leases`"
+    ) < script.index("MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`")
+    assert "AND owner_id = @owner_id" in script
+    assert "AND run_id = @run_id AND fence = @fence" in script
+    assert "ASSERT lease_guard = 1" in script
     assert "source.`updated_at` >= target.`updated_at`" in script
     assert run_id.replace("-", "") in stages["daily_activity"]
     assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
@@ -718,8 +736,14 @@ def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
             )
         },
         ingest_runs=pa.table(
-            {"run_id": [run_id], "rows_inserted": [0], "rows_updated": [0]}
+            {
+                "run_id": [run_id],
+                "source_id": ["source"],
+                "rows_inserted": [0],
+                "rows_updated": [0],
+            }
         ),
+        lease=SourceLeaseToken("source", run_id, "owner", 1),
     )
     result = backend.persist_batch(batch)
     assert (result.inserted, result.updated, result.already_committed) == (1, 0, False)

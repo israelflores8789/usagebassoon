@@ -11,6 +11,7 @@ from typing import Annotated
 
 import typer
 
+from usagebassoon.backends.base import SourceLeaseBusy
 from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.orchestrator import collect as collect_run
@@ -28,6 +29,9 @@ def collect(
     try:
         configuration = ConfigurationManager(config).load()
         run_id, summary = collect_run(configuration)
+    except SourceLeaseBusy as error:
+        typer.echo(f"Collection skipped: {error}", err=True)
+        return
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     except Exception as error:

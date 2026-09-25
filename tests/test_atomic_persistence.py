@@ -70,7 +70,7 @@ def test_batch_rolls_back_every_write_when_a_later_append_fails() -> None:
             ),
         ),
         append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=pa.table({"run_id": [run_id]}),
+        ingest_runs=pa.table({"run_id": [run_id], "source_id": ["source"]}),
     )
     try:
         backend.apply_ddl()

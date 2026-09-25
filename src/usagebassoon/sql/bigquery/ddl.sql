@@ -6,6 +6,23 @@
 -- payload absent observations are never deleted.
 -- See sql/duckdb/ for comments on the purpose of each table.
 
+-- Creating the table with its bootstrap row makes the first guard atomic.
+CREATE TABLE IF NOT EXISTS source_leases (
+    source_id STRING NOT NULL,
+    owner_id STRING,
+    run_id STRING,
+    fence INT64 NOT NULL,
+    lease_expires_at TIMESTAMP,
+    last_renewed_at TIMESTAMP
+) AS
+SELECT
+    CAST('__bootstrap__' AS STRING) AS source_id,
+    CAST(NULL AS STRING) AS owner_id,
+    CAST(NULL AS STRING) AS run_id,
+    CAST(0 AS INT64) AS fence,
+    CAST(NULL AS TIMESTAMP) AS lease_expires_at,
+    CAST(NULL AS TIMESTAMP) AS last_renewed_at;
+
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id STRING NOT NULL,
     source_id STRING NOT NULL,

@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
+from usagebassoon.backends.base import SourceLeaseBusy
 from usagebassoon.cli.app import app
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.persistence import PersistSummary
@@ -61,6 +62,27 @@ def test_collect_formats_configuration_errors_as_cli_errors(
 
     assert result.exit_code != 0
     assert "--config" in plain_cli_output(result.output)
+
+
+def test_collect_skips_when_another_worker_owns_the_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report an expected source contention without treating config as invalid."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "usagebassoon.duckdb")
+
+    def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        """Simulate a live collection already holding the source lease."""
+        raise SourceLeaseBusy("source is already collecting")
+
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
+    result = CliRunner().invoke(app, ["collect", "--config", str(config)])
+
+    assert result.exit_code == 0
+    assert plain_cli_output(result.output) == (
+        "Collection skipped: source is already collecting\n"
+    )
 
 
 def test_collect_formats_unexpected_errors_without_a_traceback(

@@ -21,6 +21,7 @@ from usagebassoon import archiver as snapshot_archiver
 from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
+from usagebassoon.buckets.base import SnapshotBucket
 from usagebassoon.buckets.base import SnapshotObject as GcsObject
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
 from usagebassoon.buckets.gcs import GcsClient
@@ -414,6 +415,55 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
             assert (tmp_path / "local" / local_object["name"]).read_bytes() == (
                 archive.read_bytes(gcs_object["name"], version=gcs_object["version"])
             )
+
+
+def test_pending_destination_renews_during_slow_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a second reservation live while the first destination finishes."""
+    monkeypatch.setattr(snapshot_archiver, "_LEASE_SECONDS", 1)
+    archive = MemoryGcsArchive()
+    store = SnapshotStore(
+        file_uri=f"file://{tmp_path}/local",
+        gcs_archive_uri="gs://bucket/archive",
+        gcs_bucket=archive,
+    )
+    original = store._publish_for
+    calls = 0
+
+    def slow_publish(
+        destination: SnapshotBucket,
+        entry: dict[str, object],
+        *,
+        owner: str,
+        fence: int,
+        now: datetime,
+        published_at: datetime | None = None,
+    ) -> bool | None:
+        """Delay completion of the first publication past one lease period."""
+        nonlocal calls
+        result = original(
+            destination,
+            entry,
+            owner=owner,
+            fence=fence,
+            now=now,
+            published_at=published_at,
+        )
+        calls += 1
+        if calls == 1:
+            time.sleep(1.2)
+        return result
+
+    monkeypatch.setattr(store, "_publish_for", slow_publish)
+    published = store.write(cast(StorageBackend, TableBackend()), run_id="slow")
+
+    assert published is not None
+    assert len(store.list_snapshots()) == 1
+    gcs_catalog, _ = archive.read_json("catalog.json")
+    assert gcs_catalog is not None
+    assert len(cast(list[dict[str, object]], gcs_catalog["entries"])) == 1
 
 
 def test_dual_publication_failure_does_not_prune_previous_snapshots(

@@ -28,6 +28,7 @@ from google.oauth2 import service_account
 from pandas_gbq.arrow import from_read_rows_response
 
 from usagebassoon.backends.base import (
+    SOURCE_LEASE_SECONDS,
     AbstractStorageBackend,
     ActiveTransaction,
     BatchPersistResult,
@@ -36,6 +37,8 @@ from usagebassoon.backends.base import (
     CuratedRenameResult,
     CurrentStateWrite,
     PersistenceBatch,
+    SnapshotRead,
+    SourceLeaseToken,
     UpsertResult,
     is_simple_identifier,
 )
@@ -384,6 +387,186 @@ class BigQueryBackend(AbstractStorageBackend):
         except GoogleAPICallError as error:
             raise RuntimeError("BigQuery schema initialization failed") from error
 
+    def _lease_rows(
+        self, sql: str, parameters: list[bigquery.ScalarQueryParameter]
+    ) -> tuple[Mapping[str, object], ...]:
+        """Run one parameterized source lease script and return its final rows."""
+        return tuple(
+            self._wait_for_job(
+                self.client.query(
+                    sql,
+                    job_config=self._query_config(parameters=parameters),
+                    location=self.location,
+                )
+            )
+        )
+
+    @override
+    def ensure_source_lease(self, source_id: str) -> None:
+        """Provision a source row under the seeded singleton mutation guard."""
+        if not source_id or source_id == "__bootstrap__":
+            raise ValueError("invalid source lease identity")
+        target = self._table_ref("source_leases")
+        parameters = [bigquery.ScalarQueryParameter("source_id", "STRING", source_id)]
+        count_sql = (
+            f"SELECT COUNT(*) AS row_count FROM {target} WHERE source_id = @source_id"
+        )
+        initial = self._lease_rows(count_sql, parameters)
+        if len(initial) != 1:
+            raise RuntimeError("source lease count query returned no row")
+        count = cast(int, initial[0]["row_count"])
+        if count == 1:
+            return
+        if count != 0:
+            raise RuntimeError("source lease identity is not unique")
+        script = "\n".join(
+            [
+                "DECLARE guarded INT64 DEFAULT 0;",
+                "BEGIN TRANSACTION;",
+                f"UPDATE {target} SET fence = fence + 1 "
+                "WHERE source_id = '__bootstrap__';",
+                "SET guarded = @@row_count;",
+                "ASSERT guarded = 1 AS 'source lease bootstrap is invalid';",
+                f"INSERT INTO {target} "
+                "(source_id, owner_id, run_id, fence, "
+                "lease_expires_at, last_renewed_at) "
+                "SELECT @source_id, NULL, NULL, 0, NULL, NULL "
+                "WHERE NOT EXISTS (SELECT 1 FROM "
+                f"{target} WHERE source_id = @source_id);",
+                "COMMIT TRANSACTION;",
+                count_sql + ";",
+            ]
+        )
+        created = self._lease_rows(script, parameters)
+        if len(created) != 1 or created[0]["row_count"] != 1:
+            raise RuntimeError("source lease provisioning did not create one row")
+
+    @override
+    def claim_source_lease(
+        self, source_id: str, run_id: str, owner_id: str
+    ) -> SourceLeaseToken | None:
+        """Claim an existing row through a conditional mutating transaction."""
+        target = self._table_ref("source_leases")
+        script = "\n".join(
+            [
+                "DECLARE changed INT64 DEFAULT 0;",
+                "BEGIN TRANSACTION;",
+                f"UPDATE {target} SET owner_id = @owner_id, run_id = @run_id, "
+                "fence = fence + 1, "
+                "lease_expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+                f"INTERVAL {SOURCE_LEASE_SECONDS} SECOND), "
+                "last_renewed_at = CURRENT_TIMESTAMP() "
+                "WHERE source_id = @source_id AND "
+                "(owner_id IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP());",
+                "SET changed = @@row_count;",
+                "ASSERT changed <= 1 AS 'source lease identity is not unique';",
+                "COMMIT TRANSACTION;",
+                f"SELECT fence FROM {target} WHERE source_id = @source_id "
+                "AND owner_id = @owner_id AND run_id = @run_id AND changed = 1;",
+            ]
+        )
+        rows = self._lease_rows(
+            script,
+            [
+                bigquery.ScalarQueryParameter("source_id", "STRING", source_id),
+                bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+                bigquery.ScalarQueryParameter("owner_id", "STRING", owner_id),
+            ],
+        )
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("source lease claim returned duplicate rows")
+        return SourceLeaseToken(
+            source_id, run_id, owner_id, cast(int, rows[0]["fence"])
+        )
+
+    def _lease_update_count(self, sql: str, lease: SourceLeaseToken) -> int:
+        """Execute one fenced lease update and return its affected row count."""
+        rows = self._lease_rows(
+            sql + "\nSELECT @@row_count AS changed;",
+            [
+                bigquery.ScalarQueryParameter("source_id", "STRING", lease.source_id),
+                bigquery.ScalarQueryParameter("run_id", "STRING", lease.run_id),
+                bigquery.ScalarQueryParameter("owner_id", "STRING", lease.owner_id),
+                bigquery.ScalarQueryParameter("fence", "INT64", lease.fence),
+            ],
+        )
+        if len(rows) != 1:
+            raise RuntimeError("source lease update returned no row count")
+        changed = cast(int, rows[0]["changed"])
+        if changed > 1:
+            raise RuntimeError("source lease identity is not unique")
+        return changed
+
+    @override
+    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Extend only the live matching lease using BigQuery time."""
+        target = self._table_ref("source_leases")
+        return (
+            self._lease_update_count(
+                f"UPDATE {target} SET lease_expires_at = "
+                "TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+                f"INTERVAL {SOURCE_LEASE_SECONDS} SECOND), "
+                "last_renewed_at = CURRENT_TIMESTAMP() "
+                "WHERE source_id = @source_id AND owner_id = @owner_id "
+                "AND run_id = @run_id AND fence = @fence "
+                "AND lease_expires_at > CURRENT_TIMESTAMP();",
+                lease,
+            )
+            == 1
+        )
+
+    @override
+    def release_source_lease(self, lease: SourceLeaseToken) -> None:
+        """Clear an owned lease without changing its fence."""
+        target = self._table_ref("source_leases")
+        self._lease_update_count(
+            f"UPDATE {target} SET owner_id = NULL, run_id = NULL, "
+            "lease_expires_at = NULL, last_renewed_at = CURRENT_TIMESTAMP() "
+            "WHERE source_id = @source_id AND owner_id = @owner_id "
+            "AND run_id = @run_id AND fence = @fence;",
+            lease,
+        )
+
+    @override
+    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Reject generic guards that cannot span separate BigQuery jobs."""
+        raise RuntimeError("BigQuery fences leases inside persist_batch")
+
+    @override
+    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
+        """Read every table at one BigQuery warehouse timestamp."""
+        timestamp_rows = self._lease_rows(
+            "SELECT CURRENT_TIMESTAMP() AS captured_at",
+            [],
+        )
+        if len(timestamp_rows) != 1 or not isinstance(
+            timestamp_rows[0]["captured_at"], datetime
+        ):
+            raise RuntimeError("BigQuery did not return a snapshot timestamp")
+        captured_at = timestamp_rows[0]["captured_at"]
+        captured: dict[str, pa.Table] = {}
+        for table in tables:
+            statement = (
+                f"SELECT * FROM {self._table_ref(table)} "
+                "FOR SYSTEM_TIME AS OF @captured_at"
+            )
+            job = self.client.query(
+                statement,
+                job_config=self._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "captured_at", "TIMESTAMP", captured_at
+                        )
+                    ]
+                ),
+                location=self.location,
+            )
+            self._wait_for_job(job)
+            captured[table] = self._read_query_arrow(job)
+        return SnapshotRead(captured_at, captured)
+
     def _load(
         self,
         data: pa.Table,
@@ -652,45 +835,60 @@ class BigQueryBackend(AbstractStorageBackend):
         tables["ingest_runs"] = batch.ingest_runs
         stage_ids = {table: self._stage_id(table, batch.run_id) for table in tables}
         stages = {table: f"`{stage_id}`" for table, stage_id in stage_ids.items()}
-        try:
-            for table, data in tables.items():
-                self._load(
-                    data,
-                    stage_ids[table],
-                    disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        with self._batch_lease(batch) as lease:
+            try:
+                for table, data in tables.items():
+                    self._load(
+                        data,
+                        stage_ids[table],
+                        disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    )
+                result = self._wait_for_job(
+                    self.client.query(
+                        self._batch_script(batch, stages, lease),
+                        job_config=self._query_config(
+                            parameters=[
+                                bigquery.ScalarQueryParameter(
+                                    "run_id", "STRING", batch.run_id
+                                ),
+                                bigquery.ScalarQueryParameter(
+                                    "source_id", "STRING", lease.source_id
+                                ),
+                                bigquery.ScalarQueryParameter(
+                                    "owner_id", "STRING", lease.owner_id
+                                ),
+                                bigquery.ScalarQueryParameter(
+                                    "fence", "INT64", lease.fence
+                                ),
+                            ]
+                        ),
+                        location=self.location,
+                    )
                 )
-            result = self._wait_for_job(
-                self.client.query(
-                    self._batch_script(batch, stages),
-                    job_config=self._query_config(
-                        parameters=[
-                            bigquery.ScalarQueryParameter(
-                                "run_id", "STRING", batch.run_id
-                            )
-                        ]
-                    ),
-                    location=self.location,
+                row = next(iter(result), None)
+                if row is None:
+                    raise RuntimeError(
+                        "BigQuery persistence batch returned no summary row"
+                    )
+                already_committed = bool(row["already_committed"])
+                per_table = {
+                    write.table: UpsertResult(
+                        inserted=cast(int, row[f"inserted_{write.table}"]),
+                        updated=cast(int, row[f"updated_{write.table}"]),
+                    )
+                    for write in batch.current_state
+                }
+                return BatchPersistResult(
+                    per_table, already_committed=already_committed
                 )
-            )
-            row = next(iter(result), None)
-            if row is None:
-                raise RuntimeError("BigQuery persistence batch returned no summary row")
-            already_committed = bool(row["already_committed"])
-            per_table = {
-                write.table: UpsertResult(
-                    inserted=cast(int, row[f"inserted_{write.table}"]),
-                    updated=cast(int, row[f"updated_{write.table}"]),
-                )
-                for write in batch.current_state
-            }
-            return BatchPersistResult(per_table, already_committed=already_committed)
-        finally:
-            self._delete_stages(tuple(stage_ids.values()))
+            finally:
+                self._delete_stages(tuple(stage_ids.values()))
 
     def _batch_script(
         self,
         batch: PersistenceBatch,
         stages: Mapping[str, str],
+        lease: SourceLeaseToken,
     ) -> str:
         """Build the remote staging and atomic persistence script.
 
@@ -699,10 +897,11 @@ class BigQueryBackend(AbstractStorageBackend):
         is inserted last, providing the idempotency ledger for retrying the
         same UUID after an ambiguous client-side outcome.
         """
+        if lease.source_id != batch.source_id or lease.run_id != batch.run_id:
+            raise ValueError("source lease does not match persistence batch")
         declarations = [
-            "DECLARE already_committed BOOL DEFAULT EXISTS("
-            f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
-            "WHERE `run_id` = @run_id);"
+            "DECLARE already_committed BOOL DEFAULT FALSE;",
+            "DECLARE lease_guard INT64 DEFAULT 0;",
         ]
         for write in batch.current_state:
             declarations.extend(
@@ -713,8 +912,20 @@ class BigQueryBackend(AbstractStorageBackend):
             )
         statements = [
             *declarations,
-            "IF NOT already_committed THEN",
             "BEGIN TRANSACTION;",
+            "SET already_committed = EXISTS("
+            f"SELECT 1 FROM {self._table_ref('ingest_runs')} "
+            "WHERE `run_id` = @run_id AND `source_id` = @source_id);",
+            "IF NOT already_committed THEN",
+            f"UPDATE {self._table_ref('source_leases')} SET "
+            "lease_expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+            f"INTERVAL {SOURCE_LEASE_SECONDS} SECOND), "
+            "last_renewed_at = CURRENT_TIMESTAMP() "
+            "WHERE source_id = @source_id AND owner_id = @owner_id "
+            "AND run_id = @run_id AND fence = @fence "
+            "AND lease_expires_at > CURRENT_TIMESTAMP();",
+            "SET lease_guard = @@row_count;",
+            "ASSERT lease_guard = 1 AS 'collection source lease was lost';",
         ]
         for write in batch.current_state:
             join = self._join_sql(write.natural_keys)
@@ -771,8 +982,8 @@ class BigQueryBackend(AbstractStorageBackend):
             [
                 f"INSERT INTO {self._table_ref('ingest_runs')} ({target_columns}) "
                 f"SELECT {source_columns} FROM {stages['ingest_runs']} AS source;",
-                "COMMIT TRANSACTION;",
                 "END IF;",
+                "COMMIT TRANSACTION;",
             ]
         )
         select_columns = ["already_committed"]

@@ -41,6 +41,7 @@ def init(
         raise typer.BadParameter(str(error), param_hint="--config") from error
     try:
         backend.apply_ddl()
+        backend.ensure_source_lease(configuration.source_id)
     finally:
         close_backend(backend, context="initializing the schema")
     action = "Created" if created else "Using existing"

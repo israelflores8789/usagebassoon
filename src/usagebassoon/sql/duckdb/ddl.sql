@@ -6,6 +6,17 @@
 -- upserts: new natural keys are inserted, changed keys update in place,
 -- and payload absent observations are never deleted.
 
+-- Source leases serialize collection planning and persistence across processes.
+-- The bootstrap row serializes first-time source provisioning on BigQuery.
+CREATE TABLE IF NOT EXISTS source_leases (
+    source_id TEXT PRIMARY KEY,
+    owner_id TEXT,
+    run_id TEXT,
+    fence BIGINT NOT NULL,
+    lease_expires_at TIMESTAMPTZ,
+    last_renewed_at TIMESTAMPTZ
+);
+
 -- Metadata about each ingest information about the collection environment.
 CREATE TABLE IF NOT EXISTS ingest_runs (
     run_id TEXT PRIMARY KEY,

@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pyarrow as pa
+
+SOURCE_LEASE_SECONDS = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,12 +63,65 @@ class PersistenceBatch:
         current_state: Current-state tables updated in this cycle.
         append_only: Audit and history tables excluding ``ingest_runs``.
         ingest_runs: Exactly one audit row, written last within the batch.
+        lease: Source lease held from collection planning through persistence.
     """
 
     run_id: str
     current_state: tuple[CurrentStateWrite, ...]
     append_only: Mapping[str, pa.Table]
     ingest_runs: pa.Table
+    lease: SourceLeaseToken | None = None
+
+    @property
+    def source_id(self) -> str:
+        """Return the source namespace of the single ingest audit row."""
+        if (
+            self.ingest_runs.num_rows != 1
+            or "source_id" not in self.ingest_runs.column_names
+        ):
+            raise ValueError("ingest_runs requires one source_id")
+        value = self.ingest_runs.column("source_id").to_pylist()[0]
+        if not isinstance(value, str) or not value:
+            raise ValueError("ingest_runs source_id must be nonempty text")
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class SourceLeaseToken:
+    """Identity and generation of one active source lease.
+
+    Attributes:
+        source_id: Source namespace protected by the lease.
+        run_id: Collection run using the lease.
+        owner_id: Unique identifier for this lease attempt.
+        fence: Monotonically increasing source generation.
+    """
+
+    source_id: str
+    run_id: str
+    owner_id: str
+    fence: int
+
+
+class SourceLeaseBusy(RuntimeError):
+    """Raised when another collection owns an unexpired source lease."""
+
+
+class SourceLeaseLost(RuntimeError):
+    """Raised when a collection no longer owns its source lease."""
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRead:
+    """Warehouse tables observed at one consistent read point.
+
+    Attributes:
+        captured_at: Warehouse timestamp of the read point.
+        tables: Materialized canonical Arrow tables by name.
+    """
+
+    captured_at: datetime
+    tables: Mapping[str, pa.Table]
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +258,32 @@ class StorageBackend(Protocol):
         """Atomically commit or reject every write in one collection cycle."""
         ...
 
+    def ensure_source_lease(self, source_id: str) -> None:
+        """Provision exactly one dormant lease row for a source."""
+        ...
+
+    def claim_source_lease(
+        self, source_id: str, run_id: str, owner_id: str
+    ) -> SourceLeaseToken | None:
+        """Claim an available source lease and advance its fence."""
+        ...
+
+    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Extend an owned lease before its warehouse expiry."""
+        ...
+
+    def release_source_lease(self, lease: SourceLeaseToken) -> None:
+        """Release only the matching owner and fence."""
+        ...
+
+    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Mutate and verify the lease inside a persistence transaction."""
+        ...
+
+    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
+        """Read all requested tables from one warehouse state."""
+        ...
+
     def is_retryable_error(self, error: Exception) -> bool:
         """Return whether an error permits retrying the same collection run."""
         ...
@@ -319,6 +400,32 @@ class AbstractStorageBackend(ABC):
         return ()
 
     @abstractmethod
+    def ensure_source_lease(self, source_id: str) -> None:
+        """Provision the source row before an atomic conditional claim."""
+
+    @abstractmethod
+    def claim_source_lease(
+        self, source_id: str, run_id: str, owner_id: str
+    ) -> SourceLeaseToken | None:
+        """Claim an available source row and return its new fence."""
+
+    @abstractmethod
+    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Renew a live matching source lease."""
+
+    @abstractmethod
+    def release_source_lease(self, lease: SourceLeaseToken) -> None:
+        """Clear a matching source lease without resetting its fence."""
+
+    @abstractmethod
+    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
+        """Update a matching lease within the caller's write transaction."""
+
+    @abstractmethod
+    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
+        """Return tables materialized at one consistent read point."""
+
+    @abstractmethod
     def has_committed_run(self, run_id: str) -> bool:
         """Return whether a complete collection cycle has this run identifier."""
 
@@ -424,6 +531,11 @@ class AbstractStorageBackend(ABC):
         ingest_run_id = batch.ingest_runs.column("run_id").to_pylist()[0]
         if ingest_run_id != batch.run_id:
             raise ValueError("ingest_runs run_id does not match persistence batch")
+        source_id = batch.source_id
+        if batch.lease is not None and (
+            batch.lease.run_id != batch.run_id or batch.lease.source_id != source_id
+        ):
+            raise ValueError("source lease does not match persistence batch")
         names: set[str] = set()
         for write in batch.current_state:
             if write.table in names:
@@ -435,6 +547,11 @@ class AbstractStorageBackend(ABC):
                 write.natural_keys,
                 write.change_fields,
             )
+            if "source_id" not in write.data.column_names or any(
+                value != source_id
+                for value in write.data.column("source_id").to_pylist()
+            ):
+                raise ValueError(f"{write.table} has a mismatched source_id")
         for table, data in batch.append_only.items():
             if table in names or not is_simple_identifier(table):
                 raise ValueError(f"invalid append-only table {table!r}")
@@ -445,6 +562,36 @@ class AbstractStorageBackend(ABC):
                 value != batch.run_id for value in data.column("run_id").to_pylist()
             ):
                 raise ValueError(f"append-only table {table!r} has a mismatched run_id")
+            if "source_id" in data.column_names and any(
+                value != source_id for value in data.column("source_id").to_pylist()
+            ):
+                raise ValueError(
+                    f"append-only table {table!r} has a mismatched source_id"
+                )
+
+    @contextmanager
+    def _batch_lease(self, batch: PersistenceBatch) -> Generator[SourceLeaseToken]:
+        """Use the collection lease or claim one for a direct batch call.
+
+        Yields:
+            A source lease token to validate inside the batch transaction.
+        """
+        if batch.lease is not None:
+            yield batch.lease
+            return
+        self.ensure_source_lease(batch.source_id)
+        lease = self.claim_source_lease(batch.source_id, batch.run_id, str(uuid4()))
+        if lease is None:
+            raise SourceLeaseBusy(f"source {batch.source_id} already has a collection")
+        try:
+            yield lease
+        finally:
+            try:
+                self.release_source_lease(lease)
+            except Exception:
+                logging.getLogger("usagebassoon").exception(
+                    "could not release source lease for %s", batch.source_id
+                )
 
     def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
         """Atomically persist one validated collection cycle.
@@ -459,10 +606,12 @@ class AbstractStorageBackend(ABC):
             Per-table current-state outcomes or an idempotent no-op result.
         """
         self._validate_batch(batch)
-        if self.has_committed_run(batch.run_id):
-            return BatchPersistResult({}, already_committed=True)
-        per_table: dict[str, UpsertResult] = {}
-        with self.transaction():
+        with self._batch_lease(batch) as lease, self.transaction():
+            if self.has_committed_run(batch.run_id):
+                return BatchPersistResult({}, already_committed=True)
+            if not self.guard_source_lease(lease):
+                raise SourceLeaseLost(f"source lease was lost for {lease.source_id}")
+            per_table: dict[str, UpsertResult] = {}
             for write in batch.current_state:
                 per_table[write.table] = self.upsert(
                     write.table,
@@ -480,4 +629,4 @@ class AbstractStorageBackend(ABC):
                     sum(result.updated for result in per_table.values()),
                 ),
             )
-        return BatchPersistResult(per_table)
+            return BatchPersistResult(per_table)

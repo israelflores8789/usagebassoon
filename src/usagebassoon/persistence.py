@@ -14,6 +14,7 @@ from datetime import date, datetime
 from usagebassoon.backends.base import (
     CurrentStateWrite,
     PersistenceBatch,
+    SourceLeaseToken,
     StorageBackend,
     UpsertResult,
     close_backend,
@@ -267,7 +268,12 @@ def load_ingest_status(
         close_backend(backend, context="loading ingest status", logger=_LOG)
 
 
-def persist_run(backend: StorageBackend, bundle: NormalizedBundle) -> PersistSummary:
+def persist_run(
+    backend: StorageBackend,
+    bundle: NormalizedBundle,
+    *,
+    lease: SourceLeaseToken | None = None,
+) -> PersistSummary:
     """Persist one normalized collection in a single backend transaction.
 
     Current-state tables are upserted, append-only audit/history tables are
@@ -276,6 +282,7 @@ def persist_run(backend: StorageBackend, bundle: NormalizedBundle) -> PersistSum
     Args:
         backend: Destination storage backend.
         bundle: Canonical Arrow tables produced by normalizer.
+        lease: Source lease already held by the collection orchestrator.
 
     Returns:
         Counts of inserted and updated current-state rows.
@@ -306,6 +313,7 @@ def persist_run(backend: StorageBackend, bundle: NormalizedBundle) -> PersistSum
             current_state=current_state,
             append_only=append_only,
             ingest_runs=bundle.tables["ingest_runs"],
+            lease=lease,
         )
     )
     return PersistSummary(
@@ -319,30 +327,35 @@ def persist_with_retries(
     config: UsageBassoonConfig,
     bundle: NormalizedBundle,
     logger: logging.Logger,
+    *,
+    lease: SourceLeaseToken | None = None,
 ) -> PersistSummary:
     """Initialize storage and persist a batch with bounded backend retries."""
-    schema_backend: StorageBackend | None = None
-    try:
-        schema_backend = open_backend(config)
-        schema_backend.apply_ddl()
-    except Exception:
-        logger.exception(
-            "collection run %s could not initialize the schema", bundle.run_id
-        )
-        raise
-    finally:
-        if schema_backend is not None:
-            close_backend(
-                schema_backend,
-                context=f"schema initialization for {bundle.run_id}",
-                logger=logger,
+    if lease is None:
+        schema_backend: StorageBackend | None = None
+        try:
+            schema_backend = open_backend(config)
+            schema_backend.apply_ddl()
+        except Exception:
+            logger.exception(
+                "collection run %s could not initialize the schema", bundle.run_id
             )
+            raise
+        finally:
+            if schema_backend is not None:
+                close_backend(
+                    schema_backend,
+                    context=f"schema initialization for {bundle.run_id}",
+                    logger=logger,
+                )
     attempts = config.collection.max_retries + 1
     for attempt in range(1, attempts + 1):
         backend: StorageBackend | None = None
         try:
             backend = open_backend(config)
-            return persist_run(backend, bundle)
+            if lease is None:
+                return persist_run(backend, bundle)
+            return persist_run(backend, bundle, lease=lease)
         except Exception as error:
             try:
                 retryable = backend is not None and backend.is_retryable_error(error)

@@ -43,7 +43,7 @@ def _config(path: Path) -> UsageBassoonConfig:
         path=path,
         source_id=SOURCE_ID,
         backend="duckdb",
-        local_database=Path(":memory:"),
+        local_database=path.parent / "collector.duckdb",
         logging=LoggingConfig(directory=path.parent / "logs"),
     )
 
@@ -301,8 +301,11 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _configuration: UsageBassoonConfig,
         _bundle: NormalizedBundle,
         _logger: logging.Logger,
+        *,
+        lease: object,
     ) -> PersistSummary:
         """Return the persistence outcome used for collection assertions."""
+        assert lease is not None
         return PersistSummary(0, 0, {})
 
     monkeypatch.setattr(collector, "datetime", _FixedDatetime)

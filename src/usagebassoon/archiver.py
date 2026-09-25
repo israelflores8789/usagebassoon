@@ -13,7 +13,7 @@ import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -144,7 +144,7 @@ class _CapturedTable:
 
 
 class _ReservationHeartbeat:
-    """Keep snapshot reservations valid while a capture is in progress."""
+    """Keep pending snapshot reservations valid through publication."""
 
     def __init__(
         self,
@@ -156,6 +156,8 @@ class _ReservationHeartbeat:
         self._archiver = archiver
         self._owner = owner
         self._claims = claims
+        self._locks = {archive: Lock() for archive, _ in claims}
+        self._pending = set(archive for archive, _ in claims)
         self._stop = Event()
         self._failure: Exception | None = None
         self._thread = Thread(target=self._run, name="snapshot-lease", daemon=True)
@@ -164,8 +166,19 @@ class _ReservationHeartbeat:
         """Renew reservations until stopped or a claim is lost."""
         while not self._stop.wait(_LEASE_SECONDS / 3):
             try:
-                if not self._archiver._renew_claims(self._owner, self._claims, _now()):
-                    raise RuntimeError("snapshot publication reservation was lost")
+                for archive, fence in self._claims:
+                    lock = self._locks[archive]
+                    if not lock.acquire(blocking=False):
+                        continue
+                    try:
+                        if archive in self._pending and not self._archiver._renew_for(
+                            archive, self._owner, fence, _now()
+                        ):
+                            raise RuntimeError(
+                                f"snapshot reservation was lost for {archive.uri}"
+                            )
+                    finally:
+                        lock.release()
             except Exception as error:
                 self._failure = error
                 self._stop.set()
@@ -176,14 +189,44 @@ class _ReservationHeartbeat:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop renewal before catalog publication or failure cleanup."""
+        """Stop renewal after publication or before failure cleanup."""
         self._stop.set()
         self._thread.join()
 
     def check(self) -> None:
-        """Raise if renewal failed during the capture."""
+        """Raise if renewal failed while a destination remained pending."""
         if self._failure is not None:
             raise RuntimeError("snapshot reservation renewal failed") from self._failure
+
+    def publish(
+        self,
+        archive: SnapshotBucket,
+        fence: int,
+        entry: dict[str, object],
+        published_at: datetime,
+    ) -> None:
+        """Publish one destination while other reservations keep renewing."""
+        with self._locks[archive]:
+            self.check()
+            if not self._archiver._renew_for(archive, self._owner, fence, _now()):
+                raise RuntimeError(
+                    f"snapshot publication reservation was lost for {archive.uri}"
+                )
+            if (
+                self._archiver._publish_for(
+                    archive,
+                    entry,
+                    owner=self._owner,
+                    fence=fence,
+                    now=_now(),
+                    published_at=published_at,
+                )
+                is None
+            ):
+                raise RuntimeError(
+                    f"snapshot publication reservation was lost for {archive.uri}"
+                )
+            self._pending.remove(archive)
 
 
 class SnapshotArchiver:
@@ -490,11 +533,8 @@ class SnapshotArchiver:
         pq.write_table(data, sink)
         return sink.getvalue()
 
-    def _capture_table(self, backend: StorageBackend, table: str) -> _CapturedTable:
-        """Read and serialize one expected table exactly once."""
-        data = backend.query(f"SELECT * FROM {table}")
-        if not isinstance(data, pa.Table):
-            raise TypeError(f"snapshot query for {table} did not return an Arrow table")
+    def _capture_table(self, data: pa.Table) -> _CapturedTable:
+        """Serialize one table from a consistent warehouse read."""
         return _CapturedTable(
             rows=data.num_rows,
             schema=self._schema(data),
@@ -591,6 +631,7 @@ class SnapshotArchiver:
         owner: str,
         fence: int,
         now: datetime,
+        published_at: datetime | None = None,
     ) -> bool | None:
         """Publish one destination entry under its active reservation."""
         for _ in range(5):
@@ -609,7 +650,10 @@ class SnapshotArchiver:
                 or not self._due(catalog, now)
             ):
                 return None
-            published_entry = {**entry, "published_at": now.isoformat()}
+            published_entry = {
+                **entry,
+                "published_at": (published_at or now).isoformat(),
+            }
             all_entries = [*self._entries(catalog), published_entry]
             catalog["entries"] = all_entries
             catalog["reservation"] = None
@@ -825,14 +869,18 @@ class SnapshotArchiver:
             return None
         owner, claims = claimed
         heartbeat = _ReservationHeartbeat(self, owner, claims)
-        heartbeat.start()
         snapshot_id = f"{created.strftime('%Y-%m-%dT%H%M%SZ')}_{uuid4().hex}"
         written: dict[SnapshotBucket, list[dict[str, object]]] = {}
         entries: dict[SnapshotBucket, dict[str, object]] = {}
         published: list[SnapshotBucket] = []
+        started = False
         try:
+            heartbeat.start()
+            started = True
+            snapshot_read = backend.read_snapshot_tables(SNAPSHOT_TABLES)
             captures = {
-                table: self._capture_table(backend, table) for table in SNAPSHOT_TABLES
+                table: self._capture_table(snapshot_read.tables[table])
+                for table in SNAPSHOT_TABLES
             }
             fingerprint = hashlib.sha256(
                 json.dumps(
@@ -844,6 +892,7 @@ class SnapshotArchiver:
                 "version": _FORMAT_VERSION,
                 "snapshot_id": snapshot_id,
                 "created_at": created.isoformat(),
+                "captured_at": snapshot_read.captured_at.isoformat(),
                 "source_backend": getattr(backend, "dialect", type(backend).__name__),
                 "run_id": run_id,
                 "schema_fingerprint": fingerprint,
@@ -857,26 +906,14 @@ class SnapshotArchiver:
                 )
                 entries[archive] = entry
                 written[archive] = objects
-            heartbeat.stop()
             heartbeat.check()
             published_at = _now()
-            if not self._renew_claims(owner, claims, published_at):
-                raise RuntimeError("snapshot publication reservation was lost")
             for archive, fence in claims:
-                published_target = self._publish_for(
-                    archive,
-                    entries[archive],
-                    owner=owner,
-                    fence=fence,
-                    now=published_at,
-                )
-                if published_target is None:
-                    raise RuntimeError(
-                        f"snapshot publication reservation was lost for {archive.uri}"
-                    )
+                heartbeat.publish(archive, fence, entries[archive], published_at)
                 published.append(archive)
         except Exception:
-            heartbeat.stop()
+            if started:
+                heartbeat.stop()
             for archive in published:
                 self._remove_entry(archive, snapshot_id)
             self._release_claims(owner, list(claims))
@@ -884,7 +921,8 @@ class SnapshotArchiver:
                 self._delete_objects(archive, objects)
             raise
         finally:
-            heartbeat.stop()
+            if started:
+                heartbeat.stop()
         for archive in published:
             retired = self._rotate_for(archive)
             for old in retired:

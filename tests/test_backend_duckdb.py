@@ -50,6 +50,7 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             "session_notes",
             "session_tags",
             "sessions",
+            "source_leases",
             "tagged_sessions",
             "tags",
         ]

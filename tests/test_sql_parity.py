@@ -111,6 +111,8 @@ def test_synthetic_rows_produce_equal_results_for_every_shipped_view() -> None:
                 write="duckdb",
                 unsupported_level=sqlglot.ErrorLevel.RAISE,
             ):
+                if filename == "ddl.sql" and "source_leases" in statement:
+                    continue
                 transpiled_bigquery.connection.execute(statement)
         seed_synthetic_data(duckdb)
         seed_synthetic_data(transpiled_bigquery)
