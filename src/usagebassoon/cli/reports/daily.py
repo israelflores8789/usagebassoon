@@ -19,6 +19,7 @@ from usagebassoon.cli.reports._common import (
     format_cost_per_million,
     format_tokens,
     load_configured_daily_usage,
+    parse_report_dates,
     parse_width,
     render_table,
     resolve_filters,
@@ -34,6 +35,12 @@ def daily(
         int,
         typer.Option("--limit", min=1, help="Maximum newest-first dates to display."),
     ] = 16,
+    since: Annotated[
+        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+    ] = None,
+    until: Annotated[
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+    ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
     ] = None,
@@ -71,6 +78,7 @@ def daily(
     ] = None,
 ) -> None:
     """Render newest-first daily token usage and calculated cost."""
+    start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
         client=client,
@@ -80,10 +88,15 @@ def daily(
     )
     records = (
         sample_daily_usage(
-            resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID), limit=limit
+            resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID),
+            limit=limit,
+            since=start,
+            until=end,
         )
         if test
-        else load_configured_daily_usage(config, filters, limit=limit)
+        else load_configured_daily_usage(
+            config, filters, limit=limit, since=start, until=end
+        )
     )
     rows = [
         {

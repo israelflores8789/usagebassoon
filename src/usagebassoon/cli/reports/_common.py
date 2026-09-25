@@ -82,6 +82,7 @@ class _SampleUsage:
     cost_usd: float | None
     perf_duration_ms: int | None
     perf_timed_tokens: int | None
+    created_at: datetime | None
     last_active: datetime
     tags: tuple[str, ...]
 
@@ -111,12 +112,50 @@ def resolve_filters(filters: ReportFilters, local_source_id: str) -> ReportFilte
         ) from error
 
 
+def parse_report_dates(
+    since: str | None, until: str | None
+) -> tuple[date | None, date | None]:
+    """Parse optional inclusive day bounds for a terminal report.
+
+    Args:
+        since: Lower day bound in YYYY-MM-DD form.
+        until: Upper day bound in YYYY-MM-DD form.
+
+    Returns:
+        Parsed lower and upper bounds, with omitted bounds left open.
+
+    Raises:
+        typer.BadParameter: A bound is malformed or the range is reversed.
+    """
+
+    def parse(value: str | None, option: str) -> date | None:
+        """Parse one optional day bound and name its CLI option on failure."""
+        if value is None:
+            return None
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"{option} must use YYYY-MM-DD", param_hint=option
+            ) from error
+        if parsed.isoformat() != value:
+            raise typer.BadParameter(f"{option} must use YYYY-MM-DD", param_hint=option)
+        return parsed
+
+    start = parse(since, "--since")
+    end = parse(until, "--until")
+    if start is not None and end is not None and start > end:
+        raise typer.BadParameter("--since must be on or before --until")
+    return start, end
+
+
 def report_where(
     filters: ReportFilters,
     *,
     since: date | None = None,
     until: date | None = None,
     alias: str = "facts",
+    date_column: Literal["day", "last_active", "created_at"] = "day",
 ) -> tuple[str, dict[str, str]]:
     """Build dialect-neutral report predicates and bound string parameters.
 
@@ -128,6 +167,7 @@ def report_where(
         since: Inclusive lower day bound, when applicable.
         until: Inclusive upper day bound, when applicable.
         alias: SQL table alias for the report source view.
+        date_column: Source date or timestamp field to constrain.
 
     Returns:
         SQL ``WHERE`` fragment and its named bindings.
@@ -155,11 +195,16 @@ def report_where(
             ")"
         )
         parameters["tag"] = filters.tag
+    day_expression = (
+        f"{alias}.day"
+        if date_column == "day"
+        else f"CAST({alias}.{date_column} AS DATE)"
+    )
     if since is not None:
-        conditions.append(f"{alias}.day >= CAST(:since AS DATE)")
+        conditions.append(f"{day_expression} >= CAST(:since AS DATE)")
         parameters["since"] = since.isoformat()
     if until is not None:
-        conditions.append(f"{alias}.day <= CAST(:until AS DATE)")
+        conditions.append(f"{day_expression} <= CAST(:until AS DATE)")
         parameters["until"] = until.isoformat()
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     return where, parameters
@@ -216,7 +261,10 @@ def load_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
+    by_created_at: bool = False,
     limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
 ) -> list[ReportRecord]:
     """Load session report rows from the dialect-paired report source view.
 
@@ -224,12 +272,18 @@ def load_session_usage(
         backend: Initialized storage backend.
         filters: Resolved report filters.
         by_model: Keep one row per session/model instead of one session row.
-        limit: Maximum rows after last-active ordering, when requested.
+        by_created_at: Filter and order by session creation time.
+        limit: Maximum rows after timestamp ordering, when requested.
+        since: Inclusive lower date bound on the selected timestamp.
+        until: Inclusive upper date bound on the selected timestamp.
 
     Returns:
         Aggregated session report records.
     """
-    where, parameters = report_where(filters)
+    timestamp = "created_at" if by_created_at else "last_active"
+    where, parameters = report_where(
+        filters, since=since, until=until, date_column=timestamp
+    )
     limit_sql = "" if limit is None else f" LIMIT {limit}"
     model_select = (
         "facts.model AS model, "
@@ -242,11 +296,12 @@ def load_session_usage(
         "facts.cache_write AS cache_write, "
         "facts.total_tokens AS total_tokens, "
         "COALESCE(facts.cost_usd, facts.tokscale_cost_usd) AS cost_usd, "
-        "facts.last_active AS last_active "
+        "facts.last_active AS last_active, "
+        "facts.created_at AS created_at "
         "FROM report_session_models AS facts"
         f"{where} "
-        "ORDER BY facts.last_active DESC NULLS LAST, facts.client, facts.session_id, "
-        "facts.model"
+        f"ORDER BY facts.{timestamp} DESC NULLS LAST, facts.client, "
+        "facts.session_id, facts.model"
     )
     session_select = (
         "STRING_AGG(facts.model, ', ' ORDER BY facts.model) AS model, "
@@ -261,11 +316,12 @@ def load_session_usage(
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
         "THEN SUM(facts.cost_usd) "
         "ELSE SUM(facts.tokscale_cost_usd) END AS cost_usd, "
-        "MAX(facts.last_active) AS last_active "
+        "MAX(facts.last_active) AS last_active, "
+        "MAX(facts.created_at) AS created_at "
         "FROM report_session_models AS facts"
         f"{where} "
         "GROUP BY facts.source_id, facts.client, facts.session_id "
-        "ORDER BY last_active DESC NULLS LAST, facts.client, facts.session_id"
+        f"ORDER BY {timestamp} DESC NULLS LAST, facts.client, facts.session_id"
     )
     select = model_select if by_model else session_select
     sql = f"SELECT facts.source_id, facts.client, facts.session_id, {select}{limit_sql}"
@@ -274,10 +330,14 @@ def load_session_usage(
 
 
 def load_model_usage(
-    backend: StorageBackend, filters: ReportFilters
+    backend: StorageBackend,
+    filters: ReportFilters,
+    *,
+    since: date | None = None,
+    until: date | None = None,
 ) -> list[ReportRecord]:
     """Aggregate filtered daily model facts by model and client."""
-    where, parameters = report_where(filters)
+    where, parameters = report_where(filters, since=since, until=until)
     result = backend.query(
         "SELECT "
         "facts.model AS model, "
@@ -329,13 +389,20 @@ def load_configured_daily_usage(
 
 
 def load_configured_model_usage(
-    config: Path | None, filters: ReportFilters
+    config: Path | None,
+    filters: ReportFilters,
+    *,
+    since: date | None = None,
+    until: date | None = None,
 ) -> list[ReportRecord]:
     """Open the configured warehouse and load filtered model totals."""
     configuration, backend = configured_backend(config)
     try:
         return load_model_usage(
-            backend, resolve_filters(filters, configuration.source_id)
+            backend,
+            resolve_filters(filters, configuration.source_id),
+            since=since,
+            until=until,
         )
     finally:
         close_backend(backend, context="rendering a models report")
@@ -346,7 +413,10 @@ def load_configured_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
+    by_created_at: bool = False,
     limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
 ) -> list[ReportRecord]:
     """Open the configured warehouse and load session report records."""
     configuration, backend = configured_backend(config)
@@ -355,7 +425,10 @@ def load_configured_session_usage(
             backend,
             resolve_filters(filters, configuration.source_id),
             by_model=by_model,
+            by_created_at=by_created_at,
             limit=limit,
+            since=since,
+            until=until,
         )
     finally:
         close_backend(backend, context="rendering a sessions report")
@@ -370,11 +443,7 @@ def sample_daily_usage(
 ) -> list[ReportRecord]:
     """Return deterministic, filtered daily rows without opening a backend."""
     grouped: dict[date, list[_SampleUsage]] = {}
-    for fact in _sample_usage(filters):
-        if (since is not None and fact.day < since) or (
-            until is not None and fact.day > until
-        ):
-            continue
+    for fact in _sample_usage(filters, since=since, until=until):
         grouped.setdefault(fact.day, []).append(fact)
     records = [_daily_record(day, facts) for day, facts in grouped.items()]
     records.sort(key=_daily_sort_key, reverse=True)
@@ -385,7 +454,10 @@ def sample_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
+    by_created_at: bool = False,
     limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
 ) -> list[ReportRecord]:
     """Return deterministic, filtered session rows without opening a backend."""
     grouped: dict[tuple[str, str, str, str | None], list[_SampleUsage]] = {}
@@ -401,14 +473,32 @@ def sample_session_usage(
         _session_record(source_id, client, session_id, facts)
         for (source_id, client, session_id, _), facts in grouped.items()
     ]
-    records.sort(key=_session_sort_key, reverse=True)
+    timestamp = "created_at" if by_created_at else "last_active"
+    if since is not None or until is not None:
+        bounded: list[ReportRecord] = []
+        for record in records:
+            value = record[timestamp]
+            if value is None:
+                continue
+            day = _as_datetime(value).date()
+            if (since is None or day >= since) and (until is None or day <= until):
+                bounded.append(record)
+        records = bounded
+
+    def sort_key(record: ReportRecord) -> tuple[datetime, str, str, str]:
+        """Sort sample sessions by the selected timestamp and identity."""
+        return _session_sort_key(record, timestamp)
+
+    records.sort(key=sort_key, reverse=True)
     return records if limit is None else records[:limit]
 
 
-def sample_model_usage(filters: ReportFilters) -> list[ReportRecord]:
+def sample_model_usage(
+    filters: ReportFilters, *, since: date | None = None, until: date | None = None
+) -> list[ReportRecord]:
     """Aggregate filtered golden daily facts by model and client."""
     grouped: dict[tuple[str, str], list[_SampleUsage]] = {}
-    for fact in _sample_usage(filters):
+    for fact in _sample_usage(filters, since=since, until=until):
         grouped.setdefault((fact.model, fact.client), []).append(fact)
     records = [
         _model_record(model, client, facts)
@@ -593,7 +683,7 @@ def render_tables(
         )
         for header, justify in columns:
             protected_width = (
-                max(len(header), *(len(row[header]) for row in rows))
+                max((len(header), *(len(row[header]) for row in rows)))
                 if width is None
                 or (width >= 80 and (justify == "right" or header == "Model"))
                 else None
@@ -632,9 +722,17 @@ def render_graph(
         save.write_text(text, encoding="utf-8")
 
 
-def _sample_usage(filters: ReportFilters) -> list[_SampleUsage]:
+def _sample_usage(
+    filters: ReportFilters, *, since: date | None = None, until: date | None = None
+) -> list[_SampleUsage]:
     """Return filtered facts parsed from the packaged golden test fixtures."""
-    return [fact for fact in _golden_usage() if _matches(fact, filters)]
+    return [
+        fact
+        for fact in _golden_usage()
+        if _matches(fact, filters)
+        and (since is None or fact.day >= since)
+        and (until is None or fact.day <= until)
+    ]
 
 
 @cache
@@ -650,15 +748,16 @@ def _golden_usage() -> tuple[_SampleUsage, ...]:
         session_metadata = {
             (row.client, row.session_id): (
                 row.workspace or "unknown",
+                row.created_at,
                 row.last_active or datetime(day.year, day.month, day.day, tzinfo=UTC),
             )
             for row in parse_report(_load_fixture_json(report_file))
         }
         for daily_row in parse_daily(_load_fixture_json(daily_file), day=day).entries:
             stats = daily_row.stats
-            workspace, last_active = session_metadata.get(
+            workspace, created_at, last_active = session_metadata.get(
                 (stats.client, stats.session_id),
-                ("unknown", datetime(day.year, day.month, day.day, tzinfo=UTC)),
+                ("unknown", None, datetime(day.year, day.month, day.day, tzinfo=UTC)),
             )
             facts.append(
                 _SampleUsage(
@@ -683,11 +782,31 @@ def _golden_usage() -> tuple[_SampleUsage, ...]:
                     cost_usd=stats.tokscale_cost_usd,
                     perf_duration_ms=stats.perf_duration_ms,
                     perf_timed_tokens=stats.perf_timed_tokens,
+                    created_at=created_at,
                     last_active=last_active,
                     tags=("golden",),
                 )
             )
-    return tuple(facts)
+    session_times: dict[tuple[str, str, str], tuple[datetime | None, datetime]] = {}
+    for fact in facts:
+        key = (fact.source_id, fact.client, fact.session_id)
+        previous = session_times.get(key)
+        if previous is None:
+            session_times[key] = (fact.created_at, fact.last_active)
+            continue
+        created_at = previous[0]
+        if fact.created_at is not None and (
+            created_at is None or fact.created_at < created_at
+        ):
+            created_at = fact.created_at
+        session_times[key] = (created_at, max(previous[1], fact.last_active))
+    normalized: list[_SampleUsage] = []
+    for fact in facts:
+        created_at, last_active = session_times[
+            (fact.source_id, fact.client, fact.session_id)
+        ]
+        normalized.append(replace(fact, created_at=created_at, last_active=last_active))
+    return tuple(normalized)
 
 
 def _golden_fixture_root() -> Path | Traversable:
@@ -746,12 +865,14 @@ def _session_record(
     facts: Sequence[_SampleUsage],
 ) -> ReportRecord:
     """Aggregate sample facts into one session or session/model report record."""
+    creation_times = [fact.created_at for fact in facts if fact.created_at is not None]
     record = _usage_record(
         {
             "source_id": source_id,
             "client": client,
             "session_id": session_id,
             "model": ", ".join(sorted({fact.model for fact in facts})),
+            "created_at": min(creation_times) if creation_times else None,
             "last_active": max(fact.last_active for fact in facts),
         },
         facts,
@@ -804,10 +925,13 @@ def _daily_sort_key(record: ReportRecord) -> date:
     return _as_date(record["day"])
 
 
-def _session_sort_key(record: ReportRecord) -> tuple[datetime, str, str, str]:
+def _session_sort_key(
+    record: ReportRecord, timestamp: str
+) -> tuple[datetime, str, str, str]:
     """Return the descending sort values for one sample session record."""
+    value = record[timestamp]
     return (
-        _as_datetime(record["last_active"]),
+        _as_datetime(value) if value is not None else datetime.min.replace(tzinfo=UTC),
         _as_text(record["client"]),
         _as_text(record["session_id"]),
         _as_text(record["model"]),

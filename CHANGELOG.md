@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.
 - Added support for MotherDuck databases for remote persistence using the `StorageBackend` protocol.
 - Added terminal summary, model, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
+- Added workspace, client, model, tag, source, and inclusive date filters to daily and model reports, session last-active date filters, and a session creation-date display and filter mode; date bounds combine with all other report filters.
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
 - Added source-scoped workspace, client, and session tags and notes for user-curated reports.
 - Added ingest audits, models payload reconciliation, and diagnostics. Repeated detections update issues by source, check, and issue key while retaining first and latest detection metadata.

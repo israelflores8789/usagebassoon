@@ -10,6 +10,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.cli.reports.graph import _tick_positions
@@ -46,15 +47,16 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend.apply_ddl()
     backend.connection.executemany(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, workspace, last_active, first_seen_at, "
-        "last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
+        "(source_id, client, session_id, workspace, created_at, last_active, "
+        "first_seen_at, last_seen_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
         [
             (
                 LOCAL_SOURCE_ID,
                 "codex",
                 "ses_local_demonstration_identifier",
                 "/work/atlas",
+                "2026-09-08 08:00:00+00",
                 "2026-09-11 14:30:00+00",
             ),
             (
@@ -62,6 +64,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
                 "opencode",
                 "ses_local_other",
                 "/work/meteor",
+                "2026-09-09 08:00:00+00",
                 "2026-09-09 10:00:00+00",
             ),
             (
@@ -69,6 +72,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
                 "codex",
                 "ses_remote",
                 "/work/atlas",
+                "2026-09-12 08:00:00+00",
                 "2026-09-12 09:00:00+00",
             ),
         ],
@@ -271,15 +275,17 @@ def test_models_report_weights_timing_after_source_and_tag_filters(
     )
 
     assert all_sources.exit_code == 0
-    assert "Model Token Usage" in all_sources.output
-    assert "Cache R" in all_sources.output
-    assert "Cache \N{MULTIPLICATION SIGN}" in all_sources.output
-    assert "ms/1K" in all_sources.output
-    assert "Cost/1M" in all_sources.output
-    assert "108.91" in all_sources.output
+    all_sources_text = plain_cli_output(all_sources.output)
+    assert "Model Token Usage" in all_sources_text
+    assert "Cache R" in all_sources_text
+    assert "Cache \N{MULTIPLICATION SIGN}" in all_sources_text
+    assert "ms/1K" in all_sources_text
+    assert "Cost/1M" in all_sources_text
+    assert "109" in all_sources_text
     assert local_tagged.exit_code == 0
-    assert "1,000.00" in local_tagged.output
-    assert "108.91" not in local_tagged.output
+    local_tagged_text = plain_cli_output(local_tagged.output)
+    assert "1,000" in local_tagged_text
+    assert "109" not in local_tagged_text
 
 
 def test_models_report_test_mode_uses_daily_fixture_timing() -> None:
@@ -326,7 +332,7 @@ def test_models_report_excludes_duration_without_timed_tokens(tmp_path: Path) ->
     )
 
     assert result.exit_code == 0
-    assert "1,000.00" in result.output
+    assert "1,000" in plain_cli_output(result.output)
 
 
 def test_sessions_report_defaults_to_session_and_can_split_models(
@@ -381,6 +387,167 @@ def test_sessions_report_defaults_to_session_and_can_split_models(
     assert "Session Token Usage by Model" in model_result.output
     assert "gpt-test" in model_result.output
     assert "gpt-mini" in model_result.output
+
+
+def test_daily_and_models_date_bounds_compose_with_source_and_client(
+    tmp_path: Path,
+) -> None:
+    """Apply usage-day bounds alongside source and client filters."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    runner = CliRunner()
+    options = [
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--client",
+        "codex",
+        "--since",
+        "2026-09-10",
+        "--until",
+        "2026-09-10",
+        "--width",
+        "max",
+    ]
+
+    daily = runner.invoke(app, ["report", "daily", *options])
+    models = runner.invoke(app, ["report", "models", *options])
+
+    assert daily.exit_code == 0
+    daily_text = plain_cli_output(daily.output)
+    assert "2026-09-10" in daily_text
+    assert "2026-09-11" not in daily_text
+    assert "2026-09-12" not in daily_text
+    assert models.exit_code == 0
+    models_text = plain_cli_output(models.output)
+    assert "gpt-test" in models_text
+    assert "gpt-mini" not in models_text
+    assert "claude-test" not in models_text
+    assert "185" in models_text
+    assert "1,657" not in models_text
+
+
+def test_session_date_bounds_select_whole_sessions_and_creation_mode(
+    tmp_path: Path,
+) -> None:
+    """Filter complete session totals by the selected session timestamp."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    runner = CliRunner()
+    options = [
+        "report",
+        "sessions",
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--client",
+        "codex",
+        "--width",
+        "max",
+    ]
+
+    last_active = runner.invoke(
+        app, [*options, "--since", "2026-09-11", "--until", "2026-09-11"]
+    )
+    by_model = runner.invoke(
+        app,
+        [
+            *options,
+            "--by-model",
+            "--since",
+            "2026-09-11",
+            "--until",
+            "2026-09-11",
+        ],
+    )
+    by_created_at = runner.invoke(
+        app,
+        [
+            *options,
+            "--by-created-at",
+            "--since",
+            "2026-09-08",
+            "--until",
+            "2026-09-08",
+        ],
+    )
+    created_by_model = runner.invoke(
+        app,
+        [
+            *options,
+            "--by-model",
+            "--by-created-at",
+            "--since",
+            "2026-09-08",
+            "--until",
+            "2026-09-08",
+        ],
+    )
+    created_at_excluded = runner.invoke(
+        app,
+        [*options, "--by-created-at", "--since", "2026-09-11"],
+    )
+
+    assert last_active.exit_code == 0
+    last_active_text = plain_cli_output(last_active.output)
+    assert "ses_local_demonstration_identifier" in last_active_text
+    assert "278" in last_active_text
+    assert "ses_local_other" not in last_active_text
+    assert "ses_remote" not in last_active_text
+    assert by_model.exit_code == 0
+    by_model_text = plain_cli_output(by_model.output)
+    assert "gpt-test" in by_model_text
+    assert "gpt-mini" in by_model_text
+    assert "185" in by_model_text
+    assert "93" in by_model_text
+    assert by_created_at.exit_code == 0
+    created_text = plain_cli_output(by_created_at.output)
+    assert "Created At" in created_text
+    assert "Last Active" not in created_text
+    assert "2026-09-08 08:00" in created_text
+    assert "278" in created_text
+    assert created_by_model.exit_code == 0
+    created_by_model_text = plain_cli_output(created_by_model.output)
+    assert "Created At" in created_by_model_text
+    assert "gpt-test" in created_by_model_text
+    assert "gpt-mini" in created_by_model_text
+    assert created_at_excluded.exit_code == 0
+    assert "ses_local_demonstration_identifier" not in plain_cli_output(
+        created_at_excluded.output
+    )
+
+
+def test_session_creation_mode_changes_ordering(tmp_path: Path) -> None:
+    """Order complete sessions by the timestamp named in the last column."""
+    config, backend = _configured_store(tmp_path)
+    backend.close()
+    runner = CliRunner()
+    options = [
+        "report",
+        "sessions",
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--width",
+        "max",
+    ]
+
+    active = runner.invoke(app, options)
+    created = runner.invoke(app, [*options, "--by-created-at"])
+
+    assert active.exit_code == 0
+    active_text = plain_cli_output(active.output)
+    assert active_text.index("ses_local_demonstration_identifier") < active_text.index(
+        "ses_local_other"
+    )
+    assert created.exit_code == 0
+    created_text = plain_cli_output(created.output)
+    assert created_text.index("ses_local_other") < created_text.index(
+        "ses_local_demonstration_identifier"
+    )
 
 
 def test_session_values_and_model_counts_remain_whole_at_eighty_columns() -> None:
