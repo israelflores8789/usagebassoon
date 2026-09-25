@@ -8,6 +8,11 @@ CREATE OR REPLACE VIEW daily_cost AS
 SELECT
     daily_stats.*,
     CASE
+        WHEN daily_stats.perf_timed_tokens > 0
+            AND daily_stats.perf_duration_ms IS NOT NULL
+        THEN 1000.0 * daily_stats.perf_duration_ms / daily_stats.perf_timed_tokens
+    END AS ms_per_1k_tokens,
+    CASE
         WHEN (daily_stats.input_tokens <> 0 AND price_versions.price_input_per_token IS NULL)
             OR ((daily_stats.output_tokens <> 0 OR daily_stats.reasoning <> 0)
                 AND price_versions.price_output_per_token IS NULL)
@@ -28,6 +33,13 @@ LEFT JOIN price_versions
 
 CREATE OR REPLACE VIEW session_model_stats AS
 SELECT
+    totals.*,
+    CASE
+        WHEN totals.perf_timed_tokens > 0
+        THEN 1000.0 * totals.perf_duration_ms / totals.perf_timed_tokens
+    END AS ms_per_1k_tokens
+FROM (
+SELECT
     source_id,
     client,
     session_id,
@@ -41,10 +53,20 @@ SELECT
     SUM(total_tokens) AS total_tokens,
     SUM(message_count) AS message_count,
     SUM(tokscale_cost_usd) AS tokscale_cost_usd,
+    SUM(CASE
+        WHEN perf_duration_ms IS NOT NULL AND perf_timed_tokens > 0
+        THEN perf_duration_ms
+    END) AS perf_duration_ms,
+    SUM(CASE
+        WHEN perf_duration_ms IS NOT NULL AND perf_timed_tokens > 0
+        THEN perf_timed_tokens
+    END) AS perf_timed_tokens,
+    SUM(perf_sample_count) AS perf_sample_count,
     CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS cost_usd,
     MAX(updated_at) AS updated_at
 FROM daily_cost
-GROUP BY source_id, client, session_id, model;
+GROUP BY source_id, client, session_id, model
+) AS totals;
 
 CREATE OR REPLACE VIEW session_model_stats_current AS
 SELECT * FROM session_model_stats;
@@ -65,6 +87,12 @@ SELECT
     daily_cost.cache_write,
     daily_cost.reasoning,
     daily_cost.total_tokens,
+    daily_cost.perf_duration_ms,
+    daily_cost.perf_timed_tokens,
+    daily_cost.perf_sample_count,
+    daily_cost.perf_token_coverage,
+    daily_cost.tokscale_ms_per_1k_tokens,
+    daily_cost.ms_per_1k_tokens,
     daily_cost.cost_usd,
     daily_cost.tokscale_cost_usd
 FROM daily_cost
@@ -87,6 +115,10 @@ SELECT
     session_model_stats.cache_write,
     session_model_stats.reasoning,
     session_model_stats.total_tokens,
+    session_model_stats.perf_duration_ms,
+    session_model_stats.perf_timed_tokens,
+    session_model_stats.perf_sample_count,
+    session_model_stats.ms_per_1k_tokens,
     session_model_stats.cost_usd,
     session_model_stats.tokscale_cost_usd
 FROM session_model_stats
@@ -111,7 +143,7 @@ FROM (
     GROUP BY source_id, client, session_id
 ) AS session_costs;
 
-CREATE OR REPLACE VIEW report_models AS
+CREATE OR REPLACE VIEW report_summary_models AS
 SELECT
     model,
     COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -119,6 +151,31 @@ SELECT
 FROM report_session_models
 GROUP BY model
 ORDER BY cost_usd DESC, model;
+
+-- Model reports filter source facts before aggregating by client and model.
+CREATE OR REPLACE VIEW report_models AS
+SELECT
+    source_id,
+    day,
+    client,
+    session_id,
+    model,
+    workspace,
+    input_tokens,
+    output_tokens,
+    cache_read,
+    cache_write,
+    reasoning,
+    total_tokens,
+    perf_duration_ms,
+    perf_timed_tokens,
+    perf_sample_count,
+    perf_token_coverage,
+    tokscale_ms_per_1k_tokens,
+    ms_per_1k_tokens,
+    cost_usd,
+    tokscale_cost_usd
+FROM report_daily_usage;
 
 CREATE OR REPLACE VIEW session_tags AS
 SELECT DISTINCT

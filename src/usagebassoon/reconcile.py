@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from math import isclose
 
 from usagebassoon.parsers.daily import DailyModelsPayload
 
@@ -157,6 +158,31 @@ def reconcile_all(
                 "total_cost_mismatch",
                 f"{day.isoformat()}: totalCost={declared_cost}, "
                 f"entries sum={actual_cost}",
+            )
+        performance_mismatches: list[str] = []
+        for row in rows:
+            duration = row.perf_duration_ms
+            timed_tokens = row.perf_timed_tokens
+            reported = row.tokscale_ms_per_1k_tokens
+            if duration is None or timed_tokens is None or reported is None:
+                continue
+            calculated = 1000.0 * duration / timed_tokens if timed_tokens else None
+            if calculated is None:
+                mismatch = duration != 0 or reported != 0
+            else:
+                mismatch = not isclose(calculated, reported, rel_tol=1e-9, abs_tol=1e-9)
+            if mismatch:
+                performance_mismatches.append(
+                    f"{row.client}/{row.model}: reported={reported}, "
+                    f"calculated={calculated}"
+                )
+        if performance_mismatches:
+            affected_days.add(day)
+            issues["performance_rate_mismatch"] = ReconciliationIssue(
+                "models_performance",
+                "performance_rate_mismatch",
+                f"{day.isoformat()}: {len(performance_mismatches)} rate mismatch(es); "
+                f"{performance_mismatches[0]}",
             )
     return ReconciliationResult(
         tuple(issues[key] for key in sorted(issues)),

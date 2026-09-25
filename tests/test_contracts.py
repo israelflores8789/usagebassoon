@@ -118,6 +118,25 @@ def test_unused_graph_fields_are_optional_in_the_shipped_contract() -> None:
     assert validation.fatal is False
 
 
+def test_models_performance_can_be_absent_without_losing_token_facts() -> None:
+    """Keep timing optional while monitoring present performance field types."""
+    models_contract = load_shipped_contracts()["models"]
+    entries = {entry.path: entry for entry in models_contract.entries}
+    performance = tuple(
+        entry
+        for path, entry in entries.items()
+        if path == "entries[].performance" or path.startswith("entries[].performance.")
+    )
+    assert len(performance) == 6
+    assert all(not entry.required for entry in performance)
+    focused = PayloadContract(
+        payload_kind=models_contract.payload_kind,
+        tokscale_version=models_contract.tokscale_version,
+        entries=performance,
+    )
+    assert diff_contract(focused, {}).events == ()
+
+
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,

@@ -9,6 +9,7 @@ import typer
 
 from usagebassoon.cli.reports.daily import daily
 from usagebassoon.cli.reports.graph import graph
+from usagebassoon.cli.reports.models import models
 from usagebassoon.cli.reports.sessions import sessions
 from usagebassoon.cli.reports.summary import summary
 
@@ -18,6 +19,7 @@ report_app = typer.Typer(
 )
 
 report_app.command("daily")(daily)
+report_app.command("models")(models)
 report_app.command("sessions")(sessions)
 report_app.command("graph")(graph)
 report_app.command("summary")(summary)

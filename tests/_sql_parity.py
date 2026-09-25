@@ -145,6 +145,11 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "total_tokens": 15,
                 "message_count": 1,
                 "tokscale_cost_usd": 1.5,
+                "perf_duration_ms": 30,
+                "perf_timed_tokens": 15,
+                "perf_sample_count": 1,
+                "perf_token_coverage": 1.0,
+                "tokscale_ms_per_1k_tokens": 2_000.0,
                 "updated_at": _CAPTURED_AT,
             },
             {
@@ -162,6 +167,11 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "total_tokens": 7,
                 "message_count": 1,
                 "tokscale_cost_usd": 0.7,
+                "perf_duration_ms": 14,
+                "perf_timed_tokens": 7,
+                "perf_sample_count": 1,
+                "perf_token_coverage": 1.0,
+                "tokscale_ms_per_1k_tokens": 2_000.0,
                 "updated_at": _CAPTURED_AT,
             },
             {
@@ -179,6 +189,11 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "total_tokens": 3,
                 "message_count": 1,
                 "tokscale_cost_usd": 1.5,
+                "perf_duration_ms": 100,
+                "perf_timed_tokens": 0,
+                "perf_sample_count": 0,
+                "perf_token_coverage": 0.0,
+                "tokscale_ms_per_1k_tokens": 0.0,
                 "updated_at": _CAPTURED_AT,
             },
         ],
@@ -291,7 +306,7 @@ def assert_view_results_match(
             f"{name}: result columns differ: "
             f"left={left_result.column_names!r}, right={right_result.column_names!r}"
         )
-        preserve_order = name == "report_models"
+        preserve_order = name == "report_summary_models"
         left_records = normalized_records(
             left_result,
             preserve_order=preserve_order,
@@ -301,7 +316,7 @@ def assert_view_results_match(
             preserve_order=preserve_order,
         )
         _assert_records_match(name, left_records, right_records)
-    report_models = left.query("SELECT * FROM report_models")
+    report_models = left.query("SELECT * FROM report_summary_models")
     assert report_models.column("model").to_pylist() == [
         "model-alpha",
         "model-gamma",

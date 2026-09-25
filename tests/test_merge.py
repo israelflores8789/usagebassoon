@@ -30,8 +30,13 @@ def test_normalize_emits_daily_tables_and_ingest_status(
     """Emit only base tables needed for daily facts and calculated views."""
     normalized = normalize(collection_bundle)
     assert "session_model_stats" not in normalized.tables
-    assert normalized.tables["daily_stats"].column_names[-2:] == [
+    assert normalized.tables["daily_stats"].column_names[-7:] == [
         "tokscale_cost_usd",
+        "perf_duration_ms",
+        "perf_timed_tokens",
+        "perf_sample_count",
+        "perf_token_coverage",
+        "tokscale_ms_per_1k_tokens",
         "updated_at",
     ]
     assert normalized.tables["price_versions"].column_names[-2:] == [
@@ -163,6 +168,55 @@ def test_reasoning_uses_the_output_price(
         assert row["cost_usd"] >= (
             (row["output_tokens"] + row["reasoning"]) * row["price_output_per_token"]
         )
+    finally:
+        backend.close()
+
+
+def test_refreshed_daily_timing_replaces_the_prior_observation(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Upsert the latest timing components at the existing daily natural key."""
+    first = normalize(collection_bundle)
+    refreshed = normalize(
+        replace(
+            collection_bundle,
+            run_id=str(uuid4()),
+            started_at=collection_bundle.started_at + timedelta(minutes=1),
+            finished_at=collection_bundle.finished_at + timedelta(minutes=1),
+        )
+    )
+    original = first.tables["daily_stats"].slice(0, 1).to_pylist()[0]
+    refreshed_daily = refreshed.tables["daily_stats"]
+    for name, value in (("perf_duration_ms", 1_234), ("perf_timed_tokens", 5_678)):
+        index = refreshed_daily.schema.get_field_index(name)
+        values = refreshed_daily.column(name).to_pylist()
+        refreshed_daily = refreshed_daily.set_column(
+            index,
+            refreshed_daily.schema.field(index),
+            pa.array(
+                [value, *values[1:]], type=refreshed_daily.schema.field(index).type
+            ),
+        )
+    refreshed = replace(
+        refreshed, tables={**refreshed.tables, "daily_stats": refreshed_daily}
+    )
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, first)
+        persist_run(backend, refreshed)
+        row = backend.query(
+            "SELECT perf_duration_ms, perf_timed_tokens, ms_per_1k_tokens "
+            "FROM daily_cost WHERE source_id = :source_id AND day = :day "
+            "AND client = :client AND session_id = :session_id AND model = :model",
+            {
+                key: original[key]
+                for key in ("source_id", "day", "client", "session_id", "model")
+            },
+        ).to_pylist()[0]
+        assert row["perf_duration_ms"] == 1_234
+        assert row["perf_timed_tokens"] == 5_678
+        assert row["ms_per_1k_tokens"] == pytest.approx(1_000 * 1_234 / 5_678)
     finally:
         backend.close()
 

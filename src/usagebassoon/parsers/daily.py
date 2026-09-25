@@ -38,8 +38,10 @@ class ModelStatsRow(BaseModel):
     reasoning: NonNegativeInt = 0
     message_count: NonNegativeInt = Field(default=0, alias="messageCount")
     tokscale_cost_usd: NonNegativeFloat = Field(default=0.0, alias="cost")
-    ms_per_1k_tokens: NonNegativeFloat | None = None
+    tokscale_ms_per_1k_tokens: NonNegativeFloat | None = None
     perf_duration_ms: NonNegativeInt | None = None
+    perf_timed_tokens: NonNegativeInt | None = None
+    perf_sample_count: NonNegativeInt | None = None
     perf_token_coverage: UnitInterval | None = None
 
     @field_validator("merged_clients", mode="before")
@@ -77,8 +79,10 @@ class ModelStatsRow(BaseModel):
         return cls.model_validate(
             {
                 **entry,
-                "ms_per_1k_tokens": perf.get("msPer1KTokens"),
+                "tokscale_ms_per_1k_tokens": perf.get("msPer1KTokens"),
                 "perf_duration_ms": perf.get("totalDurationMs"),
+                "perf_timed_tokens": perf.get("timedTokens"),
+                "perf_sample_count": perf.get("sampleCount"),
                 "perf_token_coverage": perf.get("tokenCoverage"),
             }
         )

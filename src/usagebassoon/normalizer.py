@@ -60,6 +60,11 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("total_tokens", pa.int64()),
             pa.field("message_count", pa.int64()),
             pa.field("tokscale_cost_usd", pa.float64()),
+            pa.field("perf_duration_ms", pa.int64()),
+            pa.field("perf_timed_tokens", pa.int64()),
+            pa.field("perf_sample_count", pa.int64()),
+            pa.field("perf_token_coverage", pa.float64()),
+            pa.field("tokscale_ms_per_1k_tokens", pa.float64()),
             pa.field("updated_at", _TIMESTAMP),
         ]
     ),
@@ -243,6 +248,11 @@ def _daily_stats_rows(
                     ),
                     "message_count": row.message_count,
                     "tokscale_cost_usd": row.tokscale_cost_usd,
+                    "perf_duration_ms": row.perf_duration_ms,
+                    "perf_timed_tokens": row.perf_timed_tokens,
+                    "perf_sample_count": row.perf_sample_count,
+                    "perf_token_coverage": row.perf_token_coverage,
+                    "tokscale_ms_per_1k_tokens": row.tokscale_ms_per_1k_tokens,
                     "updated_at": at,
                 }
             )
