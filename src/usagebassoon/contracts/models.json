@@ -78,42 +78,42 @@
       "types": [
         "object"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].performance.msPer1KTokens",
       "types": [
         "float"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].performance.sampleCount",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].performance.timedTokens",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].performance.tokenCoverage",
       "types": [
         "float"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].performance.totalDurationMs",
       "types": [
         "int"
       ],
-      "required": true
+      "required": false
     },
     {
       "path": "entries[].provider",

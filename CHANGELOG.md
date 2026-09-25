@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added support for local DuckDB databases using the `StorageBackend` protocol.
 - Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.
 - Added support for MotherDuck databases for remote persistence using the `StorageBackend` protocol.
-- Added terminal summary, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
+- Added terminal summary, model, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
+- Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
 - Added source-scoped workspace, client, and session tags and notes for user-curated reports.
 - Added ingest audits, models payload reconciliation, and diagnostics. Repeated detections update issues by source, check, and issue key while retaining first and latest detection metadata.
 - Added portable Parquet snapshots and restore for local and remote object store archives, with catalog-based publication, integrity checks, retention, and optional collection-triggered cadence.

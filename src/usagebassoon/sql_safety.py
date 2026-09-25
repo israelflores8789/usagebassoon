@@ -15,6 +15,7 @@ PUBLIC_RELATIONS = frozenset(
         "daily_cost",
         "noted_sessions",
         "report_models",
+        "report_summary_models",
         "report_summary",
         "report_daily_usage",
         "report_session_models",

@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     total_tokens INT64 NOT NULL,
     message_count INT64,
     tokscale_cost_usd FLOAT64,
+    perf_duration_ms INT64,
+    perf_timed_tokens INT64,
+    perf_sample_count INT64,
+    perf_token_coverage FLOAT64,
+    tokscale_ms_per_1k_tokens FLOAT64,
     updated_at TIMESTAMP NOT NULL
 );
 

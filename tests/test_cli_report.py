@@ -163,6 +163,7 @@ def test_report_group_lists_v1_commands() -> None:
 
     assert result.exit_code == 0
     assert "daily" in result.output
+    assert "models" in result.output
     assert "sessions" in result.output
     assert "graph" in result.output
 
@@ -233,6 +234,99 @@ def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
     assert result.exit_code == 0
     assert "$1.23" in result.output
     assert "$6,670.270" in result.output
+
+
+def test_models_report_weights_timing_after_source_and_tag_filters(
+    tmp_path: Path,
+) -> None:
+    """Aggregate timing by model/client from the filtered daily components."""
+    config, backend = _configured_store(tmp_path)
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 100, perf_timed_tokens = 100 "
+        "WHERE source_id = ? AND model = 'gpt-test'",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 1000, perf_timed_tokens = 10000 "
+        "WHERE source_id = ? AND model = 'gpt-test'",
+        [REMOTE_SOURCE_ID],
+    )
+    backend.close()
+    runner = CliRunner()
+    command = [
+        "report",
+        "models",
+        "--config",
+        str(config),
+        "--model",
+        "gpt-test",
+        "--width",
+        "max",
+        "--sanitize",
+    ]
+
+    all_sources = runner.invoke(app, command)
+    local_tagged = runner.invoke(
+        app, [*command, "--source", "local", "--tag", "focused"]
+    )
+
+    assert all_sources.exit_code == 0
+    assert "Model Token Usage" in all_sources.output
+    assert "Cache R" in all_sources.output
+    assert "Cache \N{MULTIPLICATION SIGN}" in all_sources.output
+    assert "ms/1K" in all_sources.output
+    assert "Cost/1M" in all_sources.output
+    assert "108.91" in all_sources.output
+    assert local_tagged.exit_code == 0
+    assert "1,000.00" in local_tagged.output
+    assert "108.91" not in local_tagged.output
+
+
+def test_models_report_test_mode_uses_daily_fixture_timing() -> None:
+    """Show model timing from golden daily fixtures without a configured backend."""
+    result = CliRunner().invoke(
+        app, ["report", "models", "--test", "--width", "max", "--sanitize"]
+    )
+
+    assert result.exit_code == 0
+    assert "gemini-3.7-flash" in result.output
+    assert "gpt-5.6-terra" in result.output
+    assert "ms/1K" in result.output
+    assert "—" not in result.output
+
+
+def test_models_report_excludes_duration_without_timed_tokens(tmp_path: Path) -> None:
+    """Keep zero-token timing rows out of the grouped performance rate."""
+    config, backend = _configured_store(tmp_path)
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 100, perf_timed_tokens = 100 "
+        "WHERE source_id = ? AND model = 'gpt-test'",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 1000, perf_timed_tokens = 0 "
+        "WHERE source_id = ? AND model = 'gpt-test'",
+        [REMOTE_SOURCE_ID],
+    )
+    backend.close()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "models",
+            "--config",
+            str(config),
+            "--model",
+            "gpt-test",
+            "--width",
+            "max",
+            "--sanitize",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "1,000.00" in result.output
 
 
 def test_sessions_report_defaults_to_session_and_can_split_models(

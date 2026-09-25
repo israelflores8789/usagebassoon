@@ -80,6 +80,8 @@ class _SampleUsage:
     reasoning: int
     total_tokens: int
     cost_usd: float | None
+    perf_duration_ms: int | None
+    perf_timed_tokens: int | None
     last_active: datetime
     tags: tuple[str, ...]
 
@@ -271,6 +273,39 @@ def load_session_usage(
     return [dict(record) for record in result.to_pylist()]
 
 
+def load_model_usage(
+    backend: StorageBackend, filters: ReportFilters
+) -> list[ReportRecord]:
+    """Aggregate filtered daily model facts by model and client."""
+    where, parameters = report_where(filters)
+    result = backend.query(
+        "SELECT "
+        "facts.model AS model, "
+        "facts.client AS client, "
+        "SUM(COALESCE(facts.input_tokens, 0)) AS input_tokens, "
+        "SUM(COALESCE(facts.output_tokens, 0) + COALESCE(facts.reasoning, 0)) "
+        "AS output_tokens, "
+        "SUM(COALESCE(facts.cache_read, 0)) AS cache_read, "
+        "SUM(COALESCE(facts.cache_write, 0)) AS cache_write, "
+        "SUM(COALESCE(facts.total_tokens, 0)) AS total_tokens, "
+        "SUM(CASE WHEN facts.perf_duration_ms IS NOT NULL "
+        "AND facts.perf_timed_tokens > 0 "
+        "THEN facts.perf_duration_ms END) AS perf_duration_ms, "
+        "SUM(CASE WHEN facts.perf_duration_ms IS NOT NULL "
+        "AND facts.perf_timed_tokens > 0 "
+        "THEN facts.perf_timed_tokens END) AS perf_timed_tokens, "
+        "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
+        "THEN SUM(facts.cost_usd) ELSE SUM(facts.tokscale_cost_usd) "
+        "END AS cost_usd "
+        "FROM report_models AS facts"
+        f"{where} "
+        "GROUP BY facts.model, facts.client "
+        "ORDER BY total_tokens DESC, facts.model, facts.client",
+        parameters,
+    )
+    return [dict(record) for record in result.to_pylist()]
+
+
 def load_configured_daily_usage(
     config: Path | None,
     filters: ReportFilters,
@@ -291,6 +326,19 @@ def load_configured_daily_usage(
         )
     finally:
         close_backend(backend, context="rendering a daily report")
+
+
+def load_configured_model_usage(
+    config: Path | None, filters: ReportFilters
+) -> list[ReportRecord]:
+    """Open the configured warehouse and load filtered model totals."""
+    configuration, backend = configured_backend(config)
+    try:
+        return load_model_usage(
+            backend, resolve_filters(filters, configuration.source_id)
+        )
+    finally:
+        close_backend(backend, context="rendering a models report")
 
 
 def load_configured_session_usage(
@@ -355,6 +403,28 @@ def sample_session_usage(
     ]
     records.sort(key=_session_sort_key, reverse=True)
     return records if limit is None else records[:limit]
+
+
+def sample_model_usage(filters: ReportFilters) -> list[ReportRecord]:
+    """Aggregate filtered golden daily facts by model and client."""
+    grouped: dict[tuple[str, str], list[_SampleUsage]] = {}
+    for fact in _sample_usage(filters):
+        grouped.setdefault((fact.model, fact.client), []).append(fact)
+    records = [
+        _model_record(model, client, facts)
+        for (model, client), facts in grouped.items()
+    ]
+    records.sort(key=_model_sort_key)
+    return records
+
+
+def _model_sort_key(record: ReportRecord) -> tuple[int, str, str]:
+    """Sort sample model rows by descending tokens and stable identifiers."""
+    return (
+        -integer_value(record["total_tokens"]),
+        str(record["model"]),
+        str(record["client"]),
+    )
 
 
 def parse_width(value: str) -> int | None:
@@ -425,6 +495,17 @@ def format_cost_per_million(
     if amount is None or total == 0:
         return "—"
     return f"${amount * 1_000_000 / total:,.{precision}f}"
+
+
+def format_ms_per_1k_tokens(
+    duration_ms: object, timed_tokens: object, *, precision: int = 2
+) -> str:
+    """Format milliseconds per thousand timed tokens from additive components."""
+    duration = numeric_value(duration_ms)
+    tokens = integer_value(timed_tokens)
+    if duration is None or tokens <= 0:
+        return "—"
+    return f"{duration * 1_000 / tokens:,.{precision}f}"
 
 
 def format_cache_multiplier(cache_read: object, input_tokens: object) -> str:
@@ -600,6 +681,8 @@ def _golden_usage() -> tuple[_SampleUsage, ...]:
                         + stats.reasoning
                     ),
                     cost_usd=stats.tokscale_cost_usd,
+                    perf_duration_ms=stats.perf_duration_ms,
+                    perf_timed_tokens=stats.perf_timed_tokens,
                     last_active=last_active,
                     tags=("golden",),
                 )
@@ -672,6 +755,27 @@ def _session_record(
             "last_active": max(fact.last_active for fact in facts),
         },
         facts,
+    )
+    return record
+
+
+def _model_record(
+    model: str, client: str, facts: Sequence[_SampleUsage]
+) -> ReportRecord:
+    """Aggregate sample usage and paired timing components for one model/client."""
+    record = _usage_record({"model": model, "client": client}, facts)
+    timed = [
+        fact
+        for fact in facts
+        if fact.perf_duration_ms is not None
+        and fact.perf_timed_tokens is not None
+        and fact.perf_timed_tokens > 0
+    ]
+    record["perf_duration_ms"] = (
+        sum(fact.perf_duration_ms or 0 for fact in timed) if timed else None
+    )
+    record["perf_timed_tokens"] = (
+        sum(fact.perf_timed_tokens or 0 for fact in timed) if timed else None
     )
     return record
 

@@ -62,6 +62,30 @@ def test_model_totals_identify_assertion_across_days(
     assert next_day.isoformat() in issue.message
 
 
+def test_performance_rate_mismatch_is_reconciled_without_unsafe_facts(
+    daily_models: dict[date, DailyModelsPayload],
+) -> None:
+    """Retain daily facts while reporting a conflicting Tokscale timing rate."""
+    day = min(daily_models)
+    original = daily_models[day]
+    first = original.entries[0]
+    rate = first.stats.tokscale_ms_per_1k_tokens
+    assert rate is not None
+    changed_row = replace(
+        first,
+        stats=first.stats.model_copy(update={"tokscale_ms_per_1k_tokens": rate + 1}),
+    )
+    changed = replace(original, entries=(changed_row, *original.entries[1:]))
+
+    result = reconcile_all({day: changed})
+
+    assert result.affected_days == {day}
+    assert result.unsafe_days == frozenset()
+    assert [(issue.check, issue.key) for issue in result.issues] == [
+        ("models_performance", "performance_rate_mismatch")
+    ]
+
+
 def test_repeated_issue_updates_one_row(
     collection_bundle: CollectionBundle,
 ) -> None:

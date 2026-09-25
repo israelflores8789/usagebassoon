@@ -84,6 +84,11 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     total_tokens BIGINT NOT NULL,
     message_count BIGINT,
     tokscale_cost_usd DOUBLE,
+    perf_duration_ms BIGINT,
+    perf_timed_tokens BIGINT,
+    perf_sample_count BIGINT,
+    perf_token_coverage DOUBLE,
+    tokscale_ms_per_1k_tokens DOUBLE,
     updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day, client, session_id, model)
 );

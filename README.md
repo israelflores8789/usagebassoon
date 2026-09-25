@@ -97,6 +97,7 @@ bunx tokscale --version  # v4.15.1
 ## Terminal Reports
 
 - `bassoon report summary` shows summary statistics.
+- `bassoon report models` shows token, cost, and timing statistics by model and client.
 - `bassoon report daily` shows the newest daily usage and cost rows (16 by default).
 - `bassoon report sessions` shows the newest sessions.
 - `bassoon report graph` renders up to 31 days of daily bars.
@@ -128,6 +129,22 @@ UsageBassoon Summary
  gpt-5.6-terra            9.3M      $3.60
  gpt-5.6-luna             4.7M      $0.18
 ```
+
+### Models
+
+```text
+$ bassoon report models --test --sanitize
+                                  Model Token Usage
+
+ Model            Client    Input Output Cache R Cache ×  Total  ms/1K Cost/1M   Cost
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ gemini-3.7-flash opencode  52.4M   1.6M  239.5M   4.57× 293.4M 110.03  $0.215 $63.13
+ gemini-3.8-flash opencode  25.2M   1.4M  244.3M   9.70× 270.9M  60.20  $0.157 $42.58
+ gpt-5.6-terra    codex    436.8K  80.6K    8.8M  20.12×   9.3M 303.89  $0.387  $3.60
+ gpt-5.6-luna     codex    308.7K  22.1K    4.4M  14.09×   4.7M 104.61  $0.037  $0.18
+```
+
+`ms/1K` is calculated from the total measured milliseconds and timed tokens for each model and client. `Cache ×` is cache-read tokens divided by input tokens. Output includes reasoning tokens.
 
 ### Daily usage
 

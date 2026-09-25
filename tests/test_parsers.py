@@ -44,8 +44,13 @@ def test_models_field_promotion(
         for daily in payload.entries
         if daily.stats.model == "gemini-3.8-flash"
     )
-    assert row.ms_per_1k_tokens is not None
+    assert row.tokscale_ms_per_1k_tokens is not None
     assert row.perf_duration_ms is not None
+    assert row.perf_timed_tokens is not None
+    assert row.perf_sample_count is not None
+    assert row.tokscale_ms_per_1k_tokens == pytest.approx(
+        1_000 * row.perf_duration_ms / row.perf_timed_tokens
+    )
     assert 0.0 <= (row.perf_token_coverage or 0.0) <= 1.0
 
 
