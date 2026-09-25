@@ -22,11 +22,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery
 from typer.testing import CliRunner
 
@@ -36,8 +37,14 @@ from tests.conftest import (
     EXPECTED_DAYS,
     EXPECTED_REPORT_ROWS,
 )
+from usagebassoon import persistence as persistence_module
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
-from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
+from usagebassoon.backends.base import (
+    CurrentStateWrite,
+    PersistenceBatch,
+    SourceLeaseBusy,
+    SourceLeaseToken,
+)
 from usagebassoon.backends.bigquery import BigQueryBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
@@ -45,6 +52,7 @@ from usagebassoon.config import ConfigurationManager
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
+from usagebassoon.source_leases import source_lease
 
 pytestmark = pytest.mark.bigquery_live
 
@@ -236,6 +244,30 @@ def _stage_tables(
     )
 
 
+def _audit_only_batch(
+    source_id: str,
+    run_id: str,
+    *,
+    lease: SourceLeaseToken | None = None,
+) -> PersistenceBatch:
+    """Build a valid minimal batch for live lease and ledger assertions."""
+    return PersistenceBatch(
+        run_id=run_id,
+        current_state=(),
+        append_only={},
+        ingest_runs=pa.table(
+            {
+                "run_id": [run_id],
+                "source_id": [source_id],
+                "started_at": [datetime.now(UTC)],
+                "rows_inserted": [0],
+                "rows_updated": [0],
+            }
+        ),
+        lease=lease,
+    )
+
+
 def test_live_synthetic_views_match_duckdb(live_settings: LiveSettings) -> None:
     """Compare every view using purpose-built rows in native BigQuery."""
     duckdb_backend = DuckDBBackend(":memory:")
@@ -375,6 +407,275 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         bigquery_backend.close()
 
 
+def test_live_source_lease_takeover_fences_stale_batches(
+    live_settings: LiveSettings,
+) -> None:
+    """Reclaim an expired source and reject its former owner's batch."""
+    first_backend = _backend(live_settings)
+    second_backend = _backend(live_settings)
+    source_id = str(uuid4())
+    first_run = str(uuid4())
+    first: SourceLeaseToken | None = None
+    successor: SourceLeaseToken | None = None
+    try:
+        first_backend.ensure_source_lease(source_id)
+        second_backend.ensure_source_lease(source_id)
+        assert first_backend.query(
+            "SELECT COUNT(*) AS n FROM source_leases WHERE source_id = @source_id",
+            {"source_id": source_id},
+        ).to_pylist() == [{"n": 1}]
+        first = first_backend.claim_source_lease(source_id, first_run, str(uuid4()))
+        assert first is not None
+        assert (
+            second_backend.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
+            is None
+        )
+        assert first_backend.renew_source_lease(first)
+
+        other_source = str(uuid4())
+        second_backend.ensure_source_lease(other_source)
+        independent = second_backend.claim_source_lease(
+            other_source, str(uuid4()), str(uuid4())
+        )
+        assert independent is not None
+        second_backend.release_source_lease(independent)
+
+        first_backend._lease_rows(
+            f"UPDATE {first_backend._table_ref('source_leases')} "
+            "SET lease_expires_at = TIMESTAMP_SUB(CURRENT_TIMESTAMP(), "
+            "INTERVAL 1 SECOND) WHERE source_id = @source_id AND fence = @fence",
+            [
+                bigquery.ScalarQueryParameter("source_id", "STRING", source_id),
+                bigquery.ScalarQueryParameter("fence", "INT64", first.fence),
+            ],
+        )
+        successor = second_backend.claim_source_lease(
+            source_id, str(uuid4()), str(uuid4())
+        )
+        assert successor is not None
+        assert successor.fence == first.fence + 1
+        assert not first_backend.renew_source_lease(first)
+        first_backend.release_source_lease(first)
+        assert second_backend.renew_source_lease(successor)
+
+        with pytest.raises(BadRequest, match="collection source lease was lost"):
+            first_backend.persist_batch(
+                _audit_only_batch(source_id, first_run, lease=first)
+            )
+        assert first_backend.query(
+            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
+            {"run_id": first_run},
+        ).to_pylist() == [{"n": 0}]
+        assert (
+            _stage_tables(
+                first_backend.client, live_settings.dataset_id, run_id=first_run
+            )
+            == []
+        )
+    finally:
+        if first is not None:
+            first_backend.release_source_lease(first)
+        if successor is not None:
+            second_backend.release_source_lease(successor)
+        first_backend.close()
+        second_backend.close()
+
+
+def test_live_simultaneous_source_claims_have_one_owner(
+    live_settings: LiveSettings,
+) -> None:
+    """Allow only one of two simultaneous claims on the same source row."""
+    first_backend = _backend(live_settings)
+    second_backend = _backend(live_settings)
+    source_id = str(uuid4())
+    start = Barrier(2)
+    winner: SourceLeaseToken | None = None
+
+    def claim(backend: BigQueryBackend) -> SourceLeaseToken | None:
+        """Start a contender only after both BigQuery clients are ready."""
+        start.wait()
+        return backend.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
+
+    try:
+        first_backend.ensure_source_lease(source_id)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(executor.map(claim, (first_backend, second_backend)))
+        owned = [token for token in claims if token is not None]
+        assert len(owned) == 1
+        winner = owned[0]
+        assert first_backend.query(
+            "SELECT fence, owner_id FROM source_leases WHERE source_id = @source_id",
+            {"source_id": source_id},
+        ).to_pylist() == [{"fence": winner.fence, "owner_id": winner.owner_id}]
+        assert winner.fence == 1
+    finally:
+        if winner is not None:
+            first_backend.release_source_lease(winner)
+        first_backend.close()
+        second_backend.close()
+
+
+def test_live_same_run_lease_and_ledger_prevent_duplicate_audit_rows(
+    live_settings: LiveSettings,
+) -> None:
+    """Block a competing run and make a later retry an idempotent no-op."""
+    first_backend = _backend(live_settings)
+    second_backend = _backend(live_settings)
+    source_id = str(uuid4())
+    run_id = str(uuid4())
+    token: SourceLeaseToken | None = None
+    try:
+        first_backend.ensure_source_lease(source_id)
+        token = first_backend.claim_source_lease(source_id, run_id, str(uuid4()))
+        assert token is not None
+        batch = _audit_only_batch(source_id, run_id)
+        with pytest.raises(SourceLeaseBusy):
+            second_backend.persist_batch(batch)
+        committed = first_backend.persist_batch(replace(batch, lease=token))
+        assert not committed.already_committed
+        first_backend.release_source_lease(token)
+        retried = second_backend.persist_batch(batch)
+        assert retried.already_committed
+        assert second_backend.query(
+            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
+            {"run_id": run_id},
+        ).to_pylist() == [{"n": 1}]
+        assert (
+            _stage_tables(
+                second_backend.client, live_settings.dataset_id, run_id=run_id
+            )
+            == []
+        )
+    finally:
+        if token is not None:
+            first_backend.release_source_lease(token)
+        first_backend.close()
+        second_backend.close()
+
+
+def test_live_ambiguous_commit_retry_keeps_one_audit_row(
+    live_settings: LiveSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry a committed run after its acknowledgement is lost."""
+    run_id = str(uuid4())
+    source_id = str(uuid4())
+    bundle = NormalizedBundle(
+        run_id, {"ingest_runs": _audit_only_batch(source_id, run_id).ingest_runs}
+    )
+    configuration = ConfigurationManager(live_settings.config_path).load()
+    actual_persist = persistence_module.persist_run
+    attempts = 0
+
+    def lose_first_acknowledgement(
+        backend: BigQueryBackend, normalized: NormalizedBundle
+    ) -> PersistSummary:
+        """Commit remotely, then simulate losing the first client response."""
+        nonlocal attempts
+        result = actual_persist(backend, normalized)
+        attempts += 1
+        if attempts == 1:
+            raise BadRequest("transaction is aborted due to concurrent update")
+        return result
+
+    monkeypatch.setattr(persistence_module, "persist_run", lose_first_acknowledgement)
+    summary = persistence_module.persist_with_retries(
+        configuration,
+        bundle,
+        logging.getLogger("usagebassoon-bigquery-live"),
+    )
+    assert attempts == 2
+    assert summary == PersistSummary(0, 0, {})
+    backend = _backend(live_settings)
+    try:
+        assert backend.query(
+            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
+            {"run_id": run_id},
+        ).to_pylist() == [{"n": 1}]
+        assert (
+            _stage_tables(backend.client, live_settings.dataset_id, run_id=run_id) == []
+        )
+    finally:
+        backend.close()
+
+
+def test_live_source_lease_context_releases_for_next_collection(
+    live_settings: LiveSettings,
+) -> None:
+    """Hold the collection source from planning until context exit."""
+    configuration = ConfigurationManager(live_settings.config_path).load()
+    logger = logging.getLogger("usagebassoon-bigquery-live")
+    contender = _backend(live_settings)
+    try:
+        with source_lease(configuration, str(uuid4()), logger) as active:
+            active.check()
+            assert (
+                contender.claim_source_lease(
+                    configuration.source_id, str(uuid4()), str(uuid4())
+                )
+                is None
+            )
+        next_token = contender.claim_source_lease(
+            configuration.source_id, str(uuid4()), str(uuid4())
+        )
+        assert next_token is not None
+        assert next_token.fence > active.token.fence
+        contender.release_source_lease(next_token)
+    finally:
+        contender.close()
+
+
+def test_live_snapshot_reads_tables_at_one_bigquery_timestamp(
+    live_settings: LiveSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclude a note committed between two historical table reads."""
+    reader = _backend(live_settings)
+    writer = _backend(live_settings)
+    source_id = str(uuid4())
+    original = reader._read_query_arrow
+    reads = 0
+
+    def read_then_write(job: bigquery.job.QueryJob) -> pa.Table:
+        """Commit a note after the first snapshot table materializes."""
+        nonlocal reads
+        data = original(job)
+        reads += 1
+        if reads == 1:
+            stamp = datetime.now(UTC)
+            writer.append(
+                "notes",
+                pa.table(
+                    {
+                        "source_id": [source_id],
+                        "client": ["codex"],
+                        "session_id": ["between-reads"],
+                        "note": ["committed after capture"],
+                        "created_at": [stamp],
+                        "updated_at": [stamp],
+                    }
+                ),
+            )
+        return data
+
+    monkeypatch.setattr(reader, "_read_query_arrow", read_then_write)
+    try:
+        snapshot = reader.read_snapshot_tables(("sessions", "notes"))
+        assert snapshot.captured_at.tzinfo is not None
+        assert reads == 2
+        assert all(
+            row["source_id"] != source_id
+            for row in snapshot.tables["notes"].to_pylist()
+        )
+        assert writer.query(
+            "SELECT COUNT(*) AS n FROM notes WHERE source_id = @source_id",
+            {"source_id": source_id},
+        ).to_pylist() == [{"n": 1}]
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_live_batch_rolls_back_after_staging_and_logs_cleanup(
     live_settings: LiveSettings,
     caplog: pytest.LogCaptureFixture,
@@ -403,7 +704,7 @@ def test_live_batch_rolls_back_after_staging_and_logs_cleanup(
             ),
         ),
         append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=pa.table({"run_id": [run_id]}),
+        ingest_runs=pa.table({"run_id": [run_id], "source_id": [source_id]}),
     )
     try:
         backend.apply_ddl()
@@ -573,6 +874,7 @@ def test_live_cli_commands_including_models_report(
 
     failures = [
         f"{command!r} exited with {result.exit_code}:\n{result.output}"
+        f"\nexception: {result.exception!r}"
         for command, result in zip(commands, results, strict=True)
         if result.exit_code != 0
     ]

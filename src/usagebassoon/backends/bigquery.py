@@ -431,6 +431,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 "(source_id, owner_id, run_id, fence, "
                 "lease_expires_at, last_renewed_at) "
                 "SELECT @source_id, NULL, NULL, 0, NULL, NULL "
+                "FROM (SELECT 1) AS candidate "
                 "WHERE NOT EXISTS (SELECT 1 FROM "
                 f"{target} WHERE source_id = @source_id);",
                 "COMMIT TRANSACTION;",
@@ -445,33 +446,27 @@ class BigQueryBackend(AbstractStorageBackend):
     def claim_source_lease(
         self, source_id: str, run_id: str, owner_id: str
     ) -> SourceLeaseToken | None:
-        """Claim an existing row through a conditional mutating transaction."""
+        """Claim an existing row with one conditional mutating statement."""
         target = self._table_ref("source_leases")
-        script = "\n".join(
-            [
-                "DECLARE changed INT64 DEFAULT 0;",
-                "BEGIN TRANSACTION;",
-                f"UPDATE {target} SET owner_id = @owner_id, run_id = @run_id, "
-                "fence = fence + 1, "
-                "lease_expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
-                f"INTERVAL {SOURCE_LEASE_SECONDS} SECOND), "
-                "last_renewed_at = CURRENT_TIMESTAMP() "
-                "WHERE source_id = @source_id AND "
-                "(owner_id IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP());",
-                "SET changed = @@row_count;",
-                "ASSERT changed <= 1 AS 'source lease identity is not unique';",
-                "COMMIT TRANSACTION;",
-                f"SELECT fence FROM {target} WHERE source_id = @source_id "
-                "AND owner_id = @owner_id AND run_id = @run_id AND changed = 1;",
-            ]
+        parameters = [
+            bigquery.ScalarQueryParameter("source_id", "STRING", source_id),
+            bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+            bigquery.ScalarQueryParameter("owner_id", "STRING", owner_id),
+        ]
+        self._lease_rows(
+            f"UPDATE {target} SET owner_id = @owner_id, run_id = @run_id, "
+            "fence = fence + 1, "
+            "lease_expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+            f"INTERVAL {SOURCE_LEASE_SECONDS} SECOND), "
+            "last_renewed_at = CURRENT_TIMESTAMP() "
+            "WHERE source_id = @source_id AND "
+            "(owner_id IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP())",
+            parameters,
         )
         rows = self._lease_rows(
-            script,
-            [
-                bigquery.ScalarQueryParameter("source_id", "STRING", source_id),
-                bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
-                bigquery.ScalarQueryParameter("owner_id", "STRING", owner_id),
-            ],
+            f"SELECT fence FROM {target} WHERE source_id = @source_id "
+            "AND owner_id = @owner_id AND run_id = @run_id",
+            parameters,
         )
         if not rows:
             return None
