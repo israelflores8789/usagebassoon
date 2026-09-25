@@ -498,7 +498,7 @@ def format_cost_per_million(
 
 
 def format_ms_per_1k_tokens(
-    duration_ms: object, timed_tokens: object, *, precision: int = 2
+    duration_ms: object, timed_tokens: object, *, precision: int = 0
 ) -> str:
     """Format milliseconds per thousand timed tokens from additive components."""
     duration = numeric_value(duration_ms)
