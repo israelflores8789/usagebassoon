@@ -20,6 +20,7 @@ from usagebassoon.cli.reports._common import (
     format_timestamp,
     format_tokens,
     load_configured_session_usage,
+    parse_report_dates,
     parse_width,
     render_table,
     resolve_filters,
@@ -41,6 +42,18 @@ def sessions(
         bool,
         typer.Option("--by-model", help="Show one row per session and model."),
     ] = False,
+    by_created_at: Annotated[
+        bool,
+        typer.Option(
+            "--by-created-at", help="Filter and sort by session creation time."
+        ),
+    ] = False,
+    since: Annotated[
+        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+    ] = None,
+    until: Annotated[
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+    ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
     ] = None,
@@ -78,6 +91,7 @@ def sessions(
     ] = None,
 ) -> None:
     """Render newest-first session usage, optionally split by model."""
+    start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
         client=client,
@@ -89,15 +103,26 @@ def sessions(
         sample_session_usage(
             resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID),
             by_model=by_model,
+            by_created_at=by_created_at,
             limit=limit,
+            since=start,
+            until=end,
         )
         if test
         else load_configured_session_usage(
-            config, filters, by_model=by_model, limit=limit
+            config,
+            filters,
+            by_model=by_model,
+            by_created_at=by_created_at,
+            limit=limit,
+            since=start,
+            until=end,
         )
     )
     records = sanitize_records(records, sanitize)
     output_width = parse_width(width)
+    timestamp_column = "Created At" if by_created_at else "Last Active"
+    timestamp_key = "created_at" if by_created_at else "last_active"
     rows: list[dict[str, str]] = []
     for record in records:
         row = {
@@ -115,8 +140,8 @@ def sessions(
             "Cost/1M": format_cost_per_million(
                 record["cost_usd"], record["total_tokens"]
             ),
-            "Last Active": format_timestamp(
-                record["last_active"], compact=output_width is not None
+            timestamp_column: format_timestamp(
+                record[timestamp_key], compact=output_width is not None
             ),
         }
         rows.append(row)
@@ -131,7 +156,7 @@ def sessions(
         ("Total", "right"),
         ("Cost", "right"),
         ("Cost/1M", "right"),
-        ("Last Active", "left"),
+        (timestamp_column, "left"),
     )
     render_table(
         "Session Token Usage by Model" if by_model else "Session Token Usage",

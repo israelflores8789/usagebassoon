@@ -104,6 +104,8 @@ bunx tokscale --version  # v4.15.1
 
 All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only.
 
+All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--by-created-at`.
+
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 
 > [!IMPORTANT]
@@ -133,7 +135,7 @@ UsageBassoon Summary
 ### Models
 
 ```text
-$ bassoon report models --test --sanitize
+$ bassoon report models --test
                                   Model Token Usage
 
  Model            Client    Input Output Cache R Cache ×  Total  ms/1K Cost/1M   Cost
@@ -175,7 +177,7 @@ $ bassoon report daily --test
 ### Session usage
 
 ```text
-$ bassoon report sessions --test  # add --by-model for per-model detail
+$ bassoon report sessions --test    # add --by-model for per-model detail
                                        Session Token Usage
 
  Session    Client  Model           Input Output Cache R Cache ×  Total  Cost Cost/1M Last Active
@@ -201,8 +203,7 @@ $ bassoon report sessions --test  # add --by-model for per-model detail
 ### Cost graph
 
 ```text
-# shows USD cost by default. use `--metric` for token metrics.
-$ bassoon report graph --test
+$ bassoon report graph --test       # shows USD cost by default. use `--metric` for token metrics.
 
                        Cost (USD): 2026-09-01 to 2026-09-10
       ┌────────────────────────────────────────────────────────────────────────┐

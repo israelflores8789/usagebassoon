@@ -20,6 +20,7 @@ from usagebassoon.cli.reports._common import (
     format_ms_per_1k_tokens,
     format_tokens,
     load_configured_model_usage,
+    parse_report_dates,
     parse_width,
     render_table,
     resolve_filters,
@@ -32,6 +33,12 @@ from usagebassoon.cli.reports._common import (
 def models(
     config: Annotated[
         Path | None, typer.Option("--config", help="Use this configuration file.")
+    ] = None,
+    since: Annotated[
+        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+    ] = None,
+    until: Annotated[
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
     ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
@@ -70,6 +77,7 @@ def models(
     ] = None,
 ) -> None:
     """Render token, cost, and timing totals for each model and client."""
+    start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
         client=client,
@@ -78,9 +86,11 @@ def models(
         tag=tag,
     )
     records = (
-        sample_model_usage(resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID))
+        sample_model_usage(
+            resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID), since=start, until=end
+        )
         if test
-        else load_configured_model_usage(config, filters)
+        else load_configured_model_usage(config, filters, since=start, until=end)
     )
     report_width = parse_width(width)
     rows = [

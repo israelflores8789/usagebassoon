@@ -108,6 +108,7 @@ SELECT
     session_model_stats.session_id,
     session_model_stats.model,
     sessions.workspace,
+    sessions.created_at,
     sessions.last_active,
     session_model_stats.input_tokens,
     session_model_stats.output_tokens,
