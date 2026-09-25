@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS schema_drift_events (
     updated_at TIMESTAMP NOT NULL,
     detected_run_id STRING NOT NULL,
     updated_run_id STRING NOT NULL,
-    resolved BOOL NOT NULL DEFAULT FALSE,
+    resolved BOOL DEFAULT FALSE NOT NULL,
     observation_count INT64 NOT NULL
 );
 
@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_issues (
     updated_at TIMESTAMP,
     detected_run_id STRING,
     updated_run_id STRING,
-    resolved BOOL NOT NULL DEFAULT FALSE,
+    resolved BOOL DEFAULT FALSE NOT NULL,
     observation_count INT64 NOT NULL
 );
 

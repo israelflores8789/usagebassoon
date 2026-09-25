@@ -352,7 +352,24 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         daily_schema = bigquery_backend.client.get_table(
             f"{live_settings.dataset_id}.daily_stats"
         ).schema
-        assert {field.name: field.field_type for field in daily_schema}["day"] == "DATE"
+        daily_types = {field.name: field.field_type for field in daily_schema}
+        assert daily_types["day"] == "DATE"
+        assert {
+            name: daily_types[name]
+            for name in (
+                "perf_duration_ms",
+                "perf_timed_tokens",
+                "perf_sample_count",
+                "perf_token_coverage",
+                "tokscale_ms_per_1k_tokens",
+            )
+        } == {
+            "perf_duration_ms": "INTEGER",
+            "perf_timed_tokens": "INTEGER",
+            "perf_sample_count": "INTEGER",
+            "perf_token_coverage": "FLOAT",
+            "tokscale_ms_per_1k_tokens": "FLOAT",
+        }
     finally:
         duckdb_backend.close()
         bigquery_backend.close()
@@ -481,13 +498,13 @@ def test_live_concurrent_sources_use_distinct_stages_and_retry(
         backend.close()
 
 
-def test_live_cli_commands_except_report(
+def test_live_cli_commands_including_models_report(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Exercise configured BigQuery CLI commands other than out-of-scope report."""
+    """Exercise configured BigQuery CLI commands, including the models report."""
     normalized = _normalized_bundle(live_settings, collection_bundle)
     configuration = ConfigurationManager(live_settings.config_path).load()
     persist_with_retries(
@@ -518,6 +535,7 @@ def test_live_cli_commands_except_report(
             "--config",
             str(live_settings.config_path),
         ],
+        ["report", "models", "--config", str(live_settings.config_path)],
         [
             "export",
             "sessions",
