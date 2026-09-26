@@ -234,8 +234,9 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Database CI: `.github/workflows/dialect-parity.yml`** — on every PR that touches `sql/` or `tests/fixtures/`:
   1. `SQLGlot` parses both dialects' DDL/views.
-  2. Transpiles `bigquery/*` → duckdb dialect, asserts AST-equivalence against the duckdb tree (and vice-versa for the view sets).
-  3. A **replay test** runs the same golden-fixture dataset through both dialects in DuckDB (translated BigQuery SQL) and asserts identical result sets. Transpiler parity is *structural*, not semantic.
+  2. Transpiles `bigquery/*` → duckdb dialect, for example, asserts AST-equivalence against the duckdb tree (and vice-versa for the view sets).
+  3. **Structural replay tests:** Use SQLGlot to compare every dialect's table columns and view definitions, then replay transpiled SQL with shared synthetic rows in DuckDB. Keep these checks in sync as tables and views change. Transpiler parity is *structural*, not semantic.
+  4. **Synthetic replay tests:** Run the shared rows through each backend's native SQL and compare every shared view to observe dialect-specific behavior. Update these tests when a view or its input tables change. For tables unused by views, use structural and focused backend tests.
 
 - **Ingest semantics:** Date-filtered `models` rows are upserted at daily session/model grain. `graph` contributions are authoritative only for `daily_activity` and candidate dates. `session_model_stats` is an all-time calculated view over `daily_stats`. Tags and notes are owned by the user and are never touched by merge.
 
