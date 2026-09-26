@@ -61,7 +61,7 @@ jobs:
       uses: pavelzw/pytest-action@v2
       with:
         custom-pytest: just test
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
@@ -101,7 +101,7 @@ jobs:
       uses: pavelzw/pytest-action@v2
       with:
         custom-pytest: just test-unit
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true

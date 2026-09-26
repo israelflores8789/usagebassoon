@@ -67,7 +67,7 @@ jobs:
       uses: pavelzw/pytest-action@v2
       with:
         custom-pytest: just test
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
@@ -107,7 +107,7 @@ jobs:
       uses: pavelzw/pytest-action@v2
       with:
         custom-pytest: just test-unit
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
@@ -195,7 +195,7 @@ jobs:
         USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
       with:
         custom-pytest: just test
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
@@ -250,7 +250,7 @@ jobs:
         USAGEBASSOON_GCS_LIVE: "1"
       with:
         custom-pytest: just test
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
@@ -298,7 +298,7 @@ jobs:
         USAGEBASSOON_MOTHERDUCK_LIVE_RESET: "1"
       with:
         custom-pytest: just test
-        verbose: false
+        verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
