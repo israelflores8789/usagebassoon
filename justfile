@@ -4,7 +4,6 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-py := "uv run python"
 pytest := "uv run pytest"
 src_dir := "src"
 test_dir := "tests"
