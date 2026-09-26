@@ -58,7 +58,7 @@ test-unit *args:
     test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
     trap 'rm -rf "$test_log_directory"' EXIT
     USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{ pytest }} -v -s \
-        -m "not (bigquery_live or gcs_live or sql_parity)" {{ args }}
+        -m "not (bigquery_live or gcs_live or motherduck_live or sql_parity)" {{ args }}
 
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
 test-bq-live test-name="tests/test_backend_bigquery_live.py" reset="0":
@@ -89,6 +89,21 @@ test-gcs-live test-name="tests/test_bucket_gcs_live.py":
         --color=no \
         "{{ test-name }}" < /dev/null
     } 2>&1 | tee .test_logs/pytest-gcs-live.log
+
+# Dedicated MotherDuck database reset and live execution require this recipe.
+test-md-live test-name="tests/test_backend_motherduck_live.py":
+    #!/usr/bin/env bash
+    set -o pipefail
+    mkdir -p .test_logs
+    test_log_directory="$(mktemp -d /tmp/usagebassoon-test-logs.XXXXXX)"
+    trap 'rm -rf "$test_log_directory"' EXIT
+    {
+        echo "[just] $(date -u +%FT%TZ) starting pytest for {{ test-name }}"
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_MOTHERDUCK_LIVE=1 USAGEBASSOON_MOTHERDUCK_LIVE_RESET=1 {{ pytest }} -vv \
+        --tb=short \
+        --color=no \
+        "{{ test-name }}" < /dev/null
+    } 2>&1 | tee .test_logs/pytest-md-live.log
 
 # Run tests with coverage reporting
 coverage *args:

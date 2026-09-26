@@ -331,28 +331,15 @@ def persist_with_retries(
     lease: SourceLeaseToken | None = None,
 ) -> PersistSummary:
     """Initialize storage and persist a batch with bounded backend retries."""
-    if lease is None:
-        schema_backend: StorageBackend | None = None
-        try:
-            schema_backend = open_backend(config)
-            schema_backend.apply_ddl()
-        except Exception:
-            logger.exception(
-                "collection run %s could not initialize the schema", bundle.run_id
-            )
-            raise
-        finally:
-            if schema_backend is not None:
-                close_backend(
-                    schema_backend,
-                    context=f"schema initialization for {bundle.run_id}",
-                    logger=logger,
-                )
+    schema_ready = lease is not None
     attempts = config.collection.max_retries + 1
     for attempt in range(1, attempts + 1):
         backend: StorageBackend | None = None
         try:
             backend = open_backend(config)
+            if not schema_ready:
+                backend.apply_ddl()
+                schema_ready = True
             if lease is None:
                 return persist_run(backend, bundle)
             return persist_run(backend, bundle, lease=lease)

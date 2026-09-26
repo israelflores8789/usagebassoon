@@ -132,37 +132,43 @@ def source_lease(
     Raises:
         SourceLeaseBusy: Another live collection owns the source.
     """
-    backend: StorageBackend | None = None
     token: SourceLeaseToken | None = None
     owner_id = str(uuid4())
-    try:
-        backend = open_backend(config)
-        backend.apply_ddl()
-        attempts = config.collection.max_retries + 1
-        for attempt in range(attempts):
-            try:
-                backend.ensure_source_lease(config.source_id)
-                token = backend.claim_source_lease(config.source_id, run_id, owner_id)
-                break
-            except Exception as error:
-                if attempt + 1 == attempts or not backend.is_retryable_error(error):
-                    raise
-                delay = random.uniform(
-                    0, min(30.0, config.collection.retry_initial_seconds * 2**attempt)
-                )
-                logger.warning(
-                    "source lease claim conflicted for %s; retrying in %.1fs",
-                    config.source_id,
-                    delay,
-                )
-                time.sleep(delay)
-        if token is None:
-            raise SourceLeaseBusy(
-                f"source {config.source_id} already has an active collection"
+    schema_ready = False
+    attempts = config.collection.max_retries + 1
+    for attempt in range(attempts):
+        backend: StorageBackend | None = None
+        try:
+            backend = open_backend(config)
+            if not schema_ready:
+                backend.apply_ddl()
+                schema_ready = True
+            backend.ensure_source_lease(config.source_id)
+            token = backend.claim_source_lease(config.source_id, run_id, owner_id)
+            break
+        except Exception as error:
+            if (
+                attempt + 1 == attempts
+                or backend is None
+                or not backend.is_retryable_error(error)
+            ):
+                raise
+            delay = random.uniform(
+                0, min(30.0, config.collection.retry_initial_seconds * 2**attempt)
             )
-    finally:
-        if backend is not None:
-            close_backend(backend, context="source lease claim", logger=logger)
+            logger.warning(
+                "source lease setup conflicted for %s; retrying in %.1fs",
+                config.source_id,
+                delay,
+            )
+            time.sleep(delay)
+        finally:
+            if backend is not None:
+                close_backend(backend, context="source lease claim", logger=logger)
+    if token is None:
+        raise SourceLeaseBusy(
+            f"source {config.source_id} already has an active collection"
+        )
 
     heartbeat = _SourceLeaseHeartbeat(config, token, logger)
     started = False

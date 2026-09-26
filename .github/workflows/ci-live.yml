@@ -11,10 +11,11 @@ concurrency:
   group: ci-live-${{ github.ref }}
   cancel-in-progress: false
 
-# Environment-scoped variables are intentionally used only by the two cloud
+# Environment-scoped variables are intentionally used only by the cloud
 # jobs below. The ci-live environment should be restricted to main and dev.
 # Live tests use fixed, protected, pre-provisioned resources:
 #   BigQuery dataset: usagebassoon_it
+#   MotherDuck database: usagebassoon_it
 #   GCS bucket: gs://usagebassoon-test-snapshots-gen-lang-client-0670612427
 
 permissions:
@@ -265,11 +266,59 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
 
+  motherduck-live:
+    name: Live MotherDuck (service account)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    environment:
+      name: ci-live
+    concurrency:
+      # The tests reset the shared dedicated database at module setup.
+      group: usagebassoon-motherduck-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Run motherduck_live tests
+      uses: pavelzw/pytest-action@v2
+      env:
+        MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        USAGEBASSOON_MOTHERDUCK_LIVE: "1"
+        USAGEBASSOON_MOTHERDUCK_LIVE_RESET: "1"
+      with:
+        custom-pytest: just test
+        verbose: false
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: MotherDuck live tests
+        custom-arguments: >-
+          -m motherduck_live --junitxml=junit-motherduck-live.xml -q
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-motherduck-live
+        path: junit-motherduck-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
   gate:
     name: CI Live gate
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [lint, sql-parity, unit, build, bigquery-live, gcs-live]
+    needs: [lint, sql-parity, unit, build, bigquery-live, gcs-live, motherduck-live]
     if: always()
     steps:
     - name: Evaluate results
@@ -280,9 +329,10 @@ jobs:
         BUILD: ${{ needs.build.result }}
         BQ: ${{ needs.bigquery-live.result }}
         GCS: ${{ needs.gcs-live.result }}
+        MOTHERDUCK: ${{ needs.motherduck-live.result }}
       run: |
         set -euo pipefail
-        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS"
-        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD" "$BQ" "$GCS"; do
+        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS motherduck_live=$MOTHERDUCK"
+        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD" "$BQ" "$GCS" "$MOTHERDUCK"; do
           [ "$result" = "success" ] || exit 1
         done

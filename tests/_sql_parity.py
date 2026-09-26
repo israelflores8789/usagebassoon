@@ -297,6 +297,9 @@ def assert_view_results_match(
     left: StorageBackend,
     right: StorageBackend,
     names: Iterable[str] | None = None,
+    *,
+    left_label: str = "DuckDB",
+    right_label: str = "BigQuery",
 ) -> None:
     """Compare every requested view's Arrow schema and normalized rows."""
     for name in names or view_names():
@@ -304,7 +307,8 @@ def assert_view_results_match(
         right_result = right.query(f"SELECT * FROM {name}")
         assert left_result.column_names == right_result.column_names, (
             f"{name}: result columns differ: "
-            f"left={left_result.column_names!r}, right={right_result.column_names!r}"
+            f"{left_label}={left_result.column_names!r}, "
+            f"{right_label}={right_result.column_names!r}"
         )
         preserve_order = name == "report_summary_models"
         left_records = normalized_records(
@@ -315,7 +319,13 @@ def assert_view_results_match(
             right_result,
             preserve_order=preserve_order,
         )
-        _assert_records_match(name, left_records, right_records)
+        _assert_records_match(
+            name,
+            left_records,
+            right_records,
+            left_label=left_label,
+            right_label=right_label,
+        )
     report_models = left.query("SELECT * FROM report_summary_models")
     assert report_models.column("model").to_pylist() == [
         "model-alpha",
@@ -347,12 +357,16 @@ def _assert_records_match(
     view: str,
     left: list[dict[str, object]],
     right: list[dict[str, object]],
+    *,
+    left_label: str,
+    right_label: str,
 ) -> None:
     """Raise an assertion identifying the first cross-engine result mismatch."""
     if len(left) != len(right):
         raise AssertionError(
-            f"{view}: row count differs: DuckDB={len(left)}, BigQuery={len(right)}; "
-            f"DuckDB rows={left!r}; BigQuery rows={right!r}"
+            f"{view}: row count differs: {left_label}={len(left)}, "
+            f"{right_label}={len(right)}; "
+            f"{left_label} rows={left!r}; {right_label} rows={right!r}"
         )
     for index, (left_row, right_row) in enumerate(zip(left, right, strict=True)):
         if left_row == right_row:
@@ -364,7 +378,7 @@ def _assert_records_match(
         }
         raise AssertionError(
             f"{view}: row {index} differs by field: {differences!r}; "
-            f"DuckDB row={left_row!r}; BigQuery row={right_row!r}"
+            f"{left_label} row={left_row!r}; {right_label} row={right_row!r}"
         )
 
 

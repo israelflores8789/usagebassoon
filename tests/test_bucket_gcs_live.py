@@ -3,7 +3,8 @@
 
 """test_bucket_gcs_live.py — Opt-in live GCS snapshot integration tests.
 
-Run with ``USAGEBASSOON_GCS_LIVE=1 uv run pytest -m gcs_live``.
+Run with ``just test-gcs-live`` against a disposable bucket.
+Or, run with ``USAGEBASSOON_GCS_LIVE=1 uv run pytest -m gcs_live``.
 
 The ``gcs_live`` marker selects these tests, and ``USAGEBASSOON_GCS_LIVE=1``
 enables access to a preconfigured GCS test bucket.

@@ -69,9 +69,9 @@ class _DuckDBStorage(AbstractStorageBackend):
 
     @override
     def is_retryable_error(self, error: Exception) -> bool:
-        """Retry transaction conflicts caused by another source lease update."""
+        """Retry concurrent row and catalog transaction conflicts."""
         return isinstance(error, duckdb.TransactionException) and (
-            "conflict on update" in str(error).casefold()
+            "conflict" in str(error).casefold()
         )
 
     @override

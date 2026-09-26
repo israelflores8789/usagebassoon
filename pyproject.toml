@@ -107,6 +107,7 @@ addopts = "-q --strict-markers"
 markers = [
     "bigquery_live: runs against the dedicated usagebassoon_it BigQuery dataset.",
     "gcs_live: runs against the dedicated UsageBassoon GCS test bucket.",
+    "motherduck_live: runs against the dedicated usagebassoon_it MotherDuck database.",
     "sql_parity: runs hermetic DuckDB and SQLGlot dialect-parity tests.",
 ]
 

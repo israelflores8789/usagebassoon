@@ -343,9 +343,8 @@ bassoon schedule worker --foreground --interval 15m
 
 > [!TIP]
 > If you set `source_id` manually, you can reuse it for ephemeral environments that you want to namespace token usage. For example, if you have a container that should be considered the same as previous container builds for token statistics purposes.
-
-> [!WARNING]
-> Do **not** set multiple environments with the same `source_id`. This can cause unpredictable behavior if more than one environment attempts to persist to the same remote data warehouse. You can reuse a `source_id` for *unique* environments that should be considered identical. For example, a container crashes and has to be rebuilt. When that container is reborn, you can set the `source_id` to be the same and preserve how your data was organized. However, you can **not** have multiple containers with the same `source_id`.
+>
+> While features are in place to prevent identical concurrent source IDs from colliding, including lease fencing mechanics, multiple environments with the same `source_id` is *not* the intended use case, and we *strongly* recommend you use one `source_id` per logical source agentic environment.
 
 ## Tags and Notes
 
