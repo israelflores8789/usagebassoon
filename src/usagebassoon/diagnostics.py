@@ -20,14 +20,13 @@ DRIFT_ISSUE_URL = "https://github.com/israelflores8789/usagebassoon/issues/new"
 _LOG = logging.getLogger("usagebassoon")
 
 REQUIRED_RELATIONS: tuple[str, ...] = (
-    "ingest_runs",
+    "collection_runs",
     "schema_drift_events",
     "sessions",
     "session_model_stats",
     "daily_stats",
-    "daily_activity",
     "price_versions",
-    "ingest_status",
+    "collection_status",
     "reconciliation_issues",
     "tags",
     "notes",
@@ -175,10 +174,10 @@ def unresolved_schema_drift(
     rows = _materialized_rows(
         backend,
         "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
-        "contract_tokscale_ver, created_at, updated_at, detected_run_id, "
-        "updated_run_id, observation_count FROM schema_drift_events "
+        "contract_tokscale_ver, created_at, collected_at, "
+        "observation_count FROM current_schema_drift_events "
         "WHERE resolved = FALSE "
-        f"ORDER BY updated_at DESC LIMIT {limit}",
+        f"ORDER BY collected_at DESC LIMIT {limit}",
     )
     return tuple(
         SchemaDriftRecord(
@@ -192,9 +191,7 @@ def unresolved_schema_drift(
                 _row_value(row, "contract_tokscale_ver")
             ),
             created_at=_as_required_datetime(_row_value(row, "created_at")),
-            updated_at=_as_required_datetime(_row_value(row, "updated_at")),
-            detected_run_id=_as_required_string(_row_value(row, "detected_run_id")),
-            updated_run_id=_as_required_string(_row_value(row, "updated_run_id")),
+            collected_at=_as_required_datetime(_row_value(row, "collected_at")),
             observation_count=_as_required_int(_row_value(row, "observation_count")),
         )
         for row in rows
@@ -217,10 +214,10 @@ def reconciliation_issues(
         raise ValueError("limit must be positive")
     rows = _materialized_rows(
         backend,
-        "SELECT check_name, issue_key, message, created_at, updated_at, "
-        "detected_run_id, updated_run_id, observation_count "
-        "FROM reconciliation_issues WHERE resolved = FALSE "
-        f"ORDER BY updated_at DESC NULLS LAST LIMIT {limit}",
+        "SELECT check_name, issue_key, message, created_at, collected_at, "
+        "observation_count "
+        "FROM current_reconciliation_issues WHERE resolved = FALSE "
+        f"ORDER BY collected_at DESC NULLS LAST LIMIT {limit}",
     )
     return tuple(
         reconcile.ReconciliationIssueRecord(
@@ -228,9 +225,7 @@ def reconciliation_issues(
             issue_key=_as_required_string(row.get("issue_key")),
             message=_as_optional_string(row.get("message")),
             created_at=_as_optional_datetime(row.get("created_at")),
-            updated_at=_as_optional_datetime(row.get("updated_at")),
-            detected_run_id=_as_optional_string(row.get("detected_run_id")),
-            updated_run_id=_as_optional_string(row.get("updated_run_id")),
+            collected_at=_as_optional_datetime(row.get("collected_at")),
             observation_count=_as_required_int(_row_value(row, "observation_count")),
         )
         for row in rows
@@ -258,8 +253,8 @@ def ingest_issues(
         raise ValueError("limit must be positive")
     rows = _materialized_rows(
         backend,
-        "SELECT run_id, finished_at, status, drift_events "
-        "FROM ingest_runs "
+        "SELECT run_id, finished_at, status "
+        "FROM collection_runs "
         "WHERE status IN ('failed', 'partial', 'schema_drift') "
         "ORDER BY finished_at DESC NULLS LAST "
         f"LIMIT {limit}",
@@ -269,7 +264,6 @@ def ingest_issues(
             run_id=_as_required_string(_row_value(row, "run_id")),
             finished_at=_as_optional_datetime(_row_value(row, "finished_at")),
             status=_as_optional_string(_row_value(row, "status")),
-            drift_events=_as_optional_int(_row_value(row, "drift_events")),
         )
         for row in rows
     )
@@ -401,8 +395,7 @@ def run_doctor(
                     "transactions",
                     "warning" if transactions else "ok",
                     (
-                        f"{len(transactions)} active transaction(s) may delay "
-                        "collection"
+                        f"{len(transactions)} active warehouse transaction(s)"
                         if transactions
                         else "no active BigQuery transactions for this dataset"
                     ),
@@ -410,6 +403,41 @@ def run_doctor(
                         f"job {transaction.job_id}; "
                         f"transaction {transaction.transaction_id}"
                         for transaction in transactions
+                    ),
+                )
+            )
+
+    if backend_name == "bigquery":
+        try:
+            backlog = backend.query(
+                "SELECT domain, arrival_day, pending_rows, age_days "
+                "FROM compaction_backlog WHERE age_days >= 2 "
+                "ORDER BY age_days DESC"
+            ).to_pylist()
+        except Exception as error:
+            checks.append(
+                DoctorCheck(
+                    "compaction",
+                    "error",
+                    f"could not read compaction progress: {error}",
+                )
+            )
+        else:
+            at_risk = any(row["age_days"] >= 80 for row in backlog)
+            checks.append(
+                DoctorCheck(
+                    "compaction",
+                    "error" if at_risk else "warning" if backlog else "ok",
+                    "uncompacted observations approach the 90-day retention limit"
+                    if at_risk
+                    else "nightly compaction is overdue"
+                    if backlog
+                    else "no overdue compaction buckets",
+                    tuple(
+                        f"{row['domain']}: {row['pending_rows']} "
+                        "pending observation(s); "
+                        f"arrival {row['arrival_day']} ({row['age_days']} days old)"
+                        for row in backlog[:limit]
                     ),
                 )
             )
@@ -448,20 +476,18 @@ def run_doctor(
         active_logger.exception("doctor ingest-run inspection failed")
         checks.append(
             DoctorCheck(
-                "ingest_runs",
+                "collection_runs",
                 "error",
                 f"could not read run log: {error}",
             )
         )
     else:
         details = tuple(
-            f"{issue.status or 'unknown'} run {issue.run_id}"
-            + (f" ({issue.drift_events} drift event(s))" if issue.drift_events else "")
-            for issue in issues
+            f"{issue.status or 'unknown'} run {issue.run_id}" for issue in issues
         )
         checks.append(
             DoctorCheck(
-                "ingest_runs",
+                "collection_runs",
                 "warning" if issues else "ok",
                 (
                     f"{len(issues)} recent non-success run(s)"
@@ -495,9 +521,8 @@ def run_doctor(
                     f"{item.check_name}/{item.issue_key}: {item.message or ''} "
                     f"({item.observation_count} observation(s); "
                     f"first {item.created_at or 'unknown'} "
-                    f"in run {item.detected_run_id or 'unknown'}; "
-                    f"latest {item.updated_at or 'unknown'} "
-                    f"in run {item.updated_run_id or 'unknown'})"
+                    f"latest {item.collected_at or 'unknown'} "
+                    ")"
                     for item in recorded
                 ),
             )

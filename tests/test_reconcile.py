@@ -111,9 +111,9 @@ def test_repeated_issue_updates_one_row(
         persist_run(backend, normalize(first))
         persist_run(backend, normalize(second))
         rows = backend.query(
-            "SELECT check_name, issue_key, message, created_at, updated_at, "
-            "detected_run_id, updated_run_id, resolved, observation_count "
-            "FROM reconciliation_issues"
+            "SELECT check_name, issue_key, message, created_at, collected_at, "
+            "resolved, observation_count "
+            "FROM current_reconciliation_issues"
         ).to_pylist()
         assert rows == [
             {
@@ -121,9 +121,7 @@ def test_repeated_issue_updates_one_row(
                 "issue_key": issue.key,
                 "message": "second observation",
                 "created_at": first.finished_at,
-                "updated_at": second.finished_at,
-                "detected_run_id": first.run_id,
-                "updated_run_id": second.run_id,
+                "collected_at": second.finished_at,
                 "resolved": False,
                 "observation_count": 2,
             }
@@ -138,8 +136,6 @@ def test_repeated_issue_updates_one_row(
         assert check.status == "warning"
         assert "models_payload_totals/total_input_mismatch" in check.details[0]
         assert "2 observation(s)" in check.details[0]
-        assert first.run_id in check.details[0]
-        assert second.run_id in check.details[0]
     finally:
         backend.close()
 
@@ -219,14 +215,12 @@ def test_successful_recheck_resolves_persisted_issue(
         persist_run(backend, normalize(first))
         persist_run(backend, normalize(second))
         row = backend.query(
-            "SELECT message, detected_run_id, updated_run_id, resolved, "
+            "SELECT message, resolved, "
             "observation_count "
-            "FROM reconciliation_issues"
+            "FROM current_reconciliation_issues"
         ).to_pylist()[0]
         assert row == {
             "message": issue.message,
-            "detected_run_id": first.run_id,
-            "updated_run_id": second.run_id,
             "resolved": True,
             "observation_count": 1,
         }
@@ -245,7 +239,7 @@ def test_successful_recheck_resolves_persisted_issue(
         )
         persist_run(backend, normalize(reopened))
         assert backend.query(
-            "SELECT resolved, observation_count FROM reconciliation_issues "
+            "SELECT resolved, observation_count FROM current_reconciliation_issues "
             "WHERE resolved = FALSE"
         ).to_pylist() == [{"resolved": False, "observation_count": 2}]
     finally:
@@ -264,9 +258,7 @@ def test_resolution_requires_all_previous_bad_days_to_be_rechecked(
     graph_plan = plan_graph(graph_raw)
     models_plan = plan_models({day: daily_raws[day]})
     identity = ("models_payload_totals", "total_input_mismatch")
-    pending = IngestStatus(
-        later, "models", "partial", 1, 0, "old", None, "reconciliation"
-    )
+    pending = IngestStatus(later, "models", "partial", 1, 0, "old", "reconciliation")
     evidence = IngestEvidence(
         graph_plan=graph_plan,
         models_plan=models_plan,

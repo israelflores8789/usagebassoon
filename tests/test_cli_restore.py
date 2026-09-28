@@ -30,8 +30,9 @@ def _seed_session(database: Path, session_id: str) -> None:
     backend.apply_ddl()
     backend.connection.execute(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, first_seen_at, last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, NOW(), NOW(), NOW())",
+        "(event_id, source_id, client, session_id, first_seen_at, "
+        "last_seen_at, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, NOW(), NOW(), NOW())",
         [SOURCE_ID, "codex", session_id],
     )
     backend.close()
@@ -53,6 +54,9 @@ def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
     destination_config = tmp_path / "destination.toml"
     destination_database = tmp_path / "destination.duckdb"
     _write_config(destination_config, destination_database)
+    target = DuckDBBackend(destination_database)
+    target.apply_ddl()
+    target.close()
     restore_result = runner.invoke(
         app, ["restore", "--config", str(destination_config)]
     )

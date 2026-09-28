@@ -5,19 +5,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, cast
+from uuid import uuid4
 
 import pyarrow as pa
 
 from usagebassoon.drift import SchemaDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
+from usagebassoon.system_metadata import capture_system_metadata
 
 if TYPE_CHECKING:
-    from usagebassoon.ingest import CollectionBundle, IngestStatus
+    from usagebassoon.ingest import CollectionBundle
     from usagebassoon.parsers.daily import DailyModelsPayload
-    from usagebassoon.parsers.graph import GraphPayload
     from usagebassoon.parsers.pricing import PricingRow
 
 type ColumnarData = dict[str, list[object | None]]
@@ -27,9 +28,10 @@ _TIMESTAMP = pa.timestamp("us", tz="UTC")
 CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "sessions": pa.schema(
         [
-            pa.field("source_id", pa.string()),
-            pa.field("client", pa.string()),
-            pa.field("session_id", pa.string()),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("client", pa.string(), nullable=False),
+            pa.field("session_id", pa.string(), nullable=False),
             pa.field("workspace", pa.string()),
             pa.field("workspace_label", pa.string()),
             pa.field("created_at", _TIMESTAMP),
@@ -39,25 +41,26 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("tokscale_cost_usd", pa.float64()),
             pa.field("models_used", pa.list_(pa.string())),
             pa.field("session_label", pa.string()),
-            pa.field("first_seen_at", _TIMESTAMP),
-            pa.field("last_seen_at", _TIMESTAMP),
-            pa.field("updated_at", _TIMESTAMP),
+            pa.field("first_seen_at", _TIMESTAMP, nullable=False),
+            pa.field("last_seen_at", _TIMESTAMP, nullable=False),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
         ]
     ),
     "daily_stats": pa.schema(
         [
-            pa.field("source_id", pa.string()),
-            pa.field("day", pa.date32()),
-            pa.field("client", pa.string()),
-            pa.field("session_id", pa.string()),
-            pa.field("model", pa.string()),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("day", pa.date32(), nullable=False),
+            pa.field("client", pa.string(), nullable=False),
+            pa.field("session_id", pa.string(), nullable=False),
+            pa.field("model", pa.string(), nullable=False),
             pa.field("provider", pa.string()),
             pa.field("input_tokens", pa.int64()),
             pa.field("output_tokens", pa.int64()),
             pa.field("cache_read", pa.int64()),
             pa.field("cache_write", pa.int64()),
             pa.field("reasoning", pa.int64()),
-            pa.field("total_tokens", pa.int64()),
+            pa.field("total_tokens", pa.int64(), nullable=False),
             pa.field("message_count", pa.int64()),
             pa.field("tokscale_cost_usd", pa.float64()),
             pa.field("perf_duration_ms", pa.int64()),
@@ -65,53 +68,37 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("perf_sample_count", pa.int64()),
             pa.field("perf_token_coverage", pa.float64()),
             pa.field("tokscale_ms_per_1k_tokens", pa.float64()),
-            pa.field("updated_at", _TIMESTAMP),
-        ]
-    ),
-    "daily_activity": pa.schema(
-        [
-            pa.field("source_id", pa.string()),
-            pa.field("day", pa.date32()),
-            pa.field("intensity", pa.int64()),
-            pa.field("active_time_ms", pa.int64()),
-            pa.field("updated_at", _TIMESTAMP),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
         ]
     ),
     "price_versions": pa.schema(
         [
-            pa.field("source_id", pa.string()),
-            pa.field("day", pa.date32()),
-            pa.field("model", pa.string()),
-            pa.field("source", pa.string()),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("day", pa.date32(), nullable=False),
+            pa.field("model", pa.string(), nullable=False),
+            pa.field("source", pa.string(), nullable=False),
             pa.field("matched_key", pa.string()),
             pa.field("match_kind", pa.string()),
             pa.field("price_input_per_token", pa.float64()),
             pa.field("price_output_per_token", pa.float64()),
             pa.field("price_cache_read_per_token", pa.float64()),
             pa.field("price_cache_write_per_token", pa.float64()),
-            pa.field("observed_at", _TIMESTAMP),
-            pa.field("updated_at", _TIMESTAMP),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
         ]
     ),
-    "ingest_status": pa.schema(
+    "collection_ledger": pa.schema(
         [
-            pa.field("source_id", pa.string()),
-            pa.field("day", pa.date32()),
-            pa.field("domain", pa.string()),
-            pa.field("status", pa.string()),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("run_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("day", pa.date32(), nullable=False),
+            pa.field("domain", pa.string(), nullable=False),
             pa.field("expected_count", pa.int64()),
             pa.field("succeeded_count", pa.int64()),
-            pa.field("last_attempted_run", pa.string()),
-            pa.field("last_succeeded_run", pa.string()),
             pa.field("failure_code", pa.string()),
-            pa.field("updated_at", _TIMESTAMP),
-        ]
-    ),
-    "ingest_runs": pa.schema(
-        [
-            pa.field("run_id", pa.string()),
-            pa.field("source_id", pa.string()),
-            pa.field("started_at", _TIMESTAMP),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
+            pa.field("started_at", _TIMESTAMP, nullable=False),
             pa.field("finished_at", _TIMESTAMP),
             pa.field("host", pa.string()),
             pa.field("os_name", pa.string()),
@@ -123,46 +110,71 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("shell", pa.string()),
             pa.field("tokscale_ver", pa.string()),
             pa.field("status", pa.string()),
-            pa.field("rows_in", pa.int64()),
-            pa.field("rows_inserted", pa.int64()),
-            pa.field("rows_updated", pa.int64()),
-            pa.field("drift_events", pa.int64()),
         ]
     ),
     "reconciliation_issues": pa.schema(
         [
-            pa.field("run_id", pa.string()),
-            pa.field("source_id", pa.string()),
-            pa.field("check_name", pa.string()),
-            pa.field("issue_key", pa.string()),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("run_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("check_name", pa.string(), nullable=False),
+            pa.field("issue_key", pa.string(), nullable=False),
             pa.field("message", pa.string()),
             pa.field("created_at", _TIMESTAMP),
-            pa.field("updated_at", _TIMESTAMP),
-            pa.field("detected_run_id", pa.string()),
-            pa.field("updated_run_id", pa.string()),
-            pa.field("resolved", pa.bool_()),
-            pa.field("observation_count", pa.int64()),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
+            pa.field("resolved", pa.bool_(), nullable=False),
+            pa.field("observation_count", pa.int64(), nullable=False),
         ]
     ),
     "schema_drift_events": pa.schema(
         [
-            pa.field("source_id", pa.string()),
-            pa.field("domain", pa.string()),
-            pa.field("tokscale_ver", pa.string()),
-            pa.field("drift_key", pa.string()),
-            pa.field("drift_kind", pa.string()),
-            pa.field("path", pa.string()),
-            pa.field("detail", pa.string()),
-            pa.field("contract_tokscale_ver", pa.string()),
-            pa.field("created_at", _TIMESTAMP),
-            pa.field("updated_at", _TIMESTAMP),
-            pa.field("detected_run_id", pa.string()),
-            pa.field("updated_run_id", pa.string()),
-            pa.field("resolved", pa.bool_()),
-            pa.field("observation_count", pa.int64()),
+            pa.field("run_id", pa.string(), nullable=False),
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=False),
+            pa.field("domain", pa.string(), nullable=False),
+            pa.field("tokscale_ver", pa.string(), nullable=False),
+            pa.field("drift_key", pa.string(), nullable=False),
+            pa.field("drift_kind", pa.string(), nullable=False),
+            pa.field("path", pa.string(), nullable=False),
+            pa.field("detail", pa.string(), nullable=False),
+            pa.field("contract_tokscale_ver", pa.string(), nullable=False),
+            pa.field("created_at", _TIMESTAMP, nullable=False),
+            pa.field("collected_at", _TIMESTAMP, nullable=False),
+            pa.field("resolved", pa.bool_(), nullable=False),
+            pa.field("observation_count", pa.int64(), nullable=False),
         ]
     ),
 }
+CANONICAL_TABLE_SCHEMAS.update(
+    {
+        "tags": pa.schema(
+            [
+                pa.field("event_id", pa.string(), nullable=False),
+                pa.field("scope", pa.string(), nullable=False),
+                pa.field("source_id", pa.string(), nullable=False),
+                pa.field("client", pa.string(), nullable=False),
+                pa.field("workspace", pa.string(), nullable=False),
+                pa.field("session_id", pa.string(), nullable=False),
+                pa.field("tag", pa.string(), nullable=False),
+                pa.field("created_at", _TIMESTAMP, nullable=False),
+                pa.field("collected_at", _TIMESTAMP, nullable=False),
+                pa.field("is_deleted", pa.bool_(), nullable=False),
+            ]
+        ),
+        "notes": pa.schema(
+            [
+                pa.field("event_id", pa.string(), nullable=False),
+                pa.field("source_id", pa.string(), nullable=False),
+                pa.field("client", pa.string(), nullable=False),
+                pa.field("session_id", pa.string(), nullable=False),
+                pa.field("note", pa.string(), nullable=False),
+                pa.field("created_at", _TIMESTAMP, nullable=False),
+                pa.field("collected_at", _TIMESTAMP, nullable=False),
+                pa.field("is_deleted", pa.bool_(), nullable=False),
+            ]
+        ),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +200,7 @@ def _table(name: str, columns: ColumnarData) -> pa.Table:
         schema = CANONICAL_TABLE_SCHEMAS[name]
     except KeyError as error:
         raise ValueError(f"missing canonical Arrow schema for {name!r}") from error
+    columns["event_id"] = [str(uuid4()) for _ in next(iter(columns.values()))]
     return pa.Table.from_pydict(columns, schema=schema)
 
 
@@ -211,7 +224,7 @@ def _session_rows(
             "session_label": make_session_label(row),
             "first_seen_at": at,
             "last_seen_at": row.last_active or at,
-            "updated_at": freshness_at,
+            "collected_at": freshness_at,
         }
         for row in rows
     ]
@@ -253,30 +266,14 @@ def _daily_stats_rows(
                     "perf_sample_count": row.perf_sample_count,
                     "perf_token_coverage": row.perf_token_coverage,
                     "tokscale_ms_per_1k_tokens": row.tokscale_ms_per_1k_tokens,
-                    "updated_at": at,
+                    "collected_at": at,
                 }
             )
     return _col_major(records) if records else {}
 
 
-def _activity_rows(graph: GraphPayload, at: datetime, source_id: str) -> ColumnarData:
-    """Build graph-sourced daily activity rows."""
-    records = [
-        {
-            "source_id": source_id,
-            "day": contribution.date,
-            "intensity": contribution.intensity,
-            "active_time_ms": contribution.active_time_ms,
-            "updated_at": at,
-        }
-        for contribution in graph.contributions
-    ]
-    return _col_major(records) if records else {}
-
-
 def _price_version_rows(
     pricing_by_day: dict[date, dict[str, PricingRow]],
-    at: datetime,
     source_id: str,
     *,
     freshness_at: datetime,
@@ -304,45 +301,14 @@ def _price_version_rows(
                         if pricing.pricing.cache_write_input_token_cost is not None
                         else 0.0
                     ),
-                    "observed_at": at,
-                    "updated_at": freshness_at,
+                    "collected_at": freshness_at,
                 }
             )
     return _col_major(records) if records else {}
 
 
-def _ingest_status_rows(
-    statuses: tuple[IngestStatus, ...], at: datetime, source_id: str
-) -> ColumnarData:
-    """Build retry-ledger rows for domain outcomes in this collection."""
-    records = [
-        {
-            "source_id": source_id,
-            "day": status.day,
-            "domain": status.domain,
-            "status": status.status,
-            "expected_count": status.expected_count,
-            "succeeded_count": status.succeeded_count,
-            "last_attempted_run": status.last_attempted_run,
-            "last_succeeded_run": status.last_succeeded_run,
-            "failure_code": status.failure_code,
-            "updated_at": at,
-        }
-        for status in sorted(statuses, key=_ingest_status_key)
-    ]
-    return _col_major(records) if records else {}
-
-
-def _ingest_status_key(status: IngestStatus) -> tuple[date, str]:
-    """Order one retry-ledger row deterministically by day and domain."""
-    return (status.day, status.domain)
-
-
 def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, ColumnarData]:
-    """Build audit, drift, and current reconciliation issue rows."""
-    rows_in = (bundle.fetch_summary or {}).get("rows_in") or sum(
-        len(payload.entries) for payload in bundle.daily_models.values()
-    ) + len(bundle.report_rows) + len(bundle.graph.contributions)
+    """Build collection outcomes and append-only diagnostic observation events."""
     if bundle.drift_fatal:
         status = "failed"
     elif bundle.contract_drift:
@@ -355,7 +321,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
     else:
         status = "ok"
     tables: dict[str, ColumnarData] = {
-        "ingest_runs": {
+        "collection_ledger": {
             "run_id": [bundle.run_id],
             "source_id": [bundle.source_id],
             "started_at": [bundle.started_at],
@@ -382,12 +348,28 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             "shell": [bundle.system_metadata.shell if bundle.system_metadata else None],
             "tokscale_ver": [bundle.graph.meta.version],
             "status": [status],
-            "rows_in": [rows_in],
-            "rows_inserted": [0],
-            "rows_updated": [0],
-            "drift_events": [len(bundle.contract_drift)],
+            "day": [bundle.started_at.date()],
+            "domain": ["collection"],
+            "expected_count": [None],
+            "succeeded_count": [None],
+            "failure_code": [None],
+            "collected_at": [bundle.started_at],
         },
     }
+    ledger = tables["collection_ledger"]
+    for target in bundle.ingest_status:
+        for field, values in ledger.items():
+            value = values[0]
+            if field in {
+                "day",
+                "domain",
+                "status",
+                "expected_count",
+                "succeeded_count",
+                "failure_code",
+            }:
+                value = getattr(target, field)
+            values.append(value)
     if bundle.reconciliation.issues or bundle.reconciliation.resolved:
         issue_rows: list[dict[str, object]] = [
             {
@@ -397,9 +379,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
                 "issue_key": issue.key,
                 "message": issue.message,
                 "created_at": at,
-                "updated_at": at,
-                "detected_run_id": bundle.run_id,
-                "updated_run_id": bundle.run_id,
+                "collected_at": at,
                 "resolved": False,
                 "observation_count": 1,
             }
@@ -412,9 +392,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
                 "issue_key": key,
                 "message": None,
                 "created_at": at,
-                "updated_at": at,
-                "detected_run_id": bundle.run_id,
-                "updated_run_id": bundle.run_id,
+                "collected_at": at,
                 "resolved": True,
                 "observation_count": 0,
             }
@@ -428,6 +406,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
         row = event_rows.get(identity)
         if row is None:
             event_rows[identity] = {
+                "run_id": bundle.run_id,
                 "source_id": bundle.source_id,
                 "domain": drift.domain,
                 "tokscale_ver": tokscale_ver,
@@ -437,9 +416,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
                 "detail": drift.detail,
                 "contract_tokscale_ver": drift.contract_tokscale_ver,
                 "created_at": at,
-                "updated_at": at,
-                "detected_run_id": bundle.run_id,
-                "updated_run_id": bundle.run_id,
+                "collected_at": at,
                 "resolved": False,
                 "observation_count": 1,
             }
@@ -450,6 +427,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
     for state in bundle.resolved_schema_drift:
         identity = drift_identity(state)
         event_rows[identity] = {
+            "run_id": bundle.run_id,
             "source_id": bundle.source_id,
             "domain": state.domain,
             "tokscale_ver": state.tokscale_ver,
@@ -459,9 +437,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             "detail": state.detail,
             "contract_tokscale_ver": state.contract_tokscale_ver,
             "created_at": state.created_at,
-            "updated_at": at,
-            "detected_run_id": state.detected_run_id,
-            "updated_run_id": bundle.run_id,
+            "collected_at": at,
             "resolved": True,
             "observation_count": 0,
         }
@@ -489,18 +465,10 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
             _daily_stats_rows(bundle.daily_models, freshness_at, bundle.source_id),
         ),
         (
-            "daily_activity",
-            _activity_rows(bundle.graph, freshness_at, bundle.source_id),
-        ),
-        (
             "price_versions",
             _price_version_rows(
-                bundle.pricing_by_day, at, bundle.source_id, freshness_at=freshness_at
+                bundle.pricing_by_day, bundle.source_id, freshness_at=freshness_at
             ),
-        ),
-        (
-            "ingest_status",
-            _ingest_status_rows(bundle.ingest_status, freshness_at, bundle.source_id),
         ),
     )
     tables = {
@@ -514,3 +482,33 @@ def normalize(bundle: CollectionBundle) -> NormalizedBundle:
         }
     )
     return NormalizedBundle(bundle.run_id, tables)
+
+
+def failed_collection(
+    *,
+    run_id: str,
+    source_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+    host: str,
+    error: Exception,
+) -> NormalizedBundle:
+    """Record a failed client acquisition without inventing token observations."""
+    row = {
+        **asdict(capture_system_metadata()),
+        "event_id": str(uuid4()),
+        "run_id": run_id,
+        "source_id": source_id,
+        "day": started_at.date(),
+        "domain": "collection",
+        "collected_at": started_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "host": host,
+        "status": "failed",
+        "failure_code": type(error).__name__,
+    }
+    ledger = pa.Table.from_pylist(
+        [row], schema=CANONICAL_TABLE_SCHEMAS["collection_ledger"]
+    )
+    return NormalizedBundle(run_id, {"collection_ledger": ledger})

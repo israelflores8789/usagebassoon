@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 from typer.testing import CliRunner
 
+from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.diagnostics import DoctorCheck
@@ -56,23 +57,25 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     config, backend = _configured_store(tmp_path)
     backend.append(
         "schema_drift_events",
-        pa.table(
-            {
-                "source_id": [SOURCE_ID],
-                "domain": ["models"],
-                "tokscale_ver": ["4.15.1"],
-                "drift_key": ["unknown_field:entries[].extra"],
-                "drift_kind": ["unknown_field"],
-                "path": ["entries[].extra"],
-                "detail": ["unexpected field"],
-                "contract_tokscale_ver": ["4.15.1"],
-                "created_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                "updated_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                "detected_run_id": ["run-1"],
-                "updated_run_id": ["run-1"],
-                "resolved": [False],
-                "observation_count": [1],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": [SOURCE_ID],
+                    "domain": ["models"],
+                    "tokscale_ver": ["4.15.1"],
+                    "drift_key": ["unknown_field:entries[].extra"],
+                    "drift_kind": ["unknown_field"],
+                    "path": ["entries[].extra"],
+                    "detail": ["unexpected field"],
+                    "contract_tokscale_ver": ["4.15.1"],
+                    "created_at": [datetime(2026, 9, 15, tzinfo=UTC)],
+                    "collected_at": [datetime(2026, 9, 15, tzinfo=UTC)],
+                    "detected_run_id": ["run-1"],
+                    "updated_run_id": ["run-1"],
+                    "resolved": [False],
+                    "observation_count": [1],
+                }
+            )
         ),
     )
     backend.close()

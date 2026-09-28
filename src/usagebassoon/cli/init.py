@@ -36,12 +36,21 @@ def init(
     try:
         created = write_initial_config(manager.path)
         configuration = manager.load()
-        backend = open_backend(configuration)
+        backend = open_backend(configuration, initialize=True)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     try:
         backend.apply_ddl()
-        backend.ensure_source_lease(configuration.source_id)
+        if configuration.backend == "bigquery":
+            from usagebassoon.backends.bigquery import BigQueryBackend
+            from usagebassoon.compaction import install_compaction
+
+            if not isinstance(backend, BigQueryBackend):
+                raise RuntimeError("configured BigQuery backend has an invalid type")
+            schedule = install_compaction(backend)
+            typer.echo(f"Nightly compaction scheduled at 02:00 UTC: {schedule}")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--config") from error
     finally:
         close_backend(backend, context="initializing the schema")
     action = "Created" if created else "Using existing"

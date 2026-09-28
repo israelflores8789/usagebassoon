@@ -8,26 +8,31 @@ from __future__ import annotations
 import re
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from typing import override
+from typing import cast, override
+from uuid import uuid4
 
 import duckdb
 import pyarrow as pa
 
 from usagebassoon.backends.base import (
-    SOURCE_LEASE_SECONDS,
     AbstractStorageBackend,
     CuratedIdentity,
     CuratedRenameError,
     CuratedRenameResult,
     SnapshotRead,
-    SourceLeaseToken,
     UpsertResult,
     is_simple_identifier,
 )
-from usagebassoon.schema_assets import RUNTIME_SCHEMA_ASSETS
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
+from usagebassoon.schema_assets import (
+    RUNTIME_SCHEMA_ASSETS,
+    SCHEMA_VERSION,
+    schema_hash,
+)
+from usagebassoon.storage_model import DEBUG_TABLES, newer_observation
 
 
 def _identifier(value: str) -> str:
@@ -62,10 +67,61 @@ class _DuckDBStorage(AbstractStorageBackend):
 
     @override
     def apply_ddl(self) -> None:
-        """Apply the shared DuckDB and MotherDuck DDL plus views."""
+        """Provision a fresh baseline or validate an existing initialized schema."""
+        exists = self.connection.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'schema_marker' "
+            "AND table_schema = current_schema() AND table_catalog = current_database()"
+        ).fetchone()
+        if exists:
+            self.preflight()
+            return
         package = resources.files("usagebassoon.sql.duckdb")
-        for filename in RUNTIME_SCHEMA_ASSETS:
-            self.connection.execute(package.joinpath(filename).read_text())
+        with self.transaction():
+            for filename in RUNTIME_SCHEMA_ASSETS:
+                self.connection.execute(package.joinpath(filename).read_text())
+            self.connection.execute(
+                "INSERT INTO schema_marker VALUES (?, ?, ?)",
+                [
+                    "00000000-0000-0000-0000-000000000000",
+                    SCHEMA_VERSION,
+                    schema_hash("duckdb"),
+                ],
+            )
+
+    @override
+    def preflight(self) -> None:
+        """Read the schema marker; never implicitly provision a fresh database."""
+        try:
+            row = self.connection.execute(
+                "SELECT version, schema_hash FROM schema_marker"
+            ).fetchone()
+        except duckdb.CatalogException as error:
+            raise RuntimeError(
+                "warehouse is not initialized; run bassoon init"
+            ) from error
+        if row is None:
+            raise RuntimeError("warehouse has no schema marker; run bassoon init")
+        from usagebassoon.schema_assets import pending_migrations
+
+        steps = pending_migrations(int(row[0]), str(row[1]), "duckdb")
+        if steps:
+            with self.transaction():
+                for step in steps:
+                    self.connection.execute(step.sql("duckdb"))
+                    self.connection.execute(
+                        "INSERT INTO schema_migrations "
+                        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                        [
+                            "00000000-0000-0000-0000-000000000000",
+                            step.version,
+                            step.target_hashes["duckdb"],
+                        ],
+                    )
+                self.connection.execute(
+                    "UPDATE schema_marker SET version = ?, schema_hash = ?",
+                    [SCHEMA_VERSION, schema_hash("duckdb")],
+                )
 
     @override
     def is_retryable_error(self, error: Exception) -> bool:
@@ -75,83 +131,26 @@ class _DuckDBStorage(AbstractStorageBackend):
         )
 
     @override
-    def ensure_source_lease(self, source_id: str) -> None:
-        """Create one source row under DuckDB's enforced primary key."""
-        if not source_id or source_id == "__bootstrap__":
-            raise ValueError("invalid source lease identity")
-        self.connection.execute(
-            "INSERT INTO source_leases "
-            "(source_id, owner_id, run_id, fence, lease_expires_at, last_renewed_at) "
-            "VALUES (?, NULL, NULL, 0, NULL, NULL) "
-            "ON CONFLICT (source_id) DO NOTHING",
-            [source_id],
-        )
-
-    @override
-    def claim_source_lease(
-        self, source_id: str, run_id: str, owner_id: str
-    ) -> SourceLeaseToken | None:
-        """Conditionally claim one expired or unowned source row."""
-        rows = self.connection.execute(
-            "UPDATE source_leases SET owner_id = ?, run_id = ?, fence = fence + 1, "
-            "lease_expires_at = CURRENT_TIMESTAMP + "
-            f"INTERVAL '{SOURCE_LEASE_SECONDS} seconds', "
-            "last_renewed_at = CURRENT_TIMESTAMP "
-            "WHERE source_id = ? AND "
-            "(owner_id IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP) "
-            "RETURNING fence",
-            [owner_id, run_id, source_id],
-        ).fetchall()
-        if not rows:
-            return None
-        if len(rows) != 1:
-            raise RuntimeError("source lease identity is not unique")
-        return SourceLeaseToken(source_id, run_id, owner_id, int(rows[0][0]))
-
-    @override
-    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Extend one owned lease using the database clock."""
-        rows = self.connection.execute(
-            "UPDATE source_leases SET "
-            "lease_expires_at = CURRENT_TIMESTAMP + "
-            f"INTERVAL '{SOURCE_LEASE_SECONDS} seconds', "
-            "last_renewed_at = CURRENT_TIMESTAMP "
-            "WHERE source_id = ? AND owner_id = ? AND run_id = ? AND fence = ? "
-            "AND lease_expires_at > CURRENT_TIMESTAMP RETURNING fence",
-            [lease.source_id, lease.owner_id, lease.run_id, lease.fence],
-        ).fetchall()
-        return len(rows) == 1
-
-    @override
-    def release_source_lease(self, lease: SourceLeaseToken) -> None:
-        """Release only the matching owner and fence."""
-        self.connection.execute(
-            "UPDATE source_leases SET owner_id = NULL, run_id = NULL, "
-            "lease_expires_at = NULL, last_renewed_at = CURRENT_TIMESTAMP "
-            "WHERE source_id = ? AND owner_id = ? AND run_id = ? AND fence = ?",
-            [lease.source_id, lease.owner_id, lease.run_id, lease.fence],
-        )
-
-    @override
-    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Renew the fenced source row in the caller's write transaction."""
-        return self.renew_source_lease(lease)
-
-    @override
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
-        """Materialize all requested tables in one DuckDB read transaction."""
+        """Capture canonical state and deduplicated ledger rows in one transaction."""
+        result: dict[str, pa.Table] = {}
         with self.transaction():
-            row = self.connection.execute(
-                "SELECT epoch_us(CURRENT_TIMESTAMP)"
-            ).fetchone()
-            if row is None or not isinstance(row[0], int):
-                raise RuntimeError("warehouse did not return a snapshot timestamp")
-            captured_at = datetime.fromtimestamp(row[0] / 1_000_000, UTC)
-            captured = {
-                table: self.query(f"SELECT * FROM {_identifier(table)}")
-                for table in tables
-            }
-        return SnapshotRead(captured_at, captured)
+            captured = self.query("SELECT CURRENT_TIMESTAMP AS stamp").to_pylist()[0]
+            assert captured is not None
+            for table in tables:
+                relation = (
+                    f"current_{table}"
+                    if table not in DEBUG_TABLES
+                    else "replay_" + table
+                )
+                result[table] = (
+                    self.query(f"SELECT * FROM {_identifier(relation)}")
+                    .select(CANONICAL_TABLE_SCHEMAS[table].names)
+                    .cast(CANONICAL_TABLE_SCHEMAS[table])
+                )
+        return SnapshotRead(
+            captured_at=cast(datetime, captured["stamp"]), tables=result
+        )
 
     @override
     def upsert(
@@ -167,7 +166,7 @@ class _DuckDBStorage(AbstractStorageBackend):
             table: Target current-state table.
             data: Normalized Arrow batch.
             natural_keys: Columns identifying a current row.
-            change_fields: Columns compared null-safely for material changes.
+            change_fields: Fields validated against the incoming table schema.
 
         Returns:
             Counts of rows inserted and updated.
@@ -182,38 +181,14 @@ class _DuckDBStorage(AbstractStorageBackend):
             f"target.{_identifier(key)} = source.{_identifier(key)}"
             for key in natural_keys
         )
-        change_predicate = (
-            " OR ".join(
-                f"target.{_identifier(field)} IS DISTINCT FROM "
-                f"source.{_identifier(field)}"
-                for field in change_fields
-            )
-            or "FALSE"
-        )
-        if "updated_at" in columns:
-            change_predicate = (
-                f"source.updated_at >= target.updated_at AND ({change_predicate})"
-            )
+        change_predicate = newer_observation(table)
         assignments: list[str] = []
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if table == "reconciliation_issues" and column == "message":
-                value = (
-                    'CASE WHEN source."resolved" = TRUE '
-                    f"THEN target.{quoted_column} ELSE {value} END"
-                )
-            elif (
-                table in {"reconciliation_issues", "schema_drift_events"}
-                and column == "observation_count"
+            if column == "first_seen_at" or (
+                table in {"tags", "notes"} and column == "created_at"
             ):
-                value = (
-                    'CASE WHEN source."updated_run_id" = '
-                    'target."updated_run_id" OR source."observation_count" = 0 '
-                    f"THEN target.{quoted_column} ELSE "
-                    f"target.{quoted_column} + source.{quoted_column} END"
-                )
-            elif column in {"created_at", "first_seen_at", "detected_run_id", "run_id"}:
                 value = f"COALESCE(target.{quoted_column}, {value})"
             assignments.append(f"{quoted_column} = {value}")
         source_values = ", ".join(f"source.{_identifier(column)}" for column in columns)
@@ -241,6 +216,14 @@ class _DuckDBStorage(AbstractStorageBackend):
                 f"WHEN NOT MATCHED THEN INSERT ({quoted_columns}) "
                 f"VALUES ({source_values})"
             )
+            if table == "sessions":
+                self.connection.execute(
+                    f"UPDATE {quoted_table} AS target SET "
+                    "first_seen_at = "
+                    "LEAST(target.first_seen_at, source.first_seen_at), "
+                    "last_seen_at = GREATEST(target.last_seen_at, source.last_seen_at) "
+                    f"FROM _usagebassoon_upsert_batch AS source WHERE {join}"
+                )
         finally:
             self.connection.unregister("_usagebassoon_upsert_batch")
         return UpsertResult(inserted=int(inserted), updated=int(updated))
@@ -255,6 +238,11 @@ class _DuckDBStorage(AbstractStorageBackend):
         """
         if data.num_rows == 0:
             return
+        if table in DEBUG_TABLES:
+            self.connection.execute(
+                f"DELETE FROM {_identifier(table)} "
+                "WHERE collected_at < CURRENT_TIMESTAMP - INTERVAL '90 days'"
+            )
         quoted_columns = ", ".join(map(_identifier, data.column_names))
         self.connection.register("_usagebassoon_append_batch", data)
         try:
@@ -267,12 +255,15 @@ class _DuckDBStorage(AbstractStorageBackend):
 
     @override
     def has_committed_run(self, run_id: str) -> bool:
-        """Return whether an ingest audit row already owns a run identifier."""
-        result = self.connection.execute(
-            "SELECT 1 FROM ingest_runs WHERE run_id = ? LIMIT 1",
-            [run_id],
-        ).fetchone()
-        return result is not None
+        """Return whether this run's collection summary was committed atomically."""
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM collection_ledger "
+                "WHERE run_id = ? AND domain = 'collection'",
+                [run_id],
+            ).fetchone()
+            is not None
+        )
 
     @override
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
@@ -317,7 +308,8 @@ class _DuckDBStorage(AbstractStorageBackend):
         insert_parameters = {
             **source_parameters,
             "destination_tag": destination_parameters["destination_tag"],
-            "updated_at": updated_at,
+            "collected_at": updated_at,
+            "event_id": str(uuid4()),
         }
         source_predicate = " AND ".join(
             f"{_identifier(name)} = $source_{name}" for name, _ in source.values
@@ -342,9 +334,10 @@ class _DuckDBStorage(AbstractStorageBackend):
             insert_sql = (
                 'INSERT INTO "tags" '
                 "(source_id, scope, client, workspace, session_id, "
-                "tag, created_at, updated_at) "
+                "tag, created_at, collected_at, event_id, is_deleted) "
                 "SELECT source_id, scope, client, workspace, session_id, "
-                ' $destination_tag, created_at, $updated_at FROM "tags" WHERE '
+                " $destination_tag, created_at, $collected_at, $event_id, "
+                'FALSE FROM "tags" WHERE '
                 f"{source_predicate}"
             )
             self.connection.execute(

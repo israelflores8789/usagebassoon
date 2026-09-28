@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
+from uuid import uuid4
 
 import pyarrow as pa
 
@@ -140,7 +141,9 @@ def add_tag(
             "session_id": [assignment.session_id or ""],
             "tag": [assignment.tag],
             "created_at": [timestamp],
-            "updated_at": [timestamp],
+            "collected_at": [timestamp],
+            "event_id": [str(uuid4())],
+            "is_deleted": [False],
         }
     )
     return backend.upsert(
@@ -228,7 +231,9 @@ def set_note(
             "session_id": [assignment.session_id],
             "note": [assignment.note],
             "created_at": [timestamp],
-            "updated_at": [timestamp],
+            "collected_at": [timestamp],
+            "event_id": [str(uuid4())],
+            "is_deleted": [False],
         }
     )
     return backend.upsert(

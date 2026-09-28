@@ -23,7 +23,7 @@ from pathlib import Path
 from threading import Event
 from typing import Literal
 
-from usagebassoon.backends.base import SourceLeaseBusy
+from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationManager,
@@ -788,7 +788,7 @@ def run_worker(
         while not stop_requested.is_set():
             try:
                 run_id, summary = collect_run(configuration)
-            except SourceLeaseBusy as error:
+            except CollectionBusy as error:
                 logger.info("scheduled collection skipped: %s", error)
                 print(
                     f"scheduled collection skipped: {error}",

@@ -11,6 +11,7 @@ from pathlib import Path
 import pyarrow as pa
 from typer.testing import CliRunner
 
+from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 
@@ -34,25 +35,27 @@ def test_audit_orders_runs_newest_first_and_honors_limit(tmp_path: Path) -> None
     """Render only the requested newest audit records."""
     config, backend = _configured_store(tmp_path)
     backend.append(
-        "ingest_runs",
-        pa.table(
-            {
-                "run_id": ["old-run", "new-run"],
-                "source_id": [SOURCE_ID, SOURCE_ID],
-                "started_at": [
-                    datetime(2026, 9, 14, tzinfo=UTC),
-                    datetime(2026, 9, 15, tzinfo=UTC),
-                ],
-                "finished_at": [
-                    datetime(2026, 9, 14, 1, tzinfo=UTC),
-                    datetime(2026, 9, 15, 1, tzinfo=UTC),
-                ],
-                "status": ["ok", "partial"],
-                "rows_in": [1, 2],
-                "rows_inserted": [1, 1],
-                "rows_updated": [0, 1],
-                "drift_events": [0, 1],
-            }
+        "collection_ledger",
+        observations(
+            pa.table(
+                {
+                    "run_id": ["old-run", "new-run"],
+                    "source_id": [SOURCE_ID, SOURCE_ID],
+                    "started_at": [
+                        datetime(2026, 9, 14, tzinfo=UTC),
+                        datetime(2026, 9, 15, tzinfo=UTC),
+                    ],
+                    "finished_at": [
+                        datetime(2026, 9, 14, 1, tzinfo=UTC),
+                        datetime(2026, 9, 15, 1, tzinfo=UTC),
+                    ],
+                    "status": ["ok", "partial"],
+                    "rows_in": [1, 2],
+                    "rows_inserted": [1, 1],
+                    "rows_updated": [0, 1],
+                    "drift_events": [0, 1],
+                }
+            )
         ),
     )
     backend.close()

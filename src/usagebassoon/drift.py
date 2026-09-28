@@ -22,9 +22,7 @@ class SchemaDriftRecord:
         detail: Human-readable deviation detail.
         contract_tokscale_ver: Tokscale version pinned by the contract.
         created_at: First observation time.
-        updated_at: Most recent observation or resolution time.
-        detected_run_id: First collection run that observed the event.
-        updated_run_id: Most recent collection run that observed the event.
+        collected_at: Most recent observation or resolution time.
         observation_count: Number of payload observations while active.
     """
 
@@ -36,9 +34,7 @@ class SchemaDriftRecord:
     detail: str
     contract_tokscale_ver: str
     created_at: datetime
-    updated_at: datetime
-    detected_run_id: str
-    updated_run_id: str
+    collected_at: datetime
     observation_count: int
 
 
@@ -54,7 +50,6 @@ class SchemaDriftState:
     detail: str
     contract_tokscale_ver: str
     created_at: datetime
-    detected_run_id: str
     observation_count: int
 
 
@@ -79,5 +74,5 @@ def format_drift(record: SchemaDriftRecord) -> str:
         f"{record.domain}: {record.path}: {record.detail} "
         f"(tokscale {record.tokscale_ver}; contract "
         f"{record.contract_tokscale_ver}; observed {record.observation_count} times; "
-        f"runs {record.detected_run_id}..{record.updated_run_id})"
+        f"last collected {record.collected_at.isoformat()})"
     )

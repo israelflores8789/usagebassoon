@@ -253,8 +253,7 @@ def collection_bundle(
                     if domain == "models"
                     else len({row.stats.model for row in payload.entries})
                 ),
-                last_attempted_run=run_id,
-                last_succeeded_run=run_id,
+                run_id=run_id,
             )
             for day, payload in daily_models.items()
             for domain in ("models", "pricing")

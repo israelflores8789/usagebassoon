@@ -22,7 +22,7 @@ from usagebassoon.config import (
 def configured_backend(
     config: Path | None,
 ) -> tuple[UsageBassoonConfig, StorageBackend]:
-    """Open and initialize the backend selected by one configuration path.
+    """Open and validate the backend selected by one configuration path.
 
     Args:
         config: Explicit configuration path, when supplied.
@@ -34,7 +34,6 @@ def configured_backend(
     try:
         configuration = ConfigurationManager(config).load()
         backend = open_backend(configuration)
-        backend.apply_ddl()
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         if backend is not None:
             close_backend(backend, context="backend initialization")

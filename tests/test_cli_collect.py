@@ -12,8 +12,8 @@ import pytest
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
-from usagebassoon.backends.base import SourceLeaseBusy
 from usagebassoon.cli.app import app
+from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.persistence import PersistSummary
 
@@ -74,14 +74,14 @@ def test_collect_skips_when_another_worker_owns_the_source(
 
     def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
         """Simulate a live collection already holding the source lease."""
-        raise SourceLeaseBusy("source is already collecting")
+        raise CollectionBusy("source is already collecting")
 
     monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
     result = CliRunner().invoke(app, ["collect", "--config", str(config)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert plain_cli_output(result.output) == (
-        "Collection skipped: source is already collecting\n"
+        "Collection failed: source is already collecting\n"
     )
 
 

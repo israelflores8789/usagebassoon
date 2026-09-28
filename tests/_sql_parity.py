@@ -16,6 +16,7 @@ import pyarrow as pa
 import sqlglot
 from sqlglot import exp
 
+from tests._observations import observations
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.schema_assets import PARITY_SCHEMA_ASSETS
@@ -72,7 +73,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "session_label": "alpha",
                 "first_seen_at": _CAPTURED_AT,
                 "last_seen_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -89,7 +90,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "session_label": "beta",
                 "first_seen_at": _CAPTURED_AT,
                 "last_seen_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -106,7 +107,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "session_label": "gamma",
                 "first_seen_at": _CAPTURED_AT,
                 "last_seen_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -123,7 +124,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "session_label": "empty",
                 "first_seen_at": _CAPTURED_AT,
                 "last_seen_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
         ],
         schema=CANONICAL_TABLE_SCHEMAS["sessions"],
@@ -150,7 +151,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "perf_sample_count": 1,
                 "perf_token_coverage": 1.0,
                 "tokscale_ms_per_1k_tokens": 2_000.0,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -172,7 +173,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "perf_sample_count": 1,
                 "perf_token_coverage": 1.0,
                 "tokscale_ms_per_1k_tokens": 2_000.0,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -194,7 +195,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "perf_sample_count": 0,
                 "perf_token_coverage": 0.0,
                 "tokscale_ms_per_1k_tokens": 0.0,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
         ],
         schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
@@ -213,7 +214,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
                 "observed_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -227,7 +228,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
                 "observed_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
             {
                 "source_id": _SOURCE_ID,
@@ -241,7 +242,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
                 "observed_at": _CAPTURED_AT,
-                "updated_at": _CAPTURED_AT,
+                "collected_at": _CAPTURED_AT,
             },
         ],
         schema=CANONICAL_TABLE_SCHEMAS["price_versions"],
@@ -255,7 +256,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
             "session_id": ["", "", "session-alpha", "session-empty"],
             "tag": ["client-tag", "workspace-tag", "session-tag", "empty-tag"],
             "created_at": [_CAPTURED_AT] * 4,
-            "updated_at": [_CAPTURED_AT] * 4,
+            "collected_at": [_CAPTURED_AT] * 4,
         }
     )
     notes = pa.table(
@@ -265,7 +266,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
             "session_id": ["session-alpha"],
             "note": ["synthetic note"],
             "created_at": [_CAPTURED_AT],
-            "updated_at": [_CAPTURED_AT],
+            "collected_at": [_CAPTURED_AT],
         }
     )
     for name, table in (
@@ -275,7 +276,7 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
         ("tags", tags),
         ("notes", notes),
     ):
-        backend.append(name, table)
+        backend.append(name, observations(table))
 
 
 def normalized_records(

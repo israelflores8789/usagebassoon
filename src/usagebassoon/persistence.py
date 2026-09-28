@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""persistence.py — Transactional persistence of normalized collection batches."""
+"""persistence.py — Backend-specific publication of normalized collection batches."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from datetime import date, datetime
 from usagebassoon.backends.base import (
     CurrentStateWrite,
     PersistenceBatch,
-    SourceLeaseToken,
     StorageBackend,
     UpsertResult,
     close_backend,
@@ -25,93 +24,17 @@ from usagebassoon.ingest import IngestStatus, IngestTarget
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
 from usagebassoon.reconcile import ReconciliationIdentity
+from usagebassoon.storage_model import DEBUG_TABLES, STATE_KEYS
 
 _MAX_TRANSACTION_RETRY_SECONDS = 30.0
 _LOG = logging.getLogger(LOGGER_NAME)
 
-CURRENT_STATE_TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "sessions": (
-        ("source_id", "client", "session_id"),
-        (
-            "workspace",
-            "workspace_label",
-            "created_at",
-            "last_active",
-            "duration_minutes",
-            "message_count",
-            "tokscale_cost_usd",
-            "models_used",
-            "session_label",
-            "last_seen_at",
-        ),
-    ),
-    "daily_stats": (
-        ("source_id", "day", "client", "session_id", "model"),
-        (
-            "provider",
-            "input_tokens",
-            "output_tokens",
-            "cache_read",
-            "cache_write",
-            "reasoning",
-            "total_tokens",
-            "message_count",
-            "tokscale_cost_usd",
-            "perf_duration_ms",
-            "perf_timed_tokens",
-            "perf_sample_count",
-            "perf_token_coverage",
-            "tokscale_ms_per_1k_tokens",
-        ),
-    ),
-    "daily_activity": (("source_id", "day"), ("intensity", "active_time_ms")),
-    "price_versions": (
-        ("source_id", "day", "model"),
-        (
-            "source",
-            "matched_key",
-            "match_kind",
-            "price_input_per_token",
-            "price_output_per_token",
-            "price_cache_read_per_token",
-            "price_cache_write_per_token",
-            "observed_at",
-        ),
-    ),
-    "ingest_status": (
-        ("source_id", "day", "domain"),
-        (
-            "status",
-            "expected_count",
-            "succeeded_count",
-            "last_attempted_run",
-            "last_succeeded_run",
-            "failure_code",
-        ),
-    ),
-    "reconciliation_issues": (
-        ("source_id", "check_name", "issue_key"),
-        ("message", "updated_at", "updated_run_id", "resolved"),
-    ),
-    "schema_drift_events": (
-        ("source_id", "domain", "tokscale_ver", "drift_key"),
-        (
-            "drift_kind",
-            "path",
-            "detail",
-            "contract_tokscale_ver",
-            "updated_at",
-            "updated_run_id",
-            "resolved",
-        ),
-    ),
+CURRENT_STATE_TABLES = {
+    table: (keys, ("collected_at", "event_id"))
+    for table, keys in STATE_KEYS.items()
+    if table not in {"tags", "notes"}
 }
-
-APPEND_ONLY_TABLES = frozenset(
-    {
-        "ingest_runs",
-    }
-)
+APPEND_ONLY_TABLES = DEBUG_TABLES | {"collection_ledger"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +42,9 @@ class PersistSummary:
     """Outcome of persisting one normalized collection run.
 
     Attributes:
-        inserted: New current-state rows.
-        updated: Materially changed current-state rows.
-        per_table: Per-current-table upsert outcomes.
+        inserted: New state rows locally, appended observations in BigQuery.
+        updated: Locally replaced state rows; zero for BigQuery publication.
+        per_table: Backend write counts, excluding the collection ledger.
     """
 
     inserted: int
@@ -147,19 +70,16 @@ def load_ingest_status(
     backend = open_backend(config)
     source = _source_literal(config.source_id)
     try:
-        backend.apply_ddl()
-        status_rows = backend.query(
-            "SELECT day, domain, status, expected_count, succeeded_count, "
-            "last_attempted_run, last_succeeded_run, failure_code "
-            f"FROM ingest_status WHERE source_id = {source}"
+        planning = backend.query(
+            f"SELECT * FROM collection_preflight WHERE source_id = {source}"
         ).to_pylist()
+        status_rows = [row for row in planning if row["record_kind"] == "status"]
         statuses: dict[IngestTarget, IngestStatus] = {}
         for row in status_rows:
             day = row["day"]
             domain = row["domain"]
             status = row["status"]
-            attempted = row["last_attempted_run"]
-            succeeded = row["last_succeeded_run"]
+            attempted = row["run_id"]
             failure_code = row["failure_code"]
             expected_count = row["expected_count"]
             succeeded_count = row["succeeded_count"]
@@ -168,56 +88,46 @@ def load_ingest_status(
                 or not isinstance(domain, str)
                 or not isinstance(status, str)
                 or not isinstance(attempted, str)
-                or (succeeded is not None and not isinstance(succeeded, str))
                 or (failure_code is not None and not isinstance(failure_code, str))
                 or (expected_count is not None and not isinstance(expected_count, int))
                 or (
                     succeeded_count is not None and not isinstance(succeeded_count, int)
                 )
             ):
-                raise RuntimeError("ingest_status contains an invalid row")
+                raise RuntimeError("collection_status contains an invalid row")
             statuses[(day, domain)] = IngestStatus(
                 day=day,
                 domain=domain,
                 status=status,
                 expected_count=expected_count,
                 succeeded_count=succeeded_count,
-                last_attempted_run=attempted,
-                last_succeeded_run=succeeded,
+                run_id=attempted,
                 failure_code=failure_code,
             )
         models_by_day: dict[date, set[str]] = {}
-        for row in backend.query(
-            f"SELECT DISTINCT day, model FROM daily_stats WHERE source_id = {source}"
-        ).to_pylist():
+        for row in planning:
+            if row["record_kind"] != "models":
+                continue
             day, model = row["day"], row["model"]
             if not isinstance(day, date) or not isinstance(model, str):
                 raise RuntimeError("daily_stats contains an invalid daily model key")
             models_by_day.setdefault(day, set()).add(model)
         prices_by_day: dict[date, set[str]] = {}
-        for row in backend.query(
-            f"SELECT DISTINCT day, model FROM price_versions WHERE source_id = {source}"
-        ).to_pylist():
+        for row in planning:
+            if row["record_kind"] != "prices":
+                continue
             day, model = row["day"], row["model"]
             if not isinstance(day, date) or not isinstance(model, str):
                 raise RuntimeError("price_versions contains an invalid daily model key")
             prices_by_day.setdefault(day, set()).add(model)
-        issue_rows = backend.query(
-            "SELECT check_name, issue_key FROM reconciliation_issues "
-            f"WHERE source_id = {source} AND resolved = FALSE"
-        ).to_pylist()
+        issue_rows = [row for row in planning if row["record_kind"] == "issues"]
         issue_identities: set[ReconciliationIdentity] = set()
         for row in issue_rows:
             check_name, issue_key = row["check_name"], row["issue_key"]
             if not isinstance(check_name, str) or not isinstance(issue_key, str):
                 raise RuntimeError("reconciliation_issues contains an invalid identity")
             issue_identities.add((check_name, issue_key))
-        drift_rows = backend.query(
-            "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
-            "contract_tokscale_ver, created_at, detected_run_id, observation_count "
-            "FROM schema_drift_events "
-            f"WHERE source_id = {source} AND COALESCE(resolved, FALSE) = FALSE"
-        ).to_pylist()
+        drift_rows = [row for row in planning if row["record_kind"] == "drift"]
         schema_drift: list[SchemaDriftState] = []
         for row in drift_rows:
             domain = row["domain"]
@@ -228,7 +138,6 @@ def load_ingest_status(
             detail = row["detail"]
             contract_tokscale_ver = row["contract_tokscale_ver"]
             created_at = row["created_at"]
-            detected_run_id = row["detected_run_id"]
             observation_count = row["observation_count"]
             if (
                 not isinstance(domain, str)
@@ -239,7 +148,6 @@ def load_ingest_status(
                 or not isinstance(detail, str)
                 or not isinstance(contract_tokscale_ver, str)
                 or not isinstance(created_at, datetime)
-                or not isinstance(detected_run_id, str)
                 or not isinstance(observation_count, int)
             ):
                 raise RuntimeError("schema_drift_events contains an invalid row")
@@ -253,7 +161,6 @@ def load_ingest_status(
                     detail=detail,
                     contract_tokscale_ver=contract_tokscale_ver,
                     created_at=created_at,
-                    detected_run_id=detected_run_id,
                     observation_count=observation_count,
                 )
             )
@@ -268,81 +175,44 @@ def load_ingest_status(
         close_backend(backend, context="loading ingest status", logger=_LOG)
 
 
-def persist_run(
-    backend: StorageBackend,
-    bundle: NormalizedBundle,
-    *,
-    lease: SourceLeaseToken | None = None,
-) -> PersistSummary:
-    """Persist one normalized collection in a single backend transaction.
-
-    Current-state tables are upserted, append-only audit/history tables are
-    appended, and user-owned curation tables are deliberately not accepted.
-
-    Args:
-        backend: Destination storage backend.
-        bundle: Canonical Arrow tables produced by normalizer.
-        lease: Source lease already held by the collection orchestrator.
-
-    Returns:
-        Counts of inserted and updated current-state rows.
-
-    Raises:
-        ValueError: If normalizer supplies an unknown or incomplete table.
-    """
-    supplied = frozenset(bundle.tables)
+def persist_run(backend: StorageBackend, bundle: NormalizedBundle) -> PersistSummary:
+    """Publish one run using the backend's native persistence strategy."""
     permitted = frozenset(CURRENT_STATE_TABLES) | APPEND_ONLY_TABLES
-    if unknown := supplied - permitted:
+    if unknown := frozenset(bundle.tables) - permitted:
         raise ValueError(f"normalizer produced unsupported tables: {sorted(unknown)}")
-    if "ingest_runs" not in bundle.tables:
-        raise ValueError("normalizer must produce an ingest_runs table")
-
-    current_state = tuple(
-        CurrentStateWrite(table, data, natural_keys, change_fields)
-        for table, (natural_keys, change_fields) in CURRENT_STATE_TABLES.items()
-        if (data := bundle.tables.get(table)) is not None
-    )
-    append_only = {
-        table: data
-        for table in APPEND_ONLY_TABLES - {"ingest_runs"}
-        if (data := bundle.tables.get(table)) is not None
-    }
+    if "collection_ledger" not in bundle.tables:
+        raise ValueError("normalizer must produce a collection_ledger table")
     outcome = backend.persist_batch(
         PersistenceBatch(
             run_id=bundle.run_id,
-            current_state=current_state,
-            append_only=append_only,
-            ingest_runs=bundle.tables["ingest_runs"],
-            lease=lease,
+            current_state=tuple(
+                CurrentStateWrite(table, data, keys, fields)
+                for table, (keys, fields) in CURRENT_STATE_TABLES.items()
+                if (data := bundle.tables.get(table)) is not None
+            ),
+            append_only={
+                table: data
+                for table in DEBUG_TABLES
+                if (data := bundle.tables.get(table)) is not None
+            },
+            collection_ledger=bundle.tables["collection_ledger"],
         )
     )
-    return PersistSummary(
-        inserted=outcome.inserted,
-        updated=outcome.updated,
-        per_table=dict(outcome.per_table),
-    )
+    return PersistSummary(outcome.inserted, outcome.updated, dict(outcome.per_table))
 
 
 def persist_with_retries(
     config: UsageBassoonConfig,
     bundle: NormalizedBundle,
     logger: logging.Logger,
-    *,
-    lease: SourceLeaseToken | None = None,
 ) -> PersistSummary:
-    """Initialize storage and persist a batch with bounded backend retries."""
-    schema_ready = lease is not None
+    """Publish a stable observation batch with bounded backend retries."""
     attempts = config.collection.max_retries + 1
     for attempt in range(1, attempts + 1):
         backend: StorageBackend | None = None
         try:
             backend = open_backend(config)
-            if not schema_ready:
-                backend.apply_ddl()
-                schema_ready = True
-            if lease is None:
-                return persist_run(backend, bundle)
-            return persist_run(backend, bundle, lease=lease)
+            return persist_run(backend, bundle)
         except Exception as error:
             try:
                 retryable = backend is not None and backend.is_retryable_error(error)
@@ -364,8 +234,9 @@ def persist_with_retries(
                 config.collection.retry_initial_seconds * (2 ** (attempt - 1)),
             )
             delay = random.uniform(0, maximum_delay)
-            logger.exception(
-                "collection run %s had a retryable transaction conflict on attempt "
+            logger.warning(
+                "another UsageBassoon instance may be writing to the database; "
+                "collection run %s had a retryable write conflict on attempt "
                 "%s of %s; retrying in %.1fs",
                 bundle.run_id,
                 attempt,

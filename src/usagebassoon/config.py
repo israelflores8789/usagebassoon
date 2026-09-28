@@ -818,11 +818,14 @@ def _configuration_error_with_log(
     )
 
 
-def open_backend(config: UsageBassoonConfig) -> StorageBackend:
+def open_backend(
+    config: UsageBassoonConfig, *, initialize: bool = False
+) -> StorageBackend:
     """Open the backend selected by a validated configuration.
 
     Args:
         config: Validated UsageBassoon settings.
+        initialize: Skip preflight only for explicit schema provisioning.
 
     Returns:
         An open storage backend owned by the caller.
@@ -833,23 +836,31 @@ def open_backend(config: UsageBassoonConfig) -> StorageBackend:
     if config.backend == "duckdb":
         if config.local_database is None:
             raise ValueError("Local DuckDB path is missing")
-        return DuckDBBackend(config.local_database)
-    if config.backend == "motherduck":
+        backend: StorageBackend = DuckDBBackend(config.local_database)
+    elif config.backend == "motherduck":
         if config.motherduck is None:
             raise ValueError("MotherDuck settings are missing")
-        return MotherDuckBackend(config.motherduck.database)
-    if config.bigquery is None:
-        raise ValueError("BigQuery settings are missing")
-    from usagebassoon.backends.bigquery import BigQueryBackend
+        backend = MotherDuckBackend(config.motherduck.database)
+    else:
+        if config.bigquery is None:
+            raise ValueError("BigQuery settings are missing")
+        from usagebassoon.backends.bigquery import BigQueryBackend
 
-    return BigQueryBackend(
-        config.bigquery.project,
-        config.bigquery.dataset,
-        location=config.bigquery.location,
-        credentials_file=config.bigquery.credentials_file,
-        maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
-        timeout_seconds=config.bigquery.timeout_seconds,
-    )
+        backend = BigQueryBackend(
+            config.bigquery.project,
+            config.bigquery.dataset,
+            location=config.bigquery.location,
+            credentials_file=config.bigquery.credentials_file,
+            maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
+            timeout_seconds=config.bigquery.timeout_seconds,
+        )
+    if not initialize:
+        try:
+            backend.preflight()
+        except Exception:
+            backend.close()
+            raise
+    return backend
 
 
 class ConfigurationManager:

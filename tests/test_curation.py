@@ -130,14 +130,14 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
             == 1
         )
         assert backend.query(
-            "SELECT note, note_created_at, note_updated_at FROM noted_sessions "
+            "SELECT note, note_created_at, note_collected_at FROM noted_sessions "
             f"WHERE client = '{target.client}' "
             f"AND session_id = '{target.session_id}'"
         ).to_pylist() == [
             {
                 "note": "Revised annotation",
                 "note_created_at": created,
-                "note_updated_at": updated,
+                "note_collected_at": updated,
             }
         ]
     finally:
@@ -210,8 +210,10 @@ def test_tag_rename_preserves_creation_time_and_updates_timestamp() -> None:
         result = rename_tag(backend, assignment, "new", at=renamed)
         assert result.renamed
         assert backend.query(
-            "SELECT tag, created_at, updated_at FROM tags"
-        ).to_pylist() == [{"tag": "new", "created_at": created, "updated_at": renamed}]
+            "SELECT tag, created_at, collected_at FROM tags"
+        ).to_pylist() == [
+            {"tag": "new", "created_at": created, "collected_at": renamed}
+        ]
     finally:
         backend.close()
 

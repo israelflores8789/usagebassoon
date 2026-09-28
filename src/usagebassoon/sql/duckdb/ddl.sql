@@ -6,20 +6,17 @@
 -- upserts: new natural keys are inserted, changed keys update in place,
 -- and payload absent observations are never deleted.
 
--- Source leases serialize collection planning and persistence across processes.
--- The bootstrap row serializes first-time source provisioning on BigQuery.
-CREATE TABLE IF NOT EXISTS source_leases (
-    source_id TEXT PRIMARY KEY,
-    owner_id TEXT,
-    run_id TEXT,
-    fence BIGINT NOT NULL,
-    lease_expires_at TIMESTAMPTZ,
-    last_renewed_at TIMESTAMPTZ
-);
 
--- Metadata about each ingest information about the collection environment.
-CREATE TABLE IF NOT EXISTS ingest_runs (
-    run_id TEXT PRIMARY KEY,
+-- Client collection outcomes and execution-environment metadata, retained forever.
+CREATE TABLE collection_ledger (
+    event_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    domain TEXT NOT NULL,
+    expected_count BIGINT,
+    succeeded_count BIGINT,
+    failure_code TEXT,
+    collected_at TIMESTAMPTZ NOT NULL,
     source_id TEXT NOT NULL,
     started_at TIMESTAMPTZ NOT NULL,
     finished_at TIMESTAMPTZ,
@@ -32,16 +29,14 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     memory_bytes BIGINT,
     shell TEXT,
     tokscale_ver TEXT,
-    status TEXT,
-    rows_in INTEGER,
-    rows_inserted INTEGER,
-    rows_updated INTEGER,
-    drift_events INTEGER
+    status TEXT
 );
 
 -- Artifacts of tokscale payload drift events from the expected tokscale schema.
 -- Reported in `bassoon doctor`.
-CREATE TABLE IF NOT EXISTS schema_drift_events (
+CREATE TABLE schema_drift_events (
+    run_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     domain TEXT NOT NULL,
     tokscale_ver TEXT NOT NULL,
@@ -51,16 +46,14 @@ CREATE TABLE IF NOT EXISTS schema_drift_events (
     detail TEXT NOT NULL,
     contract_tokscale_ver TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    detected_run_id TEXT NOT NULL,
-    updated_run_id TEXT NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
     resolved BOOLEAN NOT NULL DEFAULT FALSE,
-    observation_count BIGINT NOT NULL,
-    PRIMARY KEY (source_id, domain, tokscale_ver, drift_key)
+    observation_count BIGINT NOT NULL
 );
 
 -- Holds metadata about each usage session typically from `tokscale report`.
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE TABLE sessions (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     client TEXT NOT NULL,
     session_id TEXT NOT NULL,
@@ -75,12 +68,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_label TEXT,
     first_seen_at TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, client, session_id)
 );
 
 -- Date-filtered usage facts from `tokscale models` at the session×model grain.
-CREATE TABLE IF NOT EXISTS daily_stats (
+CREATE TABLE daily_stats (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
     client TEXT NOT NULL,
@@ -100,24 +94,15 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     perf_sample_count BIGINT,
     perf_token_coverage DOUBLE,
     tokscale_ms_per_1k_tokens DOUBLE,
-    updated_at TIMESTAMPTZ NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day, client, session_id, model)
 );
 
--- Activity reported by `tokscale graph`.
--- Used to identify candidate days for usage history collection.
-CREATE TABLE IF NOT EXISTS daily_activity (
-    source_id TEXT NOT NULL,
-    day DATE NOT NULL,
-    intensity INTEGER,
-    active_time_ms BIGINT,
-    updated_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (source_id, day)
-);
 
 -- Snapshots of rates for models in use at the daily grain, typically
 -- from `tokscale pricing`. Allows for historical cost accuracy.
-CREATE TABLE IF NOT EXISTS price_versions (
+CREATE TABLE price_versions (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     day DATE NOT NULL,
     model TEXT NOT NULL,
@@ -128,50 +113,31 @@ CREATE TABLE IF NOT EXISTS price_versions (
     price_output_per_token DOUBLE,
     price_cache_read_per_token DOUBLE,
     price_cache_write_per_token DOUBLE,
-    observed_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (source_id, day, model)
 );
 
--- A ledger of days where token usage history has already been collected and
--- a status of the collection's success state. This table allows for tolerant
--- collection that prioritizes token usage data over metadata. It also makes
--- collection calls more efficient by providing the intelligence to not have
--- to ask tokscale for all usage history every call.
-CREATE TABLE IF NOT EXISTS ingest_status (
-    source_id TEXT NOT NULL,
-    day DATE NOT NULL,
-    domain TEXT NOT NULL,
-    status TEXT NOT NULL,
-    expected_count BIGINT,
-    succeeded_count BIGINT,
-    last_attempted_run TEXT NOT NULL,
-    last_succeeded_run TEXT,
-    failure_code TEXT,
-    updated_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (source_id, day, domain)
-);
 
 -- Artifacts of unexpected math errors when performing reconciliation checks on
 -- the usage data. Reported in `bassoon doctor`.
 -- `check_name` is the name of the reconciliation check that failed.
 -- `issue_key` is the specific issue that was detected within that check.
-CREATE TABLE IF NOT EXISTS reconciliation_issues (
+CREATE TABLE reconciliation_issues (
+    event_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     check_name TEXT NOT NULL,
     issue_key TEXT NOT NULL,
     message TEXT,
     created_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ,
-    detected_run_id TEXT,
-    updated_run_id TEXT,
+    collected_at TIMESTAMPTZ NOT NULL,
     resolved BOOLEAN NOT NULL DEFAULT FALSE,
     observation_count BIGINT NOT NULL
 );
 
 -- Table of user-curated tags across usage data.
-CREATE TABLE IF NOT EXISTS tags (
+CREATE TABLE tags (
+    event_id TEXT NOT NULL,
     scope TEXT NOT NULL CHECK (scope IN ('client', 'workspace', 'session')),
     source_id TEXT NOT NULL,
     client TEXT NOT NULL DEFAULT '',
@@ -179,7 +145,8 @@ CREATE TABLE IF NOT EXISTS tags (
     session_id TEXT NOT NULL DEFAULT '',
     tag TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (source_id, scope, client, workspace, session_id, tag),
     CHECK (
         (scope = 'client' AND client <> '' AND workspace = '' AND session_id = '')
@@ -189,12 +156,29 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 
 -- Table of user-curated notes across usage data.
-CREATE TABLE IF NOT EXISTS notes (
+CREATE TABLE notes (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     client TEXT NOT NULL,
     session_id TEXT NOT NULL,
     note TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (source_id, client, session_id)
+);
+
+-- Schema metadata is local to this backend and excluded from portable snapshots.
+CREATE TABLE schema_marker (
+    source_id TEXT NOT NULL,
+    version BIGINT NOT NULL,
+    schema_hash TEXT NOT NULL
+);
+
+-- Upgrade bookkeeping is backend-local metadata, excluded from snapshots.
+CREATE TABLE schema_migrations (
+    source_id TEXT NOT NULL,
+    version BIGINT NOT NULL,
+    schema_hash TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL
 );

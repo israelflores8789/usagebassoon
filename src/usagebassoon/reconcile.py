@@ -39,9 +39,7 @@ class ReconciliationIssueRecord:
         issue_key: Stable key for the failed assertion.
         message: Detail from the latest detection, when available.
         created_at: First detection time, when available.
-        updated_at: Latest detection time, when available.
-        detected_run_id: Run that first detected the issue, when available.
-        updated_run_id: Run that last detected the issue, when available.
+        collected_at: Latest detection time, when available.
         observation_count: Number of times the issue was observed while active.
     """
 
@@ -49,9 +47,7 @@ class ReconciliationIssueRecord:
     issue_key: str
     message: str | None
     created_at: datetime | None
-    updated_at: datetime | None
-    detected_run_id: str | None
-    updated_run_id: str | None
+    collected_at: datetime | None
     observation_count: int
 
 

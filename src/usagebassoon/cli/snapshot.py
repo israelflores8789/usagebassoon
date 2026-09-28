@@ -25,7 +25,7 @@ def snapshot(
     try:
         archiver = snapshot_archiver(configuration)
         latest = backend.query(
-            "SELECT run_id FROM ingest_runs ORDER BY finished_at DESC LIMIT 1"
+            "SELECT run_id FROM collection_runs ORDER BY finished_at DESC LIMIT 1"
         ).to_pylist()
         uri = archiver.write(
             backend,

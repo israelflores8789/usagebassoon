@@ -176,7 +176,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
         assert backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, "
             "contract_tokscale_ver, resolved, observation_count "
-            "FROM schema_drift_events"
+            "FROM current_schema_drift_events"
         ).to_pylist() == [
             {
                 "domain": "models",
@@ -241,8 +241,8 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
         persist_run(backend, normalize(bundles[1]))
         rows = backend.query(
             "SELECT domain, tokscale_ver, drift_key, contract_tokscale_ver, "
-            "created_at, updated_at, detected_run_id, updated_run_id, resolved, "
-            "observation_count FROM schema_drift_events "
+            "created_at, collected_at, resolved, "
+            "observation_count FROM current_schema_drift_events "
             "ORDER BY tokscale_ver"
         ).to_pylist()
         first, second, third = bundles
@@ -255,9 +255,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
                     "models"
                 ].tokscale_version,
                 "created_at": first.finished_at,
-                "updated_at": second.finished_at,
-                "detected_run_id": first.run_id,
-                "updated_run_id": second.run_id,
+                "collected_at": second.finished_at,
                 "resolved": False,
                 "observation_count": 2,
             },
@@ -269,9 +267,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
                     "models"
                 ].tokscale_version,
                 "created_at": third.finished_at,
-                "updated_at": third.finished_at,
-                "detected_run_id": third.run_id,
-                "updated_run_id": third.run_id,
+                "collected_at": third.finished_at,
                 "resolved": False,
                 "observation_count": 1,
             },
@@ -303,7 +299,7 @@ def test_same_run_payload_sightings_are_counted_in_one_event(
         persist_run(backend, normalize(bundle))
         rows = backend.query(
             "SELECT count(*) AS event_count, min(observation_count) AS observations "
-            "FROM schema_drift_events"
+            "FROM current_schema_drift_events"
         ).to_pylist()
         assert rows == [{"event_count": 1, "observations": len(daily_raws)}]
     finally:
@@ -339,8 +335,8 @@ def test_clean_complete_domain_resolves_existing_event(
         persist_run(backend, normalize(first))
         persisted = backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
-            "contract_tokscale_ver, created_at, detected_run_id, observation_count "
-            "FROM schema_drift_events"
+            "contract_tokscale_ver, created_at, observation_count "
+            "FROM current_schema_drift_events"
         ).to_pylist()[0]
         state = SchemaDriftState(
             domain=persisted["domain"],
@@ -351,7 +347,6 @@ def test_clean_complete_domain_resolves_existing_event(
             detail=persisted["detail"],
             contract_tokscale_ver=persisted["contract_tokscale_ver"],
             created_at=persisted["created_at"],
-            detected_run_id=persisted["detected_run_id"],
             observation_count=persisted["observation_count"],
         )
         next_time = when + timedelta(seconds=1)
@@ -407,14 +402,12 @@ def test_clean_complete_domain_resolves_existing_event(
         assert second.resolved_schema_drift == (state,)
         persist_run(backend, normalize(second))
         row = backend.query(
-            "SELECT created_at, updated_at, detected_run_id, updated_run_id, "
-            "resolved, observation_count FROM schema_drift_events"
+            "SELECT created_at, collected_at, "
+            "resolved, observation_count FROM current_schema_drift_events"
         ).to_pylist()[0]
         assert row == {
             "created_at": first.finished_at,
-            "updated_at": second.finished_at,
-            "detected_run_id": first.run_id,
-            "updated_run_id": second.run_id,
+            "collected_at": second.finished_at,
             "resolved": True,
             "observation_count": 1,
         }
@@ -511,7 +504,7 @@ def test_empty_report_is_a_successful_secondary_domain(
         report_status.status,
         report_status.expected_count,
         report_status.succeeded_count,
-        report_status.last_succeeded_run,
+        report_status.run_id,
         report_status.failure_code,
     ) == ("complete", 1, 1, run_id, None)
 

@@ -47,9 +47,9 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend.apply_ddl()
     backend.connection.executemany(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, workspace, created_at, last_active, "
-        "first_seen_at, last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
+        "(event_id, source_id, client, session_id, workspace, created_at, last_active, "
+        "first_seen_at, last_seen_at, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
         [
             (
                 LOCAL_SOURCE_ID,
@@ -79,9 +79,10 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.executemany(
         "INSERT INTO daily_stats "
-        "(source_id, day, client, session_id, model, input_tokens, output_tokens, "
-        "cache_read, cache_write, reasoning, total_tokens, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        "(event_id, source_id, day, client, session_id, model, "
+        "input_tokens, output_tokens, "
+        "cache_read, cache_write, reasoning, total_tokens, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         [
             (
                 LOCAL_SOURCE_ID,
@@ -139,11 +140,11 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.executemany(
         "INSERT INTO price_versions "
-        "(source_id, day, model, source, price_input_per_token, "
+        "(event_id, source_id, day, model, source, price_input_per_token, "
         "price_output_per_token, price_cache_read_per_token, "
-        "price_cache_write_per_token, observed_at, updated_at) "
-        "VALUES (?, ?, ?, 'fixture', 0.000001, 0.000002, 0.0000005, "
-        "0.0000007, NOW(), NOW())",
+        "price_cache_write_per_token, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, 'fixture', 0.000001, 0.000002, 0.0000005, "
+        "0.0000007, NOW())",
         [
             (LOCAL_SOURCE_ID, "2026-09-10", "gpt-test"),
             (LOCAL_SOURCE_ID, "2026-09-11", "gpt-mini"),
@@ -153,9 +154,10 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.execute(
         "INSERT INTO tags "
-        "(scope, source_id, client, workspace, session_id, tag, created_at, "
-        "updated_at) "
-        "VALUES ('workspace', ?, '', '/work/atlas', '', 'focused', NOW(), NOW())",
+        "(event_id, scope, source_id, client, workspace, session_id, tag, created_at, "
+        "collected_at) "
+        "VALUES (UUID(), 'workspace', ?, '', '/work/atlas', '', "
+        "'focused', NOW(), NOW())",
         [LOCAL_SOURCE_ID],
     )
     return config, backend

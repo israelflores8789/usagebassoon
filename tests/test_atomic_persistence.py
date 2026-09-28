@@ -6,11 +6,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
 from pathlib import Path
-from uuid import uuid4
 
-import pyarrow as pa
 import pytest
 
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
@@ -33,9 +30,9 @@ def test_replaying_a_committed_run_is_an_idempotent_no_op(
         retry = persist_run(backend, normalized)
         assert first.inserted > 0
         assert (retry.inserted, retry.updated, retry.per_table) == (0, 0, {})
-        assert backend.query("SELECT count(*) AS n FROM ingest_runs").to_pylist() == [
-            {"n": 1}
-        ]
+        assert backend.query(
+            "SELECT count(*) AS n FROM collection_runs"
+        ).to_pylist() == [{"n": 1}]
         price_count = sum(
             len(prices) for prices in collection_bundle.pricing_by_day.values()
         )
@@ -46,42 +43,30 @@ def test_replaying_a_committed_run_is_an_idempotent_no_op(
         backend.close()
 
 
-def test_batch_rolls_back_every_write_when_a_later_append_fails() -> None:
-    """Reject a partial cycle instead of committing its current-state mutation."""
+def test_batch_rolls_back_every_write_when_a_later_append_fails(
+    collection_bundle: CollectionBundle,
+) -> None:
+    bundle = normalize(collection_bundle)
     backend = DuckDBBackend(":memory:")
-    run_id = str(uuid4())
-    data = pa.table(
-        {
-            "source_id": ["source"],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
-    )
+    backend.apply_ddl()
     batch = PersistenceBatch(
-        run_id=run_id,
+        run_id=bundle.run_id,
         current_state=(
             CurrentStateWrite(
-                "daily_activity",
-                data,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
+                "daily_stats",
+                bundle.tables["daily_stats"],
+                ("source_id", "day", "client", "session_id", "model"),
+                ("total_tokens",),
             ),
         ),
-        append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=pa.table({"run_id": [run_id], "source_id": ["source"]}),
+        append_only={"missing_history": bundle.tables["collection_ledger"]},
+        collection_ledger=bundle.tables["collection_ledger"],
     )
     try:
-        backend.apply_ddl()
         with pytest.raises(Exception, match="missing_history"):
             backend.persist_batch(batch)
-        assert backend.query(
-            "SELECT count(*) AS n FROM daily_activity"
-        ).to_pylist() == [{"n": 0}]
-        assert backend.query("SELECT count(*) AS n FROM ingest_runs").to_pylist() == [
-            {"n": 0}
-        ]
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM collection_ledger").num_rows == 0
     finally:
         backend.close()
 
@@ -148,4 +133,4 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     assert result.inserted == 1
     assert attempts == [normalized.run_id, normalized.run_id]
-    assert schema_attempts == [None]
+    assert schema_attempts == []

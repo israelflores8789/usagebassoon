@@ -30,22 +30,12 @@ from usagebassoon.buckets.base import (
 )
 from usagebassoon.buckets.local import LocalSnapshotBucket
 from usagebassoon.config import default_snapshot_directory, parse_interval
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
+from usagebassoon.storage_model import SNAPSHOT_TABLES
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
 
-SNAPSHOT_TABLES: tuple[str, ...] = (
-    "sessions",
-    "daily_stats",
-    "daily_activity",
-    "price_versions",
-    "ingest_status",
-    "reconciliation_issues",
-    "schema_drift_events",
-    "ingest_runs",
-    "tags",
-    "notes",
-)
 _CATALOG_NAME = "catalog.json"
 _FORMAT_VERSION = 1
 _LEASE_SECONDS = 300
@@ -971,7 +961,6 @@ class SnapshotArchiver:
         self, backend: StorageBackend, snapshot: str = "latest"
     ) -> dict[str, int]:
         """Validate then append a complete snapshot into an empty backend."""
-        self._ensure_empty(backend)
         archive, entry = self._restore_entry(snapshot)
         manifest = self._load_manifest(entry, archive)
         tables = manifest["tables"]
@@ -984,8 +973,9 @@ class SnapshotArchiver:
             if not isinstance(schema_ipc, str):
                 raise ValueError(f"snapshot table {table} has no serialized schema")
             expected_schema = pa.ipc.read_schema(pa.BufferReader(b64decode(schema_ipc)))
-            destination = backend.query(f"SELECT * FROM {table} LIMIT 0")
-            if not destination.schema.equals(expected_schema, check_metadata=True):
+            if not CANONICAL_TABLE_SCHEMAS[table].equals(
+                expected_schema, check_metadata=True
+            ):
                 raise ValueError(
                     f"snapshot table {table} is incompatible with destination schema"
                 )
@@ -1013,35 +1003,14 @@ class SnapshotArchiver:
                 data = pa.concat_tables(parts)
                 if data.num_rows != rows:
                     raise ValueError(f"snapshot table {table} row count does not match")
-                loaded[table] = data
-        restored: dict[str, int] = {}
-        for table in SNAPSHOT_TABLES:
-            data = loaded.get(table)
-            rows = 0 if data is None else data.num_rows
-            if data is not None and rows:
-                backend.append(table, data)
-            restored[table] = rows
-        return restored
-
-    @staticmethod
-    def _ensure_empty(backend: StorageBackend) -> None:
-        """Require every snapshot table in the destination to be empty.
-
-        Args:
-            backend: Initialized destination warehouse.
-
-        Raises:
-            ValueError: If the destination contains any restorable data.
-        """
-        populated: list[str] = []
-        for table in SNAPSHOT_TABLES:
-            rows = backend.query(f"SELECT count(*) AS count FROM {table}").to_pylist()
-            if len(rows) != 1 or not isinstance(rows[0].get("count"), int):
-                raise ValueError(f"could not count destination snapshot table {table}")
-            if rows[0]["count"]:
-                populated.append(table)
-        if populated:
-            raise ValueError(
-                "restore requires an empty warehouse; populated tables: "
-                + ", ".join(populated)
-            )
+                if not data.schema.equals(expected_schema, check_metadata=False):
+                    raise ValueError(
+                        f"snapshot table {table} payload schema does not match"
+                    )
+                # Parquet normalizes list child names (item to element).
+                loaded[table] = data.cast(expected_schema)
+        backend.restore_tables(loaded)
+        return {
+            table: loaded[table].num_rows if table in loaded else 0
+            for table in SNAPSHOT_TABLES
+        }

@@ -24,6 +24,11 @@ def _write_config(path: Path, database: Path) -> None:
         f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
         f'local_database = "{database}"\n'
     )
+    backend = DuckDBBackend(database)
+    try:
+        backend.apply_ddl()
+    finally:
+        backend.close()
 
 
 def _command(config: Path, *parts: str) -> list[str]:
@@ -154,7 +159,7 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     backend = DuckDBBackend(database)
     try:
         original = backend.query(
-            "SELECT created_at, updated_at FROM notes"
+            "SELECT created_at, collected_at FROM notes"
         ).to_pylist()[0]
     finally:
         backend.close()
@@ -176,11 +181,11 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     backend = DuckDBBackend(database)
     try:
         revised = backend.query(
-            "SELECT note, created_at, updated_at FROM notes"
+            "SELECT note, created_at, collected_at FROM notes"
         ).to_pylist()[0]
         assert revised["note"] == "edited"
         assert revised["created_at"] == original["created_at"]
-        assert revised["updated_at"] > original["updated_at"]
+        assert revised["collected_at"] > original["collected_at"]
     finally:
         backend.close()
 

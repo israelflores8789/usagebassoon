@@ -21,6 +21,7 @@ from uuid import uuid4
 import pyarrow as pa
 import pytest
 
+from tests._observations import observations
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
@@ -56,15 +57,17 @@ def _append_note(backend: DuckDBBackend) -> None:
     captured_at = datetime(2026, 9, 19, tzinfo=UTC)
     backend.append(
         "notes",
-        pa.table(
-            {
-                "source_id": ["11111111-1111-4111-8111-111111111111"],
-                "client": ["codex"],
-                "session_id": ["live-gcs-session"],
-                "note": ["live GCS snapshot"],
-                "created_at": [captured_at],
-                "updated_at": [captured_at],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": ["11111111-1111-4111-8111-111111111111"],
+                    "client": ["codex"],
+                    "session_id": ["live-gcs-session"],
+                    "note": ["live GCS snapshot"],
+                    "created_at": [captured_at],
+                    "collected_at": [captured_at],
+                }
+            )
         ),
     )
 
@@ -105,16 +108,10 @@ def test_live_gcs_snapshot_round_trip_verifies_downloaded_references(
         restored = store.restore(destination)
 
         assert restored["notes"] == 1
-        assert destination.query("SELECT * FROM notes").to_pylist() == [
-            {
-                "source_id": "11111111-1111-4111-8111-111111111111",
-                "client": "codex",
-                "session_id": "live-gcs-session",
-                "note": "live GCS snapshot",
-                "created_at": datetime(2026, 9, 19, tzinfo=UTC),
-                "updated_at": datetime(2026, 9, 19, tzinfo=UTC),
-            }
-        ]
+        assert (
+            destination.query("SELECT * FROM notes").to_pylist()
+            == source.query("SELECT * FROM notes").to_pylist()
+        )
     finally:
         source.close()
         destination.close()

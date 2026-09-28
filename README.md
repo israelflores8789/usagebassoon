@@ -27,7 +27,7 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 ## Overview
 
 - Collects daily, per-session, and per-model token statistics, costs, pricing versions, session metadata, and collection-host metadata.
-- Merges new and changed facts idempotently without deleting history.
+- Publishes observations idempotently with backend-specific ingestion while preserving history.
 - Provides terminal reports, bounded relation queries, user-managed tags and notes, diagnostics, exports, and portable snapshots.
 - Keeps cloud storage optional: a local DuckDB installation needs no cloud account.
 
@@ -66,7 +66,7 @@ Then, initialize UsageBassoon.
 bassoon init
 ```
 
-This creates `~/.config/usagebassoon/config.toml` when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB warehouse by default.
+This creates `~/.config/usagebassoon/config.toml` when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB warehouse by default. Init is safe to repeat. Ordinary commands require an initialized warehouse and perform a schema preflight; supported package upgrades apply only registered migration steps. Newer or incompatible schemas fail with an explicit error.
 
 > [!NOTE]
 > Use `bassoon init` after for setting up new environments with an existing `config.toml` as well, especially if using a remote backend. It performs important setup including creating the configured schema, setting `source_id`, and does *not* overwrite your existing configuration file.
@@ -344,7 +344,9 @@ bassoon schedule worker --foreground --interval 15m
 > [!TIP]
 > If you set `source_id` manually, you can reuse it for ephemeral environments that you want to namespace token usage. For example, if you have a container that should be considered the same as previous container builds for token statistics purposes.
 >
-> While features are in place to prevent identical concurrent source IDs from colliding, including lease fencing mechanics, multiple environments with the same `source_id` is *not* the intended use case, and we *strongly* recommend you use one `source_id` per logical source agentic environment.
+> Concurrent remote collections may duplicate work. Stable event identities make retries safe, and canonical views select the latest observation. Use one `source_id` per logical agentic environment; local DuckDB rejects a second collector for the same user environment.
+
+BigQuery collection appends directly to arrival-partitioned raw tables. Reports combine durable tables with deduplicated raw observations immediately; a nightly 02:00 UTC Scheduled Query compacts affected data into durable tables. Raw data expires after 90 days, so the schedule must remain operational. DuckDB and MotherDuck keep transactional upserts. See the [persistence architecture](docs/persistence.md) for schema, retry, retention, and compaction details.
 
 ## Tags and Notes
 
@@ -369,9 +371,9 @@ The same configured data warehouse is available from Python. Results are `pandas
 ```python
 import usagebassoon
 
-daily = usagebassoon.query("SELECT * FROM daily_cost")
-polars_daily = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")
-arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost")
+daily = usagebassoon.query("SELECT * FROM daily_cost LIMIT 1000")
+polars_daily = usagebassoon.query("SELECT * FROM daily_cost LIMIT 1000", engine="polars")
+arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost LIMIT 1000")
 ```
 
 ## Privacy and sharing
@@ -401,9 +403,9 @@ The commands have deliberately different sharing behavior:
 You can archive or perform routine backup of your token usage data with `bassoon snapshot`.
 `snapshot` writes a catalog-published Parquet restoration archive.
 
-`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse.
+`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Snapshots are portable across all backends, including BigQuery to local DuckDB. BigQuery snapshots include deduplicated observations that have not yet compacted. Restore validates the entire archive before writing and fails atomically if destination data is already present. Stop destination collectors during restore: concurrent BigQuery append loads cannot be excluded by the restore transaction.
 
-Local archives rotate under `~/.usagebassoon/snapshots/` by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
+Local archives rotate under the platform data directory documented in the configuration section by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
 
 Set `gcs.uri` to use Google Cloud Storage (install with `usagebassoon[gcs]`). You can set both `gcs.uri` and `snapshots.file_uri` to publish the same complete snapshot both locally and remotely.
 
@@ -418,6 +420,8 @@ The permissions below describe the operations performed by UsageBassoon. Grant o
 
 #### BigQuery
 For the BigQuery backend, UsageBassoon needs `roles/bigquery.jobUser` and `roles/bigquery.readSessionUser` on the project and `roles/bigquery.dataEditor` on the dataset.
+
+BigQuery initialization also provisions a nightly Scheduled Query. Enable the BigQuery Data Transfer API and grant the initialization identity `bigquery.transfers.get` and `bigquery.transfers.update`; when using a service account to run the schedule, it also needs `iam.serviceAccounts.actAs` on that account. These provisioning permissions are separate from normal publication and reads. The scheduled identity needs BigQuery job and dataset write permissions to execute compaction.
 
 See Google's [BigQuery IAM documentation](https://docs.cloud.google.com/iam/docs/roles-permissions/bigquery) and [dataset access controls](https://docs.cloud.google.com/bigquery/docs/access-control).
 

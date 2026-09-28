@@ -17,9 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
 - Added support for `tokscale` v4.15.1.
-- Added `tokscale` collection of daily per-session and per-model usage, activity, session metadata, observed pricing, and collector-host metadata.
-- Added schema-drift event persistence of tokscale payload differences into version-scoped `schema_drift_events` current-state rows with stable domain/drift identities, first/latest run metadata, resolution state, and observation counts.
-- Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and idempotent transactional upserts that preserve token usage history.
+- Added `tokscale` collection of daily per-session and per-model usage, session metadata, observed pricing, and collector-host metadata.
+- Added ephemeral append-only schema-drift observations and resolution events with replay-safe identities and deduplicated observation counts.
+- Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and backend-specific idempotent publication that preserves token usage history.
 - Added support for local DuckDB databases using the `StorageBackend` protocol.
 - Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.
 - Added support for MotherDuck databases for remote persistence using the `StorageBackend` protocol.
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added workspace, client, model, tag, source, and inclusive date filters to daily and model reports, session last-active date filters, and a session creation-date display and filter mode; date bounds combine with all other report filters.
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
 - Added source-scoped workspace, client, and session tags and notes for user-curated reports.
-- Added ingest audits, models payload reconciliation, and diagnostics. Repeated detections update issues by source, check, and issue key while retaining first and latest detection metadata.
+- Added permanent collection audits, models payload reconciliation, and diagnostics using append-only outcomes and issue events.
 - Added portable Parquet snapshots and restore for local and remote object store archives, with catalog-based publication, integrity checks, retention, and optional collection-triggered cadence.
 - Added support for Google Cloud Storage for snapshot archives.
 - Added scheduled token usage history collection for Linux (systemd), macOS (launchd), and container environments (worker script) with status, log controls, per-operation timeouts, and retries.
@@ -35,3 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added comprehensive unit test suite that ensures consistent behavior across backends and object stores.
 - Added a live persistence test suite against all implemented remote backends and object stores including BigQuery, MotherDuck, and Google Cloud Storage. Tests are automated in the CI Live GitHub workflow.
 - Added SQL parity test suite that ensures structural and synthetic replay behavior against all SQL dialects using SQLGlot.
+
+### Changed
+
+- BigQuery collection now uses concurrent append loads into arrival-partitioned raw tables, immediate canonical views, and a versioned nightly transactional compaction schedule with arrival-bucket counts and durable curation tombstones.
+- Initialization is explicit and idempotent; schema preflight checks version/hash compatibility and applies only registered future migration steps.
+- Snapshots capture canonical gold plus raw state and restore atomically into an empty destination across supported backends.
+- Local collection uses an OS process lock; remote persistence uses replay-safe event identifiers and bounded retries.
+
+### Removed
+
+- Removed `daily_activity`, warehouse source leases, separate ingest run/status tables, persisted row-change counters, and pre-release migration SQL files.

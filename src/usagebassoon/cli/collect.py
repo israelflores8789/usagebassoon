@@ -11,7 +11,7 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.backends.base import SourceLeaseBusy
+from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.orchestrator import collect as collect_run
@@ -25,13 +25,13 @@ def collect(
         typer.Option("--config", help="Use this configuration file."),
     ] = None,
 ) -> None:
-    """Collect one cumulative tokscale state and merge it into storage."""
+    """Collect daily tokscale observations and publish them to storage."""
     try:
         configuration = ConfigurationManager(config).load()
         run_id, summary = collect_run(configuration)
-    except SourceLeaseBusy as error:
-        typer.echo(f"Collection skipped: {error}", err=True)
-        return
+    except CollectionBusy as error:
+        typer.echo(f"Collection failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     except Exception as error:

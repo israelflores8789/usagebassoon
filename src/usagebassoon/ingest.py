@@ -52,8 +52,7 @@ class IngestStatus:
     status: str
     expected_count: int | None
     succeeded_count: int | None
-    last_attempted_run: str
-    last_succeeded_run: str | None
+    run_id: str
     failure_code: str | None = None
 
 
@@ -71,7 +70,6 @@ class IngestIssue:
     run_id: str
     finished_at: datetime | None
     status: str | None
-    drift_events: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,21 +223,14 @@ def _status(
     failure_code: str | None = None,
 ) -> IngestStatus:
     """Build one retry-ledger row while retaining prior full success linkage."""
-    prior = prior_statuses.get((day, domain))
+    del prior_statuses
     return IngestStatus(
         day=day,
         domain=domain,
         status=status,
         expected_count=expected_count,
         succeeded_count=succeeded_count,
-        last_attempted_run=run_id,
-        last_succeeded_run=(
-            run_id
-            if status == "complete"
-            else prior.last_succeeded_run
-            if prior is not None
-            else None
-        ),
+        run_id=run_id,
         failure_code=failure_code,
     )
 

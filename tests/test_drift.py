@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 
+from tests._observations import observations
 from usagebassoon.backends.base import ActiveTransaction
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.config import UsageBassoonConfig
@@ -35,26 +36,28 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
         now = datetime.now(UTC)
         backend.append(
             "schema_drift_events",
-            pa.table(
-                {
-                    "source_id": ["source", "source"],
-                    "domain": ["models", "pricing"],
-                    "tokscale_ver": ["4.15.1", "4.15.2"],
-                    "drift_key": [
-                        "unknown_field:future",
-                        "type_change:resolution.price",
-                    ],
-                    "drift_kind": ["unknown_field", "type_change"],
-                    "path": ["future", "resolution.price"],
-                    "detail": ["additive", "changed"],
-                    "contract_tokscale_ver": ["4.15.1", "4.15.1"],
-                    "created_at": [now, now],
-                    "updated_at": [now, now + timedelta(seconds=1)],
-                    "detected_run_id": [str(uuid4()), str(uuid4())],
-                    "updated_run_id": [str(uuid4()), str(uuid4())],
-                    "resolved": [True, False],
-                    "observation_count": [1, 3],
-                }
+            observations(
+                pa.table(
+                    {
+                        "source_id": ["source", "source"],
+                        "domain": ["models", "pricing"],
+                        "tokscale_ver": ["4.15.1", "4.15.2"],
+                        "drift_key": [
+                            "unknown_field:future",
+                            "type_change:resolution.price",
+                        ],
+                        "drift_kind": ["unknown_field", "type_change"],
+                        "path": ["future", "resolution.price"],
+                        "detail": ["additive", "changed"],
+                        "contract_tokscale_ver": ["4.15.1", "4.15.1"],
+                        "created_at": [now, now],
+                        "collected_at": [now, now + timedelta(seconds=1)],
+                        "detected_run_id": [str(uuid4()), str(uuid4())],
+                        "updated_run_id": [str(uuid4()), str(uuid4())],
+                        "resolved": [True, False],
+                        "observation_count": [1, 3],
+                    }
+                )
             ),
         )
         records = unresolved_schema_drift(backend)
@@ -75,41 +78,45 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
         now = datetime.now(UTC)
         backend.append(
             "schema_drift_events",
-            pa.table(
-                {
-                    "source_id": ["source"],
-                    "domain": ["models"],
-                    "tokscale_ver": ["4.15.1"],
-                    "drift_key": ["unknown_field:futureMetric"],
-                    "drift_kind": ["unknown_field"],
-                    "path": ["futureMetric"],
-                    "detail": ["types int; tolerated"],
-                    "contract_tokscale_ver": ["4.15.1"],
-                    "created_at": [now],
-                    "updated_at": [now],
-                    "detected_run_id": [run_id],
-                    "updated_run_id": [run_id],
-                    "resolved": [False],
-                    "observation_count": [1],
-                }
+            observations(
+                pa.table(
+                    {
+                        "source_id": ["source"],
+                        "domain": ["models"],
+                        "tokscale_ver": ["4.15.1"],
+                        "drift_key": ["unknown_field:futureMetric"],
+                        "drift_kind": ["unknown_field"],
+                        "path": ["futureMetric"],
+                        "detail": ["types int; tolerated"],
+                        "contract_tokscale_ver": ["4.15.1"],
+                        "created_at": [now],
+                        "collected_at": [now],
+                        "detected_run_id": [run_id],
+                        "updated_run_id": [run_id],
+                        "resolved": [False],
+                        "observation_count": [1],
+                    }
+                )
             ),
         )
         backend.append(
-            "ingest_runs",
-            pa.table(
-                {
-                    "run_id": [run_id],
-                    "source_id": ["source"],
-                    "started_at": [now],
-                    "finished_at": [now],
-                    "host": ["pytest"],
-                    "tokscale_ver": ["4.15.1"],
-                    "status": ["schema_drift"],
-                    "rows_in": [1],
-                    "rows_inserted": [0],
-                    "rows_updated": [0],
-                    "drift_events": [1],
-                }
+            "collection_ledger",
+            observations(
+                pa.table(
+                    {
+                        "run_id": [run_id],
+                        "source_id": ["source"],
+                        "started_at": [now],
+                        "finished_at": [now],
+                        "host": ["pytest"],
+                        "tokscale_ver": ["4.15.1"],
+                        "status": ["schema_drift"],
+                        "rows_in": [1],
+                        "rows_inserted": [0],
+                        "rows_updated": [0],
+                        "drift_events": [1],
+                    }
+                )
             ),
         )
         report = run_doctor(
@@ -122,17 +129,17 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
         assert not report.errors
         assert {check.name for check in report.warnings} == {
             "schema_drift",
-            "ingest_runs",
+            "collection_runs",
         }
         assert backend.query(
-            "SELECT count(*) AS count FROM schema_drift_events"
+            "SELECT count(*) AS count FROM current_schema_drift_events"
         ).to_pylist() == [{"count": 1}]
         assert format_checks(report.checks)[0].startswith("OK configuration:")
     finally:
         backend.close()
 
 
-def test_load_ingest_status_returns_unresolved_drift_state(tmp_path: Path) -> None:
+def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -> None:
     """Load persisted event identity and first-detection metadata for rechecks."""
     database = tmp_path / "drift.duckdb"
     backend = DuckDBBackend(database)
@@ -142,23 +149,25 @@ def test_load_ingest_status_returns_unresolved_drift_state(tmp_path: Path) -> No
         backend.apply_ddl()
         backend.append(
             "schema_drift_events",
-            pa.table(
-                {
-                    "source_id": [SOURCE_ID],
-                    "domain": ["models"],
-                    "tokscale_ver": ["4.15.2"],
-                    "drift_key": ["unknown_field:future"],
-                    "drift_kind": ["unknown_field"],
-                    "path": ["future"],
-                    "detail": ["types int; tolerated"],
-                    "contract_tokscale_ver": ["4.15.1"],
-                    "created_at": [detected_at],
-                    "updated_at": [detected_at],
-                    "detected_run_id": [detected_run_id],
-                    "updated_run_id": [detected_run_id],
-                    "resolved": [False],
-                    "observation_count": [4],
-                }
+            observations(
+                pa.table(
+                    {
+                        "source_id": [SOURCE_ID],
+                        "domain": ["models"],
+                        "tokscale_ver": ["4.15.2"],
+                        "drift_key": ["unknown_field:future"],
+                        "drift_kind": ["unknown_field"],
+                        "path": ["future"],
+                        "detail": ["types int; tolerated"],
+                        "contract_tokscale_ver": ["4.15.1"],
+                        "created_at": [detected_at],
+                        "collected_at": [detected_at],
+                        "detected_run_id": [detected_run_id],
+                        "updated_run_id": [detected_run_id],
+                        "resolved": [False],
+                        "observation_count": [4],
+                    }
+                )
             ),
         )
     finally:
@@ -183,7 +192,6 @@ def test_load_ingest_status_returns_unresolved_drift_state(tmp_path: Path) -> No
             detail="types int; tolerated",
             contract_tokscale_ver="4.15.1",
             created_at=detected_at,
-            detected_run_id=detected_run_id,
             observation_count=4,
         ),
     )

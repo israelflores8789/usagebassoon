@@ -1,171 +1,240 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_sql_parity.py — Hermetic SQLGlot and DuckDB dialect parity tests."""
+"""test_sql_parity.py — Shared logical contracts with native ingestion layouts."""
 
-from __future__ import annotations
-
+from datetime import UTC, datetime, timedelta
 from importlib import resources
+from typing import override
 
+import pyarrow as pa
 import pytest
 import sqlglot
+from sqlglot import exp
 
 from tests._sql_parity import (
-    DIALECTS,
     assert_view_results_match,
-    asset_sql,
+    normalized_records,
     seed_synthetic_data,
     statements,
     view_names,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.schema_assets import PARITY_SCHEMA_ASSETS, RUNTIME_SCHEMA_ASSETS
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.storage_model import DEBUG_TABLES, EVENT_KEYS, STATE_KEYS
 
 pytestmark = pytest.mark.sql_parity
 
-_TYPE_ALIASES = {
-    "ARRAY<STRING>": "string[]",
-    "ARRAY<TEXT>": "string[]",
-    "BOOLEAN": "bool",
-    "BOOL": "bool",
-    "BIGINT": "int64",
-    "DATE": "date",
-    "DOUBLE": "float64",
-    "FLOAT64": "float64",
-    "INT": "int64",
-    "INT64": "int64",
-    "INTEGER": "int64",
-    "STRING": "string",
-    "TEXT": "string",
-    "TIMESTAMP": "timestamp",
-    "TIMESTAMPTZ": "timestamp",
-}
+
+def _tables(dialect: str) -> dict[str, exp.Create]:
+    return {
+        statement.this.this.name: statement
+        for statement in statements(dialect, "ddl.sql")
+        if isinstance(statement, exp.Create) and statement.kind == "TABLE"
+    }
 
 
-def test_paired_sql_asset_inventory_is_complete() -> None:
-    """Require every dialect package to ship exactly the parity asset set."""
-    expected = set(PARITY_SCHEMA_ASSETS)
-    for dialect in DIALECTS:
+def _columns(table: exp.Create) -> dict[str, tuple[str, bool]]:
+    result = {}
+    for column in table.this.expressions:
+        if not isinstance(column, exp.ColumnDef):
+            continue
+        kind = column.args["kind"].sql(dialect="duckdb")
+        if kind == "INT":
+            kind = "BIGINT"
+        if kind in {"TIMESTAMP", "TIMESTAMPTZ"}:
+            kind = "timestamp"
+        constraints = [item.sql().upper() for item in column.args["constraints"]]
+        result[column.name] = (
+            kind,
+            "NOT NULL" in constraints or "PRIMARY KEY" in constraints,
+        )
+    return result
+
+
+def test_logical_gold_and_event_schemas_match() -> None:
+    duckdb, bigquery = _tables("duckdb"), _tables("bigquery")
+    for table in STATE_KEYS | EVENT_KEYS:
+        physical = "raw_" + table if table in DEBUG_TABLES else table
+        assert _columns(duckdb[table]) == _columns(bigquery[physical]), table
+    for dialect in (duckdb, bigquery):
+        for table in dialect.values():
+            assert _columns(table)["source_id"][1]
+    for table in STATE_KEYS:
+        assert _columns(bigquery[table]) == _columns(bigquery["raw_" + table])
+    assert "daily_activity" not in duckdb | bigquery
+    assert "source_leases" not in duckdb | bigquery
+
+
+def test_packaged_asset_inventory_and_native_parsing() -> None:
+    for dialect in ("duckdb", "bigquery"):
         package = resources.files(f"usagebassoon.sql.{dialect}")
+        expected = {"ddl.sql", "views.sql"} | (
+            {"compaction.sql"} if dialect == "bigquery" else set()
+        )
         actual = {item.name for item in package.iterdir() if item.name.endswith(".sql")}
         assert actual == expected
+        for filename in actual:
+            assert sqlglot.parse(package.joinpath(filename).read_text(), read=dialect)
 
 
-@pytest.mark.parametrize("dialect", DIALECTS)
-@pytest.mark.parametrize("filename", PARITY_SCHEMA_ASSETS)
-def test_every_sql_asset_parses_in_its_native_dialect(
-    dialect: str,
-    filename: str,
-) -> None:
-    """Parse every packaged statement with SQLGlot's strict default handling."""
-    assert sqlglot.parse(asset_sql(dialect, filename), read=dialect)
-
-
-def test_runtime_schema_assets_exclude_dormant_migrations() -> None:
-    """Keep migration execution an explicit future runtime decision."""
-    assert RUNTIME_SCHEMA_ASSETS == ("ddl.sql", "views.sql")
-    assert "migrations.sql" not in RUNTIME_SCHEMA_ASSETS
-
-
-def test_executable_migrations_require_an_explicit_replay_case() -> None:
-    """Reject unplanned migration SQL until it receives a replay test case."""
-    executable = {
-        dialect: statements(dialect, "migrations.sql") for dialect in DIALECTS
-    }
-    assert executable == {"duckdb": [], "bigquery": []}, (
-        "add a versioned predecessor-schema replay case before introducing "
-        "executable migration SQL"
-    )
-
-
-def test_ddl_relations_and_logical_columns_are_dialect_paired() -> None:
-    """Compare table names, ordered columns, logical types, and nullability."""
-    duckdb = _ddl_contract("duckdb")
-    bigquery = _ddl_contract("bigquery")
-    assert bigquery == duckdb
-
-
-def test_views_have_equivalent_normalized_duckdb_ast() -> None:
-    """Compare view definitions after BigQuery-to-DuckDB SQLGlot normalization."""
-    duckdb = [
-        _normalized_view_sql(statement)
-        for statement in statements("duckdb", "views.sql")
-    ]
-    bigquery = [
-        _normalized_view_sql(statement)
-        for statement in statements("bigquery", "views.sql")
-    ]
-    assert bigquery == duckdb
-
-
-def test_synthetic_rows_produce_equal_results_for_every_shipped_view() -> None:
-    """Replay synthetic data through native and transpiled dialect SQL in DuckDB."""
-    duckdb = DuckDBBackend(":memory:")
-    transpiled_bigquery = DuckDBBackend(":memory:")
-    try:
-        for filename in PARITY_SCHEMA_ASSETS:
-            duckdb.connection.execute(asset_sql("duckdb", filename))
-            for statement in sqlglot.transpile(
-                asset_sql("bigquery", filename),
-                read="bigquery",
-                write="duckdb",
-                unsupported_level=sqlglot.ErrorLevel.RAISE,
-            ):
-                if filename == "ddl.sql" and "source_leases" in statement:
-                    continue
-                transpiled_bigquery.connection.execute(statement)
-        seed_synthetic_data(duckdb)
-        seed_synthetic_data(transpiled_bigquery)
-        assert_view_results_match(duckdb, transpiled_bigquery, view_names())
-    finally:
-        duckdb.close()
-        transpiled_bigquery.close()
-
-
-def _ddl_contract(
-    dialect: str,
-) -> dict[str, tuple[tuple[str, str, bool, str | None], ...]]:
-    """Extract a logical cross-dialect column contract from DDL statements."""
-    contract: dict[str, tuple[tuple[str, str, bool, str | None], ...]] = {}
-    for statement in statements(dialect, "ddl.sql"):
-        if (
-            not isinstance(statement, sqlglot.exp.Create)
-            or statement.args["kind"] != "TABLE"
-        ):
-            raise ValueError("ddl.sql must contain only CREATE TABLE statements")
-        schema = statement.this
-        table_name = schema.this.name
-        columns = []
-        for column in schema.expressions:
-            if not isinstance(column, sqlglot.exp.ColumnDef):
+def test_report_view_asts_remain_equivalent() -> None:
+    def logical_views(dialect: str) -> dict[str, str]:
+        result = {}
+        for statement in statements(dialect, "views.sql"):
+            name = statement.this.name
+            if name.startswith(("current_", "replay_")) or name in DEBUG_TABLES | {
+                "compaction_backlog"
+            }:
                 continue
-            kind = _TYPE_ALIASES[column.args["kind"].sql().upper()]
-            constraints = [
-                constraint.sql().upper() for constraint in column.args["constraints"]
-            ]
-            default = next(
-                (
-                    constraint
-                    for constraint in constraints
-                    if constraint.startswith("DEFAULT")
-                ),
-                None,
+            for kind in statement.find_all(exp.DataType):
+                if kind.this == exp.DataType.Type.TIMESTAMPTZ:
+                    kind.set("this", exp.DataType.Type.TIMESTAMP)
+            for ordered in statement.find_all(exp.Ordered):
+                ordered.set("nulls_first", None)
+            result[name] = statement.sql(dialect="duckdb", comments=False)
+        return result
+
+    assert logical_views("duckdb") == logical_views("bigquery")
+
+
+class _BronzeReplay(DuckDBBackend):
+    @override
+    def append(self, table: str, data: pa.Table) -> None:
+        physical = (
+            "raw_" + table if table in STATE_KEYS or table in DEBUG_TABLES else table
+        )
+        super().append(physical, data)
+
+
+def test_synthetic_raw_and_gold_replay_matches_shared_views() -> None:
+    local = DuckDBBackend(":memory:")
+    remote = _BronzeReplay(":memory:")
+    try:
+        local.apply_ddl()
+        for statement in _tables("bigquery").values():
+            statement.set("properties", None)
+            remote.connection.execute(statement.sql(dialect="duckdb"))
+        remote.connection.execute(
+            ";\n".join(
+                statement.sql(dialect="duckdb")
+                for statement in statements("bigquery", "views.sql")
+                if statement.this.name != "compaction_backlog"
             )
-            columns.append(
-                (
-                    column.name,
-                    kind,
-                    "NOT NULL" in constraints or "PRIMARY KEY" in constraints,
-                    default,
+        )
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        seed_synthetic_data(remote)
+        assert remote.query("SELECT * FROM daily_stats").num_rows == 0
+        assert (
+            remote.query("SELECT * FROM raw_daily_stats").num_rows
+            > local.query("SELECT * FROM daily_stats").num_rows
+        )
+        assert_view_results_match(local, remote, view_names())
+    finally:
+        local.close()
+        remote.close()
+
+
+def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Select domain-preferred values even when their UUID loses lexical ordering."""
+    local = DuckDBBackend(":memory:")
+    remote = _BronzeReplay(":memory:")
+    try:
+        local.apply_ddl()
+        for statement in _tables("bigquery").values():
+            statement.set("properties", None)
+            remote.connection.execute(statement.sql(dialect="duckdb"))
+        remote.connection.execute(
+            ";\n".join(
+                statement.sql(dialect="duckdb")
+                for statement in statements("bigquery", "views.sql")
+                if statement.this.name != "compaction_backlog"
+            )
+        )
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        stamp = datetime(2026, 10, 1, tzinfo=UTC)
+        ledger = normalize(collection_bundle).tables["collection_ledger"]
+        local.append("collection_ledger", ledger)
+        remote.append("collection_ledger", ledger)
+        for table in DEBUG_TABLES:
+            schema = CANONICAL_TABLE_SCHEMAS[table]
+            row: dict[str, object] = {field.name: "synthetic" for field in schema}
+            row.update(
+                source_id=collection_bundle.source_id,
+                run_id=collection_bundle.run_id,
+                event_id="00000000-0000-4000-8000-000000000002",
+                created_at=stamp - timedelta(days=1),
+                collected_at=stamp - timedelta(days=1),
+                resolved=False,
+                observation_count=1,
+            )
+            data = pa.Table.from_pylist([row], schema=schema)
+            local.append(table, data)
+            remote.append(table, data)
+        for table in (
+            "sessions",
+            "daily_stats",
+            "price_versions",
+            "tags",
+            "notes",
+            "schema_drift_events",
+            "reconciliation_issues",
+            "collection_ledger",
+        ):
+            seed = local.query(f"SELECT * FROM current_{table} LIMIT 1").to_pylist()[0]
+            preferred: dict[str, object] = dict(
+                seed,
+                collected_at=stamp,
+                event_id="00000000-0000-4000-8000-000000000001",
+            )
+            other: dict[str, object] = dict(
+                seed,
+                collected_at=stamp,
+                event_id="ffffffff-ffff-4fff-bfff-ffffffffffff",
+            )
+            if table == "sessions":
+                preferred["event_id"], other["event_id"] = (
+                    other["event_id"],
+                    preferred["event_id"],
                 )
-            )
-        contract[table_name] = tuple(columns)
-    return contract
-
-
-def _normalized_view_sql(statement: sqlglot.exp.Expr) -> str:
-    """Render a view AST while ignoring dialect-default null ordering metadata."""
-    normalized = statement.copy()
-    for ordered in normalized.find_all(sqlglot.exp.Ordered):
-        ordered.set("nulls_first", None)
-    return normalized.sql(dialect="duckdb", comments=False)
+                preferred["created_at"] = stamp
+                preferred["first_seen_at"] = stamp + timedelta(days=1)
+                preferred["last_seen_at"] = stamp + timedelta(days=1)
+                other["last_seen_at"] = stamp + timedelta(days=2)
+            elif table == "daily_stats":
+                preferred["total_tokens"] = int(seed["total_tokens"]) + 100
+                preferred["input_tokens"] = int(seed["input_tokens"]) + 100
+            elif table == "price_versions":
+                preferred["price_output_per_token"] = -1.0
+                other["price_output_per_token"] = None
+            elif table in {"tags", "notes"}:
+                preferred["is_deleted"], other["is_deleted"] = False, True
+            elif table in DEBUG_TABLES:
+                preferred["resolved"], other["resolved"] = True, False
+                preferred["observation_count"] = 0
+            else:
+                preferred["finished_at"] = stamp + timedelta(seconds=1)
+                other["finished_at"] = stamp
+            for row in (preferred, other):
+                data = pa.Table.from_pylist(
+                    [row], schema=CANONICAL_TABLE_SCHEMAS[table]
+                )
+                if table in STATE_KEYS:
+                    local.upsert(table, data, STATE_KEYS[table], ())
+                else:
+                    local.append(table, data)
+                remote.append(table, data)
+            assert normalized_records(
+                local.query(f"SELECT * FROM current_{table}")
+            ) == normalized_records(remote.query(f"SELECT * FROM current_{table}"))
+            rows = local.query(f"SELECT * FROM current_{table}").to_pylist()
+            assert any(row["event_id"] == preferred["event_id"] for row in rows), table
+            assert not any(row["event_id"] == other["event_id"] for row in rows), table
+    finally:
+        local.close()
+        remote.close()

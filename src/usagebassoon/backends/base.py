@@ -7,16 +7,14 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pyarrow as pa
-
-SOURCE_LEASE_SECONDS = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,59 +54,26 @@ class CurrentStateWrite:
 
 @dataclass(frozen=True, slots=True)
 class PersistenceBatch:
-    """All writes belonging to one idempotent collection cycle.
-
-    Attributes:
-        run_id: UUID identifying this collection cycle and retry unit.
-        current_state: Current-state tables updated in this cycle.
-        append_only: Audit and history tables excluding ``ingest_runs``.
-        ingest_runs: Exactly one audit row, written last within the batch.
-        lease: Source lease held from collection planning through persistence.
-    """
+    """Stable observations belonging to one client-side collection run."""
 
     run_id: str
     current_state: tuple[CurrentStateWrite, ...]
     append_only: Mapping[str, pa.Table]
-    ingest_runs: pa.Table
-    lease: SourceLeaseToken | None = None
+    collection_ledger: pa.Table
 
     @property
     def source_id(self) -> str:
-        """Return the source namespace of the single ingest audit row."""
+        """Return the sole source namespace of this collection's ledger."""
+        if not self.collection_ledger.num_rows:
+            raise ValueError("collection_ledger requires at least one row")
+        values = self.collection_ledger.column("source_id").to_pylist()
         if (
-            self.ingest_runs.num_rows != 1
-            or "source_id" not in self.ingest_runs.column_names
+            not isinstance(values[0], str)
+            or not values[0]
+            or any(value != values[0] for value in values)
         ):
-            raise ValueError("ingest_runs requires one source_id")
-        value = self.ingest_runs.column("source_id").to_pylist()[0]
-        if not isinstance(value, str) or not value:
-            raise ValueError("ingest_runs source_id must be nonempty text")
-        return value
-
-
-@dataclass(frozen=True, slots=True)
-class SourceLeaseToken:
-    """Identity and generation of one active source lease.
-
-    Attributes:
-        source_id: Source namespace protected by the lease.
-        run_id: Collection run using the lease.
-        owner_id: Unique identifier for this lease attempt.
-        fence: Monotonically increasing source generation.
-    """
-
-    source_id: str
-    run_id: str
-    owner_id: str
-    fence: int
-
-
-class SourceLeaseBusy(RuntimeError):
-    """Raised when another collection owns an unexpired source lease."""
-
-
-class SourceLeaseLost(RuntimeError):
-    """Raised when a collection no longer owns its source lease."""
+            raise ValueError("collection_ledger requires one nonempty source_id")
+        return values[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,29 +189,6 @@ def is_simple_identifier(value: str) -> bool:
     return value.isascii() and value.isidentifier()
 
 
-def with_ingest_counts(ingest_runs: pa.Table, inserted: int, updated: int) -> pa.Table:
-    """Return an ingest audit row populated with final current-state counts.
-
-    Args:
-        ingest_runs: Single normalized ingest-runs row.
-        inserted: Total newly inserted current-state rows.
-        updated: Total materially updated current-state rows.
-
-    Returns:
-        The run table with final inserted and updated counts.
-
-    Raises:
-        ValueError: If the audit row lacks required columns.
-    """
-    result = ingest_runs
-    for name, value in (("rows_inserted", inserted), ("rows_updated", updated)):
-        index = result.schema.get_field_index(name)
-        if index < 0:
-            raise ValueError(f"ingest_runs is missing required column {name!r}")
-        result = result.set_column(index, name, pa.array([value], type=pa.int64()))
-    return result
-
-
 class StorageBackend(Protocol):
     """Public capability contract for a dialect-specific Arrow warehouse."""
 
@@ -255,29 +197,7 @@ class StorageBackend(Protocol):
         ...
 
     def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
-        """Atomically commit or reject every write in one collection cycle."""
-        ...
-
-    def ensure_source_lease(self, source_id: str) -> None:
-        """Provision exactly one dormant lease row for a source."""
-        ...
-
-    def claim_source_lease(
-        self, source_id: str, run_id: str, owner_id: str
-    ) -> SourceLeaseToken | None:
-        """Claim an available source lease and advance its fence."""
-        ...
-
-    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Extend an owned lease before its warehouse expiry."""
-        ...
-
-    def release_source_lease(self, lease: SourceLeaseToken) -> None:
-        """Release only the matching owner and fence."""
-        ...
-
-    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Mutate and verify the lease inside a persistence transaction."""
+        """Publish replay-safe observations using the backend's native strategy."""
         ...
 
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
@@ -299,25 +219,21 @@ class StorageBackend(Protocol):
         natural_keys: Sequence[str],
         change_fields: Sequence[str],
     ) -> UpsertResult:
-        """Insert new current-state rows and update materially changed ones.
+        """Publish observations at a source-scoped natural key.
 
         Args:
             table: Current-state table named by the active dialect DDL.
             data: Normalized Arrow batch with columns matching that table.
             natural_keys: Columns that uniquely identify a current row.
-            change_fields: Logical fields used for null-safe change detection.
+            change_fields: Fields validated against the incoming table schema.
 
         Returns:
-            Separate inserted and updated row counts.
+            Backend write counts; BigQuery counts appended observations.
         """
         ...
 
     def append(self, table: str, data: pa.Table) -> None:
-        """Append rows to a DDL-defined append-only table.
-
-        Callers must not use this for a current-state table unless restoring
-        into a known-empty database.
-        """
+        """Append events, publish BigQuery raw state, or restore empty local state."""
         ...
 
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
@@ -344,6 +260,14 @@ class StorageBackend(Protocol):
 
     def close(self) -> None:
         """Release backend resources."""
+        ...
+
+    def preflight(self) -> None:
+        """Validate initialization and reconcile registered schema upgrades."""
+        ...
+
+    def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
+        """Atomically restore canonical rows into an empty destination."""
         ...
 
 
@@ -398,28 +322,6 @@ class AbstractStorageBackend(ABC):
         if limit < 1:
             raise ValueError("limit must be positive")
         return ()
-
-    @abstractmethod
-    def ensure_source_lease(self, source_id: str) -> None:
-        """Provision the source row before an atomic conditional claim."""
-
-    @abstractmethod
-    def claim_source_lease(
-        self, source_id: str, run_id: str, owner_id: str
-    ) -> SourceLeaseToken | None:
-        """Claim an available source row and return its new fence."""
-
-    @abstractmethod
-    def renew_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Renew a live matching source lease."""
-
-    @abstractmethod
-    def release_source_lease(self, lease: SourceLeaseToken) -> None:
-        """Clear a matching source lease without resetting its fence."""
-
-    @abstractmethod
-    def guard_source_lease(self, lease: SourceLeaseToken) -> bool:
-        """Update a matching lease within the caller's write transaction."""
 
     @abstractmethod
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
@@ -512,121 +414,68 @@ class AbstractStorageBackend(ABC):
             seen.add(key)
 
     def _validate_batch(self, batch: PersistenceBatch) -> None:
-        """Validate the shared persistence invariants for one cycle.
-
-        Args:
-            batch: Complete collection-cycle data prepared by the merge layer.
-
-        Raises:
-            ValueError: If the batch cannot safely be applied atomically.
-        """
-        try:
-            UUID(batch.run_id)
-        except ValueError as error:
-            raise ValueError("persistence batch run_id must be a UUID") from error
-        if batch.ingest_runs.num_rows != 1:
-            raise ValueError("persistence batches require exactly one ingest_runs row")
-        if "run_id" not in batch.ingest_runs.column_names:
-            raise ValueError("ingest_runs is missing required column 'run_id'")
-        ingest_run_id = batch.ingest_runs.column("run_id").to_pylist()[0]
-        if ingest_run_id != batch.run_id:
-            raise ValueError("ingest_runs run_id does not match persistence batch")
+        """Validate run, source, and non-null observation identities before writing."""
+        UUID(batch.run_id)
         source_id = batch.source_id
-        if batch.lease is not None and (
-            batch.lease.run_id != batch.run_id or batch.lease.source_id != source_id
-        ):
-            raise ValueError("source lease does not match persistence batch")
         names: set[str] = set()
-        for write in batch.current_state:
-            if write.table in names:
-                raise ValueError(f"persistence batch repeats table {write.table!r}")
-            names.add(write.table)
-            self._validate_upsert(
-                write.table,
-                write.data,
-                write.natural_keys,
-                write.change_fields,
-            )
-            if "source_id" not in write.data.column_names or any(
-                value != source_id
-                for value in write.data.column("source_id").to_pylist()
-            ):
-                raise ValueError(f"{write.table} has a mismatched source_id")
-        for table, data in batch.append_only.items():
+        writes = [(write.table, write.data) for write in batch.current_state]
+        writes.extend(batch.append_only.items())
+        writes.append(("collection_ledger", batch.collection_ledger))
+        for table, data in writes:
             if table in names or not is_simple_identifier(table):
-                raise ValueError(f"invalid append-only table {table!r}")
+                raise ValueError(f"invalid or repeated batch table {table!r}")
             names.add(table)
-            if "run_id" not in data.column_names:
-                raise ValueError(f"append-only table {table!r} is missing run_id")
+            for required in ("source_id", "event_id", "collected_at"):
+                if (
+                    required not in data.column_names
+                    or data.column(required).null_count
+                ):
+                    raise ValueError(f"{table} requires non-null {required}")
             if any(
-                value != batch.run_id for value in data.column("run_id").to_pylist()
-            ):
-                raise ValueError(f"append-only table {table!r} has a mismatched run_id")
-            if "source_id" in data.column_names and any(
                 value != source_id for value in data.column("source_id").to_pylist()
             ):
-                raise ValueError(
-                    f"append-only table {table!r} has a mismatched source_id"
-                )
-
-    @contextmanager
-    def _batch_lease(self, batch: PersistenceBatch) -> Generator[SourceLeaseToken]:
-        """Use the collection lease or claim one for a direct batch call.
-
-        Yields:
-            A source lease token to validate inside the batch transaction.
-        """
-        if batch.lease is not None:
-            yield batch.lease
-            return
-        self.ensure_source_lease(batch.source_id)
-        lease = self.claim_source_lease(batch.source_id, batch.run_id, str(uuid4()))
-        if lease is None:
-            raise SourceLeaseBusy(f"source {batch.source_id} already has a collection")
-        try:
-            yield lease
-        finally:
-            try:
-                self.release_source_lease(lease)
-            except Exception:
-                logging.getLogger("usagebassoon").exception(
-                    "could not release source lease for %s", batch.source_id
-                )
+                raise ValueError(f"{table} has a mismatched source_id")
+            for value in data.column("event_id").to_pylist():
+                UUID(str(value))
+            if "run_id" in data.column_names and any(
+                value != batch.run_id for value in data.column("run_id").to_pylist()
+            ):
+                raise ValueError(f"{table} has a mismatched run_id")
+        for write in batch.current_state:
+            self._validate_upsert(
+                write.table, write.data, write.natural_keys, write.change_fields
+            )
 
     def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
-        """Atomically persist one validated collection cycle.
-
-        Concrete backends may override this method for a native bulk path,
-        such as BigQuery remote staging plus a multi-statement transaction.
-
-        Args:
-            batch: Complete normalized writes for one collection cycle.
-
-        Returns:
-            Per-table current-state outcomes or an idempotent no-op result.
-        """
+        """Apply DuckDB-compatible state upserts and append events atomically."""
         self._validate_batch(batch)
-        with self._batch_lease(batch) as lease, self.transaction():
+        with self.transaction():
             if self.has_committed_run(batch.run_id):
                 return BatchPersistResult({}, already_committed=True)
-            if not self.guard_source_lease(lease):
-                raise SourceLeaseLost(f"source lease was lost for {lease.source_id}")
             per_table: dict[str, UpsertResult] = {}
             for write in batch.current_state:
                 per_table[write.table] = self.upsert(
-                    write.table,
-                    write.data,
-                    write.natural_keys,
-                    write.change_fields,
+                    write.table, write.data, write.natural_keys, write.change_fields
                 )
             for table, data in batch.append_only.items():
                 self.append(table, data)
-            self.append(
-                "ingest_runs",
-                with_ingest_counts(
-                    batch.ingest_runs,
-                    sum(result.inserted for result in per_table.values()),
-                    sum(result.updated for result in per_table.values()),
-                ),
-            )
+            self.append("collection_ledger", batch.collection_ledger)
             return BatchPersistResult(per_table)
+
+    @abstractmethod
+    def preflight(self) -> None:
+        """Validate initialization and reconcile registered schema upgrades."""
+
+    def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
+        """Atomically restore canonical rows into an empty destination."""
+        from usagebassoon.storage_model import SNAPSHOT_TABLES
+
+        unknown = set(tables) - set(SNAPSHOT_TABLES)
+        if unknown:
+            raise ValueError(f"unsupported restore tables: {sorted(unknown)}")
+        with self.transaction():
+            for table in SNAPSHOT_TABLES:
+                if self.query(f"SELECT * FROM {table} LIMIT 1").num_rows:
+                    raise ValueError("restore requires an empty warehouse")
+            for table, data in tables.items():
+                self.append(table, data)

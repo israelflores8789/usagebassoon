@@ -18,28 +18,12 @@ from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._output import output_console
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.privacy import sanitize_table
+from usagebassoon.sql_safety import PUBLIC_RELATIONS
+from usagebassoon.storage_model import EVENT_KEYS, STATE_KEYS
 
 ExportFormat = Literal["csv", "json", "parquet"]
-_EXPORTABLE_RELATIONS = frozenset(
-    {
-        "daily_activity",
-        "daily_stats",
-        "daily_cost",
-        "daily_processed_state",
-        "ingest_runs",
-        "notes",
-        "noted_sessions",
-        "price_versions",
-        "reconciliation_issues",
-        "schema_drift_events",
-        "session_model_stats",
-        "session_model_stats_current",
-        "session_tags",
-        "sessions",
-        "tagged_sessions",
-        "tags",
-    }
-)
+_CANONICAL_EXPORTS = frozenset(STATE_KEYS | EVENT_KEYS)
+_EXPORTABLE_RELATIONS = _CANONICAL_EXPORTS | PUBLIC_RELATIONS
 
 
 def _json_default(value: object) -> str:
@@ -96,7 +80,8 @@ def export(
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     try:
-        result = backend.query(f"SELECT * FROM {target}")
+        relation = "current_" + target if target in _CANONICAL_EXPORTS else target
+        result = backend.query(f"SELECT * FROM {relation}")
     finally:
         close_backend(backend, context="exporting data")
     if not raw:

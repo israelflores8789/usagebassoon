@@ -5,9 +5,12 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
 [[package]]
@@ -534,6 +537,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ce/a5/64ba829eb6c8acf5c0a80b4c9b217c286a2cd592f661121660de9cdba329/google_cloud_bigquery-3.45.0.tar.gz", hash = "sha256:5a799856825f47743ce561802cbd01b4d5c70062b36a942cfef5146017ecf0a4", size = 528642, upload-time = "2026-09-03T22:30:57.289Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ce/af/f1c877f3d47a616f19003ba958cec5efe6e8d43d3576c5827bf53ae94ad2/google_cloud_bigquery-3.45.0-py3-none-any.whl", hash = "sha256:30637314d67526cbaefebfb9106c5a41c5f30a137ace404531148f09a6b487a6", size = 267964, upload-time = "2026-09-03T22:30:15.283Z" },
+]
+
+[[package]]
+name = "google-cloud-bigquery-datatransfer"
+version = "3.23.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/3b/38fb04da6ffe772affa30907d0420b01e02d14df816914c3d08df61d8a2d/google_cloud_bigquery_datatransfer-3.23.0.tar.gz", hash = "sha256:2d0100a93f6e89a115d668d4fc2abc0f0c223ea099f5b7c736bce0102ba623f9", size = 112127, upload-time = "2026-06-03T15:12:57.749Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/85/2388250efee0f85c9d7c1176ce0fd8c9bb9d1c95070b179f36858c699eeb/google_cloud_bigquery_datatransfer-3.23.0-py3-none-any.whl", hash = "sha256:a629de815a46fc0404f880f28e365f1b2a01c07783b3413d1020407114742d17", size = 89164, upload-time = "2026-06-03T15:12:09.908Z" },
 ]
 
 [[package]]
@@ -1582,6 +1601,15 @@ wheels = [
 ]
 
 [[package]]
+name = "types-protobuf"
+version = "7.35.1.20260906"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/6c/e3e5b3e10bc328126a39637c138f9ebfd734bf14342b9f3540039b4ab995/types_protobuf-7.35.1.20260906.tar.gz", hash = "sha256:efd1a3862d4c967dad5512ef8d56b1530ac84f182c41735b94004756518c4998", size = 69895, upload-time = "2026-09-06T06:35:28.308Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/4e/f63e826c68f77ef875506d72f225918800346545ee99847bc28f3394f18d/types_protobuf-7.35.1.20260906-py3-none-any.whl", hash = "sha256:5155e48569e0dabff303fdf578db96cd31ea9a4a63b18018a4ceac6b0ae17462", size = 86419, upload-time = "2026-09-06T06:35:27.247Z" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1638,11 +1666,13 @@ dependencies = [
 [package.optional-dependencies]
 bigquery = [
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-bigquery-datatransfer" },
     { name = "google-cloud-bigquery-storage" },
     { name = "pandas-gbq" },
 ]
 full = [
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-bigquery-datatransfer" },
     { name = "google-cloud-bigquery-storage" },
     { name = "google-cloud-storage" },
     { name = "pandas-gbq" },
@@ -1658,6 +1688,7 @@ polars = [
 [package.dev-dependencies]
 dev = [
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-bigquery-datatransfer" },
     { name = "google-cloud-bigquery-storage" },
     { name = "google-cloud-storage" },
     { name = "pandas-gbq" },
@@ -1668,6 +1699,7 @@ dev = [
     { name = "pytest-md" },
     { name = "ruff" },
     { name = "twine" },
+    { name = "types-protobuf" },
 ]
 
 [package.metadata]
@@ -1675,6 +1707,8 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.0" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3.17" },
     { name = "google-cloud-bigquery", marker = "extra == 'full'", specifier = ">=3.17" },
+    { name = "google-cloud-bigquery-datatransfer", marker = "extra == 'bigquery'", specifier = ">=3.15" },
+    { name = "google-cloud-bigquery-datatransfer", marker = "extra == 'full'", specifier = ">=3.15" },
     { name = "google-cloud-bigquery-storage", marker = "extra == 'bigquery'", specifier = ">=2.24" },
     { name = "google-cloud-bigquery-storage", marker = "extra == 'full'", specifier = ">=2.24" },
     { name = "google-cloud-storage", marker = "extra == 'full'", specifier = ">=3.0" },
@@ -1697,6 +1731,7 @@ provides-extras = ["bigquery", "full", "gcs", "polars"]
 [package.metadata.requires-dev]
 dev = [
     { name = "google-cloud-bigquery", specifier = ">=3.17" },
+    { name = "google-cloud-bigquery-datatransfer", specifier = ">=3.15" },
     { name = "google-cloud-bigquery-storage", specifier = ">=2.24" },
     { name = "google-cloud-storage", specifier = ">=3.0" },
     { name = "pandas-gbq", specifier = ">=0.35.2" },
@@ -1707,4 +1742,5 @@ dev = [
     { name = "pytest-md", specifier = ">=0.2.0" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "twine", specifier = ">=7.0.0" },
+    { name = "types-protobuf", specifier = ">=5.0" },
 ]

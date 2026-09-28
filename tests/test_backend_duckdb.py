@@ -5,126 +5,67 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
+from usagebassoon.ingest import CollectionBundle
 
 
 def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
-    """Assert the local backend applies the DDL currently shipped for DuckDB."""
+    from usagebassoon.storage_model import SNAPSHOT_TABLES
+
     backend = DuckDBBackend(tmp_path / "deep" / "stats.duckdb")
     try:
         backend.apply_ddl()
-        tables = (
+        backend.apply_ddl()
+        backend.preflight()
+        tables = set(
             backend.query(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'main' ORDER BY table_name"
+                "WHERE table_type = 'BASE TABLE'"
             )
             .column("table_name")
             .to_pylist()
         )
-        assert tables == [
-            "daily_activity",
-            "daily_cost",
-            "daily_stats",
-            "ingest_runs",
-            "ingest_status",
-            "noted_sessions",
-            "notes",
-            "price_versions",
-            "reconciliation_issues",
-            "report_daily_usage",
-            "report_models",
-            "report_session_models",
-            "report_summary",
-            "report_summary_models",
-            "schema_drift_events",
-            "session_model_stats",
-            "session_model_stats_current",
-            "session_notes",
-            "session_tags",
-            "sessions",
-            "source_leases",
-            "tagged_sessions",
-            "tags",
-        ]
-        columns = backend.query("DESCRIBE sessions").column("column_name").to_pylist()
-        assert columns[-3:] == ["first_seen_at", "last_seen_at", "updated_at"]
-        reconciliation_columns = (
-            backend.query("DESCRIBE reconciliation_issues")
-            .column("column_name")
-            .to_pylist()
-        )
-        assert reconciliation_columns[-2:] == ["resolved", "observation_count"]
-        run_columns = (
-            backend.query("DESCRIBE ingest_runs").column("column_name").to_pylist()
-        )
-        assert run_columns[4:11] == [
-            "host",
-            "os_name",
-            "os_version",
-            "architecture",
-            "cpu_model",
-            "cpu_count",
-            "memory_bytes",
-        ]
+        assert tables == set(SNAPSHOT_TABLES) | {"schema_marker", "schema_migrations"}
+        assert "daily_activity" not in tables
+        assert "source_leases" not in tables
     finally:
         backend.close()
 
 
-def test_local_backend_merges_current_state_in_place() -> None:
-    """Assert a changed fact updates its DDL primary-key row rather than appending."""
+def test_local_backend_merges_current_state_in_place(
+    collection_bundle: CollectionBundle,
+) -> None:
+    from dataclasses import replace
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from usagebassoon.normalizer import normalize
+    from usagebassoon.persistence import persist_run
+
     backend = DuckDBBackend(":memory:")
-    first_updated_at = datetime(2026, 9, 14, tzinfo=UTC)
-    second_updated_at = datetime(2026, 9, 15, tzinfo=UTC)
     try:
         backend.apply_ddl()
-        first = pa.table(
-            {
-                "source_id": ["source"],
-                "day": [date(2026, 9, 14)],
-                "intensity": [1],
-                "active_time_ms": [100],
-                "updated_at": [first_updated_at],
-            }
+        first = normalize(collection_bundle)
+        persist_run(backend, first)
+        assert persist_run(backend, first).inserted == 0
+        later = normalize(
+            replace(
+                collection_bundle,
+                run_id=str(uuid4()),
+                started_at=collection_bundle.started_at + timedelta(hours=1),
+            )
         )
-        changed = first.set_column(2, "intensity", pa.array([2])).set_column(
-            4,
-            "updated_at",
-            pa.array([second_updated_at]),
-        )
-        first_result = backend.upsert(
-            "daily_activity",
-            first,
-            ("source_id", "day"),
-            ("intensity",),
-        )
-        assert first_result.affected == 1
-        unchanged_result = backend.upsert(
-            "daily_activity",
-            first,
-            ("source_id", "day"),
-            ("intensity",),
-        )
-        assert unchanged_result.affected == 0
+        persist_run(backend, later)
         assert (
-            backend.upsert(
-                "daily_activity",
-                changed,
-                ("source_id", "day"),
-                ("intensity",),
-            ).updated
-            == 1
+            backend.query("SELECT * FROM daily_stats").num_rows
+            == first.tables["daily_stats"].num_rows
         )
-        assert backend.query(
-            "SELECT intensity, updated_at FROM daily_activity"
-        ).to_pylist() == [{"intensity": 2, "updated_at": second_updated_at}]
     finally:
         backend.close()
 
