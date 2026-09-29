@@ -16,6 +16,7 @@ from usagebassoon.curation import (
     NoteAssignment,
     TagAssignment,
     add_tag,
+    get_note,
     remove_note,
     remove_tag,
     rename_tag,
@@ -144,10 +145,10 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
         backend.close()
 
 
-def test_tags_do_not_cross_source_namespaces(
+def test_tags_are_global_and_notes_match_source_scoped_sessions(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Assert a client tag resolves only onto sessions from its own source."""
+    """Share tags across sources while joining notes to their exact sessions."""
     backend = DuckDBBackend(":memory:")
     alternate_source = "22222222-2222-4222-8222-222222222222"
     target = collection_bundle.report_rows[0]
@@ -173,9 +174,53 @@ def test_tags_do_not_cross_source_namespaces(
                 tag="source-one-only",
             ),
         )
+        expected_sources = sorted([collection_bundle.source_id, alternate_source])
         assert backend.query(
-            "SELECT DISTINCT source_id FROM session_tags WHERE tag = 'source-one-only'"
-        ).to_pylist() == [{"source_id": collection_bundle.source_id}]
+            "SELECT DISTINCT source_id FROM session_tags "
+            "WHERE tag = 'source-one-only' ORDER BY source_id"
+        ).to_pylist() == [{"source_id": source} for source in expected_sources]
+        set_note(
+            backend,
+            NoteAssignment(
+                collection_bundle.source_id,
+                target.client,
+                target.session_id,
+                "source note",
+            ),
+        )
+        assert backend.query(
+            "SELECT source_id, note FROM noted_sessions "
+            "WHERE client = :client AND session_id = :session_id ORDER BY source_id",
+            {"client": target.client, "session_id": target.session_id},
+        ).to_pylist() == [
+            {"source_id": collection_bundle.source_id, "note": "source note"}
+        ]
+        assert (
+            get_note(
+                backend,
+                source_id=alternate_source,
+                client=target.client,
+                session_id=target.session_id,
+            )
+            is None
+        )
+        set_note(
+            backend,
+            NoteAssignment(
+                alternate_source, target.client, target.session_id, "alternate note"
+            ),
+        )
+        labels = {
+            collection_bundle.source_id: "source note",
+            alternate_source: "alternate note",
+        }
+        assert backend.query(
+            "SELECT source_id, note FROM noted_sessions "
+            "WHERE client = :client AND session_id = :session_id ORDER BY source_id",
+            {"client": target.client, "session_id": target.session_id},
+        ).to_pylist() == [
+            {"source_id": source, "note": labels[source]} for source in expected_sources
+        ]
     finally:
         backend.close()
 

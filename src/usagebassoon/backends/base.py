@@ -130,11 +130,11 @@ type CuratedTable = Literal["notes", "tags"]
 
 @dataclass(frozen=True, slots=True)
 class CuratedIdentity:
-    """Complete identity for one user-curated row.
+    """Target selector for a global tag or a source-scoped session note.
 
     Attributes:
         table: Curation table containing the row.
-        values: Ordered identity fields and their values.
+        values: Ordered target fields, including source provenance for tags.
     """
 
     table: CuratedTable
@@ -162,9 +162,23 @@ class CuratedIdentity:
         if any(not values[name].strip() for name in required):
             raise ValueError("curated identity has an empty required value")
 
+    @property
+    def target_values(self) -> tuple[tuple[str, str], ...]:
+        """Return target fields, excluding source provenance only for global tags."""
+        if self.table == "notes":
+            return self.values
+        return tuple(
+            (name, value) for name, value in self.values if name != "source_id"
+        )
+
+    @property
+    def source_id(self) -> str:
+        """Return tag mutation provenance or the note's session namespace."""
+        return dict(self.values)["source_id"]
+
     def parameters(self, *, prefix: str = "") -> dict[str, str]:
         """Return uniquely named query parameters for the identity values."""
-        return {f"{prefix}{name}": value for name, value in self.values}
+        return {f"{prefix}{name}": value for name, value in self.target_values}
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +233,7 @@ class StorageBackend(Protocol):
         natural_keys: Sequence[str],
         change_fields: Sequence[str],
     ) -> UpsertResult:
-        """Publish observations at a source-scoped natural key.
+        """Publish observations at the declared natural key.
 
         Args:
             table: Current-state table named by the active dialect DDL.
@@ -267,7 +281,7 @@ class StorageBackend(Protocol):
         ...
 
     def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
-        """Atomically restore canonical rows into an empty destination."""
+        """Restore into an empty destination while all its writers are stopped."""
         ...
 
 

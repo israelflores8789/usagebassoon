@@ -960,7 +960,12 @@ class SnapshotArchiver:
     def restore(
         self, backend: StorageBackend, snapshot: str = "latest"
     ) -> dict[str, int]:
-        """Validate then append a complete snapshot into an empty backend."""
+        """Validate then append a complete snapshot into an empty backend.
+
+        All UsageBassoon instances and other destination writers must be stopped
+        before calling this method and remain stopped until it returns. Independent
+        warehouse appends cannot be excluded by the restore transaction.
+        """
         archive, entry = self._restore_entry(snapshot)
         manifest = self._load_manifest(entry, archive)
         tables = manifest["tables"]

@@ -36,12 +36,7 @@ def test_normalize_emits_daily_tables_and_collection_status(
     ledger = normalized.tables["collection_ledger"]
     assert ledger.num_rows == 1 + len(collection_bundle.ingest_status)
     assert ledger.column("domain").to_pylist().count("collection") == 1
-    assert not {
-        "rows_inserted",
-        "rows_updated",
-        "drift_events",
-        "last_attempted_run",
-    } & set(ledger.column_names)
+    assert ledger.schema == CANONICAL_TABLE_SCHEMAS["collection_ledger"]
     assert all(
         table.column("event_id").null_count == 0 for table in normalized.tables.values()
     )
@@ -71,7 +66,6 @@ def test_current_state_freshness_uses_collection_start(
         assert set(normalized.tables[name].column("collected_at").to_pylist()) == {
             collection_bundle.started_at
         }
-    assert "observed_at" not in normalized.tables["price_versions"].column_names
 
 
 def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(

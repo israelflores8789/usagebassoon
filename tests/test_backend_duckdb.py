@@ -32,8 +32,6 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             .to_pylist()
         )
         assert tables == set(SNAPSHOT_TABLES) | {"schema_marker", "schema_migrations"}
-        assert "daily_activity" not in tables
-        assert "source_leases" not in tables
     finally:
         backend.close()
 

@@ -7,7 +7,7 @@ STATE_KEYS: dict[str, tuple[str, ...]] = {
     "sessions": ("source_id", "client", "session_id"),
     "daily_stats": ("source_id", "day", "client", "session_id", "model"),
     "price_versions": ("source_id", "day", "model"),
-    "tags": ("source_id", "scope", "client", "workspace", "session_id", "tag"),
+    "tags": ("scope", "client", "workspace", "session_id", "tag"),
     "notes": ("source_id", "client", "session_id"),
 }
 EVENT_KEYS: dict[str, tuple[str, ...]] = {
@@ -23,7 +23,7 @@ def observation_order(table: str, prefix: str = "") -> str:
     """Return the shared latest-observation ordering for one relation."""
     fields = [f"{prefix}collected_at DESC"]
     if table in {"tags", "notes"}:
-        fields.append(f"{prefix}is_deleted ASC")
+        fields.append(f"({prefix}op = 'upsert') DESC")
     elif table in DEBUG_TABLES:
         fields.append(f"{prefix}resolved DESC")
     elif table == "daily_stats":
@@ -40,7 +40,7 @@ def newer_observation(table: str) -> str:
     """Return a null-safe predicate for a winning DuckDB observation."""
     fields = ["collected_at"]
     if table in {"tags", "notes"}:
-        fields.append("NOT is_deleted")
+        fields.append("op = 'upsert'")
     elif table == "daily_stats":
         fields.append("total_tokens")
     elif table == "price_versions":

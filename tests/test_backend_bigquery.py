@@ -16,6 +16,7 @@ import pytest
 import sqlglot
 from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud.bigquery.table import TableListItem
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from sqlglot import exp
 
@@ -643,3 +644,111 @@ def test_preflight_rejects_unsupported_markers_without_schema_jobs(
     with pytest.raises(RuntimeError, match=message):
         backend.preflight()
     assert client.queries == []
+
+
+def test_failed_ledger_append_leaves_facts_visible_and_retry_safe(
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing completion repeats work without hiding successful fact appends."""
+    from google.api_core.exceptions import ServiceUnavailable
+
+    backend = _backend()
+    bundle = normalize(collection_bundle)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    lock = Lock()
+    fail_ledger = True
+
+    def append(table: str, data: pa.Table) -> None:
+        """Record stable event IDs and fail the first final ledger append."""
+        nonlocal fail_ledger
+        with lock:
+            calls.append((table, tuple(data.column("event_id").to_pylist())))
+            if table == "collection_ledger" and fail_ledger:
+                fail_ledger = False
+                raise ServiceUnavailable("controlled ledger failure")
+
+    monkeypatch.setattr(backend, "append", append)
+    with pytest.raises(ServiceUnavailable, match="ledger failure"):
+        persist_run(backend, bundle)
+    assert calls[-1][0] == "collection_ledger"
+    first = dict(calls)
+    calls.clear()
+    persist_run(backend, bundle)
+    assert calls[-1][0] == "collection_ledger"
+    assert dict(calls) == first
+
+
+@pytest.mark.parametrize(
+    ("message", "exception_type"),
+    [
+        ("Query error: restore requires an empty warehouse at [4:1]", ValueError),
+        ("controlled invalid restore SQL", BadRequest),
+    ],
+)
+def test_restore_translates_emptiness_errors_and_cleans_stages(
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    exception_type: type[Exception],
+) -> None:
+    """Surface the destination precondition while preserving unrelated API errors."""
+    failure = BadRequest(message)
+
+    class Client(_BatchClient):
+        """Expose one destination table and reject the restore transaction."""
+
+        def list_tables(self, dataset: str) -> list[TableListItem]:
+            """Return the initialized destination table for emptiness validation."""
+            assert dataset == "usagebassoon-test.usagebassoon_emulated"
+            return [
+                TableListItem(
+                    {
+                        "tableReference": {
+                            "projectId": "usagebassoon-test",
+                            "datasetId": "usagebassoon_emulated",
+                            "tableId": "daily_stats",
+                        },
+                        "id": "usagebassoon-test:usagebassoon_emulated.daily_stats",
+                        "type": "TABLE",
+                    }
+                )
+            ]
+
+        @override
+        def query(
+            self,
+            sql: str,
+            *,
+            job_config: bigquery.QueryJobConfig,
+            location: str,
+        ) -> _Job:
+            """Raise the backend error after all restore assertions are assembled."""
+            assert "restore requires an empty warehouse" in sql
+            assert job_config.default_dataset is not None and location == "US"
+            raise failure
+
+    client = Client()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+    staged: list[str] = []
+
+    def load(data: pa.Table, destination: str, *, disposition: str) -> None:
+        """Record the staged snapshot without making a cloud call."""
+        assert data.num_rows > 0 and disposition == "WRITE_TRUNCATE"
+        staged.append(destination)
+
+    monkeypatch.setattr(backend, "_load", load)
+    bundle = normalize(collection_bundle)
+    with pytest.raises(exception_type) as raised:
+        backend.restore_tables({"daily_stats": bundle.tables["daily_stats"]})
+    assert client.deleted == staged
+    assert len(staged) == 1
+    if exception_type is ValueError:
+        assert str(raised.value) == "restore requires an empty warehouse"
+        assert raised.value.__cause__ is failure
+    else:
+        assert raised.value is failure

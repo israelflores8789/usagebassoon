@@ -55,6 +55,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
 ) -> None:
     """Treat diagnostic warnings as failures only when strict mode is requested."""
     config, backend = _configured_store(tmp_path)
+    observed = datetime.now(UTC)
     backend.append(
         "schema_drift_events",
         observations(
@@ -68,10 +69,9 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
                     "path": ["entries[].extra"],
                     "detail": ["unexpected field"],
                     "contract_tokscale_ver": ["4.15.1"],
-                    "created_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                    "collected_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                    "detected_run_id": ["run-1"],
-                    "updated_run_id": ["run-1"],
+                    "created_at": [observed],
+                    "collected_at": [observed],
+                    "run_id": ["run-1"],
                     "resolved": [False],
                     "observation_count": [1],
                 }

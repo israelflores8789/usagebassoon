@@ -125,17 +125,24 @@ LEFT JOIN (
 ) AS progress USING (source_id, day, arrival_day)
 WHERE counts.raw_rows_processed > COALESCE(progress.processed, 0);
 
+-- Curation is global: reconcile affected keys across every provenance source.
+CREATE TEMP TABLE keys_tags AS
+SELECT DISTINCT scope, client, workspace, session_id, tag
+FROM raw_tags FOR SYSTEM_TIME AS OF cutoff
+WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_tags);
+
 CREATE TEMP TABLE winners_tags AS
-SELECT event_id, scope, source_id, client, workspace, session_id, tag, earliest_created AS created_at, collected_at, is_deleted
+SELECT event_id, scope, source_id, client, workspace, session_id, tag, created_at, updated_at, collected_at, op, op_id
 FROM (
-SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, scope, client, workspace, session_id, tag ORDER BY collected_at DESC, is_deleted ASC, event_id DESC) AS observation_rank, MIN(created_at) OVER (PARTITION BY source_id, scope, client, workspace, session_id, tag) AS earliest_created
-FROM (SELECT * FROM tags FOR SYSTEM_TIME AS OF cutoff WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_tags) UNION ALL SELECT * FROM raw_tags FOR SYSTEM_TIME AS OF cutoff WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_tags)) AS observations
+SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY scope, client, workspace, session_id, tag ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
+FROM (SELECT * FROM tags FOR SYSTEM_TIME AS OF cutoff UNION ALL SELECT * FROM raw_tags FOR SYSTEM_TIME AS OF cutoff) AS observations
+WHERE EXISTS (SELECT 1 FROM keys_tags AS keys WHERE keys.scope = observations.scope AND keys.client = observations.client AND keys.workspace = observations.workspace AND keys.session_id = observations.session_id AND keys.tag = observations.tag)
 ) AS ranked
 WHERE observation_rank = 1;
 
 -- Existing gold rows participate, including keys no longer present in raw.
-DELETE FROM tags WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_tags);
-INSERT INTO tags (event_id, scope, source_id, client, workspace, session_id, tag, created_at, collected_at, is_deleted) SELECT * FROM winners_tags;
+DELETE FROM tags AS target WHERE EXISTS (SELECT 1 FROM keys_tags AS keys WHERE keys.scope = target.scope AND keys.client = target.client AND keys.workspace = target.workspace AND keys.session_id = target.session_id AND keys.tag = target.tag);
+INSERT INTO tags (event_id, scope, source_id, client, workspace, session_id, tag, created_at, updated_at, collected_at, op, op_id) SELECT * FROM winners_tags;
 INSERT INTO compaction_ledger
 SELECT source_id, GENERATE_UUID(), compaction_run, 'tags', day, arrival_day,
        cutoff, cutoff, raw_rows_processed
@@ -156,17 +163,24 @@ LEFT JOIN (
 ) AS progress USING (source_id, day, arrival_day)
 WHERE counts.raw_rows_processed > COALESCE(progress.processed, 0);
 
+-- Notes use the same source/client/session identity as their target sessions.
+CREATE TEMP TABLE keys_notes AS
+SELECT DISTINCT source_id, client, session_id
+FROM raw_notes FOR SYSTEM_TIME AS OF cutoff
+WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_notes);
+
 CREATE TEMP TABLE winners_notes AS
-SELECT event_id, source_id, client, session_id, note, earliest_created AS created_at, collected_at, is_deleted
+SELECT event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
 FROM (
-SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, is_deleted ASC, event_id DESC) AS observation_rank, MIN(created_at) OVER (PARTITION BY source_id, client, session_id) AS earliest_created
-FROM (SELECT * FROM notes FOR SYSTEM_TIME AS OF cutoff WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_notes) UNION ALL SELECT * FROM raw_notes FOR SYSTEM_TIME AS OF cutoff WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_notes)) AS observations
+SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
+FROM (SELECT * FROM notes FOR SYSTEM_TIME AS OF cutoff UNION ALL SELECT * FROM raw_notes FOR SYSTEM_TIME AS OF cutoff) AS observations
+WHERE EXISTS (SELECT 1 FROM keys_notes AS keys WHERE keys.source_id = observations.source_id AND keys.client = observations.client AND keys.session_id = observations.session_id)
 ) AS ranked
 WHERE observation_rank = 1;
 
 -- Existing gold rows participate, including keys no longer present in raw.
-DELETE FROM notes WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_notes);
-INSERT INTO notes (event_id, source_id, client, session_id, note, created_at, collected_at, is_deleted) SELECT * FROM winners_notes;
+DELETE FROM notes AS target WHERE EXISTS (SELECT 1 FROM keys_notes AS keys WHERE keys.source_id = target.source_id AND keys.client = target.client AND keys.session_id = target.session_id);
+INSERT INTO notes (event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id) SELECT * FROM winners_notes;
 INSERT INTO compaction_ledger
 SELECT source_id, GENERATE_UUID(), compaction_run, 'notes', day, arrival_day,
        cutoff, cutoff, raw_rows_processed

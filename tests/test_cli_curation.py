@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import CONFIG_PATH_ENV_VAR
@@ -80,17 +81,18 @@ def test_curation_commands_use_only_the_explicit_config(
         backend.close()
 
 
-def test_only_the_new_curation_command_forms_are_available(tmp_path: Path) -> None:
-    """Assert old note and tag positional forms are not compatibility aliases."""
-    config = tmp_path / "config.toml"
-    _write_config(config, tmp_path / "usage.duckdb")
+def test_curation_help_documents_the_supported_operations() -> None:
+    """Expose each supported tag and note operation in command help."""
     runner = CliRunner()
-    old_note = runner.invoke(app, _command(config, "note", "first"))
-    old_tag = runner.invoke(
-        app, _command(config, "tag", "important", "--client", "codex")
-    )
-    assert old_note.exit_code != 0
-    assert old_tag.exit_code != 0
+    for command, operations in (
+        ("tag", ("add", "rename", "remove")),
+        ("note", ("set", "edit", "remove")),
+    ):
+        result = runner.invoke(app, [command, "--help"])
+        assert result.exit_code == 0
+        output = plain_cli_output(result.stdout)
+        for operation in operations:
+            assert operation in output.split()
 
 
 def test_tag_commands_support_each_scope_rename_and_remove(tmp_path: Path) -> None:

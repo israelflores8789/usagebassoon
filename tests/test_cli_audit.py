@@ -50,10 +50,6 @@ def test_audit_orders_runs_newest_first_and_honors_limit(tmp_path: Path) -> None
                         datetime(2026, 9, 15, 1, tzinfo=UTC),
                     ],
                     "status": ["ok", "partial"],
-                    "rows_in": [1, 2],
-                    "rows_inserted": [1, 1],
-                    "rows_updated": [0, 1],
-                    "drift_events": [0, 1],
                 }
             )
         ),

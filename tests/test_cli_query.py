@@ -89,6 +89,8 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
             "client=codex",
             "--limit",
             "1",
+            "--format",
+            "json",
             "--config",
             str(config),
         ],
@@ -99,10 +101,10 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
     )
 
     assert query_result.exit_code == 0
-    assert "ses_private" in query_result.output
-    assert "returns raw data" in query_result.stderr
+    assert "ses_private" in plain_cli_output(query_result.output)
+    assert "returns raw data" in plain_cli_output(query_result.stderr)
     assert delete_result.exit_code != 0
-    assert "not supported" in delete_result.output
+    assert "not supported" in plain_cli_output(delete_result.output)
 
 
 def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:

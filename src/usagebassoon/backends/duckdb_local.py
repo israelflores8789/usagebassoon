@@ -186,9 +186,7 @@ class _DuckDBStorage(AbstractStorageBackend):
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if column == "first_seen_at" or (
-                table in {"tags", "notes"} and column == "created_at"
-            ):
+            if column == "first_seen_at":
                 value = f"COALESCE(target.{quoted_column}, {value})"
             assignments.append(f"{quoted_column} = {value}")
         source_values = ", ".join(f"source.{_identifier(column)}" for column in columns)
@@ -284,7 +282,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def delete_curated(self, identity: CuratedIdentity) -> int:
         """Delete one completely identified notes or tags row."""
         predicates = " AND ".join(
-            f"{_identifier(name)} = ${name}" for name, _ in identity.values
+            f"{_identifier(name)} = ${name}" for name, _ in identity.target_values
         )
         result = self.connection.execute(
             f"DELETE FROM {_identifier(identity.table)} WHERE {predicates} RETURNING 1",
@@ -310,13 +308,15 @@ class _DuckDBStorage(AbstractStorageBackend):
             "destination_tag": destination_parameters["destination_tag"],
             "collected_at": updated_at,
             "event_id": str(uuid4()),
+            "op_id": str(uuid4()),
+            "source_id": source.source_id,
         }
         source_predicate = " AND ".join(
-            f"{_identifier(name)} = $source_{name}" for name, _ in source.values
+            f"{_identifier(name)} = $source_{name}" for name, _ in source.target_values
         )
         destination_predicate = " AND ".join(
             f"{_identifier(name)} = $destination_{name}"
-            for name, _ in destination.values
+            for name, _ in destination.target_values
         )
         with self.transaction():
             source_exists = self.connection.execute(
@@ -334,10 +334,10 @@ class _DuckDBStorage(AbstractStorageBackend):
             insert_sql = (
                 'INSERT INTO "tags" '
                 "(source_id, scope, client, workspace, session_id, "
-                "tag, created_at, collected_at, event_id, is_deleted) "
-                "SELECT source_id, scope, client, workspace, session_id, "
-                " $destination_tag, created_at, $collected_at, $event_id, "
-                'FALSE FROM "tags" WHERE '
+                "tag, created_at, updated_at, collected_at, event_id, op, op_id) "
+                "SELECT $source_id, scope, client, workspace, session_id, "
+                " $destination_tag, created_at, $collected_at, $collected_at, "
+                "$event_id, 'upsert', $op_id FROM \"tags\" WHERE "
                 f"{source_predicate}"
             )
             self.connection.execute(

@@ -63,8 +63,15 @@ def test_logical_gold_and_event_schemas_match() -> None:
             assert _columns(table)["source_id"][1]
     for table in STATE_KEYS:
         assert _columns(bigquery[table]) == _columns(bigquery["raw_" + table])
-    assert "daily_activity" not in duckdb | bigquery
-    assert "source_leases" not in duckdb | bigquery
+    logical = set(STATE_KEYS) | set(EVENT_KEYS)
+    metadata = {"schema_marker", "schema_migrations"}
+    assert set(duckdb) == logical | metadata
+    assert set(bigquery) == (
+        set(STATE_KEYS)
+        | {"raw_" + table for table in set(STATE_KEYS) | DEBUG_TABLES}
+        | {"collection_ledger", "compaction_ledger"}
+        | metadata
+    )
 
 
 def test_packaged_asset_inventory_and_native_parsing() -> None:
@@ -213,7 +220,13 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
                 preferred["price_output_per_token"] = -1.0
                 other["price_output_per_token"] = None
             elif table in {"tags", "notes"}:
-                preferred["is_deleted"], other["is_deleted"] = False, True
+                preferred["op"], other["op"] = "upsert", "delete"
+                if table == "tags":
+                    preferred["source_id"] = "preferred-source"
+                    other["source_id"] = "other-source"
+                preferred["created_at"] = stamp
+                preferred["updated_at"] = stamp
+                other["created_at"] = stamp - timedelta(days=10)
             elif table in DEBUG_TABLES:
                 preferred["resolved"], other["resolved"] = True, False
                 preferred["observation_count"] = 0

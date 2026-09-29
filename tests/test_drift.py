@@ -11,6 +11,7 @@ from typing import override
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 
 from tests._observations import observations
 from usagebassoon.backends.base import ActiveTransaction
@@ -52,8 +53,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
                         "contract_tokscale_ver": ["4.15.1", "4.15.1"],
                         "created_at": [now, now],
                         "collected_at": [now, now + timedelta(seconds=1)],
-                        "detected_run_id": [str(uuid4()), str(uuid4())],
-                        "updated_run_id": [str(uuid4()), str(uuid4())],
+                        "run_id": [str(uuid4()), str(uuid4())],
                         "resolved": [True, False],
                         "observation_count": [1, 3],
                     }
@@ -91,8 +91,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                         "contract_tokscale_ver": ["4.15.1"],
                         "created_at": [now],
                         "collected_at": [now],
-                        "detected_run_id": [run_id],
-                        "updated_run_id": [run_id],
+                        "run_id": [run_id],
                         "resolved": [False],
                         "observation_count": [1],
                     }
@@ -111,10 +110,6 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                         "host": ["pytest"],
                         "tokscale_ver": ["4.15.1"],
                         "status": ["schema_drift"],
-                        "rows_in": [1],
-                        "rows_inserted": [0],
-                        "rows_updated": [0],
-                        "drift_events": [1],
                     }
                 )
             ),
@@ -162,8 +157,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
                         "contract_tokscale_ver": ["4.15.1"],
                         "created_at": [detected_at],
                         "collected_at": [detected_at],
-                        "detected_run_id": [detected_run_id],
-                        "updated_run_id": [detected_run_id],
+                        "run_id": [detected_run_id],
                         "resolved": [False],
                         "observation_count": [4],
                     }
@@ -237,5 +231,50 @@ def test_ingest_issues_rejects_non_positive_limit() -> None:
             assert str(error) == "limit must be positive"
         else:
             raise AssertionError("expected ValueError")
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("table", ["schema_drift_events", "reconciliation_issues"])
+def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
+    table: str,
+) -> None:
+    """Use latest observation freshness even after an idle local warehouse."""
+    from usagebassoon.diagnostics import reconciliation_issues
+    from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
+
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        now = datetime.now(UTC)
+        schema = CANONICAL_TABLE_SCHEMAS[table]
+        row: dict[str, object] = {field.name: "synthetic" for field in schema}
+        row.update(
+            event_id=str(uuid4()),
+            created_at=now - timedelta(days=120),
+            collected_at=now - timedelta(days=91),
+            resolved=False,
+            observation_count=1,
+        )
+        backend.append(table, pa.Table.from_pylist([row], schema=schema))
+        read = (
+            unresolved_schema_drift
+            if table == "schema_drift_events"
+            else reconciliation_issues
+        )
+        assert read(backend) == ()
+        assert backend.query(f"SELECT * FROM {table}").num_rows == 1
+        row.update(event_id=str(uuid4()), collected_at=now, observation_count=1)
+        backend.append(table, pa.Table.from_pylist([row], schema=schema))
+        assert len(read(backend)) == 1
+        assert read(backend)[0].created_at == now - timedelta(days=120)
+        row.update(
+            event_id=str(uuid4()),
+            collected_at=now + timedelta(seconds=1),
+            resolved=True,
+            observation_count=0,
+        )
+        backend.append(table, pa.Table.from_pylist([row], schema=schema))
+        assert read(backend) == ()
     finally:
         backend.close()

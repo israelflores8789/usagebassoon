@@ -145,9 +145,11 @@ CREATE TABLE tags (
     session_id TEXT NOT NULL DEFAULT '',
     tag TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     collected_at TIMESTAMPTZ NOT NULL,
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (source_id, scope, client, workspace, session_id, tag),
+    op TEXT NOT NULL DEFAULT 'upsert' CHECK (op IN ('upsert', 'delete')),
+    op_id TEXT,
+    PRIMARY KEY (scope, client, workspace, session_id, tag),
     CHECK (
         (scope = 'client' AND client <> '' AND workspace = '' AND session_id = '')
         OR (scope = 'workspace' AND client = '' AND workspace <> '' AND session_id = '')
@@ -163,8 +165,10 @@ CREATE TABLE notes (
     session_id TEXT NOT NULL,
     note TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     collected_at TIMESTAMPTZ NOT NULL,
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    op TEXT NOT NULL DEFAULT 'upsert' CHECK (op IN ('upsert', 'delete')),
+    op_id TEXT,
     PRIMARY KEY (source_id, client, session_id)
 );
 

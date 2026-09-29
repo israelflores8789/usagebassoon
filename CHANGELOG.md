@@ -21,14 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added ephemeral append-only schema-drift observations and resolution events with replay-safe identities and deduplicated observation counts.
 - Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and backend-specific idempotent publication that preserves token usage history.
 - Added support for local DuckDB databases using the `StorageBackend` protocol.
-- Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.
+- Added support for BigQuery datasets with concurrent append publication, immediately queryable canonical views, and nightly transactional compaction.
 - Added support for MotherDuck databases for remote persistence using the `StorageBackend` protocol.
 - Added terminal summary, model, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
 - Added workspace, client, model, tag, source, and inclusive date filters to daily and model reports, session last-active date filters, and a session creation-date display and filter mode; date bounds combine with all other report filters.
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
-- Added source-scoped workspace, client, and session tags and notes for user-curated reports.
+- Added global workspace, client, and session tags with mutation provenance and source-scoped session notes for user-curated reports.
 - Added permanent collection audits, models payload reconciliation, and diagnostics using append-only outcomes and issue events.
-- Added portable Parquet snapshots and restore for local and remote object store archives, with catalog-based publication, integrity checks, retention, and optional collection-triggered cadence.
+- Added portable Parquet snapshots and restore for local and remote object store archives, with consistent warehouse capture, catalog-based publication, integrity checks, retention, optional collection-triggered cadence, and restoration into initialized empty destinations across supported backends.
 - Added support for Google Cloud Storage for snapshot archives.
 - Added scheduled token usage history collection for Linux (systemd), macOS (launchd), and container environments (worker script) with status, log controls, per-operation timeouts, and retries.
 - Added sharing controls: reports are raw by default with `--sanitize`, exports pseudonymize session, workspace, tag, and host fields and redact notes, `doctor` diagnostics output is sanitized by default, and raw queries warn on stderr.
@@ -36,13 +36,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a live persistence test suite against all implemented remote backends and object stores including BigQuery, MotherDuck, and Google Cloud Storage. Tests are automated in the CI Live GitHub workflow.
 - Added SQL parity test suite that ensures structural and synthetic replay behavior against all SQL dialects using SQLGlot.
 
-### Changed
-
-- BigQuery collection now uses concurrent append loads into arrival-partitioned raw tables, immediate canonical views, and a versioned nightly transactional compaction schedule with arrival-bucket counts and durable curation tombstones.
-- Initialization is explicit and idempotent; schema preflight checks version/hash compatibility and applies only registered future migration steps.
-- Snapshots capture canonical gold plus raw state and restore atomically into an empty destination across supported backends.
-- Local collection uses an OS process lock; remote persistence uses replay-safe event identifiers and bounded retries.
-
-### Removed
-
-- Removed `daily_activity`, warehouse source leases, separate ingest run/status tables, persisted row-change counters, and pre-release migration SQL files.
+- Added explicit, idempotent warehouse initialization and schema-compatibility preflight checks.
+- Added local collector exclusion, replay-safe remote publication, and bounded persistence retries for concurrent ephemeral environments.

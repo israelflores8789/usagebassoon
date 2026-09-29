@@ -155,9 +155,9 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend.connection.execute(
         "INSERT INTO tags "
         "(event_id, scope, source_id, client, workspace, session_id, tag, created_at, "
-        "collected_at) "
+        "updated_at, collected_at) "
         "VALUES (UUID(), 'workspace', ?, '', '/work/atlas', '', "
-        "'focused', NOW(), NOW())",
+        "'focused', NOW(), NOW(), NOW())",
         [LOCAL_SOURCE_ID],
     )
     return config, backend

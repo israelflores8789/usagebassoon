@@ -30,21 +30,21 @@ WHERE observation_rank = 1;
 
 -- Current state includes every retained observation; progress never hides raw data.
 CREATE OR REPLACE VIEW current_tags AS
-SELECT event_id, scope, source_id, client, workspace, session_id, tag, earliest_created AS created_at, collected_at, is_deleted
+SELECT event_id, scope, source_id, client, workspace, session_id, tag, created_at, updated_at, collected_at, op, op_id
 FROM (
-SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, scope, client, workspace, session_id, tag ORDER BY collected_at DESC, is_deleted ASC, event_id DESC) AS observation_rank, MIN(created_at) OVER (PARTITION BY source_id, scope, client, workspace, session_id, tag) AS earliest_created
+SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY scope, client, workspace, session_id, tag ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
 FROM (SELECT * FROM tags UNION ALL SELECT * FROM raw_tags) AS observations
 ) AS ranked
-WHERE observation_rank = 1 AND is_deleted = FALSE;
+WHERE observation_rank = 1 AND op = 'upsert';
 
 -- Current state includes every retained observation; progress never hides raw data.
 CREATE OR REPLACE VIEW current_notes AS
-SELECT event_id, source_id, client, session_id, note, earliest_created AS created_at, collected_at, is_deleted
+SELECT event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
 FROM (
-SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, is_deleted ASC, event_id DESC) AS observation_rank, MIN(created_at) OVER (PARTITION BY source_id, client, session_id) AS earliest_created
+SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
 FROM (SELECT * FROM notes UNION ALL SELECT * FROM raw_notes) AS observations
 ) AS ranked
-WHERE observation_rank = 1 AND is_deleted = FALSE;
+WHERE observation_rank = 1 AND op = 'upsert';
 
 CREATE OR REPLACE VIEW current_collection_ledger AS
 SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status
@@ -93,6 +93,15 @@ SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, check_name, is
 FROM (SELECT * FROM replay_reconciliation_issues) AS observations
 ) AS ranked
 WHERE observation_rank = 1;
+
+-- Doctor freshness is enforced at read time, independent of physical pruning.
+CREATE OR REPLACE VIEW open_schema_drift_events AS
+SELECT * FROM current_schema_drift_events
+WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
+
+CREATE OR REPLACE VIEW open_reconciliation_issues AS
+SELECT * FROM current_reconciliation_issues
+WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
 
 CREATE OR REPLACE VIEW collection_runs AS
 SELECT * FROM current_collection_ledger WHERE domain = 'collection';
@@ -296,8 +305,7 @@ SELECT DISTINCT
     tags.scope AS tag_scope
 FROM current_sessions AS sessions
 JOIN current_tags AS tags
-    ON tags.source_id = sessions.source_id
-    AND (
+    ON (
         (tags.scope = 'client' AND tags.client = sessions.client)
         OR (tags.scope = 'workspace' AND tags.workspace = sessions.workspace)
         OR (
@@ -317,6 +325,7 @@ JOIN session_tags AS session_tags
 
 CREATE OR REPLACE VIEW noted_sessions AS
 SELECT sessions.*, notes.note, notes.created_at AS note_created_at,
+       notes.updated_at AS note_updated_at,
        notes.collected_at AS note_collected_at
 FROM current_sessions AS sessions
 JOIN current_notes AS notes
@@ -326,7 +335,7 @@ JOIN current_notes AS notes
 
 -- Curation commands read notes through this stable, dialect-paired view.
 CREATE OR REPLACE VIEW session_notes AS
-SELECT source_id, client, session_id, note, created_at, collected_at
+SELECT source_id, client, session_id, note, created_at, updated_at, collected_at
 FROM current_notes AS notes;
 
 -- Planning and resolution share one snapshot and one query job.

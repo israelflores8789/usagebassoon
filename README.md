@@ -352,16 +352,18 @@ BigQuery collection appends directly to arrival-partitioned raw tables. Reports 
 
 You can group token usage statistics together by `tag`ging all agentic sessions in a project workspace directory, all session for an agentic client (e.g. Codex), or for individual sessions, and you can generate reports across environments based on your tags!
 
+Tags apply globally to matching client, workspace, and session targets across sources; their `source_id` records the source of the latest mutation. Notes belong to one exact session identified by `(source_id, client, session_id)`. Renames and note edits preserve `created_at`; deleting and later re-adding an assignment starts a new lifetime. `updated_at` records the latest meaningful change.
+
 ```bash
-bassoon tag project-alpha --workspace /work/repo
-bassoon tag production --client codex
-bassoon tag important --client codex --session ses_123
+bassoon tag add project-alpha --workspace /work/repo
+bassoon tag add production --client codex
+bassoon tag add important --client codex --session ses_123
 ```
 
 You can use `note` to annotate individual agentic sessions to remember things like why token usage was so high, key things about a session important to a project, or add debugging notes, etc!
 
 ```bash
-bassoon note --client codex --session ses_123 "Investigate cache miss"
+bassoon note set "Investigate cache miss" --client codex --session ses_123
 ```
 
 ## Python API
@@ -403,7 +405,7 @@ The commands have deliberately different sharing behavior:
 You can archive or perform routine backup of your token usage data with `bassoon snapshot`.
 `snapshot` writes a catalog-published Parquet restoration archive.
 
-`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Snapshots are portable across all backends, including BigQuery to local DuckDB. BigQuery snapshots include deduplicated observations that have not yet compacted. Restore validates the entire archive before writing and fails atomically if destination data is already present. Stop destination collectors during restore: concurrent BigQuery append loads cannot be excluded by the restore transaction.
+`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Snapshots are portable across all backends, including BigQuery to local DuckDB. BigQuery snapshots include deduplicated observations that have not yet compacted. Restore validates the entire archive before writing and fails atomically if destination data is already present. Stop all destination writers before starting restore and keep them stopped until it completes. The CLI requires explicit confirmation (default no); library callers must enforce the same condition because concurrent BigQuery append loads cannot be excluded by the restore transaction.
 
 Local archives rotate under the platform data directory documented in the configuration section by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
 
@@ -421,7 +423,15 @@ The permissions below describe the operations performed by UsageBassoon. Grant o
 #### BigQuery
 For the BigQuery backend, UsageBassoon needs `roles/bigquery.jobUser` and `roles/bigquery.readSessionUser` on the project and `roles/bigquery.dataEditor` on the dataset.
 
-BigQuery initialization also provisions a nightly Scheduled Query. Enable the BigQuery Data Transfer API and grant the initialization identity `bigquery.transfers.get` and `bigquery.transfers.update`; when using a service account to run the schedule, it also needs `iam.serviceAccounts.actAs` on that account. These provisioning permissions are separate from normal publication and reads. The scheduled identity needs BigQuery job and dataset write permissions to execute compaction.
+These roles cover job submission, Arrow result reads through the Storage Read API, and warehouse reads and writes respectively. A read-only identity can use `roles/bigquery.dataViewer` on the dataset instead of `roles/bigquery.dataEditor`. The scheduled compaction identity needs BigQuery job and dataset read/write permissions; executing its SQL does not require transfer-configuration management permissions.
+
+BigQuery initialization also provisions a nightly Scheduled Query through the BigQuery Data Transfer API. The initializer needs `bigquery.transfers.get` on the project because UsageBassoon lists existing schedules before creating or updating its schedule. Google documents an ownership-based path for scheduled queries: `bigquery.jobs.create`, `bigquery.transfers.get`, and `bigquery.datasets.get` permit creation, and `bigquery.jobs.create` plus schedule ownership permit modification or deletion. `bigquery.transfers.update` provides broader transfer-management authorization; changing an existing schedule's query text still requires ownership or access to its associated service account. Prefer narrow custom permissions on the initialization identity over a project-wide BigQuery Admin role. See [scheduled-query permissions and ownership](https://docs.cloud.google.com/bigquery/docs/scheduling-queries#required_permissions).
+
+UsageBassoon selects the service account identified by initialization credentials when available. When assigning a service account to the schedule, grant the initializer `iam.serviceAccounts.actAs` on that specific account, for example through `roles/iam.serviceAccountUser` on the account. Ordinary collection, reports, and snapshots do not require these schedule-provisioning permissions. Enable the BigQuery Data Transfer API during project setup; UsageBassoon does not enable services itself.
+
+If `bassoon init` must create the dataset itself, the initializer additionally needs `bigquery.datasets.create` on the project. Pre-creating the intended dataset permits dataset-level warehouse grants without granting the collector permission to create other datasets.
+
+Doctor's optional active-transaction check reads project job metadata and requires `bigquery.jobs.listAll` on the project in addition to job creation. Without that permission, doctor reports a warning and continues its other checks; it is not required for ordinary collection. See [job-metadata permissions](https://docs.cloud.google.com/bigquery/docs/information-schema-jobs#required_permissions).
 
 See Google's [BigQuery IAM documentation](https://docs.cloud.google.com/iam/docs/roles-permissions/bigquery) and [dataset access controls](https://docs.cloud.google.com/bigquery/docs/access-control).
 

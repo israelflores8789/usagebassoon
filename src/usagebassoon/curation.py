@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
 import pyarrow as pa
@@ -28,10 +28,10 @@ _LOG = logging.getLogger("usagebassoon")
 
 @dataclass(frozen=True, slots=True)
 class NoteAssignment:
-    """One user-owned note at a complete session identity.
+    """One user-owned note at a source/client/session identity.
 
     Attributes:
-        source_id: Stable namespace of the session.
+        source_id: Source namespace of the target session.
         client: Client that owns the session.
         session_id: Session receiving the note.
         note: Free-text user annotation.
@@ -75,7 +75,7 @@ class TagAssignment:
 
     Attributes:
         scope: The curation scope of the assignment.
-        source_id: Stable namespace of the tag target.
+        source_id: Source emitting the mutation; provenance only.
         tag: User-defined tag label.
         client: Client identifier required for client and session scope.
         workspace: Workspace identifier required only for workspace scope.
@@ -124,6 +124,18 @@ class TagAssignment:
         )
 
 
+def _current_assignment(
+    backend: StorageBackend, identity: CuratedIdentity
+) -> dict[str, object] | None:
+    """Read current assignment fields from the dialect-paired curation view."""
+    predicate = " AND ".join(f"{name} = :{name}" for name, _ in identity.target_values)
+    rows = backend.query(
+        f"SELECT * FROM current_{identity.table} WHERE {predicate}",
+        identity.parameters(),
+    ).to_pylist()
+    return cast(dict[str, object], rows[0]) if rows else None
+
+
 def add_tag(
     backend: StorageBackend,
     assignment: TagAssignment,
@@ -132,6 +144,9 @@ def add_tag(
 ) -> UpsertResult:
     """Persist a tag assignment without duplicating an existing assignment."""
     timestamp = at or datetime.now(UTC)
+    existing = _current_assignment(backend, assignment.identity)
+    if existing is not None:
+        return UpsertResult()
     data = pa.table(
         {
             "source_id": [assignment.source_id],
@@ -143,13 +158,15 @@ def add_tag(
             "created_at": [timestamp],
             "collected_at": [timestamp],
             "event_id": [str(uuid4())],
-            "is_deleted": [False],
+            "updated_at": [timestamp],
+            "op": ["upsert"],
+            "op_id": [str(uuid4())],
         }
     )
     return backend.upsert(
         "tags",
         data,
-        ("source_id", "scope", "client", "workspace", "session_id", "tag"),
+        ("scope", "client", "workspace", "session_id", "tag"),
         (),
     )
 
@@ -202,7 +219,8 @@ def get_note(
     row = next(
         iter(
             backend.query(
-                "SELECT note FROM session_notes WHERE source_id = :source_id "
+                "SELECT note FROM session_notes "
+                "WHERE source_id = :source_id "
                 "AND client = :client AND session_id = :session_id",
                 identity.parameters(),
             ).to_pylist()
@@ -224,16 +242,22 @@ def set_note(
 ) -> UpsertResult:
     """Create or replace the single user-owned note for a session."""
     timestamp = at or datetime.now(UTC)
+    existing = _current_assignment(backend, assignment.identity)
+    if existing is not None and existing["note"] == assignment.note:
+        return UpsertResult()
+    created_at = existing["created_at"] if existing is not None else timestamp
     data = pa.table(
         {
             "source_id": [assignment.source_id],
             "client": [assignment.client],
             "session_id": [assignment.session_id],
             "note": [assignment.note],
-            "created_at": [timestamp],
+            "created_at": [created_at],
             "collected_at": [timestamp],
             "event_id": [str(uuid4())],
-            "is_deleted": [False],
+            "updated_at": [timestamp],
+            "op": ["upsert"],
+            "op_id": [str(uuid4())],
         }
     )
     return backend.upsert(

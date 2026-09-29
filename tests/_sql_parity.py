@@ -213,7 +213,6 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_output_per_token": 0.1,
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
-                "observed_at": _CAPTURED_AT,
                 "collected_at": _CAPTURED_AT,
             },
             {
@@ -227,7 +226,6 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_output_per_token": None,
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
-                "observed_at": _CAPTURED_AT,
                 "collected_at": _CAPTURED_AT,
             },
             {
@@ -241,7 +239,6 @@ def seed_synthetic_data(backend: StorageBackend) -> None:
                 "price_output_per_token": None,
                 "price_cache_read_per_token": 0.0,
                 "price_cache_write_per_token": 0.0,
-                "observed_at": _CAPTURED_AT,
                 "collected_at": _CAPTURED_AT,
             },
         ],

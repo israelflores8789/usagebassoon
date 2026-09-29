@@ -24,6 +24,17 @@ def restore(
     ] = None,
 ) -> None:
     """Restore a raw snapshot into an empty configured warehouse."""
+    typer.echo(
+        "Warning: stop all UsageBassoon instances and writers before restoring. "
+        "Concurrent writes can mix new data with the snapshot and prevent a "
+        "consistent restore.",
+        err=True,
+    )
+    typer.confirm(
+        "Have all writers stopped, and do you wish to proceed?",
+        default=False,
+        abort=True,
+    )
     configuration, backend = configured_backend(config)
     try:
         try:

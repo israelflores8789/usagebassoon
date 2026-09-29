@@ -166,7 +166,7 @@ Required-field absence from a required payload is a collection error. Unknown fi
 
 `normalizer.py` computes canonical derived columns and produces Arrow tables.
 
-`persistence.py` stages the normalized batch and delegates one transactional current-state upsert or `MERGE` per collection run to the configured `StorageBackend`; absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report/query data.
+`persistence.py` prepares the normalized batch and delegates transactional upserts to DuckDB/MotherDuck or concurrent replay-safe raw appends to BigQuery, with the collection ledger written last; absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report/query data.
 
 `archiver.py` independently coordinates portable Parquet snapshots through a configured `SnapshotBucket`.
 
@@ -174,9 +174,9 @@ Required-field absence from a required payload is a collection error. Unknown fi
 
 The following are design *constraints*, not optional:
 
-- **Upsert-only.** Collection merges may insert new natural keys and update changed current-state rows, but must never delete usage facts, price history, audit records, reconciliation results, schema-drift events, or snapshot artifacts. Deletion must be an *intentional* act of the user.
+- **History preservation.** Collection must preserve usage facts and permanent audit history. DuckDB/MotherDuck upsert current state; BigQuery appends raw observations and compacts them asynchronously. Debug events expire after 90 days, and snapshot retention follows the archive catalog.
 - **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe. Match facts by their documented natural keys, update only changed rows, and make retries repeatable without consequence.
-- **Collection Atomicity.** Stage the complete normalized Arrow batch *before* persistence, then use one transaction or equivalent backend-native atomic operation for the collection run. A partial batch must *never* appear as a successful run. Unsuccessful transactions must *always* be rolled back safely.
+- **Backend publication.** Prepare the complete normalized Arrow batch before persistence. DuckDB/MotherDuck publish transactionally. BigQuery accepts independent atomic table appends and partial publication; write the collection ledger only after the other loads succeed so historical preflight cannot skip missing facts. Stable event IDs make retries safe, and nightly compaction commits gold state and progress atomically.
 - **Arrow Normalization.** Normalization and derived columns belong *before* storage. `StorageBackend`s accept and return canonical Arrow tables so DuckDB, MotherDuck, BigQuery, and future adapters share semantics.
 - **SQL Dialect Agnostism.** Maintain the paired DuckDB and BigQuery DDL and views. CLI commands should query the appropriate **dialect-specific view** and *never* contain non-portable ad hoc SQL. SQLGlot `sql_parity` test coverage must pass for dialect changes.
 - **Canonical Command Authority.** `tokscale graph` provides candidate dates and activity only; `tokscale models` provide daily statistics; `tokscale report` provides session metadata; `tokscale pricing` provides observed rates. Do *not* invent a second source of truth.
@@ -265,7 +265,7 @@ UsageBassoon is intentionally modular, and contributions are welcome with key ne
   - Azure Blob Storage,
   - Cloudflare R2, and
   - Backblaze B2.
-- **Extend user-curation** to allow for multiple tags per session while preserving source, client, workspace, and session scoping.
+- **Extend user-curation** with further organization options while preserving global client/workspace/session tags and source-scoped session notes.
 - **Platform-native releases** extending the GitHub `Release` workflow to include:
   - Debian-native `.deb` packages,
   - RedHat-native `.rpm` packages,

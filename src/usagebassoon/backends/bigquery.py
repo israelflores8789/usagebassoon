@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import sqlglot
 from google.api_core.exceptions import (
+    BadRequest,
     GoogleAPICallError,
     InternalServerError,
     NotFound,
@@ -735,6 +736,10 @@ class BigQueryBackend(AbstractStorageBackend):
                     location=self.location,
                 )
             )
+        except BadRequest as error:
+            if "restore requires an empty warehouse" in str(error):
+                raise ValueError("restore requires an empty warehouse") from error
+            raise
         finally:
             self._delete_stages(tuple(stages.values()))
 
@@ -982,17 +987,24 @@ class BigQueryBackend(AbstractStorageBackend):
             return 0
         schema = CANONICAL_TABLE_SCHEMAS[identity.table]
         rows = data.to_pylist()
+        timestamp = datetime.now(UTC)
+        op_id = str(uuid4())
         for row in rows:
             row.update(
-                event_id=str(uuid4()), collected_at=datetime.now(UTC), is_deleted=True
+                event_id=str(uuid4()),
+                collected_at=timestamp,
+                updated_at=timestamp,
+                op="delete",
+                op_id=op_id,
+                source_id=identity.source_id,
             )
         self.append(identity.table, pa.Table.from_pylist(rows, schema=schema))
         return len(rows)
 
     def _curated_rows(self, identity: CuratedIdentity) -> pa.Table:
-        """Read one current assignment using bound source-scoped identity values."""
+        """Read one current assignment using its bound natural key."""
         predicate = " AND ".join(
-            f"{self._column(name)} = :{name}" for name, _ in identity.values
+            f"{self._column(name)} = :{name}" for name, _ in identity.target_values
         )
         return self.query(
             f"SELECT * FROM current_{identity.table} WHERE {predicate}",
@@ -1016,18 +1028,24 @@ class BigQueryBackend(AbstractStorageBackend):
         if self._curated_rows(destination).num_rows:
             return CuratedRenameResult(renamed=False, destination_exists=True)
         original = rows[0]
+        op_id = str(uuid4())
         deleted = {
             **original,
+            "source_id": source.source_id,
             "event_id": str(uuid4()),
             "collected_at": updated_at,
-            "is_deleted": True,
+            "updated_at": updated_at,
+            "op": "delete",
+            "op_id": op_id,
         }
         added = {
             **original,
             **dict(destination.values),
             "event_id": str(uuid4()),
             "collected_at": updated_at,
-            "is_deleted": False,
+            "updated_at": updated_at,
+            "op": "upsert",
+            "op_id": op_id,
         }
         self.append(
             "tags",

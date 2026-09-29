@@ -157,8 +157,10 @@ CANONICAL_TABLE_SCHEMAS.update(
                 pa.field("session_id", pa.string(), nullable=False),
                 pa.field("tag", pa.string(), nullable=False),
                 pa.field("created_at", _TIMESTAMP, nullable=False),
+                pa.field("updated_at", _TIMESTAMP, nullable=False),
                 pa.field("collected_at", _TIMESTAMP, nullable=False),
-                pa.field("is_deleted", pa.bool_(), nullable=False),
+                pa.field("op", pa.string(), nullable=False),
+                pa.field("op_id", pa.string()),
             ]
         ),
         "notes": pa.schema(
@@ -169,8 +171,10 @@ CANONICAL_TABLE_SCHEMAS.update(
                 pa.field("session_id", pa.string(), nullable=False),
                 pa.field("note", pa.string(), nullable=False),
                 pa.field("created_at", _TIMESTAMP, nullable=False),
+                pa.field("updated_at", _TIMESTAMP, nullable=False),
                 pa.field("collected_at", _TIMESTAMP, nullable=False),
-                pa.field("is_deleted", pa.bool_(), nullable=False),
+                pa.field("op", pa.string(), nullable=False),
+                pa.field("op_id", pa.string()),
             ]
         ),
     }

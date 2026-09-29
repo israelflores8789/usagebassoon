@@ -175,8 +175,7 @@ def unresolved_schema_drift(
         backend,
         "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
         "contract_tokscale_ver, created_at, collected_at, "
-        "observation_count FROM current_schema_drift_events "
-        "WHERE resolved = FALSE "
+        "observation_count FROM open_schema_drift_events "
         f"ORDER BY collected_at DESC LIMIT {limit}",
     )
     return tuple(
@@ -216,7 +215,7 @@ def reconciliation_issues(
         backend,
         "SELECT check_name, issue_key, message, created_at, collected_at, "
         "observation_count "
-        "FROM current_reconciliation_issues WHERE resolved = FALSE "
+        "FROM open_reconciliation_issues "
         f"ORDER BY collected_at DESC NULLS LAST LIMIT {limit}",
     )
     return tuple(

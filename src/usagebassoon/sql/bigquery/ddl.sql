@@ -74,8 +74,10 @@ CREATE TABLE tags (
     session_id STRING NOT NULL,
     tag STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     collected_at TIMESTAMP NOT NULL,
-    is_deleted BOOL NOT NULL
+    op STRING NOT NULL,
+    op_id STRING
 )
 CLUSTER BY source_id;
 
@@ -86,8 +88,10 @@ CREATE TABLE notes (
     session_id STRING NOT NULL,
     note STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     collected_at TIMESTAMP NOT NULL,
-    is_deleted BOOL NOT NULL
+    op STRING NOT NULL,
+    op_id STRING
 )
 CLUSTER BY source_id;
 
@@ -171,8 +175,10 @@ CREATE TABLE raw_tags (
     session_id STRING NOT NULL,
     tag STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     collected_at TIMESTAMP NOT NULL,
-    is_deleted BOOL NOT NULL
+    op STRING NOT NULL,
+    op_id STRING
 )
 PARTITION BY _PARTITIONDATE
 CLUSTER BY source_id
@@ -186,8 +192,10 @@ CREATE TABLE raw_notes (
     session_id STRING NOT NULL,
     note STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     collected_at TIMESTAMP NOT NULL,
-    is_deleted BOOL NOT NULL
+    op STRING NOT NULL,
+    op_id STRING
 )
 PARTITION BY _PARTITIONDATE
 CLUSTER BY source_id
