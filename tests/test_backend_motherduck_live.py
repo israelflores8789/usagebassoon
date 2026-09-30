@@ -4,15 +4,7 @@
 """test_backend_motherduck_live.py — Opt-in MotherDuck integration tests.
 
 Run with ``just test-md-live`` against the disposable ``usagebassoon_it`` database.
-Or, run with ``USAGEBASSOON_MOTHERDUCK_LIVE=1 uv run pytest -m motherduck_live``.
-
-The ``motherduck_live`` marker selects these tests, and
-``USAGEBASSOON_MOTHERDUCK_LIVE=1`` enables access to a
-preconfigured MotherDuck database called ``usagebassoon_it``.
-
-Set ``USAGEBASSOON_MOTHERDUCK_LIVE_RESET=1`` to enable the
-final snapshot/restore test, which deletes and recreates tables
-in the preconfigured, disposable database.
+The recipe enables live access and resets the dedicated integration schema.
 """
 
 from __future__ import annotations
@@ -44,6 +36,7 @@ from tests.conftest import (
     EXPECTED_REPORT_ROWS,
 )
 from usagebassoon.backends.base import (
+    CurrentStateWrite,
     PersistenceBatch,
     StorageBackend,
     is_simple_identifier,
@@ -54,6 +47,7 @@ from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
+from usagebassoon.storage_model import SNAPSHOT_TABLES
 
 pytestmark = [pytest.mark.motherduck_live, pytest.mark.usefixtures("live_settings")]
 
@@ -181,6 +175,23 @@ def _rows_for_source(
     )
 
 
+@pytest.fixture(autouse=True)
+def empty_live_warehouse(live_settings: LiveSettings) -> None:
+    """Isolate each case's rows in the dedicated initialized integration database.
+
+    These tests must remain serialized because they share usagebassoon_it.
+    """
+    configuration = ConfigurationManager(live_settings.config_path).load()
+    assert configuration.motherduck is not None
+    backend = MotherDuckBackend(configuration.motherduck.database)
+    try:
+        with backend.transaction():
+            for table in SNAPSHOT_TABLES:
+                backend.connection.execute(f'DELETE FROM "{table}"')
+    finally:
+        backend.close()
+
+
 def test_live_synthetic_views_match_duckdb() -> None:
     """Replay every shipped DuckDB view on the MotherDuck service."""
     local = DuckDBBackend(":memory:")
@@ -277,20 +288,34 @@ def test_live_concurrent_sources_persist_independently(
 
 
 def test_live_batch_rolls_back_after_late_failure(
-    collection_bundle: CollectionBundle, live_settings: LiveSettings
+    collection_bundle: CollectionBundle,
 ) -> None:
-    bundle = _normalized_bundle(collection_bundle, live_settings.source_id)
+    bundle = _normalized_bundle(collection_bundle, str(uuid4()))
     backend = _backend()
     try:
         batch = PersistenceBatch(
             bundle.run_id,
-            (),
+            (
+                CurrentStateWrite(
+                    "daily_stats",
+                    bundle.tables["daily_stats"],
+                    ("source_id", "day", "client", "session_id", "model"),
+                    ("total_tokens",),
+                ),
+            ),
             {"missing_history": bundle.tables["collection_ledger"]},
             bundle.tables["collection_ledger"],
         )
         with pytest.raises(Exception, match="missing_history"):
             backend.persist_batch(batch)
         assert not backend.has_committed_run(bundle.run_id)
+        assert (
+            backend.query(
+                "SELECT * FROM daily_stats WHERE source_id = :source_id",
+                {"source_id": bundle.tables["daily_stats"]["source_id"][0].as_py()},
+            ).num_rows
+            == 0
+        )
     finally:
         backend.close()
 

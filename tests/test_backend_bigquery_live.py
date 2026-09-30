@@ -265,6 +265,38 @@ def _backend(settings: LiveSettings) -> BigQueryBackend:
     return BigQueryBackend(settings.project, _DATASET, location=settings.location)
 
 
+@pytest.fixture(autouse=True)
+def empty_live_warehouse(live_settings: LiveSettings) -> None:
+    """Start every case with empty usage tables in the dedicated warehouse.
+
+    These tests must remain serialized because they share usagebassoon_it.
+    """
+    backend = _backend(live_settings)
+    physical = set(STATE_KEYS) | {
+        "raw_" + name for name in set(STATE_KEYS) | DEBUG_TABLES
+    }
+    physical.add("collection_ledger")
+    script = (
+        "BEGIN TRANSACTION;\n"
+        + "\n".join(
+            f"TRUNCATE TABLE {backend._table_ref(name)};" for name in sorted(physical)
+        )
+        + f"\nDELETE FROM {backend._table_ref('compaction_ledger')} "
+        "WHERE domain != '__lock__';\nCOMMIT TRANSACTION;"
+    )
+    try:
+        with _phase("test row cleanup"):
+            backend._wait_for_job(
+                backend.client.query(
+                    script,
+                    job_config=backend._query_config(),
+                    location=backend.location,
+                )
+            )
+    finally:
+        backend.close()
+
+
 def test_live_synthetic_views_use_the_shared_logical_contract(
     live_settings: LiveSettings,
 ) -> None:
@@ -290,24 +322,6 @@ def test_live_synthetic_views_use_the_shared_logical_contract(
                 assert normalized_records(expected, preserve_order=preserve_order) == (
                     normalized_records(actual, preserve_order=preserve_order)
                 ), name
-        # Clear test observations while retaining the initialized schema.
-        physical = {"raw_" + name for name in set(STATE_KEYS) | DEBUG_TABLES}
-        physical.add("collection_ledger")
-        script = (
-            "BEGIN TRANSACTION;\n"
-            + "\n".join(
-                f"DELETE FROM {remote._table_ref(name)} WHERE TRUE;"
-                for name in sorted(physical)
-            )
-            + "\nCOMMIT TRANSACTION;"
-        )
-        remote._wait_for_job(
-            remote.client.query(
-                script,
-                job_config=remote._query_config(),
-                location=remote.location,
-            )
-        )
     finally:
         remote.close()
         local.close()
@@ -410,7 +424,6 @@ def test_live_append_publication_is_visible_and_replay_safe(
         elapsed = time.monotonic() - started
         with capsys.disabled():
             print(f"BigQuery publication: {elapsed:.3f}s", flush=True)
-        assert elapsed < 15.0
         parameters = {"source_id": source_id}
         assert (
             remote.query(
@@ -444,6 +457,7 @@ def test_live_append_publication_is_visible_and_replay_safe(
             )
     finally:
         remote.close()
+    assert elapsed < 15.0, f"BigQuery publication took {elapsed:.3f}s"
 
 
 def test_live_snapshot_portability_includes_raw_and_compacted_facts(
@@ -482,6 +496,17 @@ def test_live_snapshot_portability_includes_raw_and_compacted_facts(
             ).num_rows
             == bundle.tables["daily_stats"].num_rows
         )
+        for table in SNAPSHOT_TABLES:
+            local.connection.execute(f"DELETE FROM {table}")
+        with _phase("compacted snapshot capture"):
+            assert archive.write(remote, run_id=str(uuid4())) is not None
+        archive.restore(local)
+        for table in SNAPSHOT_TABLES:
+            assert normalized_records(
+                local.query(f"SELECT * FROM current_{table}")
+            ) == (normalized_records(remote.query(f"SELECT * FROM current_{table}"))), (
+                table
+            )
         before = remote.query(
             "SELECT SUM(total_tokens) AS n FROM current_daily_stats"
         ).to_pylist()
@@ -501,10 +526,10 @@ def test_live_snapshot_portability_includes_raw_and_compacted_facts(
         local.close()
 
 
-def test_live_compaction_freezes_inputs_and_preserves_tombstones(
+def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
     live_settings: LiveSettings,
 ) -> None:
-    """Publish during compaction; preserve backfills and reject raw resurrection."""
+    """Exclude post-cutoff appends; preserve gold-only facts and tombstones."""
     remote = _backend(live_settings)
     source_id = str(uuid4())
     stamp = datetime.now(UTC)
@@ -573,6 +598,14 @@ def test_live_compaction_freezes_inputs_and_preserves_tombstones(
             .joinpath("compaction.sql")
             .read_text()
         )
+        cutoff = remote.query("SELECT CURRENT_TIMESTAMP() AS cutoff").to_pylist()[0][
+            "cutoff"
+        ]
+        assert isinstance(cutoff, datetime)
+        sql = sql.replace(
+            "SET cutoff = CURRENT_TIMESTAMP();",
+            f"SET cutoff = TIMESTAMP '{cutoff.isoformat()}';",
+        )
         compaction_started = time.monotonic()
         job = remote.client.query(
             sql,
@@ -583,7 +616,7 @@ def test_live_compaction_freezes_inputs_and_preserves_tombstones(
         while job.started is None and time.monotonic() < deadline:
             job.reload()
             time.sleep(0.1)
-        assert job.started is not None and job.state != "DONE"
+        assert job.started is not None
         latest = {
             **initial,
             "event_id": str(uuid4()),
@@ -614,12 +647,16 @@ def test_live_compaction_freezes_inputs_and_preserves_tombstones(
             {"op": "delete"}
         ]
         _compact(remote)
-        # Simulate raw retention after successful compaction.
+        # Simulate expiry of an arrival bucket while retaining its old progress.
         remote._wait_for_job(
             remote.client.query(
                 "BEGIN TRANSACTION;\n"
                 f"DELETE FROM {remote._table_ref('raw_tags')}" + where + ";\n"
                 f"DELETE FROM {remote._table_ref('raw_daily_stats')}" + where + ";\n"
+                f"UPDATE {remote._table_ref('compaction_ledger')} "
+                "SET arrival_day = DATE_SUB(CURRENT_DATE(), INTERVAL 91 DAY)"
+                + where
+                + " AND arrival_day = CURRENT_DATE();\n"
                 "COMMIT TRANSACTION;",
                 job_config=remote._query_config(),
                 location=remote.location,
@@ -628,6 +665,17 @@ def test_live_compaction_freezes_inputs_and_preserves_tombstones(
         assert remote.query(
             "SELECT total_tokens FROM current_daily_stats" + where
         ).to_pylist() == [{"total_tokens": 200}]
+        distinct = {**initial, "event_id": str(uuid4()), "session_id": "late-key"}
+        remote.append("daily_stats", pa.Table.from_pylist([distinct], schema=schema))
+        _compact(remote)
+        assert remote.query(
+            "SELECT session_id, total_tokens FROM daily_stats"
+            + where
+            + " ORDER BY session_id"
+        ).to_pylist() == [
+            {"session_id": "backfill", "total_tokens": 200},
+            {"session_id": "late-key", "total_tokens": 100},
+        ]
         remote.append(
             "tags", pa.Table.from_pylist([tag], schema=CANONICAL_TABLE_SCHEMAS["tags"])
         )

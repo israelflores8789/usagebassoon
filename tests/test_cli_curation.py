@@ -174,12 +174,12 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} edited")
     edited = runner.invoke(app, _command(config, "note", "edit", *target))
     assert edited.exit_code == 0
-    assert "Updated note" in edited.output
+    assert "Updated note" in plain_cli_output(edited.output)
 
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '   '")
     blank = runner.invoke(app, _command(config, "note", "edit", *target))
     assert blank.exit_code != 0
-    assert "note remove" in blank.output
+    assert "note remove" in plain_cli_output(blank.output)
     backend = DuckDBBackend(database)
     try:
         revised = backend.query(
@@ -205,4 +205,4 @@ def test_note_edit_requires_a_configured_editor(
         _command(config, "note", "edit", "--client", "codex", "--session", "ses_123"),
     )
     assert result.exit_code != 0
-    assert "note set" in result.output
+    assert "note set" in plain_cli_output(result.output)

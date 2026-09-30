@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
@@ -89,7 +90,7 @@ def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None
     sanitized_row = json.loads(sanitized_path.read_text())[0]
     raw_row = json.loads(raw_path.read_text())[0]
     assert sanitized.exit_code == 0
-    assert "obfuscated by default" in sanitized.stderr
+    assert "obfuscated by default" in plain_cli_output(sanitized.stderr)
     assert sanitized_row["client"] == "codex"
     assert sanitized_row["session_id"] == "session-alpha"
     assert sanitized_row["note"] == "[redacted]"
@@ -149,7 +150,7 @@ def test_export_supports_csv_and_parquet_and_rejects_unknown_relations(
     assert parquet_result.exit_code == 0
     assert pq.read_table(parquet_path).to_pylist()[0]["session_id"] == "ses_private"
     assert invalid.exit_code != 0
-    assert "target must be one of" in invalid.output
+    assert "target must be one of" in plain_cli_output(invalid.output)
 
 
 @pytest.mark.parametrize("target", sorted(STATE_KEYS | EVENT_KEYS))
@@ -161,8 +162,10 @@ def test_export_reads_canonical_views(
     """Export logical state through views, including accepted uncompacted raw data."""
     from unittest.mock import MagicMock
 
-    config, backend = _configured_store(tmp_path)
-    backend.close()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\nlocal_database = ":memory:"\n'
+    )
     publication = pa.table({"source_id": [SOURCE_ID], "value": ["accepted raw data"]})
     client = MagicMock()
     client.query.return_value = publication

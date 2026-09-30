@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_merge.py — Daily normalization, cost views, and persistence tests."""
+"""test_normalization.py — Daily normalization, cost views, and persistence tests."""
 
 from __future__ import annotations
 
@@ -15,6 +15,13 @@ import pytest
 from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_REPORT_ROWS,
+    EXPECTED_TOTAL_CACHE_READ,
+    EXPECTED_TOTAL_CACHE_WRITE,
+    EXPECTED_TOTAL_COST,
+    EXPECTED_TOTAL_INPUT,
+    EXPECTED_TOTAL_MESSAGES,
+    EXPECTED_TOTAL_OUTPUT,
+    EXPECTED_TOTAL_REASONING,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
@@ -110,6 +117,28 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
             "sum(tokscale_cost_usd) AS tokscale_cost_usd, "
             "sum(cost_usd) AS cost_usd FROM daily_cost"
         ).to_pylist()[0]
+        components = backend.query(
+            "SELECT SUM(input_tokens) AS input, SUM(output_tokens) AS output, "
+            "SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write, "
+            "SUM(reasoning) AS reasoning, SUM(message_count) AS messages "
+            "FROM daily_stats"
+        ).to_pylist()[0]
+        assert components == {
+            "input": EXPECTED_TOTAL_INPUT,
+            "output": EXPECTED_TOTAL_OUTPUT,
+            "cache_read": EXPECTED_TOTAL_CACHE_READ,
+            "cache_write": EXPECTED_TOTAL_CACHE_WRITE,
+            "reasoning": EXPECTED_TOTAL_REASONING,
+            "messages": EXPECTED_TOTAL_MESSAGES,
+        }
+        assert daily["total_tokens"] == (
+            EXPECTED_TOTAL_INPUT
+            + EXPECTED_TOTAL_OUTPUT
+            + EXPECTED_TOTAL_CACHE_READ
+            + EXPECTED_TOTAL_CACHE_WRITE
+            + EXPECTED_TOTAL_REASONING
+        )
+        assert daily["tokscale_cost_usd"] == pytest.approx(EXPECTED_TOTAL_COST)
         assert aggregate["total_tokens"] == daily["total_tokens"]
         assert aggregate["tokscale_cost_usd"] == pytest.approx(
             daily["tokscale_cost_usd"]
@@ -122,22 +151,61 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         backend.close()
 
 
-def test_reasoning_uses_the_output_price(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Apply the output rate to reasoning tokens in the calculated daily cost."""
+def test_reasoning_uses_the_output_price() -> None:
+    """Price every token component exactly, with reasoning at the output rate."""
+    from datetime import UTC, date, datetime
+
+    from tests._observations import observations
+
+    stamp = datetime(2026, 9, 10, tzinfo=UTC)
+    identity = {"source_id": "source", "day": date(2026, 9, 10), "model": "model"}
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
-        persist_run(backend, normalize(collection_bundle))
-        row = backend.query(
-            "SELECT output_tokens, reasoning, price_output_per_token, cost_usd "
-            "FROM daily_cost JOIN price_versions USING (source_id, day, model) "
-            "WHERE reasoning > 0 LIMIT 1"
-        ).to_pylist()[0]
-        assert row["cost_usd"] >= (
-            (row["output_tokens"] + row["reasoning"]) * row["price_output_per_token"]
+        backend.append(
+            "daily_stats",
+            observations(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **identity,
+                            "client": "codex",
+                            "session_id": "session",
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                            "reasoning": 5,
+                            "cache_read": 7,
+                            "cache_write": 11,
+                            "total_tokens": 28,
+                            "collected_at": stamp,
+                        }
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
+                )
+            ),
         )
+        backend.append(
+            "price_versions",
+            observations(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **identity,
+                            "source": "synthetic",
+                            "price_input_per_token": 0.01,
+                            "price_output_per_token": 0.02,
+                            "price_cache_read_per_token": 0.03,
+                            "price_cache_write_per_token": 0.04,
+                            "collected_at": stamp,
+                        }
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["price_versions"],
+                )
+            ),
+        )
+        assert backend.query("SELECT cost_usd FROM daily_cost").to_pylist() == [
+            {"cost_usd": pytest.approx(0.83)}
+        ]
     finally:
         backend.close()
 

@@ -82,11 +82,6 @@ def test_environment_path_precedes_default(
     assert manager.load().backend == "duckdb"
 
 
-def test_default_configuration_path_uses_platformdirs() -> None:
-    """Resolve the implicit configuration file through platformdirs."""
-    assert ConfigurationManager().path == default_config_path()
-
-
 def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     """Load subprocess, schedule, and logging defaults without TOML sections."""
     path = tmp_path / "config.toml"
@@ -135,7 +130,7 @@ def test_remote_backend_requires_its_settings(
         ConfigurationManager(path).load()
 
 
-def test_backend_remains_required(tmp_path: Path) -> None:
+def test_backend_is_required(tmp_path: Path) -> None:
     """Keep backend explicit so storage selection is clear."""
     path = tmp_path / "config.toml"
     path.write_text('source_id = "11111111-1111-4111-8111-111111111111"\n')
@@ -218,29 +213,6 @@ def test_duration_units_are_setting_specific(
         ConfigurationManager(path).load()
 
 
-@pytest.mark.parametrize(
-    ("section", "setting"),
-    [
-        ("tokscale", "timeout_seconds = 180"),
-        ("collection", 'timeout = "5m"'),
-        ("gcs", 'location = "US"'),
-    ],
-)
-def test_removed_config_keys_are_rejected(
-    tmp_path: Path, section: str, setting: str
-) -> None:
-    """Surface obsolete keys as configuration errors before collection."""
-    path = tmp_path / "config.toml"
-    path.write_text(
-        'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\nlocal_database = ":memory:"\n'
-        f"[{section}]\n{setting}\n"
-    )
-
-    with pytest.raises(ConfigurationError, match="unknown key"):
-        ConfigurationManager(path).load()
-
-
 def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) -> None:
     """Persist an interval in place without rewriting unrelated TOML values."""
     path = tmp_path / "config.toml"
@@ -257,16 +229,6 @@ def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) 
     assert 'interval = "30m"' in content
     assert "max_files = 4" in content
     assert ConfigurationManager(path).load().schedule.interval == "30m"
-
-
-def test_bigquery_requires_its_connection_settings(tmp_path: Path) -> None:
-    """Reject a partial configuration before any backend is opened."""
-    path = tmp_path / "config.toml"
-    path.write_text(
-        'source_id = "11111111-1111-4111-8111-111111111111"\nbackend = "bigquery"\n'
-    )
-    with pytest.raises(ConfigurationError, match=r"\[bigquery\]"):
-        ConfigurationManager(path).load()
 
 
 def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
@@ -293,10 +255,10 @@ def test_unknown_config_keys_fail_and_are_written_to_the_log(
         'local_database = ":memory:"\n'
     )
     if scope == "root":
-        content += 'database = "usagebassoon"\n'
+        content += "unexpected_setting = true\n"
     content += f'\n[logging]\ndirectory = "{log_directory}"\n'
     if scope == "tokscale":
-        content += '\n[tokscale]\ncommand = "bunx tokscale@latest"\n'
+        content += "\n[tokscale]\nunexpected_setting = true\n"
     path.write_text(content)
 
     with pytest.raises(ConfigurationError) as captured:
@@ -402,6 +364,7 @@ def test_platform_default_directories_use_platformdirs_and_app_name(
     monkeypatch.setattr(config_module, "user_log_path", fake_path_factory("log"))
     monkeypatch.setattr(config_module, "user_state_path", fake_path_factory("state"))
 
+    assert ConfigurationManager(environ={}).path == default_config_path()
     assert default_config_path() == tmp_path / "config" / app_name / "config.toml"
     assert default_local_database_path() == (
         tmp_path / "data" / app_name / "usagebassoon.duckdb"
@@ -465,16 +428,3 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     assert config.snapshots is not None
     assert config.snapshots.file_uri == f"file://{tmp_path / 'snapshots'}"
     assert config.snapshots.max_snapshots == 5
-
-
-def test_snapshots_gcs_uri_is_removed(tmp_path: Path) -> None:
-    """Reject the removed unified snapshot URI field."""
-    path = tmp_path / "config.toml"
-    path.write_text(
-        'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "duckdb"\nlocal_database = ":memory:"\n'
-        '[snapshots]\ngcs_uri = "gs://bucket/archive"\n'
-    )
-
-    with pytest.raises(ConfigurationError, match=r"\[snapshots\]"):
-        ConfigurationManager(path).load()

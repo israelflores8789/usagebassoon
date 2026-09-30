@@ -8,13 +8,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import override
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 
 from tests._observations import observations
-from usagebassoon.backends.base import ActiveTransaction
+from usagebassoon.backends.base import ActiveTransaction, StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.diagnostics import (
@@ -114,12 +115,20 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                 )
             ),
         )
+        before = {
+            table: backend.query(f"SELECT * FROM {table} ORDER BY event_id").to_pylist()
+            for table in ("schema_drift_events", "collection_ledger")
+        }
         report = run_doctor(
             backend,
             backend_name="duckdb",
             database=":memory:",
             snapshot_enabled=False,
         )
+        assert before == {
+            table: backend.query(f"SELECT * FROM {table} ORDER BY event_id").to_pylist()
+            for table in before
+        }
         assert report.status == "warning"
         assert not report.errors
         assert {check.name for check in report.warnings} == {
@@ -192,7 +201,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
 
 
 def test_run_doctor_reports_active_bigquery_transactions() -> None:
-    """Surface jobs that can delay a BigQuery collection transaction."""
+    """Surface active warehouse transactions in BigQuery diagnostics."""
 
     class _TransactionsBackend(DuckDBBackend):
         """DuckDB test double with BigQuery transaction diagnostics."""
@@ -223,16 +232,10 @@ def test_run_doctor_reports_active_bigquery_transactions() -> None:
 
 def test_ingest_issues_rejects_non_positive_limit() -> None:
     """Reject invalid diagnostic limits before issuing SQL."""
-    backend = DuckDBBackend(":memory:")
-    try:
-        try:
-            ingest_issues(backend, limit=0)
-        except ValueError as error:
-            assert str(error) == "limit must be positive"
-        else:
-            raise AssertionError("expected ValueError")
-    finally:
-        backend.close()
+    backend = MagicMock(spec=StorageBackend)
+    with pytest.raises(ValueError, match="limit must be positive"):
+        ingest_issues(backend, limit=0)
+    backend.query.assert_not_called()
 
 
 @pytest.mark.parametrize("table", ["schema_drift_events", "reconciliation_issues"])

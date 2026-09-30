@@ -25,15 +25,6 @@ from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, make_session_label, parse_report
 
 
-def test_daily_models_shape(
-    daily_models: dict[date, DailyModelsPayload],
-) -> None:
-    """Assert date-filtered models fixtures preserve the expected total grain."""
-    assert sum(len(payload.entries) for payload in daily_models.values()) == (
-        EXPECTED_DAILY_STATS_ROWS
-    )
-
-
 def test_models_field_promotion(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:

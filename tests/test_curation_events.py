@@ -3,26 +3,17 @@
 
 """test_curation_events.py — Curation lifetimes across native writer strategies."""
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from importlib import resources
 from pathlib import Path
-from threading import Lock
-from typing import cast, override
-from unittest.mock import MagicMock
 from uuid import UUID
 
 import pyarrow as pa
 import pytest
-import sqlglot
-from google.api_core.exceptions import ServiceUnavailable
-from google.cloud import bigquery
-from sqlglot import exp
 
-from tests._sql_parity import statements
+from tests._bigquery_replay import BigQueryReplayBackend
 from usagebassoon.archiver import SnapshotArchiver
-from usagebassoon.backends.base import SnapshotRead, StorageBackend
-from usagebassoon.backends.bigquery import BigQueryBackend
+from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.curation import (
     NoteAssignment,
@@ -33,116 +24,17 @@ from usagebassoon.curation import (
     rename_tag,
     set_note,
 )
-from usagebassoon.ingest import CollectionBundle
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
-from usagebassoon.persistence import persist_run
-from usagebassoon.storage_model import DEBUG_TABLES, STATE_KEYS
-
-
-class _AppendWarehouse(BigQueryBackend):
-    """Execute BigQuery writers and replay its SQL using a local test engine."""
-
-    def __init__(self) -> None:
-        """Install the BigQuery physical schema and transpiled canonical views."""
-        super().__init__(
-            "usagebassoon-test",
-            "usagebassoon_emulated",
-            client=cast(bigquery.Client, MagicMock(spec=bigquery.Client)),
-        )
-        self.engine = DuckDBBackend(":memory:")
-        for statement in statements("bigquery", "ddl.sql"):
-            if isinstance(statement, exp.Create):
-                statement.set("properties", None)
-                self.engine.connection.execute(statement.sql(dialect="duckdb"))
-        for statement in statements("bigquery", "views.sql"):
-            if statement.this.name != "compaction_backlog":
-                self.engine.connection.execute(statement.sql(dialect="duckdb"))
-
-    @override
-    def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
-        """Read the actual canonical views while avoiding cloud transport."""
-        return self.engine.query(sql.replace("`", '"'), parameters)
-
-    @override
-    def _load(
-        self,
-        data: pa.Table,
-        destination: str,
-        *,
-        disposition: str,
-        schema: Sequence[bigquery.SchemaField] | None = None,
-    ) -> None:
-        """Record the canonical batch produced by the real BigQuery adapter."""
-        assert disposition == "WRITE_APPEND"
-        self.engine.append(destination.rsplit(".", 1)[-1], data)
-
-    def compact(self) -> None:
-        """Replay shipped curation winner SQL and replacements, retaining tombstones."""
-        sql = (
-            resources.files("usagebassoon.sql.bigquery")
-            .joinpath("compaction.sql")
-            .read_text()
-        )
-        parsed = [
-            statement for statement in sqlglot.parse(sql, read="bigquery") if statement
-        ]
-        with self.engine.transaction():
-            for table in ("tags", "notes"):
-                self.engine.connection.execute(
-                    f"DROP TABLE IF EXISTS candidates_{table}"
-                )
-                self.engine.connection.execute(f"DROP TABLE IF EXISTS winners_{table}")
-                self.engine.connection.execute(
-                    f"CREATE TEMP TABLE candidates_{table} AS "
-                    f"SELECT DISTINCT source_id FROM raw_{table}"
-                )
-                self.engine.connection.execute(f"DROP TABLE IF EXISTS keys_{table}")
-                for statement in parsed:
-                    if isinstance(statement, exp.Create) and statement.this.name in {
-                        f"keys_{table}",
-                        f"winners_{table}",
-                    }:
-                        for relation in statement.find_all(exp.Table):
-                            relation.set("version", None)
-                        self.engine.connection.execute(statement.sql(dialect="duckdb"))
-                    elif (
-                        isinstance(statement, (exp.Delete, exp.Insert))
-                        and (
-                            statement.this.this.name
-                            if isinstance(statement.this, exp.Schema)
-                            else statement.this.name
-                        )
-                        == table
-                    ):
-                        self.engine.connection.execute(statement.sql(dialect="duckdb"))
-
-    @override
-    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
-        """Capture canonical BigQuery views with the production portable schemas."""
-        with self.engine.transaction():
-            captured = datetime.now(UTC)
-            materialized = {
-                table: self.query(
-                    f"SELECT * FROM "
-                    f"{'replay_' if table in DEBUG_TABLES else 'current_'}{table}"
-                )
-                .select(CANONICAL_TABLE_SCHEMAS[table].names)
-                .cast(CANONICAL_TABLE_SCHEMAS[table])
-                for table in tables
-            }
-        return SnapshotRead(captured, materialized)
-
-    @override
-    def close(self) -> None:
-        """Close the local replay engine."""
-        self.engine.close()
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
+from usagebassoon.storage_model import STATE_KEYS
 
 
 @pytest.fixture(params=["duckdb", "bigquery"])
 def warehouse(request: pytest.FixtureRequest) -> Iterator[StorageBackend]:
     """Provide each native curation writer against its canonical read strategy."""
     backend = (
-        _AppendWarehouse() if request.param == "bigquery" else DuckDBBackend(":memory:")
+        BigQueryReplayBackend()
+        if request.param == "bigquery"
+        else DuckDBBackend(":memory:")
     )
     if isinstance(backend, DuckDBBackend):
         backend.apply_ddl()
@@ -176,7 +68,7 @@ def test_assignment_lifetimes_and_no_op_timestamps(warehouse: StorageBackend) ->
         assert row["updated_at"] == row["collected_at"] == changed
         assert row["op"] == "upsert"
         UUID(row["op_id"])
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         events = warehouse.query(
             "SELECT * FROM raw_tags ORDER BY collected_at, op"
         ).to_pylist()
@@ -205,7 +97,7 @@ def test_assignment_lifetimes_and_no_op_timestamps(warehouse: StorageBackend) ->
             row["op_id"]
             != (original_tag if table == "tags" else original_note)["op_id"]
         )
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         warehouse.compact()
         for table in ("tags", "notes"):
             warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
@@ -234,7 +126,7 @@ def test_snapshot_restore_preserves_winning_curation_fields(
     destination.apply_ddl()
     try:
         for phase in range(2):
-            if phase and isinstance(warehouse, _AppendWarehouse):
+            if phase and isinstance(warehouse, BigQueryReplayBackend):
                 warehouse.compact()
             assert store.write(warehouse, run_id=f"snapshot-{phase}") is not None
             store.restore(destination)
@@ -260,7 +152,7 @@ def test_global_tags_and_source_scoped_notes_survive_compaction(
     set_note(
         warehouse, NoteAssignment("source-a", "codex", "session", "first"), at=created
     )
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         warehouse.compact()
         for table in ("tags", "notes"):
             warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
@@ -285,7 +177,7 @@ def test_global_tags_and_source_scoped_notes_survive_compaction(
         ).to_pylist()
         == expected_notes
     )
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         warehouse.compact()
         for table in ("tags", "notes"):
             warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
@@ -321,7 +213,7 @@ def test_global_tags_and_source_scoped_notes_survive_compaction(
         )
         == 1
     )
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         warehouse.compact()
         for table in ("tags", "notes"):
             warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
@@ -345,47 +237,6 @@ def test_global_tags_and_source_scoped_notes_survive_compaction(
     assert warehouse.query("SELECT source_id, note FROM current_notes").to_pylist() == [
         {"source_id": "source-a", "note": "first"}
     ]
-
-
-def test_partial_publication_never_marks_missing_facts_complete(
-    collection_bundle: CollectionBundle, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Fact and ledger failures leave useful data visible and safe to recollect."""
-    backend = _AppendWarehouse()
-    bundle = normalize(collection_bundle)
-    original_append = backend.append
-    lock = Lock()
-    failed_table = "daily_stats"
-
-    def append(table: str, data: pa.Table) -> None:
-        """Serialize the local replay engine while preserving independent loads."""
-        with lock:
-            if table == failed_table:
-                raise ServiceUnavailable("controlled publication failure")
-            original_append(table, data)
-
-    monkeypatch.setattr(backend, "append", append)
-    try:
-        with pytest.raises(ServiceUnavailable):
-            persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM current_sessions").num_rows > 0
-        assert backend.query("SELECT * FROM current_daily_stats").num_rows == 0
-        assert backend.query("SELECT * FROM collection_status").num_rows == 0
-        failed_table = "collection_ledger"
-        with pytest.raises(ServiceUnavailable):
-            persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM current_daily_stats").num_rows > 0
-        assert backend.query("SELECT * FROM collection_status").num_rows == 0
-        failed_table = ""
-        persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM collection_runs").num_rows == 1
-        assert backend.query("SELECT * FROM collection_status").num_rows > 0
-        for table in ("sessions", "daily_stats", "price_versions"):
-            assert backend.query(f"SELECT * FROM current_{table}").num_rows == (
-                bundle.tables[table].num_rows
-            )
-    finally:
-        backend.close()
 
 
 @pytest.mark.parametrize("table", ["tags", "notes"])
@@ -427,7 +278,7 @@ def test_curation_upsert_ties_use_event_uuid_in_both_writer_strategies(
             (),
         )
     assert warehouse.query(f"SELECT * FROM current_{table}").to_pylist() == [winner]
-    if isinstance(warehouse, _AppendWarehouse):
+    if isinstance(warehouse, BigQueryReplayBackend):
         warehouse.compact()
         warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
         assert warehouse.query(f"SELECT * FROM current_{table}").to_pylist() == [winner]

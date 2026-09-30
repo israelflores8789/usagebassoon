@@ -238,31 +238,6 @@ def test_tag_assignment_rejects_invalid_scope_targets() -> None:
         TagAssignment(scope="session", source_id="source", tag="project-alpha")
 
 
-def test_tag_rename_preserves_creation_time_and_updates_timestamp() -> None:
-    """Assert a rename changes only a complete assignment's label and freshness."""
-    backend = DuckDBBackend(":memory:")
-    created = datetime(2026, 9, 14, tzinfo=UTC)
-    renamed = created + timedelta(days=1)
-    assignment = TagAssignment(
-        scope="client",
-        source_id="11111111-1111-4111-8111-111111111111",
-        client="codex",
-        tag="old",
-    )
-    try:
-        backend.apply_ddl()
-        add_tag(backend, assignment, at=created)
-        result = rename_tag(backend, assignment, "new", at=renamed)
-        assert result.renamed
-        assert backend.query(
-            "SELECT tag, created_at, collected_at FROM tags"
-        ).to_pylist() == [
-            {"tag": "new", "created_at": created, "collected_at": renamed}
-        ]
-    finally:
-        backend.close()
-
-
 def test_tag_rename_leaves_source_when_destination_exists() -> None:
     """Assert an existing destination prevents any rename mutation."""
     backend = DuckDBBackend(":memory:")

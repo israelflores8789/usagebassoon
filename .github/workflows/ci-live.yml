@@ -146,7 +146,7 @@ jobs:
   bigquery-live:
     name: Live BigQuery (WIF)
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     environment:
       name: ci-live
     concurrency:

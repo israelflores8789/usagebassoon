@@ -11,6 +11,7 @@ from pathlib import Path
 import pyarrow as pa
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
@@ -59,8 +60,8 @@ def test_audit_orders_runs_newest_first_and_honors_limit(tmp_path: Path) -> None
     result = CliRunner().invoke(app, ["audit", "--limit", "1", "--config", str(config)])
 
     assert result.exit_code == 0
-    assert "new-run" in result.output
-    assert "old-run" not in result.output
+    assert "new-run" in plain_cli_output(result.output)
+    assert "old-run" not in plain_cli_output(result.output)
 
 
 def test_audit_rejects_a_non_positive_limit(tmp_path: Path) -> None:
@@ -71,4 +72,4 @@ def test_audit_rejects_a_non_positive_limit(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["audit", "--limit", "0", "--config", str(config)])
 
     assert result.exit_code != 0
-    assert "Invalid value" in result.output
+    assert "Invalid value" in plain_cli_output(result.output)

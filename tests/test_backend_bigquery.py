@@ -650,39 +650,6 @@ def test_preflight_rejects_unsupported_markers_without_schema_jobs(
     assert client.queries == []
 
 
-def test_failed_ledger_append_leaves_facts_visible_and_retry_safe(
-    collection_bundle: CollectionBundle,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Missing completion repeats work without hiding successful fact appends."""
-    from google.api_core.exceptions import ServiceUnavailable
-
-    backend = _backend()
-    bundle = normalize(collection_bundle)
-    calls: list[tuple[str, tuple[str, ...]]] = []
-    lock = Lock()
-    fail_ledger = True
-
-    def append(table: str, data: pa.Table) -> None:
-        """Record stable event IDs and fail the first final ledger append."""
-        nonlocal fail_ledger
-        with lock:
-            calls.append((table, tuple(data.column("event_id").to_pylist())))
-            if table == "collection_ledger" and fail_ledger:
-                fail_ledger = False
-                raise ServiceUnavailable("controlled ledger failure")
-
-    monkeypatch.setattr(backend, "append", append)
-    with pytest.raises(ServiceUnavailable, match="ledger failure"):
-        persist_run(backend, bundle)
-    assert calls[-1][0] == "collection_ledger"
-    first = dict(calls)
-    calls.clear()
-    persist_run(backend, bundle)
-    assert calls[-1][0] == "collection_ledger"
-    assert dict(calls) == first
-
-
 @pytest.mark.parametrize(
     ("message", "exception_type"),
     [

@@ -5,13 +5,13 @@
 
 from datetime import UTC, datetime, timedelta
 from importlib import resources
-from typing import override
 
 import pyarrow as pa
 import pytest
 import sqlglot
 from sqlglot import exp
 
+from tests._bigquery_replay import BigQueryReplayBackend
 from tests._sql_parity import (
     assert_view_results_match,
     normalized_records,
@@ -106,30 +106,11 @@ def test_report_view_asts_remain_equivalent() -> None:
     assert logical_views("duckdb") == logical_views("bigquery")
 
 
-class _BronzeReplay(DuckDBBackend):
-    @override
-    def append(self, table: str, data: pa.Table) -> None:
-        physical = (
-            "raw_" + table if table in STATE_KEYS or table in DEBUG_TABLES else table
-        )
-        super().append(physical, data)
-
-
 def test_synthetic_raw_and_gold_replay_matches_shared_views() -> None:
     local = DuckDBBackend(":memory:")
-    remote = _BronzeReplay(":memory:")
+    remote = BigQueryReplayBackend()
     try:
         local.apply_ddl()
-        for statement in _tables("bigquery").values():
-            statement.set("properties", None)
-            remote.connection.execute(statement.sql(dialect="duckdb"))
-        remote.connection.execute(
-            ";\n".join(
-                statement.sql(dialect="duckdb")
-                for statement in statements("bigquery", "views.sql")
-                if statement.this.name != "compaction_backlog"
-            )
-        )
         seed_synthetic_data(local)
         seed_synthetic_data(remote)
         seed_synthetic_data(remote)
@@ -149,19 +130,9 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
 ) -> None:
     """Select domain-preferred values even when their UUID loses lexical ordering."""
     local = DuckDBBackend(":memory:")
-    remote = _BronzeReplay(":memory:")
+    remote = BigQueryReplayBackend()
     try:
         local.apply_ddl()
-        for statement in _tables("bigquery").values():
-            statement.set("properties", None)
-            remote.connection.execute(statement.sql(dialect="duckdb"))
-        remote.connection.execute(
-            ";\n".join(
-                statement.sql(dialect="duckdb")
-                for statement in statements("bigquery", "views.sql")
-                if statement.this.name != "compaction_backlog"
-            )
-        )
         seed_synthetic_data(local)
         seed_synthetic_data(remote)
         stamp = datetime(2026, 10, 1, tzinfo=UTC)

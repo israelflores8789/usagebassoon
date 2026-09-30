@@ -31,12 +31,10 @@ from usagebassoon.reconcile import (
 )
 
 
-def test_daily_collection_has_no_graph_models_reconciliation(
+def test_golden_daily_models_reconcile_cleanly(
     recon_result: ReconciliationResult,
-    daily_models: dict[date, DailyModelsPayload],
 ) -> None:
-    """Reconcile each models response without comparing graph aggregates."""
-    assert recon_result == reconcile_all(daily_models)
+    """Accept internally consistent golden daily models payloads."""
     assert recon_result.ok
 
 

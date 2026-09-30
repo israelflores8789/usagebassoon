@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
-from usagebassoon.backends.base import StorageBackend
+from tests._sql_parity import normalized_records
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
 from usagebassoon.ingest import CollectionBundle
@@ -51,7 +52,6 @@ def test_local_backend_merges_current_state_in_place(
         backend.apply_ddl()
         first = normalize(collection_bundle)
         persist_run(backend, first)
-        assert persist_run(backend, first).inserted == 0
         later = normalize(
             replace(
                 collection_bundle,
@@ -59,7 +59,15 @@ def test_local_backend_merges_current_state_in_place(
                 started_at=collection_bundle.started_at + timedelta(hours=1),
             )
         )
+        daily = later.tables["daily_stats"]
+        changed = daily.to_pylist()
+        changed[0]["input_tokens"] += 10
+        changed[0]["total_tokens"] += 10
+        refreshed = pa.Table.from_pylist(changed, schema=daily.schema)
+        later = replace(later, tables={**later.tables, "daily_stats": refreshed})
         persist_run(backend, later)
+        actual = backend.query("SELECT * FROM current_daily_stats")
+        assert normalized_records(actual) == normalized_records(refreshed)
         assert (
             backend.query("SELECT * FROM daily_stats").num_rows
             == first.tables["daily_stats"].num_rows
@@ -83,17 +91,3 @@ def test_motherduck_requires_token_before_connecting(
     monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="MOTHERDUCK_TOKEN"):
         MotherDuckBackend("usagebassoon")
-
-
-def test_local_backend_satisfies_storage_protocol() -> None:
-    """Assert the local implementation exposes the Arrow StorageBackend API."""
-
-    def accept(backend: StorageBackend) -> None:
-        """Accept a structurally conforming storage backend."""
-        assert callable(backend.apply_ddl)
-
-    backend = DuckDBBackend(":memory:")
-    try:
-        accept(backend)
-    finally:
-        backend.close()

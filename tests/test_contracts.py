@@ -15,7 +15,6 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.contracts import (
     ContractValidationError,
-    PayloadContract,
     build_contract,
     diff_contract,
     load_shipped_contracts,
@@ -80,61 +79,88 @@ def test_shipped_contracts_accept_the_golden_payloads(
     assert result == type(result)(events=(), fatal=False)
 
 
-def test_unused_graph_fields_are_optional_in_the_shipped_contract() -> None:
-    """Graph aggregates and capture time are not ingestion requirements."""
-    graph_contract = load_shipped_contracts()["graph"]
-    optional_paths = frozenset(
-        {
-            "meta.generatedAt",
-            "summary",
-            "summary.activeDays",
-            "summary.averagePerDay",
-            "summary.clients",
-            "summary.maxCostInSingleDay",
-            "summary.models",
-            "summary.totalCost",
-            "summary.totalDays",
-            "summary.totalTokens",
-            "timeMetrics",
-            "timeMetrics.longestContinuousMs",
-            "timeMetrics.maxConcurrentSessions",
-            "timeMetrics.sessionCount",
-            "timeMetrics.totalActiveTimeMs",
+def test_unused_graph_fields_are_optional_in_the_shipped_contract(
+    graph_raw: JsonObject,
+) -> None:
+    """Plan candidate days from real payloads without optional graph aggregates."""
+    meta = graph_raw["meta"]
+    assert isinstance(meta, dict)
+    minimal = {
+        key: value
+        for key, value in graph_raw.items()
+        if key not in {"summary", "timeMetrics"}
+    }
+    minimal["meta"] = {
+        key: value for key, value in meta.items() if key != "generatedAt"
+    }
+    expected = plan_graph(graph_raw)
+    actual = plan_graph(minimal)
+    assert actual.candidate_days == expected.candidate_days
+    assert actual.graph.contributions == expected.graph.contributions
+    assert actual.contract_drift == ()
+    contract = load_shipped_contracts()["graph"]
+    changed = {**minimal, "summary": "unexpected aggregate type"}
+    drift = diff_contract(contract, changed)
+    assert not drift.fatal
+    assert any(
+        event.path == "summary" and event.drift_kind == "type_change"
+        for event in drift.events
+    )
+
+
+def test_models_performance_can_be_absent_without_losing_token_facts(
+    daily_raws: dict[date, JsonObject],
+) -> None:
+    """Parse token facts without timing while monitoring present timing types."""
+    day = min(daily_raws)
+    original = daily_raws[day]
+    entries = original["entries"]
+    assert isinstance(entries, list)
+    stripped: JsonArray = []
+    for entry in entries:
+        assert isinstance(entry, dict)
+        stripped.append(
+            {key: value for key, value in entry.items() if key != "performance"}
+        )
+    changed = {**original, "entries": stripped}
+    expected = plan_models({day: original})
+    actual = plan_models({day: changed})
+    assert actual.contract_drift == ()
+    assert actual.models_by_day == expected.models_by_day
+    assert actual.daily_models[day].totals.model_dump(exclude={"entries"}) == (
+        expected.daily_models[day].totals.model_dump(exclude={"entries"})
+    )
+    for observed, original_row in zip(
+        actual.daily_models[day].entries,
+        expected.daily_models[day].entries,
+        strict=True,
+    ):
+        timing = {
+            "tokscale_ms_per_1k_tokens",
+            "perf_duration_ms",
+            "perf_timed_tokens",
+            "perf_sample_count",
+            "perf_token_coverage",
         }
+        assert observed.stats.model_dump(exclude=timing) == (
+            original_row.stats.model_dump(exclude=timing)
+        )
+    assert len(actual.daily_models[day].entries) == len(entries)
+    assert all(
+        row.stats.perf_duration_ms is None for row in actual.daily_models[day].entries
     )
-    entries = {entry.path: entry for entry in graph_contract.entries}
-    assert optional_paths <= frozenset(entries)
-    optional_entries = tuple(entries[path] for path in sorted(optional_paths))
-    assert all(not entry.required for entry in optional_entries)
-
-    focused_contract = PayloadContract(
-        payload_kind=graph_contract.payload_kind,
-        tokscale_version=graph_contract.tokscale_version,
-        entries=optional_entries,
+    first = stripped[0]
+    assert isinstance(first, dict)
+    invalid = {
+        **changed,
+        "entries": [{**first, "performance": "unexpected type"}, *stripped[1:]],
+    }
+    drift = diff_contract(load_shipped_contracts()["models"], invalid)
+    assert not drift.fatal
+    assert any(
+        event.path == "entries[].performance" and event.drift_kind == "type_change"
+        for event in drift.events
     )
-    validation = diff_contract(focused_contract, {})
-
-    assert validation.events == ()
-    assert validation.fatal is False
-
-
-def test_models_performance_can_be_absent_without_losing_token_facts() -> None:
-    """Keep timing optional while monitoring present performance field types."""
-    models_contract = load_shipped_contracts()["models"]
-    entries = {entry.path: entry for entry in models_contract.entries}
-    performance = tuple(
-        entry
-        for path, entry in entries.items()
-        if path == "entries[].performance" or path.startswith("entries[].performance.")
-    )
-    assert len(performance) == 6
-    assert all(not entry.required for entry in performance)
-    focused = PayloadContract(
-        payload_kind=models_contract.payload_kind,
-        tokscale_version=models_contract.tokscale_version,
-        entries=performance,
-    )
-    assert diff_contract(focused, {}).events == ()
 
 
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(

@@ -28,11 +28,11 @@ def _write_config(path: Path, database: Path) -> None:
     )
 
 
-def test_collect_reports_the_delegated_merge_summary(
+def test_collect_reports_the_delegated_persistence_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Display the run identity and merge counts returned by the collector."""
+    """Display the run identity and persistence counts returned by the collector."""
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usagebassoon.duckdb")
 
@@ -46,7 +46,10 @@ def test_collect_reports_the_delegated_merge_summary(
     result = CliRunner().invoke(app, ["collect", "--config", str(config)])
 
     assert result.exit_code == 0
-    assert result.output == "Collected run run-123: 4 inserted, 2 updated.\n"
+    assert (
+        plain_cli_output(result.output)
+        == "Collected run run-123: 4 inserted, 2 updated.\n"
+    )
 
 
 def test_collect_formats_configuration_errors_as_cli_errors(
@@ -64,16 +67,16 @@ def test_collect_formats_configuration_errors_as_cli_errors(
     assert "--config" in plain_cli_output(result.output)
 
 
-def test_collect_skips_when_another_worker_owns_the_source(
+def test_collect_reports_local_collection_contention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Report an expected source contention without treating config as invalid."""
+    """Report local collection contention as a clean CLI error."""
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usagebassoon.duckdb")
 
     def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
-        """Simulate a live collection already holding the source lease."""
+        """Simulate a local collection already holding the environment lock."""
         raise CollectionBusy("source is already collecting")
 
     monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
@@ -104,6 +107,9 @@ def test_collect_formats_unexpected_errors_without_a_traceback(
         result = CliRunner().invoke(app, ["collect", "--config", str(config)])
 
     assert result.exit_code == 1
-    assert "Collection failed unexpectedly; see the operational log." in result.output
-    assert "Traceback" not in result.output
+    assert (
+        "Collection failed unexpectedly; see the operational log."
+        in plain_cli_output(result.output)
+    )
+    assert "Traceback" not in plain_cli_output(result.output)
     assert "unexpected collection command failure" in caplog.text
