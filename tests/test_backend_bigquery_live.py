@@ -39,9 +39,12 @@ from tests._cli import plain_cli_output
 from tests._sql_parity import normalized_records, seed_synthetic_data, view_names
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.bigquery import BigQueryBackend
+from usagebassoon.backends.bigquery_compaction import (
+    BigQueryBackendCompaction,
+    install_compaction,
+)
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
-from usagebassoon.compaction import CompactionBackend, install_compaction
 from usagebassoon.config import ConfigurationManager
 from usagebassoon.curation import (
     NoteAssignment,
@@ -240,14 +243,16 @@ def managed_compaction_schedule(
         }
         created: set[str] = set()
 
-        def install(backend: CompactionBackend) -> str:
+        def install(backend: BigQueryBackendCompaction) -> str:
             """Run real provisioning and track any newly created configuration."""
             name = install_compaction(backend)
             if name not in existing:
                 created.add(name)
             return name
 
-        monkeypatch.setattr("usagebassoon.compaction.install_compaction", install)
+        monkeypatch.setattr(
+            "usagebassoon.backends.bigquery_compaction.install_compaction", install
+        )
         try:
             yield
         finally:

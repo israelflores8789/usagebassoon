@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""compaction.py — Install the versioned nightly BigQuery Scheduled Query."""
+"""bigquery_compaction.py — Install the versioned nightly BigQuery Scheduled Query."""
 
 from collections.abc import Mapping
 from importlib import resources
@@ -10,7 +10,7 @@ from typing import Protocol, cast
 from google.auth.credentials import Credentials
 
 
-class CompactionBackend(Protocol):
+class BigQueryBackendCompaction(Protocol):
     """Metadata and SQL binding needed to install a dataset schedule."""
 
     project: str
@@ -22,7 +22,7 @@ class CompactionBackend(Protocol):
         """Bind the packaged maintenance SQL to this dataset."""
 
 
-def install_compaction(backend: CompactionBackend) -> str:
+def install_compaction(backend: BigQueryBackendCompaction) -> str:
     """Create or update this dataset's nightly transaction during explicit init."""
     from google.cloud import bigquery_datatransfer
     from google.protobuf.field_mask_pb2 import FieldMask

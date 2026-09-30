@@ -150,7 +150,10 @@ def _schema_from_arrow(data: pa.Table) -> list[bigquery.SchemaField]:
 
 
 class BigQueryBackend(AbstractStorageBackend):
-    """Append-only publication with asynchronous transactional gold compaction."""
+    """Append-only publication with asynchronous transactional gold compaction.
+
+    Implements the StorageBackend protocol.
+    """
 
     dialect = "bigquery"
 
@@ -581,7 +584,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     )
                 )
             if step.version == SCHEMA_VERSION:
-                from usagebassoon.compaction import install_compaction
+                from usagebassoon.backends.bigquery_compaction import install_compaction
 
                 install_compaction(self)
             marker.labels = {

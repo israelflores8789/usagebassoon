@@ -43,7 +43,7 @@ def init(
         backend.apply_ddl()
         if configuration.backend == "bigquery":
             from usagebassoon.backends.bigquery import BigQueryBackend
-            from usagebassoon.compaction import install_compaction
+            from usagebassoon.backends.bigquery_compaction import install_compaction
 
             if not isinstance(backend, BigQueryBackend):
                 raise RuntimeError("configured BigQuery backend has an invalid type")
