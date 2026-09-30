@@ -33,7 +33,7 @@ When reporting a bug or failed integration, run `bassoon doctor` and include its
 | pre-commit                       | Recommended local formatting, YAML, spelling, and workflow checks |
 | VS Code                          | Optional; repository recommendations and settings are included |
 
-Cloud credentials and access to the dedicated BigQuery and GCS test resources are needed only for the opt-in live integration tests. Do *not* use personal or production resources for those tests.
+Cloud credentials and access to the dedicated BigQuery, MotherDuck, and GCS test resources are needed only for the opt-in live integration tests. Do *not* use personal or production resources for those tests. The BigQuery and GCS permissions UsageBassoon requires are documented in the README.
 
 ### Clone and install
 
@@ -65,35 +65,42 @@ VS Code users should open the repository root and accept the recommended extensi
 
 The repository is organized around an explicit collection, ingest, normalization, persistence, and archival pipeline:
 
-  ```text
-  usagebassoon/
-  ├── src/usagebassoon/
-  │   ├── cli/                # Typer commands and terminal-facing presentation
-  │   ├── parsers/            # Typed parsers for individual tokscale payload kinds
-  │   ├── contracts/          # Versioned JSON schema contracts
-  │   ├── backends/           # StorageBackend protocol + data warehouse adapters
-  │   ├── buckets/            # SnapshotBucket protocol + object storage adapters
-  │   ├── sql/                # Dialect-specific DDLs and views
-  │   ├── collector.py        # tokscale subprocess management
-  │   ├── orchestrator.py     # Top-level data shuttler
-  │   ├── ingest.py           # Contract validation and parsing coordinator
-  │   ├── contracts.py        # Raw payload validation and schema-drift detection
-  │   ├── normalizer.py       # Parsed payload to canonical Arrow-table normalization
-  │   ├── persistence.py      # Normalized batch transactions to data warehouses
-  │   ├── archiver.py         # Portable Parquet snapshot and restore coordination
-  │   ├── config.py           # config.toml manager
-  │   ├── scheduling.py       # Scheduled collection execution
-  │   ├── api.py              # Public Python query and connection API
-  │   └── frames.py           # Arrow conversion to pandas or polars frames
-  ├── tests/                  # Test suite and regression coverage
-  │   └── fixtures/           # Sanitized golden fixtures; do NOT modify
-  ├── .github/                # CI, release automation, and issue forms
-  ├── .vscode/                # Recommended extensions and workspace settings
-  ├── .pre-commit-config.yaml # Convenient formatting, spell check, and yaml lint enforcement
-  ├── config.schema.json      # Official schema for user's config.toml
-  ├── pyproject.toml          # Hatchling, Twine, Pytest, & project configurations
-  └── justfile                # Convenient command runner
-  ```
+```text
+usagebassoon/
+├── src/usagebassoon/
+│   ├── cli/                # Typer commands and terminal-facing presentation
+│   ├── parsers/            # Typed parsers for individual tokscale payload kinds
+│   ├── contracts/          # Versioned JSON schema contracts
+│   ├── backends/           # StorageBackend protocol + data warehouse adapters
+│   ├── buckets/            # SnapshotBucket protocol + object storage adapters
+│   ├── sql/                # Dialect-specific DDL, views, and BigQuery compaction script
+│   │   ├── duckdb/         # ddl.sql, views.sql (also serves MotherDuck)
+│   │   └── bigquery/       # ddl.sql, views.sql, compaction.sql
+│   ├── collector.py        # tokscale subprocess management
+│   ├── orchestrator.py     # Top-level data shuttler
+│   ├── ingest.py           # Contract validation and parsing coordinator
+│   ├── contracts.py        # Raw payload validation and schema-drift detection
+│   ├── normalizer.py       # Parsed payload to canonical Arrow-table normalization
+│   ├── persistence.py      # Normalized batch publication to data warehouses
+│   ├── storage_model.py    # Shared logical keys and observation tie-break rules
+│   ├── schema_assets.py    # Ordered packaged SQL for schema initialization
+│   ├── collection_lock.py  # Local user-environment collection exclusion
+│   ├── curation.py         # User-owned tags and notes
+│   ├── diagnostics.py      # Doctor checks and read-only diagnostic queries
+│   ├── archiver.py         # Portable Parquet snapshot and restore coordination
+│   ├── config.py           # config.toml manager
+│   ├── scheduling.py       # Scheduled collection execution
+│   ├── api.py              # Public Python query and connection API
+│   └── frames.py           # Arrow conversion to pandas or polars frames
+├── tests/                  # Test suite and regression coverage
+│   └── fixtures/           # Sanitized golden fixtures; do NOT modify
+├── .github/                # CI, release automation, and issue forms
+├── .vscode/                # Recommended extensions and workspace settings
+├── .pre-commit-config.yaml # Convenient formatting, spell check, and yaml lint enforcement
+├── config.schema.json      # Official schema for user's config.toml
+├── pyproject.toml          # Hatchling, Twine, Pytest, & project configurations
+└── justfile                # Convenient command runner
+```
 
 Keep changes within these boundaries. New collection behavior should preserve the separation between acquisition, ingest validation/parsing, normalization, persistence, and archival. New persistence behavior should use the `StorageBackend` abstraction and canonical Arrow tables. New snapshot storage providers should implement `SnapshotBucket`. CLI commands should consume dialect-specific views and *never* embed non-portable SQL.
 
@@ -103,7 +110,7 @@ Presently, four **canonical `tokscale` commands** supply the collection pipeline
 
 1. `tokscale models --json --group-by client,session,model --since <YYYY-MM-DD> --until <YYYY-MM-DD>` is authoritative for date-filtered daily token statistics at client, session, and model grain.
 2. `tokscale report --json --no-summarize --since <YYYY-MM-DD> --until <YYYY-MM-DD>` is authoritative for session metadata. Non-deterministic summary fields are not persisted.
-3. `tokscale graph` is authoritative for daily activity and candidate dates. Its totals are not reconciled against daily model totals.
+3. `tokscale graph` is authoritative for candidate dates only. No activity table is persisted, and its totals are not reconciled against daily model totals.
 4. `tokscale pricing <model-id> --json` is authoritative for the pricing rates observed for each active model on each processed day.
 
 `orchestrator.py` owns the collection workflow, and it:
@@ -137,7 +144,7 @@ flowchart TD
       ING --> CON[contracts.py<br/>payload validation &<br/>drift detection]
       CON -->|ContractDrift events| ING
 
-      NORM -->|NormalizedBundle| PERSIST[persistence.py<br/>batched transactions]
+      NORM -->|NormalizedBundle| PERSIST[persistence.py<br/>backend-specific publication]
       PERSIST --> BACKEND[StorageBackend Protocol]
 
       subgraph WAREHOUSE[Data warehouses]
@@ -164,27 +171,55 @@ flowchart TD
 
 Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as schema-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
 
-`normalizer.py` computes canonical derived columns and produces Arrow tables.
+`normalizer.py` computes canonical derived columns and produces Arrow tables, and it assigns each observation row a stable `event_id` before any persistence retry.
 
-`persistence.py` prepares the normalized batch and delegates transactional upserts to DuckDB/MotherDuck or concurrent replay-safe raw appends to BigQuery, with the collection ledger written last; absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report/query data.
+`persistence.py` prepares the normalized batch and delegates publication to the backend: transactional upserts for DuckDB/MotherDuck, or concurrent replay-safe raw appends for BigQuery with the collection ledger written last. Absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report and query data.
 
 `archiver.py` independently coordinates portable Parquet snapshots through a configured `SnapshotBucket`.
 
 ## Architectural mandates
 
-The following are design *constraints*, not optional:
+The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.md) for more exhaustive detail decision reasoning; read it before changing persistence, compaction, schema, snapshot, or curation behavior.
 
-- **History preservation.** Collection must preserve usage facts and permanent audit history. DuckDB/MotherDuck upsert current state; BigQuery appends raw observations and compacts them asynchronously. Debug events expire after 90 days, and snapshot retention follows the archive catalog.
-- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe. Match facts by their documented natural keys, update only changed rows, and make retries repeatable without consequence.
-- **Backend publication.** Prepare the complete normalized Arrow batch before persistence. DuckDB/MotherDuck publish transactionally. BigQuery accepts independent atomic table appends and partial publication; write the collection ledger only after the other loads succeed so historical preflight cannot skip missing facts. Stable event IDs make retries safe, and nightly compaction commits gold state and progress atomically.
+- **History preservation.** Collection must preserve usage facts and permanent audit history. DuckDB/MotherDuck upsert current state; BigQuery appends raw observations and compacts them asynchronously. Raw BigQuery observations and diagnostic events expire after 90 days, durable usage facts never expire, and snapshot retention follows the archive catalog.
+- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe. Match facts by their documented natural keys, and make retries repeatable without consequence. A retry reuses its collection `run_id` and every row's `event_id`. Duplicate work and duplicate physical rows are acceptable on append-and-compact backends; canonical views and compaction deduplicate them.
+- **Backend publication.** Prepare the complete normalized Arrow batch before persistence. DuckDB/MotherDuck publish transactionally. BigQuery accepts independent atomic table appends and partial publication; write the collection ledger only after the other loads succeed so historical preflight cannot skip missing facts. Nightly compaction commits gold state and progress atomically.
+- **Deterministic ordering.** Current state is selected by `collected_at DESC`, with documented tie-breaks and `event_id DESC` as the final tie-break. The shared policy lives in `storage_model.py`; views, compaction, snapshots, and restore must all use it.
 - **Arrow Normalization.** Normalization and derived columns belong *before* storage. `StorageBackend`s accept and return canonical Arrow tables so DuckDB, MotherDuck, BigQuery, and future adapters share semantics.
-- **SQL Dialect Agnostism.** Maintain the paired DuckDB and BigQuery DDL and views. CLI commands should query the appropriate **dialect-specific view** and *never* contain non-portable ad hoc SQL. SQLGlot `sql_parity` test coverage must pass for dialect changes.
-- **Canonical Command Authority.** `tokscale graph` provides candidate dates and activity only; `tokscale models` provide daily statistics; `tokscale report` provides session metadata; `tokscale pricing` provides observed rates. Do *not* invent a second source of truth.
-- **Separated User-Curated Data.** Data associated with `basson tag` and `bassoon note` are user-owned data. Collection, normalization, restore, and snapshot workflows must not overwrite or silently remove them.
-- **Private, Atomic Snapshots.** A snapshot is publishable only after *complete* table coverage and a *complete* catalog manifest. `bassoon restore` validates membership, integrity, and destination compatibility before appending data. Snapshots contain raw data at-rest which can contain private data and is *not* meant for public export.
+- **SQL Dialect Agnosticism.** Maintain the paired DuckDB and BigQuery DDL and views. CLI commands should query the appropriate **dialect-specific view** and *never* contain non-portable ad hoc SQL. SQLGlot `sql_parity` test coverage must pass for dialect changes.
+- **Canonical Command Authority.** `tokscale graph` provides candidate dates only; `tokscale models` provide daily statistics; `tokscale report` provides session metadata; `tokscale pricing` provides observed rates. Do *not* invent a second source of truth.
+- **Explicit Schema Management.** DDL runs only through `bassoon init` or registered, hash-gated schema upgrades. Collection never issues DDL, and a newer or unexpected schema fails closed.
+- **Separated User-Curated Data.** Data associated with `bassoon tag` and `bassoon note` are user-owned data. Tags are global; notes belong to their exact source-scoped session. Collection, normalization, restore, and snapshot workflows must not overwrite or silently remove them.
+- **Private, Atomic Snapshots.** A snapshot is publishable only after *complete* table coverage and a *complete* catalog manifest, and it must include un-compacted raw observations through canonical state. `bassoon restore` validates membership, integrity, and destination compatibility before appending data, and requires an initialized, empty, quiescent destination. Snapshots contain raw data at-rest which can contain private data and is *not* meant for public export.
 - **Tolerant Schema Drift.** Required-field absence from tokscale's JSON payload should fail clearly, but additive fields and compatible shape changes should be recorded, reported, and investigated without blocking safe collection.
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
-- **Protect Privacy by Default.** Never place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `basson doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
+- **Protect Privacy by Default.** Never place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
+
+## Persistence architectures
+
+UsageBassoon chooses a persistence architecture according to how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, natural keys, ordering rules, underlying data model, and report views.
+
+| Architecture | How it works | Current backends |
+|:-------------|:-------------|:-----------------|
+| Direct transactional upsert | Each normalized batch upserts current-state tables in a bounded transaction; audit and debug streams append. | DuckDB, MotherDuck |
+| Append-and-compact | Collection appends immutable observations to raw tables. Canonical views combine gold with retained raw rows. Scheduled transactional compaction folds raw into gold. Curation tables have tombstones for delete. | BigQuery |
+
+Collection and curation on an append-and-compact backend never mutate raw or gold tables. *Only* scheduled compaction and atomic restore write gold. Concurrent collectors, including those sharing a `source_id`, are safe by idempotent appends and read-time deduplication, so there are no leases or fencing to maintain.
+
+A new backend contribution must:
+- state which architecture it uses and why, validating the warehouse's write and concurrency behavior first (Redshift and Microsoft Fabric are candidate append-and-compact fits);
+- implement `StorageBackend` over canonical Arrow tables and provide native DDL and views;
+- keep a non-null `source_id` on every base table and include it in the natural key of every source-scoped current-state table;
+- preserve the shared ordering policy, tombstone semantics, and schema init/marker behavior;
+- support consistent snapshot capture and atomic restore into an empty destination; and
+- add structural and synthetic parity coverage plus focused live tests against a disposable resource.
+
+## Schema, SQL, and compaction changes
+
+- Update the DuckDB and BigQuery DDL and views together, and update the `sql_parity` tests. Backend-specific raw tables, canonical ingestion views, and compaction SQL differ by design; shared logical tables and report views must not.
+- Never reshape an existing table with `CREATE TABLE IF NOT EXISTS`. A table-shape change **requires** a schema version bump and an explicit registered migration. The BigQuery schema hash includes `compaction.sql`, so a compaction change *is* a schema change.
+- Compaction changes need live BigQuery coverage. Compaction must remain idempotent, recompute affected partitions from existing gold plus retained raw rows, and commit gold and progress together.
+- Never add DDL, MERGE, staging tables, or serialization to a BigQuery collection path.
 
 ## Golden fixture policy
 
@@ -223,7 +258,7 @@ Use focused tests while developing:
 
 ```bash
 just test tests/test_parsers.py
-just test -m "not (bigquery_live or gcs_live or sql_parity)"
+just test -m "not (bigquery_live or motherduck_live or gcs_live or sql_parity)"
 uv run pytest tests/test_merge.py -q # just recipes preferred
 ```
 
@@ -231,14 +266,16 @@ Run cloud integration tests only with the dedicated disposable resources and app
 
 ```bash
 just test-bq-live <test-name> [reset]
+just test-md-live <test-name>
 just test-gcs-live <test-name>
 ```
 
 - BigQuery live tests are restricted to the `usagebassoon_it` dataset.
-- GCS live tests are restricted to `gs://usagebassoon-test-snapshots-gen-lang-client-0670612427`.
+- MotherDuck live tests are restricted to the `usagebassoon_it` database, which the recipe resets on every run.
+- GCS live tests are restricted to `gs://usagebassoon-test-snapshots-<gcp-project-id>`.
 
 > [!WARNING]
-> **Never** point live tests at a personal or production dataset or bucket, and **never** commit credentials, local configuration, database files, snapshots, logs, or unsanitized raw usage exports.
+> **Never** point live tests at a personal or production dataset, database, or bucket, and **never** commit credentials, local configuration, database files, snapshots, logs, or unsanitized raw usage exports.
 
 ## Code conventions
 
@@ -247,6 +284,7 @@ Python contributions must
 - use complete type annotations,
 - follow **Google-style docstrings**, and
 - pass the project’s **Ruff** and **Pyrefly** configuration.
+
 Prefer PEP 695 syntax for new generic declarations and type aliases. Do *not* suppress diagnostics, introduce implicit `Any`, or add bare generic types.
 
 Use the existing package boundaries and public API conventions. User-facing CLI or Python API changes need tests and documentation. Schema, DDL, or view changes need corresponding updates for both SQL dialects and the separate `sql_parity` tests. Keep comments concise and document the invariant or design decision they protect.
@@ -256,7 +294,7 @@ Use the existing package boundaries and public API conventions. User-facing CLI 
 UsageBassoon is intentionally modular, and contributions are welcome with key needs in these areas:
 
 - **Extend backend support** to include more data analytic warehouses including:
-  - AWS Redshit,
+  - AWS Redshift,
   - Azure Fabric,
   - Snowflake, and
   - Databricks.
@@ -320,7 +358,7 @@ Keep commits focused on one logical change. Update `CHANGELOG.md` in the same pu
 > [!CAUTION]
 > `CHANGELOG.md` is consumed by the `Release` workflow. Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) exactly, write entries for users rather than implementation details, and do not manually rewrite released sections.
 
-Add notable changes under `## [Unreleased]`, using `###Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` as appropriate. Internal-only `test:`, `docs:`, and `chore:` changes normally do not need an entry. For a release, maintainers use `just release VERSION` to rotate `Unreleased` into a dated version section.
+Add notable changes under `## [Unreleased]`, using `### Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` as appropriate. Internal-only `test:`, `docs:`, and `chore:` changes normally do not need an entry. For a release, maintainers use `just release VERSION` to rotate `Unreleased` into a dated version section.
 
 Example:
 
@@ -360,7 +398,7 @@ The pull request description should include:
 > [!IMPORTANT]
 > Before requesting review, **confirm that the CLA Assistant check passes**, the pull request targets `main`, required local checks are green, and no private data or credentials are included. Respond to review feedback with focused commits and keep the branch up to date with `main`.
 >
-> As a reminder, you can read the [Contributor License Agreement](cla.md) here.
+> As a reminder, you can read the [Contributor License Agreement](CLA.md) here.
 
 ## Release process (maintainers)
 
@@ -379,7 +417,7 @@ The command validates the version, moves the existing `Unreleased` entries into 
 - Review the generated changelog,
 - run `just ci`,
 - run `just test -m sql_parity`,
-- run `just test-bq-live` and `just test-gcs-live` if you have appropriate access to the live test resources or your own,
+- run `just test-bq-live`, `just test-md-live`, and `just test-gcs-live` if you have appropriate access to the live test resources or your own,
 - run `just check-dist`, then
 - open a release pull request targeting `main`.
 
@@ -388,7 +426,6 @@ The command validates the version, moves the existing `Unreleased` entries into 
 
 > [!NOTE]
 > Release tags follow [Semantic Versioning](https://semver.org/) using `vMAJOR.MINOR.PATCH`, with an optional prerelease suffix such as `v0.2.0rc1`. Note, the `v` prefix is **required**.
-
 
 ### Merge and publish
 
