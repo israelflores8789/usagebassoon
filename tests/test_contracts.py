@@ -15,7 +15,6 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.contracts import (
     ContractValidationError,
-    PayloadContract,
     build_contract,
     diff_contract,
     load_shipped_contracts,
@@ -80,61 +79,88 @@ def test_shipped_contracts_accept_the_golden_payloads(
     assert result == type(result)(events=(), fatal=False)
 
 
-def test_unused_graph_fields_are_optional_in_the_shipped_contract() -> None:
-    """Graph aggregates and capture time are not ingestion requirements."""
-    graph_contract = load_shipped_contracts()["graph"]
-    optional_paths = frozenset(
-        {
-            "meta.generatedAt",
-            "summary",
-            "summary.activeDays",
-            "summary.averagePerDay",
-            "summary.clients",
-            "summary.maxCostInSingleDay",
-            "summary.models",
-            "summary.totalCost",
-            "summary.totalDays",
-            "summary.totalTokens",
-            "timeMetrics",
-            "timeMetrics.longestContinuousMs",
-            "timeMetrics.maxConcurrentSessions",
-            "timeMetrics.sessionCount",
-            "timeMetrics.totalActiveTimeMs",
+def test_unused_graph_fields_are_optional_in_the_shipped_contract(
+    graph_raw: JsonObject,
+) -> None:
+    """Plan candidate days from real payloads without optional graph aggregates."""
+    meta = graph_raw["meta"]
+    assert isinstance(meta, dict)
+    minimal = {
+        key: value
+        for key, value in graph_raw.items()
+        if key not in {"summary", "timeMetrics"}
+    }
+    minimal["meta"] = {
+        key: value for key, value in meta.items() if key != "generatedAt"
+    }
+    expected = plan_graph(graph_raw)
+    actual = plan_graph(minimal)
+    assert actual.candidate_days == expected.candidate_days
+    assert actual.graph.contributions == expected.graph.contributions
+    assert actual.contract_drift == ()
+    contract = load_shipped_contracts()["graph"]
+    changed = {**minimal, "summary": "unexpected aggregate type"}
+    drift = diff_contract(contract, changed)
+    assert not drift.fatal
+    assert any(
+        event.path == "summary" and event.drift_kind == "type_change"
+        for event in drift.events
+    )
+
+
+def test_models_performance_can_be_absent_without_losing_token_facts(
+    daily_raws: dict[date, JsonObject],
+) -> None:
+    """Parse token facts without timing while monitoring present timing types."""
+    day = min(daily_raws)
+    original = daily_raws[day]
+    entries = original["entries"]
+    assert isinstance(entries, list)
+    stripped: JsonArray = []
+    for entry in entries:
+        assert isinstance(entry, dict)
+        stripped.append(
+            {key: value for key, value in entry.items() if key != "performance"}
+        )
+    changed = {**original, "entries": stripped}
+    expected = plan_models({day: original})
+    actual = plan_models({day: changed})
+    assert actual.contract_drift == ()
+    assert actual.models_by_day == expected.models_by_day
+    assert actual.daily_models[day].totals.model_dump(exclude={"entries"}) == (
+        expected.daily_models[day].totals.model_dump(exclude={"entries"})
+    )
+    for observed, original_row in zip(
+        actual.daily_models[day].entries,
+        expected.daily_models[day].entries,
+        strict=True,
+    ):
+        timing = {
+            "tokscale_ms_per_1k_tokens",
+            "perf_duration_ms",
+            "perf_timed_tokens",
+            "perf_sample_count",
+            "perf_token_coverage",
         }
+        assert observed.stats.model_dump(exclude=timing) == (
+            original_row.stats.model_dump(exclude=timing)
+        )
+    assert len(actual.daily_models[day].entries) == len(entries)
+    assert all(
+        row.stats.perf_duration_ms is None for row in actual.daily_models[day].entries
     )
-    entries = {entry.path: entry for entry in graph_contract.entries}
-    assert optional_paths <= frozenset(entries)
-    optional_entries = tuple(entries[path] for path in sorted(optional_paths))
-    assert all(not entry.required for entry in optional_entries)
-
-    focused_contract = PayloadContract(
-        payload_kind=graph_contract.payload_kind,
-        tokscale_version=graph_contract.tokscale_version,
-        entries=optional_entries,
+    first = stripped[0]
+    assert isinstance(first, dict)
+    invalid = {
+        **changed,
+        "entries": [{**first, "performance": "unexpected type"}, *stripped[1:]],
+    }
+    drift = diff_contract(load_shipped_contracts()["models"], invalid)
+    assert not drift.fatal
+    assert any(
+        event.path == "entries[].performance" and event.drift_kind == "type_change"
+        for event in drift.events
     )
-    validation = diff_contract(focused_contract, {})
-
-    assert validation.events == ()
-    assert validation.fatal is False
-
-
-def test_models_performance_can_be_absent_without_losing_token_facts() -> None:
-    """Keep timing optional while monitoring present performance field types."""
-    models_contract = load_shipped_contracts()["models"]
-    entries = {entry.path: entry for entry in models_contract.entries}
-    performance = tuple(
-        entry
-        for path, entry in entries.items()
-        if path == "entries[].performance" or path.startswith("entries[].performance.")
-    )
-    assert len(performance) == 6
-    assert all(not entry.required for entry in performance)
-    focused = PayloadContract(
-        payload_kind=models_contract.payload_kind,
-        tokscale_version=models_contract.tokscale_version,
-        entries=performance,
-    )
-    assert diff_contract(focused, {}).events == ()
 
 
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
@@ -176,7 +202,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
         assert backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, "
             "contract_tokscale_ver, resolved, observation_count "
-            "FROM schema_drift_events"
+            "FROM current_schema_drift_events"
         ).to_pylist() == [
             {
                 "domain": "models",
@@ -241,8 +267,8 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
         persist_run(backend, normalize(bundles[1]))
         rows = backend.query(
             "SELECT domain, tokscale_ver, drift_key, contract_tokscale_ver, "
-            "created_at, updated_at, detected_run_id, updated_run_id, resolved, "
-            "observation_count FROM schema_drift_events "
+            "created_at, collected_at, resolved, "
+            "observation_count FROM current_schema_drift_events "
             "ORDER BY tokscale_ver"
         ).to_pylist()
         first, second, third = bundles
@@ -255,9 +281,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
                     "models"
                 ].tokscale_version,
                 "created_at": first.finished_at,
-                "updated_at": second.finished_at,
-                "detected_run_id": first.run_id,
-                "updated_run_id": second.run_id,
+                "collected_at": second.finished_at,
                 "resolved": False,
                 "observation_count": 2,
             },
@@ -269,9 +293,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
                     "models"
                 ].tokscale_version,
                 "created_at": third.finished_at,
-                "updated_at": third.finished_at,
-                "detected_run_id": third.run_id,
-                "updated_run_id": third.run_id,
+                "collected_at": third.finished_at,
                 "resolved": False,
                 "observation_count": 1,
             },
@@ -303,7 +325,7 @@ def test_same_run_payload_sightings_are_counted_in_one_event(
         persist_run(backend, normalize(bundle))
         rows = backend.query(
             "SELECT count(*) AS event_count, min(observation_count) AS observations "
-            "FROM schema_drift_events"
+            "FROM current_schema_drift_events"
         ).to_pylist()
         assert rows == [{"event_count": 1, "observations": len(daily_raws)}]
     finally:
@@ -339,8 +361,8 @@ def test_clean_complete_domain_resolves_existing_event(
         persist_run(backend, normalize(first))
         persisted = backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
-            "contract_tokscale_ver, created_at, detected_run_id, observation_count "
-            "FROM schema_drift_events"
+            "contract_tokscale_ver, created_at, observation_count "
+            "FROM current_schema_drift_events"
         ).to_pylist()[0]
         state = SchemaDriftState(
             domain=persisted["domain"],
@@ -351,7 +373,6 @@ def test_clean_complete_domain_resolves_existing_event(
             detail=persisted["detail"],
             contract_tokscale_ver=persisted["contract_tokscale_ver"],
             created_at=persisted["created_at"],
-            detected_run_id=persisted["detected_run_id"],
             observation_count=persisted["observation_count"],
         )
         next_time = when + timedelta(seconds=1)
@@ -407,14 +428,12 @@ def test_clean_complete_domain_resolves_existing_event(
         assert second.resolved_schema_drift == (state,)
         persist_run(backend, normalize(second))
         row = backend.query(
-            "SELECT created_at, updated_at, detected_run_id, updated_run_id, "
-            "resolved, observation_count FROM schema_drift_events"
+            "SELECT created_at, collected_at, "
+            "resolved, observation_count FROM current_schema_drift_events"
         ).to_pylist()[0]
         assert row == {
             "created_at": first.finished_at,
-            "updated_at": second.finished_at,
-            "detected_run_id": first.run_id,
-            "updated_run_id": second.run_id,
+            "collected_at": second.finished_at,
             "resolved": True,
             "observation_count": 1,
         }
@@ -511,7 +530,7 @@ def test_empty_report_is_a_successful_secondary_domain(
         report_status.status,
         report_status.expected_count,
         report_status.succeeded_count,
-        report_status.last_succeeded_run,
+        report_status.run_id,
         report_status.failure_code,
     ) == ("complete", 1, 1, run_id, None)
 

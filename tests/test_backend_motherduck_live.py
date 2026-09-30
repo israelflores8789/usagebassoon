@@ -4,15 +4,7 @@
 """test_backend_motherduck_live.py — Opt-in MotherDuck integration tests.
 
 Run with ``just test-md-live`` against the disposable ``usagebassoon_it`` database.
-Or, run with ``USAGEBASSOON_MOTHERDUCK_LIVE=1 uv run pytest -m motherduck_live``.
-
-The ``motherduck_live`` marker selects these tests, and
-``USAGEBASSOON_MOTHERDUCK_LIVE=1`` enables access to a
-preconfigured MotherDuck database called ``usagebassoon_it``.
-
-Set ``USAGEBASSOON_MOTHERDUCK_LIVE_RESET=1`` to enable the
-final snapshot/restore test, which deletes and recreates tables
-in the preconfigured, disposable database.
+The recipe enables live access and resets the dedicated integration schema.
 """
 
 from __future__ import annotations
@@ -23,15 +15,15 @@ import signal
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from threading import Barrier
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 from sqlglot import exp
 
+from tests._observations import observations
 from tests._sql_parity import (
     assert_view_results_match,
     normalized_records,
@@ -41,15 +33,11 @@ from tests._sql_parity import (
 )
 from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
-    EXPECTED_DAYS,
     EXPECTED_REPORT_ROWS,
 )
 from usagebassoon.backends.base import (
     CurrentStateWrite,
     PersistenceBatch,
-    SourceLeaseBusy,
-    SourceLeaseLost,
-    SourceLeaseToken,
     StorageBackend,
     is_simple_identifier,
 )
@@ -59,7 +47,7 @@ from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
-from usagebassoon.source_leases import source_lease
+from usagebassoon.storage_model import SNAPSHOT_TABLES
 
 pytestmark = [pytest.mark.motherduck_live, pytest.mark.usefixtures("live_settings")]
 
@@ -149,7 +137,14 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
         backend.apply_ddl()
     finally:
         backend.close()
-    yield LiveSettings(source_id, config_path)
+    try:
+        yield LiveSettings(source_id, config_path)
+    finally:
+        cleanup = MotherDuckBackend(_DATABASE)
+        try:
+            _reset_test_schema(cleanup)
+        finally:
+            cleanup.close()
 
 
 def _backend() -> MotherDuckBackend:
@@ -180,25 +175,21 @@ def _rows_for_source(
     )
 
 
-def _audit_only_batch(
-    source_id: str, run_id: str, *, lease: SourceLeaseToken | None = None
-) -> PersistenceBatch:
-    """Build a minimal valid batch for live lease and ledger checks."""
-    return PersistenceBatch(
-        run_id=run_id,
-        current_state=(),
-        append_only={},
-        ingest_runs=pa.table(
-            {
-                "run_id": [run_id],
-                "source_id": [source_id],
-                "started_at": [datetime.now(UTC)],
-                "rows_inserted": [0],
-                "rows_updated": [0],
-            }
-        ),
-        lease=lease,
-    )
+@pytest.fixture(autouse=True)
+def empty_live_warehouse(live_settings: LiveSettings) -> None:
+    """Isolate each case's rows in the dedicated initialized integration database.
+
+    These tests must remain serialized because they share usagebassoon_it.
+    """
+    configuration = ConfigurationManager(live_settings.config_path).load()
+    assert configuration.motherduck is not None
+    backend = MotherDuckBackend(configuration.motherduck.database)
+    try:
+        with backend.transaction():
+            for table in SNAPSHOT_TABLES:
+                backend.connection.execute(f'DELETE FROM "{table}"')
+    finally:
+        backend.close()
 
 
 def test_live_synthetic_views_match_duckdb() -> None:
@@ -226,9 +217,7 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
     expected_inserted = (
         EXPECTED_REPORT_ROWS
         + EXPECTED_DAILY_STATS_ROWS
-        + EXPECTED_DAYS
         + sum(len(prices) for prices in collection_bundle.pricing_by_day.values())
-        + len(collection_bundle.ingest_status)
     )
     try:
         local.apply_ddl()
@@ -239,9 +228,8 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         for table in (
             "sessions",
             "daily_stats",
-            "daily_activity",
             "price_versions",
-            "ingest_status",
+            "collection_status",
         ):
             assert _rows_for_source(remote, table, live_settings.source_id) == (
                 _rows_for_source(local, table, live_settings.source_id)
@@ -249,172 +237,12 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         retried = persist_with_retries(configuration, normalized, _LOG)
         assert (retried.inserted, retried.updated) == (0, 0)
         assert remote.query(
-            "SELECT count(*) AS n FROM ingest_runs WHERE run_id = :run_id",
+            "SELECT count(*) AS n FROM collection_runs WHERE run_id = :run_id",
             {"run_id": normalized.run_id},
         ).to_pylist() == [{"n": 1}]
     finally:
         local.close()
         remote.close()
-
-
-def test_live_source_lease_context_releases_for_next_collection(
-    live_settings: LiveSettings,
-) -> None:
-    """Hold a configured source lease through the collection context."""
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    contender = _backend()
-    try:
-        with source_lease(configuration, str(uuid4()), _LOG) as active:
-            active.check()
-            assert (
-                contender.claim_source_lease(
-                    configuration.source_id, str(uuid4()), str(uuid4())
-                )
-                is None
-            )
-            other_source = str(uuid4())
-            contender.ensure_source_lease(other_source)
-            independent = contender.claim_source_lease(
-                other_source, str(uuid4()), str(uuid4())
-            )
-            assert independent is not None
-            contender.release_source_lease(independent)
-        next_token = contender.claim_source_lease(
-            configuration.source_id, str(uuid4()), str(uuid4())
-        )
-        assert next_token is not None
-        assert next_token.fence > active.token.fence
-        contender.release_source_lease(next_token)
-    finally:
-        contender.close()
-
-
-def test_live_distinct_sources_claim_concurrently(
-    live_settings: LiveSettings,
-) -> None:
-    """Initialize and claim independent sources from simultaneous collectors."""
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    sources = (str(uuid4()), str(uuid4()))
-    start = Barrier(2)
-
-    def claim(source_id: str) -> SourceLeaseToken:
-        """Start each configured collection after both workers are ready."""
-        config = replace(configuration, source_id=source_id)
-        start.wait()
-        with source_lease(config, str(uuid4()), _LOG) as active:
-            active.check()
-            return active.token
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        tokens = list(executor.map(claim, sources))
-    assert {token.source_id for token in tokens} == set(sources)
-
-
-def test_live_simultaneous_source_claims_have_one_owner() -> None:
-    """Keep one remote owner when separate connections race to claim."""
-    first = _backend()
-    second = _backend()
-    source_id = str(uuid4())
-    start = Barrier(2)
-    winner: SourceLeaseToken | None = None
-
-    def claim(backend: MotherDuckBackend) -> SourceLeaseToken | None:
-        """Start both claims after the two remote connections are ready."""
-        start.wait()
-        try:
-            return backend.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
-        except Exception as error:
-            if backend.is_retryable_error(error):
-                return None
-            raise
-
-    try:
-        first.ensure_source_lease(source_id)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            claims = list(executor.map(claim, (first, second)))
-        owned = [token for token in claims if token is not None]
-        assert len(owned) == 1
-        winner = owned[0]
-        assert winner.fence == 1
-        assert first.query(
-            "SELECT fence, owner_id FROM source_leases WHERE source_id = :source_id",
-            {"source_id": source_id},
-        ).to_pylist() == [{"fence": winner.fence, "owner_id": winner.owner_id}]
-    finally:
-        if winner is not None:
-            first.release_source_lease(winner)
-        first.close()
-        second.close()
-
-
-def test_live_source_lease_takeover_fences_stale_batch() -> None:
-    """Reject an expired owner's transaction after another owner takes over."""
-    first = _backend()
-    second = _backend()
-    source_id = str(uuid4())
-    run_id = str(uuid4())
-    stale: SourceLeaseToken | None = None
-    successor: SourceLeaseToken | None = None
-    try:
-        first.ensure_source_lease(source_id)
-        stale = first.claim_source_lease(source_id, run_id, str(uuid4()))
-        assert stale is not None
-        assert first.renew_source_lease(stale)
-        first.connection.execute(
-            "UPDATE source_leases SET lease_expires_at = "
-            "CURRENT_TIMESTAMP - INTERVAL '1 second' "
-            "WHERE source_id = ? AND fence = ?",
-            [source_id, stale.fence],
-        )
-        successor = second.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
-        assert successor is not None
-        assert successor.fence == stale.fence + 1
-        assert not first.renew_source_lease(stale)
-        first.release_source_lease(stale)
-        assert second.renew_source_lease(successor)
-        with pytest.raises(SourceLeaseLost):
-            first.persist_batch(_audit_only_batch(source_id, run_id, lease=stale))
-        assert first.query(
-            "SELECT count(*) AS n FROM ingest_runs WHERE run_id = :run_id",
-            {"run_id": run_id},
-        ).to_pylist() == [{"n": 0}]
-    finally:
-        if stale is not None:
-            first.release_source_lease(stale)
-        if successor is not None:
-            second.release_source_lease(successor)
-        first.close()
-        second.close()
-
-
-def test_live_same_run_lease_and_ledger_prevent_duplicate_audit_rows() -> None:
-    """Block a competing write and make a later retry a no-op."""
-    first = _backend()
-    second = _backend()
-    source_id = str(uuid4())
-    run_id = str(uuid4())
-    token: SourceLeaseToken | None = None
-    try:
-        first.ensure_source_lease(source_id)
-        token = first.claim_source_lease(source_id, run_id, str(uuid4()))
-        assert token is not None
-        batch = _audit_only_batch(source_id, run_id)
-        with pytest.raises(SourceLeaseBusy):
-            second.persist_batch(batch)
-        committed = first.persist_batch(replace(batch, lease=token))
-        assert not committed.already_committed
-        first.release_source_lease(token)
-        retried = second.persist_batch(batch)
-        assert retried.already_committed
-        assert second.query(
-            "SELECT count(*) AS n FROM ingest_runs WHERE run_id = :run_id",
-            {"run_id": run_id},
-        ).to_pylist() == [{"n": 1}]
-    finally:
-        if token is not None:
-            first.release_source_lease(token)
-        first.close()
-        second.close()
 
 
 def test_live_concurrent_sources_persist_independently(
@@ -446,7 +274,7 @@ def test_live_concurrent_sources_persist_independently(
     backend = _backend()
     try:
         assert backend.query(
-            "SELECT count(*) AS n FROM ingest_runs "
+            "SELECT count(*) AS n FROM collection_runs "
             "WHERE run_id IN (:first_run, :second_run)",
             {"first_run": first.run_id, "second_run": second.run_id},
         ).to_pylist() == [{"n": 2}]
@@ -459,44 +287,35 @@ def test_live_concurrent_sources_persist_independently(
         backend.close()
 
 
-def test_live_batch_rolls_back_after_late_failure() -> None:
-    """Rollback fact writes when a later append target is missing."""
+def test_live_batch_rolls_back_after_late_failure(
+    collection_bundle: CollectionBundle,
+) -> None:
+    bundle = _normalized_bundle(collection_bundle, str(uuid4()))
     backend = _backend()
-    source_id = str(uuid4())
-    run_id = str(uuid4())
-    current = pa.table(
-        {
-            "source_id": [source_id],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
-    )
-    batch = PersistenceBatch(
-        run_id=run_id,
-        current_state=(
-            CurrentStateWrite(
-                "daily_activity",
-                current,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
-            ),
-        ),
-        append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=_audit_only_batch(source_id, run_id).ingest_runs,
-    )
     try:
+        batch = PersistenceBatch(
+            bundle.run_id,
+            (
+                CurrentStateWrite(
+                    "daily_stats",
+                    bundle.tables["daily_stats"],
+                    ("source_id", "day", "client", "session_id", "model"),
+                    ("total_tokens",),
+                ),
+            ),
+            {"missing_history": bundle.tables["collection_ledger"]},
+            bundle.tables["collection_ledger"],
+        )
         with pytest.raises(Exception, match="missing_history"):
             backend.persist_batch(batch)
-        assert backend.query(
-            "SELECT count(*) AS n FROM daily_activity WHERE source_id = :source_id",
-            {"source_id": source_id},
-        ).to_pylist() == [{"n": 0}]
-        assert backend.query(
-            "SELECT count(*) AS n FROM ingest_runs WHERE run_id = :run_id",
-            {"run_id": run_id},
-        ).to_pylist() == [{"n": 0}]
+        assert not backend.has_committed_run(bundle.run_id)
+        assert (
+            backend.query(
+                "SELECT * FROM daily_stats WHERE source_id = :source_id",
+                {"source_id": bundle.tables["daily_stats"]["source_id"][0].as_py()},
+            ).num_rows
+            == 0
+        )
     finally:
         backend.close()
 
@@ -517,20 +336,24 @@ def test_live_snapshot_reads_one_transaction_state(
         """Commit a note after the first table read has materialized."""
         nonlocal reads
         result = original_query(sql, parameters)
+        if "CURRENT_TIMESTAMP" in sql:
+            return result
         reads += 1
         if reads == 1:
             stamp = datetime.now(UTC)
             writer.append(
                 "notes",
-                pa.table(
-                    {
-                        "source_id": [source_id],
-                        "client": ["codex"],
-                        "session_id": ["between-reads"],
-                        "note": ["committed after capture"],
-                        "created_at": [stamp],
-                        "updated_at": [stamp],
-                    }
+                observations(
+                    pa.table(
+                        {
+                            "source_id": [source_id],
+                            "client": ["codex"],
+                            "session_id": ["between-reads"],
+                            "note": ["committed after capture"],
+                            "created_at": [stamp],
+                            "collected_at": [stamp],
+                        }
+                    )
                 ),
             )
         return result

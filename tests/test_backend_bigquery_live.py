@@ -3,63 +3,115 @@
 
 """test_backend_bigquery_live.py — Opt-in live BigQuery integration tests.
 
-Run with ``just test-bq-live`` against the disposable ``usagebassoon_it`` dataset.
-Or, run with ``USAGEBASSOON_BIGQUERY_LIVE=1 uv run pytest -m bigquery_live``.
+Set ``USAGEBASSOON_BIGQUERY_LIVE=1`` to enable these ``bigquery_live`` tests against
+the dedicated ``usagebassoon_it`` dataset.
 
-The ``bigquery_live`` marker selects these tests, and ``USAGEBASSOON_BIGQUERY_LIVE=1``
-enables access to a preconfigured BigQuery dataset called ``usagebassoon_it``.
+Set ``USAGEBASSOON_BIGQUERY_LIVE_RESET=1`` to enable the restore test that deletes
+and recreates the initialized integration schema. The module fixture provisions
+and cleans up the dedicated dataset schema for every live run.
 
-Set ``USAGEBASSOON_BIGQUERY_LIVE_RESET=1`` to enable the final snapshot/restore
-test, which deletes and recreates tables in the preconfigured, disposable dataset.
+``USAGEBASSOON_BIGQUERY_PROJECT`` selects the ADC-backed project, and
+``USAGEBASSOON_BIGQUERY_LOCATION`` selects its dataset location (default ``US``).
+``USAGEBASSOON_BIGQUERY_DATASET`` must be ``usagebassoon_it`` when provided.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import signal
-from collections.abc import Iterator
+import time
+from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from importlib import resources
 from pathlib import Path
-from threading import Barrier
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
-from google.api_core.exceptions import BadRequest, NotFound
-from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery, bigquery_datatransfer
 from typer.testing import CliRunner
 
-from tests._sql_parity import assert_view_results_match, seed_synthetic_data
-from tests.conftest import (
-    EXPECTED_DAILY_STATS_ROWS,
-    EXPECTED_DAYS,
-    EXPECTED_REPORT_ROWS,
-)
-from usagebassoon import persistence as persistence_module
-from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
-from usagebassoon.backends.base import (
-    CurrentStateWrite,
-    PersistenceBatch,
-    SourceLeaseBusy,
-    SourceLeaseToken,
-)
+from tests._cli import plain_cli_output
+from tests._sql_parity import normalized_records, seed_synthetic_data, view_names
+from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.bigquery import BigQueryBackend
+from usagebassoon.backends.bigquery_compaction import (
+    BigQueryBackendCompaction,
+    install_compaction,
+)
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import ConfigurationManager
+from usagebassoon.curation import (
+    NoteAssignment,
+    TagAssignment,
+    add_tag,
+    remove_note,
+    remove_tag,
+    rename_tag,
+    set_note,
+)
 from usagebassoon.ingest import CollectionBundle
-from usagebassoon.normalizer import NormalizedBundle, normalize
-from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
-from usagebassoon.source_leases import source_lease
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle, normalize
+from usagebassoon.persistence import persist_run
+from usagebassoon.storage_model import DEBUG_TABLES, SNAPSHOT_TABLES, STATE_KEYS
 
 pytestmark = pytest.mark.bigquery_live
 
 _DATASET = "usagebassoon_it"
 _LOCATION = "US"
-_LIVE_TEST_TIMEOUT_SECONDS = 300
+_LIVE_TEST_TIMEOUT_SECONDS = 600
+
+
+@contextmanager
+def _phase(name: str) -> Generator[None, None, None]:
+    """Print phase wall time, including when a live check raises an error."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"BigQuery {name}: {time.monotonic() - started:.3f}s", flush=True)
+
+
+def _compact(backend: BigQueryBackend) -> None:
+    """Run the packaged compaction transaction and report its wall time."""
+    sql = backend._qualify_view_sql(
+        resources.files("usagebassoon.sql.bigquery")
+        .joinpath("compaction.sql")
+        .read_text()
+    )
+    with _phase("compaction"):
+        backend._wait_for_job(
+            backend.client.query(
+                sql, job_config=backend._query_config(), location=backend.location
+            )
+        )
+
+
+def _normalized_bundle(
+    collection_bundle: CollectionBundle,
+) -> tuple[str, NormalizedBundle]:
+    """Return an independent source identity and normalized collection run."""
+    source_id = str(uuid4())
+    return source_id, normalize(
+        replace(collection_bundle, source_id=source_id, run_id=str(uuid4()))
+    )
+
+
+def _snapshot_config(settings: LiveSettings, directory: Path, source_id: str) -> Path:
+    """Use the test's exact source namespace and an explicit private archive."""
+    configuration = directory / "config.toml"
+    content = settings.config_path.read_text().replace(
+        f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
+    )
+    configuration.write_text(
+        content + f'\n[snapshots]\nfile_uri = "{directory / "snapshots"}"\n'
+    )
+    return configuration
 
 
 @pytest.fixture(autouse=True)
@@ -162,8 +214,9 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
         )
         backend = BigQueryBackend(project, _DATASET, location=location)
         try:
-            _reset_test_schema(client, f"{project}.{_DATASET}")
-            backend.apply_ddl()
+            with _phase("schema provisioning"):
+                _reset_test_schema(client, f"{project}.{_DATASET}")
+                backend.apply_ddl()
             dataset = backend.client.get_dataset(f"{project}.{_DATASET}")
             assert isinstance(dataset.location, str)
             assert dataset.location.casefold() == location.casefold()
@@ -171,7 +224,40 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
             backend.close()
         yield LiveSettings(project, location, source_id, config_path)
     finally:
+        with _phase("schema cleanup"):
+            _reset_test_schema(client, f"{client.project}.{_DATASET}")
         client.close()
+
+
+@pytest.fixture
+def managed_compaction_schedule(
+    live_settings: LiveSettings, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Remove only schedules created by a live CLI initialization test."""
+    parent = (
+        f"projects/{live_settings.project}/locations/{live_settings.location.lower()}"
+    )
+    with bigquery_datatransfer.DataTransferServiceClient() as client:
+        existing = {
+            config.name for config in client.list_transfer_configs(parent=parent)
+        }
+        created: set[str] = set()
+
+        def install(backend: BigQueryBackendCompaction) -> str:
+            """Run real provisioning and track any newly created configuration."""
+            name = install_compaction(backend)
+            if name not in existing:
+                created.add(name)
+            return name
+
+        monkeypatch.setattr(
+            "usagebassoon.backends.bigquery_compaction.install_compaction", install
+        )
+        try:
+            yield
+        finally:
+            for name in created:
+                client.delete_transfer_config(name=name)
 
 
 def _backend(settings: LiveSettings) -> BigQueryBackend:
@@ -179,577 +265,142 @@ def _backend(settings: LiveSettings) -> BigQueryBackend:
     return BigQueryBackend(settings.project, _DATASET, location=settings.location)
 
 
-def _normalized_bundle(
-    settings: LiveSettings,
-    collection_bundle: CollectionBundle,
-    *,
-    source_id: str | None = None,
-) -> NormalizedBundle:
-    """Create a collision-free golden-fixture batch for the live dataset."""
-    return normalize(
-        replace(
-            collection_bundle,
-            run_id=str(uuid4()),
-            source_id=source_id or settings.source_id,
-        )
-    )
+@pytest.fixture(autouse=True)
+def empty_live_warehouse(live_settings: LiveSettings) -> None:
+    """Start every case with empty usage tables in the dedicated warehouse.
 
-
-def _rows_for_source(
-    backend: BigQueryBackend | DuckDBBackend,
-    table: str,
-    source_id: str,
-    order_by: str,
-) -> list[dict[str, object]]:
-    """Return deterministic current-state rows for one source namespace."""
-    return backend.query(
-        f"SELECT * FROM {table} WHERE source_id = '{source_id}' ORDER BY {order_by}"
-    ).to_pylist()
-
-
-def _assert_rows_match(
-    table: str,
-    actual: list[dict[str, object]],
-    expected: list[dict[str, object]],
-) -> None:
-    """Assert row parity and report the first differing fields clearly."""
-    if actual == expected:
-        return
-    for index, (actual_row, expected_row) in enumerate(
-        zip(actual, expected, strict=False)
-    ):
-        differences = {
-            field: (actual_row.get(field), expected_row.get(field))
-            for field in actual_row.keys() | expected_row.keys()
-            if actual_row.get(field) != expected_row.get(field)
-        }
-        if differences:
-            pytest.fail(f"{table} row {index} differs by field: {differences!r}")
-    pytest.fail(
-        f"{table} row count differs: BigQuery={len(actual)}, DuckDB={len(expected)}"
-    )
-
-
-def _stage_tables(
-    client: bigquery.Client,
-    dataset_id: str,
-    *,
-    run_id: str | None = None,
-) -> list[str]:
-    """List leftover remote staging tables for one dedicated test run."""
-    suffix = run_id.replace("-", "") if run_id else ""
-    return sorted(
-        item.table_id
-        for item in client.list_tables(dataset_id)
-        if item.table_id.startswith("_stage_") and item.table_id.endswith(suffix)
-    )
-
-
-def _audit_only_batch(
-    source_id: str,
-    run_id: str,
-    *,
-    lease: SourceLeaseToken | None = None,
-) -> PersistenceBatch:
-    """Build a valid minimal batch for live lease and ledger assertions."""
-    return PersistenceBatch(
-        run_id=run_id,
-        current_state=(),
-        append_only={},
-        ingest_runs=pa.table(
-            {
-                "run_id": [run_id],
-                "source_id": [source_id],
-                "started_at": [datetime.now(UTC)],
-                "rows_inserted": [0],
-                "rows_updated": [0],
-            }
-        ),
-        lease=lease,
-    )
-
-
-def test_live_synthetic_views_match_duckdb(live_settings: LiveSettings) -> None:
-    """Compare every view using purpose-built rows in native BigQuery."""
-    duckdb_backend = DuckDBBackend(":memory:")
-    bigquery_backend = _backend(live_settings)
-    try:
-        duckdb_backend.apply_ddl()
-        bigquery_backend.apply_ddl()
-        seed_synthetic_data(duckdb_backend)
-        seed_synthetic_data(bigquery_backend)
-        assert_view_results_match(duckdb_backend, bigquery_backend)
-    finally:
-        duckdb_backend.close()
-        bigquery_backend.close()
-
-
-def test_live_batch_matches_duckdb_and_retries_idempotently(
-    live_settings: LiveSettings,
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Persist the full golden batch and compare BigQuery current state to DuckDB."""
-    normalized = _normalized_bundle(live_settings, collection_bundle)
-    duckdb_backend = DuckDBBackend(":memory:")
-    bigquery_backend = _backend(live_settings)
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    expected_inserted = (
-        EXPECTED_REPORT_ROWS
-        + EXPECTED_DAILY_STATS_ROWS
-        + EXPECTED_DAYS
-        + sum(len(prices) for prices in collection_bundle.pricing_by_day.values())
-        + len(collection_bundle.ingest_status)
-    )
-    try:
-        duckdb_backend.apply_ddl()
-        bigquery_backend.apply_ddl()
-        expected = persist_run(duckdb_backend, normalized)
-        actual = persist_with_retries(
-            configuration,
-            normalized,
-            logging.getLogger("usagebassoon-bigquery-live"),
-        )
-
-        assert (actual.inserted, actual.updated) == (
-            expected_inserted,
-            0,
-        )
-        assert actual == expected
-        for table, order_by in (
-            ("sessions", "client, session_id"),
-            ("session_model_stats", "client, session_id, model"),
-            ("daily_stats", "day, client, session_id, model"),
-            ("daily_activity", "day"),
-            ("price_versions", "day, model"),
-            ("ingest_status", "day, domain"),
-        ):
-            bigquery_rows = _rows_for_source(
-                bigquery_backend,
-                table,
-                normalized.tables["ingest_runs"].column("source_id").to_pylist()[0],
-                order_by,
-            )
-            duckdb_rows = _rows_for_source(
-                duckdb_backend,
-                table,
-                normalized.tables["ingest_runs"].column("source_id").to_pylist()[0],
-                order_by,
-            )
-            _assert_rows_match(
-                table,
-                bigquery_rows,
-                duckdb_rows,
-            )
-        assert bigquery_backend.query(
-            "SELECT rows_inserted, rows_updated FROM ingest_runs "
-            f"WHERE run_id = '{normalized.run_id}'"
-        ).to_pylist() == [{"rows_inserted": expected_inserted, "rows_updated": 0}]
-        price_count = sum(
-            len(prices) for prices in collection_bundle.pricing_by_day.values()
-        )
-        assert bigquery_backend.query(
-            "SELECT count(*) AS n FROM price_versions "
-            f"WHERE source_id = '{live_settings.source_id}'"
-        ).to_pylist() == [{"n": price_count}]
-
-        retried = persist_with_retries(
-            configuration,
-            normalized,
-            logging.getLogger("usagebassoon-bigquery-live"),
-        )
-        assert (retried.inserted, retried.updated) == (0, 0)
-        assert all(
-            result.inserted == 0 and result.updated == 0
-            for result in retried.per_table.values()
-        )
-        assert bigquery_backend.query(
-            "SELECT count(*) AS n FROM ingest_runs "
-            f"WHERE run_id = '{normalized.run_id}'"
-        ).to_pylist() == [{"n": 1}]
-        assert (
-            _stage_tables(
-                bigquery_backend.client,
-                live_settings.dataset_id,
-                run_id=normalized.run_id,
-            )
-            == []
-        )
-
-        sessions_schema = bigquery_backend.client.get_table(
-            f"{live_settings.dataset_id}.sessions"
-        ).schema
-        schema_by_name = {field.name: field for field in sessions_schema}
-        assert schema_by_name["models_used"].field_type == "STRING"
-        assert schema_by_name["models_used"].mode == "REPEATED"
-        assert schema_by_name["created_at"].field_type == "TIMESTAMP"
-        daily_schema = bigquery_backend.client.get_table(
-            f"{live_settings.dataset_id}.daily_stats"
-        ).schema
-        daily_types = {field.name: field.field_type for field in daily_schema}
-        assert daily_types["day"] == "DATE"
-        assert {
-            name: daily_types[name]
-            for name in (
-                "perf_duration_ms",
-                "perf_timed_tokens",
-                "perf_sample_count",
-                "perf_token_coverage",
-                "tokscale_ms_per_1k_tokens",
-            )
-        } == {
-            "perf_duration_ms": "INTEGER",
-            "perf_timed_tokens": "INTEGER",
-            "perf_sample_count": "INTEGER",
-            "perf_token_coverage": "FLOAT",
-            "tokscale_ms_per_1k_tokens": "FLOAT",
-        }
-    finally:
-        duckdb_backend.close()
-        bigquery_backend.close()
-
-
-def test_live_source_lease_takeover_fences_stale_batches(
-    live_settings: LiveSettings,
-) -> None:
-    """Reclaim an expired source and reject its former owner's batch."""
-    first_backend = _backend(live_settings)
-    second_backend = _backend(live_settings)
-    source_id = str(uuid4())
-    first_run = str(uuid4())
-    first: SourceLeaseToken | None = None
-    successor: SourceLeaseToken | None = None
-    try:
-        first_backend.ensure_source_lease(source_id)
-        second_backend.ensure_source_lease(source_id)
-        assert first_backend.query(
-            "SELECT COUNT(*) AS n FROM source_leases WHERE source_id = @source_id",
-            {"source_id": source_id},
-        ).to_pylist() == [{"n": 1}]
-        first = first_backend.claim_source_lease(source_id, first_run, str(uuid4()))
-        assert first is not None
-        assert (
-            second_backend.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
-            is None
-        )
-        assert first_backend.renew_source_lease(first)
-
-        other_source = str(uuid4())
-        second_backend.ensure_source_lease(other_source)
-        independent = second_backend.claim_source_lease(
-            other_source, str(uuid4()), str(uuid4())
-        )
-        assert independent is not None
-        second_backend.release_source_lease(independent)
-
-        first_backend._lease_rows(
-            f"UPDATE {first_backend._table_ref('source_leases')} "
-            "SET lease_expires_at = TIMESTAMP_SUB(CURRENT_TIMESTAMP(), "
-            "INTERVAL 1 SECOND) WHERE source_id = @source_id AND fence = @fence",
-            [
-                bigquery.ScalarQueryParameter("source_id", "STRING", source_id),
-                bigquery.ScalarQueryParameter("fence", "INT64", first.fence),
-            ],
-        )
-        successor = second_backend.claim_source_lease(
-            source_id, str(uuid4()), str(uuid4())
-        )
-        assert successor is not None
-        assert successor.fence == first.fence + 1
-        assert not first_backend.renew_source_lease(first)
-        first_backend.release_source_lease(first)
-        assert second_backend.renew_source_lease(successor)
-
-        with pytest.raises(BadRequest, match="collection source lease was lost"):
-            first_backend.persist_batch(
-                _audit_only_batch(source_id, first_run, lease=first)
-            )
-        assert first_backend.query(
-            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
-            {"run_id": first_run},
-        ).to_pylist() == [{"n": 0}]
-        assert (
-            _stage_tables(
-                first_backend.client, live_settings.dataset_id, run_id=first_run
-            )
-            == []
-        )
-    finally:
-        if first is not None:
-            first_backend.release_source_lease(first)
-        if successor is not None:
-            second_backend.release_source_lease(successor)
-        first_backend.close()
-        second_backend.close()
-
-
-def test_live_simultaneous_source_claims_have_one_owner(
-    live_settings: LiveSettings,
-) -> None:
-    """Allow only one of two simultaneous claims on the same source row."""
-    first_backend = _backend(live_settings)
-    second_backend = _backend(live_settings)
-    source_id = str(uuid4())
-    start = Barrier(2)
-    winner: SourceLeaseToken | None = None
-
-    def claim(backend: BigQueryBackend) -> SourceLeaseToken | None:
-        """Start a contender only after both BigQuery clients are ready."""
-        start.wait()
-        return backend.claim_source_lease(source_id, str(uuid4()), str(uuid4()))
-
-    try:
-        first_backend.ensure_source_lease(source_id)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            claims = list(executor.map(claim, (first_backend, second_backend)))
-        owned = [token for token in claims if token is not None]
-        assert len(owned) == 1
-        winner = owned[0]
-        assert first_backend.query(
-            "SELECT fence, owner_id FROM source_leases WHERE source_id = @source_id",
-            {"source_id": source_id},
-        ).to_pylist() == [{"fence": winner.fence, "owner_id": winner.owner_id}]
-        assert winner.fence == 1
-    finally:
-        if winner is not None:
-            first_backend.release_source_lease(winner)
-        first_backend.close()
-        second_backend.close()
-
-
-def test_live_same_run_lease_and_ledger_prevent_duplicate_audit_rows(
-    live_settings: LiveSettings,
-) -> None:
-    """Block a competing run and make a later retry an idempotent no-op."""
-    first_backend = _backend(live_settings)
-    second_backend = _backend(live_settings)
-    source_id = str(uuid4())
-    run_id = str(uuid4())
-    token: SourceLeaseToken | None = None
-    try:
-        first_backend.ensure_source_lease(source_id)
-        token = first_backend.claim_source_lease(source_id, run_id, str(uuid4()))
-        assert token is not None
-        batch = _audit_only_batch(source_id, run_id)
-        with pytest.raises(SourceLeaseBusy):
-            second_backend.persist_batch(batch)
-        committed = first_backend.persist_batch(replace(batch, lease=token))
-        assert not committed.already_committed
-        first_backend.release_source_lease(token)
-        retried = second_backend.persist_batch(batch)
-        assert retried.already_committed
-        assert second_backend.query(
-            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
-            {"run_id": run_id},
-        ).to_pylist() == [{"n": 1}]
-        assert (
-            _stage_tables(
-                second_backend.client, live_settings.dataset_id, run_id=run_id
-            )
-            == []
-        )
-    finally:
-        if token is not None:
-            first_backend.release_source_lease(token)
-        first_backend.close()
-        second_backend.close()
-
-
-def test_live_ambiguous_commit_retry_keeps_one_audit_row(
-    live_settings: LiveSettings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Retry a committed run after its acknowledgement is lost."""
-    run_id = str(uuid4())
-    source_id = str(uuid4())
-    bundle = NormalizedBundle(
-        run_id, {"ingest_runs": _audit_only_batch(source_id, run_id).ingest_runs}
-    )
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    actual_persist = persistence_module.persist_run
-    attempts = 0
-
-    def lose_first_acknowledgement(
-        backend: BigQueryBackend, normalized: NormalizedBundle
-    ) -> PersistSummary:
-        """Commit remotely, then simulate losing the first client response."""
-        nonlocal attempts
-        result = actual_persist(backend, normalized)
-        attempts += 1
-        if attempts == 1:
-            raise BadRequest("transaction is aborted due to concurrent update")
-        return result
-
-    monkeypatch.setattr(persistence_module, "persist_run", lose_first_acknowledgement)
-    summary = persistence_module.persist_with_retries(
-        configuration,
-        bundle,
-        logging.getLogger("usagebassoon-bigquery-live"),
-    )
-    assert attempts == 2
-    assert summary == PersistSummary(0, 0, {})
+    These tests must remain serialized because they share usagebassoon_it.
+    """
     backend = _backend(live_settings)
-    try:
-        assert backend.query(
-            "SELECT COUNT(*) AS n FROM ingest_runs WHERE run_id = @run_id",
-            {"run_id": run_id},
-        ).to_pylist() == [{"n": 1}]
-        assert (
-            _stage_tables(backend.client, live_settings.dataset_id, run_id=run_id) == []
+    physical = set(STATE_KEYS) | {
+        "raw_" + name for name in set(STATE_KEYS) | DEBUG_TABLES
+    }
+    physical.add("collection_ledger")
+    script = (
+        "BEGIN TRANSACTION;\n"
+        + "\n".join(
+            f"TRUNCATE TABLE {backend._table_ref(name)};" for name in sorted(physical)
         )
-    finally:
-        backend.close()
-
-
-def test_live_source_lease_context_releases_for_next_collection(
-    live_settings: LiveSettings,
-) -> None:
-    """Hold the collection source from planning until context exit."""
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    logger = logging.getLogger("usagebassoon-bigquery-live")
-    contender = _backend(live_settings)
+        + f"\nDELETE FROM {backend._table_ref('compaction_ledger')} "
+        "WHERE domain != '__lock__';\nCOMMIT TRANSACTION;"
+    )
     try:
-        with source_lease(configuration, str(uuid4()), logger) as active:
-            active.check()
-            assert (
-                contender.claim_source_lease(
-                    configuration.source_id, str(uuid4()), str(uuid4())
+        with _phase("test row cleanup"):
+            backend._wait_for_job(
+                backend.client.query(
+                    script,
+                    job_config=backend._query_config(),
+                    location=backend.location,
                 )
-                is None
             )
-        next_token = contender.claim_source_lease(
-            configuration.source_id, str(uuid4()), str(uuid4())
-        )
-        assert next_token is not None
-        assert next_token.fence > active.token.fence
-        contender.release_source_lease(next_token)
-    finally:
-        contender.close()
-
-
-def test_live_snapshot_reads_tables_at_one_bigquery_timestamp(
-    live_settings: LiveSettings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exclude a note committed between two historical table reads."""
-    reader = _backend(live_settings)
-    writer = _backend(live_settings)
-    source_id = str(uuid4())
-    original = reader._read_query_arrow
-    reads = 0
-
-    def read_then_write(job: bigquery.job.QueryJob) -> pa.Table:
-        """Commit a note after the first snapshot table materializes."""
-        nonlocal reads
-        data = original(job)
-        reads += 1
-        if reads == 1:
-            stamp = datetime.now(UTC)
-            writer.append(
-                "notes",
-                pa.table(
-                    {
-                        "source_id": [source_id],
-                        "client": ["codex"],
-                        "session_id": ["between-reads"],
-                        "note": ["committed after capture"],
-                        "created_at": [stamp],
-                        "updated_at": [stamp],
-                    }
-                ),
-            )
-        return data
-
-    monkeypatch.setattr(reader, "_read_query_arrow", read_then_write)
-    try:
-        snapshot = reader.read_snapshot_tables(("sessions", "notes"))
-        assert snapshot.captured_at.tzinfo is not None
-        assert reads == 2
-        assert all(
-            row["source_id"] != source_id
-            for row in snapshot.tables["notes"].to_pylist()
-        )
-        assert writer.query(
-            "SELECT COUNT(*) AS n FROM notes WHERE source_id = @source_id",
-            {"source_id": source_id},
-        ).to_pylist() == [{"n": 1}]
-    finally:
-        reader.close()
-        writer.close()
-
-
-def test_live_batch_rolls_back_after_staging_and_logs_cleanup(
-    live_settings: LiveSettings,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Rollback user writes when a later staged append target does not exist."""
-    backend = _backend(live_settings)
-    run_id = str(uuid4())
-    source_id = str(uuid4())
-    current = pa.table(
-        {
-            "source_id": [source_id],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
-    )
-    batch = PersistenceBatch(
-        run_id=run_id,
-        current_state=(
-            CurrentStateWrite(
-                "daily_activity",
-                current,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
-            ),
-        ),
-        append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=pa.table({"run_id": [run_id], "source_id": [source_id]}),
-    )
-    try:
-        backend.apply_ddl()
-        with (
-            caplog.at_level(logging.INFO, logger="usagebassoon"),
-            pytest.raises(Exception, match="missing_history"),
-        ):
-            backend.persist_batch(batch)
-        assert backend.query(
-            f"SELECT count(*) AS n FROM daily_activity WHERE source_id = '{source_id}'"
-        ).to_pylist() == [{"n": 0}]
-        assert backend.query(
-            f"SELECT count(*) AS n FROM ingest_runs WHERE run_id = '{run_id}'"
-        ).to_pylist() == [{"n": 0}]
-        assert (
-            _stage_tables(
-                backend.client,
-                live_settings.dataset_id,
-                run_id=run_id,
-            )
-            == []
-        )
-        assert any(
-            "removed BigQuery staging table" in record.message
-            for record in caplog.records
-        )
     finally:
         backend.close()
+
+
+def test_live_synthetic_views_use_the_shared_logical_contract(
+    live_settings: LiveSettings,
+) -> None:
+    """Compare native BigQuery views with DuckDB, including duplicate raw writes."""
+    local = DuckDBBackend(":memory:")
+    remote = _backend(live_settings)
+    try:
+        local.apply_ddl()
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        seed_synthetic_data(remote)
+        names = view_names()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                name: executor.submit(remote.query, f"SELECT * FROM {name}")
+                for name in names
+            }
+            for name, future in futures.items():
+                actual = future.result()
+                expected = local.query(f"SELECT * FROM {name}")
+                assert expected.column_names == actual.column_names, name
+                preserve_order = name == "report_summary_models"
+                assert normalized_records(expected, preserve_order=preserve_order) == (
+                    normalized_records(actual, preserve_order=preserve_order)
+                ), name
+    finally:
+        remote.close()
+        local.close()
+
+
+@pytest.mark.usefixtures("managed_compaction_schedule")
+def test_live_cli_commands_including_models_report(
+    live_settings: LiveSettings,
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise configured CLI reads, curation, export, init, and snapshots."""
+    source_id, bundle = _normalized_bundle(collection_bundle)
+    backend = _backend(live_settings)
+    try:
+        persist_run(backend, bundle)
+    finally:
+        backend.close()
+    config_path = _snapshot_config(live_settings, tmp_path, source_id)
+    configuration = ConfigurationManager(config_path).load()
+
+    def preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Keep warehouse CLI checks independent of an installed tokscale binary."""
+        return ("tokscale",), collection_bundle.graph.meta.version
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", preflight)
+    session = collection_bundle.report_rows[0]
+    runner = CliRunner()
+    tag = "cli-" + str(uuid4())
+    export_path = tmp_path / "sessions.json"
+
+    def invoke(*parts: str) -> str:
+        """Run one real configured CLI command and report its wall time."""
+        with _phase("CLI " + " ".join(parts[:2])):
+            result = runner.invoke(app, [*parts, "--config", str(config_path)])
+        output = plain_cli_output(result.output)
+        assert result.exit_code == 0, f"{parts!r}: {output}\n{result.exception!r}"
+        return output
+
+    assert "Initialized bigquery schema" in invoke("init")
+    invoke("query", "report_summary", "--limit", "1", "--format", "json")
+    assert "Model Token Usage" in invoke("report", "models", "--source", source_id)
+    invoke("export", "sessions", str(export_path), "--format", "json")
+    invoke("tag", "add", tag, "--client", session.client)
+    invoke(
+        "note",
+        "set",
+        "live integration note",
+        "--client",
+        session.client,
+        "--session",
+        session.session_id,
+    )
+    invoke("doctor")
+    invoke("audit")
+    invoke("snapshot")
+    invoke("tag", "rename", tag, tag + "-renamed", "--client", session.client)
+    invoke("tag", "remove", tag + "-renamed", "--client", session.client)
+    invoke(
+        "note", "remove", "--client", session.client, "--session", session.session_id
+    )
+    assert export_path.is_file()
+    assert SnapshotArchiver.from_config(configuration).list_snapshots()
 
 
 def test_live_location_and_credential_errors_are_actionable(
-    live_settings: LiveSettings,
-    tmp_path: Path,
+    live_settings: LiveSettings, tmp_path: Path
 ) -> None:
-    """Keep location mismatch and unusable credential diagnostics predictable."""
-    mismatched = BigQueryBackend(live_settings.project, _DATASET, location="EU")
+    """Reject mismatched dataset locations and unusable credential files clearly."""
+    location = "US" if live_settings.location.casefold() == "eu" else "EU"
+    backend = BigQueryBackend(live_settings.project, _DATASET, location=location)
     try:
         with pytest.raises(
-            ValueError,
-            match="does not match existing dataset location",
+            ValueError, match="configured BigQuery location does not match the dataset"
         ):
-            mismatched.apply_ddl()
+            backend.apply_ddl()
     finally:
-        mismatched.close()
+        backend.close()
     with pytest.raises(RuntimeError, match="credentials file could not be loaded"):
         BigQueryBackend(
             live_settings.project,
@@ -758,221 +409,472 @@ def test_live_location_and_credential_errors_are_actionable(
         )
 
 
-def test_live_concurrent_sources_use_distinct_stages_and_retry(
+def test_live_append_publication_is_visible_and_replay_safe(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Persist independent source namespaces concurrently through the retry path."""
-    first_source_id = str(uuid4())
-    second_source_id = str(uuid4())
-    first = _normalized_bundle(
-        live_settings, collection_bundle, source_id=first_source_id
-    )
-    second = _normalized_bundle(
-        live_settings, collection_bundle, source_id=second_source_id
-    )
-    configuration = ConfigurationManager(live_settings.config_path).load()
-
-    def persist(normalized: NormalizedBundle) -> PersistSummary:
-        """Persist one run through the same bounded retry path as collection."""
-        return persist_with_retries(
-            configuration,
-            normalized,
-            logging.getLogger("usagebassoon-bigquery-live"),
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = list(executor.map(persist, (first, second)))
-    assert all(outcome.inserted >= 0 for outcome in outcomes)
-
-    backend = _backend(live_settings)
+    """Check immediate raw visibility, replay deduplication, and publication time."""
+    source_id, bundle = _normalized_bundle(collection_bundle)
+    remote = _backend(live_settings)
     try:
-        assert backend.query(
-            "SELECT count(*) AS n FROM ingest_runs "
-            f"WHERE run_id IN ('{first.run_id}', '{second.run_id}')"
-        ).to_pylist() == [{"n": 2}]
-        assert backend.query(
-            "SELECT count(DISTINCT source_id) AS n FROM sessions "
-            f"WHERE source_id IN ('{first_source_id}', '{second_source_id}')"
-        ).to_pylist() == [{"n": 2}]
-        assert _stage_tables(backend.client, live_settings.dataset_id) == []
+        remote.preflight()
+        started = time.monotonic()
+        persist_run(remote, bundle)
+        elapsed = time.monotonic() - started
+        with capsys.disabled():
+            print(f"BigQuery publication: {elapsed:.3f}s", flush=True)
+        parameters = {"source_id": source_id}
+        assert (
+            remote.query(
+                "SELECT * FROM daily_stats WHERE source_id = :source_id", parameters
+            ).num_rows
+            == 0
+        )
+        for table in ("sessions", "daily_stats", "price_versions"):
+            assert (
+                remote.query(
+                    f"SELECT * FROM current_{table} WHERE source_id = :source_id",
+                    parameters,
+                ).num_rows
+                == bundle.tables[table].num_rows
+            )
+        persist_run(remote, bundle)
+        assert (
+            remote.query(
+                "SELECT * FROM collection_runs WHERE run_id = :run_id",
+                {"run_id": bundle.run_id},
+            ).num_rows
+            == 1
+        )
+        for table in ("sessions", "daily_stats", "price_versions"):
+            assert (
+                remote.query(
+                    f"SELECT * FROM current_{table} WHERE source_id = :source_id",
+                    parameters,
+                ).num_rows
+                == bundle.tables[table].num_rows
+            )
     finally:
-        backend.close()
+        remote.close()
+    assert elapsed < 15.0, f"BigQuery publication took {elapsed:.3f}s"
 
 
-def test_live_cli_commands_including_models_report(
+def test_live_snapshot_portability_includes_raw_and_compacted_facts(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Exercise configured BigQuery CLI commands, including the models report."""
-    normalized = _normalized_bundle(live_settings, collection_bundle)
-    configuration = ConfigurationManager(live_settings.config_path).load()
-    persist_with_retries(
-        configuration,
-        normalized,
-        logging.getLogger("usagebassoon-bigquery-live"),
+    """Restore complete BigQuery state into DuckDB and reject populated targets."""
+    source_id, bundle = _normalized_bundle(collection_bundle)
+    remote = _backend(live_settings)
+    local = DuckDBBackend(":memory:")
+    local.apply_ddl()
+    try:
+        persist_run(remote, bundle)
+        archive = SnapshotArchiver(str(tmp_path / "portable"))
+        with _phase("snapshot capture"):
+            assert archive.write(remote, run_id=bundle.run_id) is not None
+        with _phase("DuckDB restore"):
+            archive.restore(local)
+        for table in SNAPSHOT_TABLES:
+            canonical = "current_" + table
+            assert normalized_records(local.query(f"SELECT * FROM {canonical}")) == (
+                normalized_records(remote.query(f"SELECT * FROM {canonical}"))
+            ), table
+        assert (
+            local.query("SELECT SUM(total_tokens) AS n FROM daily_stats").to_pylist()
+            == remote.query(
+                "SELECT SUM(total_tokens) AS n FROM current_daily_stats"
+            ).to_pylist()
+        )
+        _compact(remote)
+        assert (
+            remote.query(
+                "SELECT * FROM daily_stats WHERE source_id = :source_id",
+                {"source_id": source_id},
+            ).num_rows
+            == bundle.tables["daily_stats"].num_rows
+        )
+        for table in SNAPSHOT_TABLES:
+            local.connection.execute(f"DELETE FROM {table}")
+        with _phase("compacted snapshot capture"):
+            assert archive.write(remote, run_id=str(uuid4())) is not None
+        archive.restore(local)
+        for table in SNAPSHOT_TABLES:
+            assert normalized_records(
+                local.query(f"SELECT * FROM current_{table}")
+            ) == (normalized_records(remote.query(f"SELECT * FROM current_{table}"))), (
+                table
+            )
+        before = remote.query(
+            "SELECT SUM(total_tokens) AS n FROM current_daily_stats"
+        ).to_pylist()
+        with (
+            _phase("populated BigQuery restore rejection"),
+            pytest.raises(Exception, match="empty warehouse"),
+        ):
+            archive.restore(remote)
+        assert (
+            remote.query(
+                "SELECT SUM(total_tokens) AS n FROM current_daily_stats"
+            ).to_pylist()
+            == before
+        )
+    finally:
+        remote.close()
+        local.close()
+
+
+def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
+    live_settings: LiveSettings,
+) -> None:
+    """Exclude post-cutoff appends; preserve gold-only facts and tombstones."""
+    remote = _backend(live_settings)
+    source_id = str(uuid4())
+    stamp = datetime.now(UTC)
+    usage_day = date(2021, 1, 2)
+    schema = CANONICAL_TABLE_SCHEMAS["daily_stats"]
+    initial = {
+        "event_id": str(uuid4()),
+        "source_id": source_id,
+        "day": usage_day,
+        "client": "codex",
+        "session_id": "backfill",
+        "model": "test-model",
+        "input_tokens": 100,
+        "output_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total_tokens": 100,
+        "collected_at": stamp,
+    }
+    tag = {
+        "event_id": str(uuid4()),
+        "source_id": source_id,
+        "scope": "session",
+        "client": "codex",
+        "workspace": "",
+        "session_id": "backfill",
+        "tag": "temporary",
+        "created_at": stamp,
+        "collected_at": stamp,
+        "op": "upsert",
+        "updated_at": stamp,
+        "op_id": str(uuid4()),
+    }
+    try:
+        # An expired arrival bucket's larger count must not mask a new bucket.
+        remote._wait_for_job(
+            remote.client.query(
+                f"INSERT INTO {remote._table_ref('compaction_ledger')} VALUES "
+                f"('{source_id}', GENERATE_UUID(), GENERATE_UUID(), 'daily_stats', "
+                "DATE '2021-01-02', DATE_SUB(CURRENT_DATE(), INTERVAL 91 DAY), "
+                "CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 9999)",
+                job_config=remote._query_config(),
+                location=remote.location,
+            )
+        )
+        remote.append("daily_stats", pa.Table.from_pylist([initial], schema=schema))
+        remote.append(
+            "tags",
+            pa.Table.from_pylist(
+                [
+                    tag,
+                    {
+                        **tag,
+                        "event_id": str(uuid4()),
+                        "op": "delete",
+                        "updated_at": stamp + timedelta(seconds=1),
+                        "collected_at": stamp + timedelta(seconds=1),
+                    },
+                ],
+                schema=CANONICAL_TABLE_SCHEMAS["tags"],
+            ),
+        )
+        sql = remote._qualify_view_sql(
+            resources.files("usagebassoon.sql.bigquery")
+            .joinpath("compaction.sql")
+            .read_text()
+        )
+        cutoff = remote.query("SELECT CURRENT_TIMESTAMP() AS cutoff").to_pylist()[0][
+            "cutoff"
+        ]
+        assert isinstance(cutoff, datetime)
+        sql = sql.replace(
+            "SET cutoff = CURRENT_TIMESTAMP();",
+            f"SET cutoff = TIMESTAMP '{cutoff.isoformat()}';",
+        )
+        compaction_started = time.monotonic()
+        job = remote.client.query(
+            sql,
+            job_config=remote._query_config(),
+            location=remote.location,
+        )
+        deadline = time.monotonic() + 30
+        while job.started is None and time.monotonic() < deadline:
+            job.reload()
+            time.sleep(0.1)
+        assert job.started is not None
+        latest = {
+            **initial,
+            "event_id": str(uuid4()),
+            "total_tokens": 200,
+            "input_tokens": 200,
+        }
+        remote.append("daily_stats", pa.Table.from_pylist([latest], schema=schema))
+        remote._wait_for_job(job)
+        print(
+            "BigQuery compaction with concurrent append: "
+            f"{time.monotonic() - compaction_started:.3f}s",
+            flush=True,
+        )
+        where = f" WHERE source_id = '{source_id}'"
+        assert remote.query(
+            "SELECT total_tokens FROM daily_stats" + where
+        ).to_pylist() == [{"total_tokens": 100}]
+        assert remote.query(
+            "SELECT total_tokens FROM current_daily_stats" + where
+        ).to_pylist() == [{"total_tokens": 200}]
+        progress = remote.query(
+            "SELECT raw_rows_processed FROM compaction_ledger"
+            + where
+            + " AND domain = 'daily_stats' AND arrival_day = CURRENT_DATE()"
+        ).to_pylist()
+        assert progress == [{"raw_rows_processed": 1}]
+        assert remote.query("SELECT op FROM tags" + where).to_pylist() == [
+            {"op": "delete"}
+        ]
+        _compact(remote)
+        # Simulate expiry of an arrival bucket while retaining its old progress.
+        remote._wait_for_job(
+            remote.client.query(
+                "BEGIN TRANSACTION;\n"
+                f"DELETE FROM {remote._table_ref('raw_tags')}" + where + ";\n"
+                f"DELETE FROM {remote._table_ref('raw_daily_stats')}" + where + ";\n"
+                f"UPDATE {remote._table_ref('compaction_ledger')} "
+                "SET arrival_day = DATE_SUB(CURRENT_DATE(), INTERVAL 91 DAY)"
+                + where
+                + " AND arrival_day = CURRENT_DATE();\n"
+                "COMMIT TRANSACTION;",
+                job_config=remote._query_config(),
+                location=remote.location,
+            )
+        )
+        assert remote.query(
+            "SELECT total_tokens FROM current_daily_stats" + where
+        ).to_pylist() == [{"total_tokens": 200}]
+        distinct = {**initial, "event_id": str(uuid4()), "session_id": "late-key"}
+        remote.append("daily_stats", pa.Table.from_pylist([distinct], schema=schema))
+        _compact(remote)
+        assert remote.query(
+            "SELECT session_id, total_tokens FROM daily_stats"
+            + where
+            + " ORDER BY session_id"
+        ).to_pylist() == [
+            {"session_id": "backfill", "total_tokens": 200},
+            {"session_id": "late-key", "total_tokens": 100},
+        ]
+        remote.append(
+            "tags", pa.Table.from_pylist([tag], schema=CANONICAL_TABLE_SCHEMAS["tags"])
+        )
+        assert remote.query("SELECT * FROM current_tags" + where).num_rows == 0
+        assert (
+            remote.query(
+                "SELECT * FROM compaction_backlog WHERE age_days >= 2"
+            ).num_rows
+            == 0
+        )
+    finally:
+        remote.close()
+
+
+def test_live_global_tags_and_source_scoped_notes_survive_compaction_and_snapshot(
+    live_settings: LiveSettings, tmp_path: Path
+) -> None:
+    """Preserve global tag lifetimes and independent source-scoped session notes."""
+    remote = _backend(live_settings)
+    local = DuckDBBackend(":memory:")
+    source_a, source_b = str(uuid4()), str(uuid4())
+    client = "curation-" + str(uuid4())
+    session_id = str(uuid4())
+    created = datetime.now(UTC) - timedelta(days=2)
+    changed = created + timedelta(days=1)
+    tag = TagAssignment(
+        "session", source_a, "old", client=client, session_id=session_id
     )
 
-    def fake_tokscale_preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
-        """Keep BigQuery CLI coverage independent of an installed tokscale binary."""
-        return ("tokscale",), "4.15.1"
+    def current(table: str, note_source: str | None = None) -> dict[str, object]:
+        """Read a global tag or the note for one exact source/session identity."""
+        parameters = {"client": client, "session_id": session_id}
+        scope = ""
+        if table == "notes":
+            parameters["source_id"] = note_source or source_a
+            scope = " AND source_id = :source_id"
+        rows = remote.query(
+            f"SELECT * FROM current_{table} "
+            "WHERE client = :client AND session_id = :session_id" + scope,
+            parameters,
+        ).to_pylist()
+        assert len(rows) == 1
+        return rows[0]
 
-    monkeypatch.setattr(
-        "usagebassoon.cli.doctor.preflight_tokscale", fake_tokscale_preflight
-    )
-
-    session = collection_bundle.report_rows[0]
-    runner = CliRunner()
-    export_path = tmp_path / "sessions.json"
-    monkeypatch.setenv("HOME", str(tmp_path))
-    commands = (
-        ["init", "--config", str(live_settings.config_path)],
-        [
-            "query",
-            "report_summary",
-            "--limit",
-            "1",
-            "--config",
-            str(live_settings.config_path),
-        ],
-        ["report", "models", "--config", str(live_settings.config_path)],
-        [
-            "export",
-            "sessions",
-            str(export_path),
-            "--format",
-            "json",
-            "--config",
-            str(live_settings.config_path),
-        ],
-        [
-            "tag",
-            "add",
-            "live-test",
-            "--client",
-            session.client,
-            "--config",
-            str(live_settings.config_path),
-        ],
-        [
-            "note",
-            "set",
-            "live integration note",
-            "--client",
-            session.client,
-            "--session",
-            session.session_id,
-            "--config",
-            str(live_settings.config_path),
-        ],
-        ["doctor", "--config", str(live_settings.config_path)],
-        ["audit", "--config", str(live_settings.config_path)],
-        ["snapshot", "--config", str(live_settings.config_path)],
-    )
-    results = [runner.invoke(app, command) for command in commands]
-
-    failures = [
-        f"{command!r} exited with {result.exit_code}:\n{result.output}"
-        f"\nexception: {result.exception!r}"
-        for command, result in zip(commands, results, strict=True)
-        if result.exit_code != 0
-    ]
-    assert not failures, "CLI command failures:\n" + "\n".join(failures)
-    renamed = runner.invoke(
-        app,
-        [
-            "tag",
-            "rename",
-            "live-test",
-            "live-test-renamed",
-            "--client",
-            session.client,
-            "--config",
-            str(live_settings.config_path),
-        ],
-    )
-    removed_tag = runner.invoke(
-        app,
-        [
-            "tag",
-            "remove",
-            "live-test-renamed",
-            "--client",
-            session.client,
-            "--config",
-            str(live_settings.config_path),
-        ],
-    )
-    removed_note = runner.invoke(
-        app,
-        [
-            "note",
-            "remove",
-            "--client",
-            session.client,
-            "--session",
-            session.session_id,
-            "--config",
-            str(live_settings.config_path),
-        ],
-    )
-    assert renamed.exit_code == 0
-    assert removed_tag.exit_code == 0
-    assert removed_note.exit_code == 0
-    assert export_path.is_file()
-    snapshots = SnapshotStore.from_config(configuration)
-    assert snapshots.list_snapshots()
+    try:
+        local.apply_ddl()
+        add_tag(remote, tag, at=created)
+        set_note(
+            remote, NoteAssignment(source_a, client, session_id, "first"), at=created
+        )
+        _compact(remote)
+        other_tag = replace(tag, source_id=source_b)
+        assert add_tag(remote, other_tag, at=changed).affected == 0
+        assert rename_tag(remote, other_tag, "new", at=changed).renamed
+        revised_note = NoteAssignment(source_a, client, session_id, "edited")
+        set_note(remote, revised_note, at=changed)
+        set_note(
+            remote,
+            NoteAssignment(source_b, client, session_id, "independent"),
+            at=changed,
+        )
+        before = {table: current(table) for table in ("tags", "notes")}
+        _compact(remote)
+        for table, row in before.items():
+            assert current(table) == row
+            assert row["source_id"] == (source_b if table == "tags" else source_a)
+            assert row["created_at"] == created
+            assert row["updated_at"] == changed
+        assert current("notes", source_b)["note"] == "independent"
+        assert current("notes", source_b)["created_at"] == changed
+        rename_events = remote.query(
+            "SELECT op, op_id, event_id FROM raw_tags "
+            "WHERE client = :client AND source_id = :source_id ORDER BY op",
+            {"client": client, "source_id": source_b},
+        ).to_pylist()
+        assert [row["op"] for row in rename_events] == ["delete", "upsert"]
+        assert rename_events[0]["op_id"] == rename_events[1]["op_id"]
+        assert rename_events[0]["event_id"] != rename_events[1]["event_id"]
+        renamed_tag = replace(other_tag, tag="new")
+        assert remove_tag(remote, renamed_tag) == 1
+        assert remove_note(remote, revised_note) == 1
+        _compact(remote)
+        for table in ("tags", "notes"):
+            parameters = {"client": client}
+            scope = ""
+            if table == "notes":
+                parameters["source_id"] = source_a
+                scope = " AND source_id = :source_id"
+            assert (
+                remote.query(
+                    f"SELECT * FROM current_{table} WHERE client = :client" + scope,
+                    parameters,
+                ).num_rows
+                == 0
+            )
+        assert current("notes", source_b)["note"] == "independent"
+        recreated = datetime.now(UTC)
+        add_tag(remote, replace(renamed_tag, source_id=source_a), at=recreated)
+        set_note(remote, replace(revised_note, source_id=source_a), at=recreated)
+        for phase in range(2):
+            if phase:
+                _compact(remote)
+            store = SnapshotArchiver(str(tmp_path / f"archive-{phase}"))
+            with _phase("curation snapshot capture"):
+                assert store.write(remote, run_id=str(uuid4())) is not None
+            with _phase("curation DuckDB restore"):
+                store.restore(local)
+            for table in ("tags", "notes"):
+                expected = current(table)
+                assert expected["created_at"] == recreated
+                assert expected["updated_at"] == recreated
+                parameters = {"client": client}
+                scope = ""
+                if table == "notes":
+                    parameters["source_id"] = source_a
+                    scope = " AND source_id = :source_id"
+                restored = local.query(
+                    f"SELECT * FROM current_{table} WHERE client = :client" + scope,
+                    parameters,
+                ).to_pylist()
+                assert restored == [expected]
+            assert local.query(
+                "SELECT note, created_at FROM current_notes "
+                "WHERE source_id = :source_id AND client = :client",
+                {"source_id": source_b, "client": client},
+            ).to_pylist() == [{"note": "independent", "created_at": changed}]
+            # Each restore must target an initialized, empty warehouse.
+            for table in SNAPSHOT_TABLES:
+                local.connection.execute(f"DELETE FROM {table}")
+    finally:
+        remote.close()
+        local.close()
 
 
 def test_live_restore_requires_an_explicit_disposable_reset(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Restore a BigQuery snapshot only after an explicit test-dataset reset."""
+    """Restore a DuckDB snapshot into BigQuery after an opted-in schema reset."""
     if os.environ.get("USAGEBASSOON_BIGQUERY_LIVE_RESET") != "1":
         pytest.skip("set USAGEBASSOON_BIGQUERY_LIVE_RESET=1 to run live restore")
-
-    normalized = _normalized_bundle(live_settings, collection_bundle)
-    backend = _backend(live_settings)
-    try:
-        backend.apply_ddl()
-        persist_run(backend, normalized)
-    finally:
-        backend.close()
-
-    monkeypatch.setenv("HOME", str(tmp_path))
+    source_id, bundle = _normalized_bundle(collection_bundle)
+    remote = _backend(live_settings)
+    local = DuckDBBackend(":memory:")
+    local.apply_ddl()
+    config_path = _snapshot_config(live_settings, tmp_path, source_id)
+    configuration = ConfigurationManager(config_path).load()
+    archive = SnapshotArchiver.from_config(configuration)
     runner = CliRunner()
-    snapshot = runner.invoke(
-        app,
-        ["snapshot", "--config", str(live_settings.config_path)],
-    )
-    assert snapshot.exit_code == 0
-
-    client = bigquery.Client(
-        project=live_settings.project,
-        location=live_settings.location,
-    )
+    command = ["restore", "--config", str(config_path)]
+    parameters = {"source_id": source_id}
     try:
-        for item in client.list_tables(live_settings.dataset_id):
-            if item.table_type == "TABLE":
-                client.delete_table(item.reference, not_found_ok=True)
+        persist_run(local, bundle)
+        persist_run(remote, bundle)
+        assert archive.write(local, run_id=bundle.run_id) is not None
+        before = normalized_records(
+            remote.query(
+                "SELECT * FROM current_daily_stats WHERE source_id = :source_id",
+                parameters,
+            )
+        )
+        declined = runner.invoke(app, command, input="n\n")
+        assert declined.exit_code != 0
+        assert "Aborted" in plain_cli_output(declined.output)
+        with _phase("populated BigQuery CLI restore rejection"):
+            rejected = runner.invoke(app, command, input="y\n")
+        assert rejected.exit_code != 0
+        assert "restore requires an empty warehouse" in plain_cli_output(
+            rejected.output
+        )
+        assert (
+            normalized_records(
+                remote.query(
+                    "SELECT * FROM current_daily_stats WHERE source_id = :source_id",
+                    parameters,
+                )
+            )
+            == before
+        )
+        with _phase("explicit disposable schema reset"):
+            _reset_test_schema(remote.client, remote.dataset_ref)
+            remote.apply_ddl()
+        with _phase("BigQuery CLI restore"):
+            restored = runner.invoke(app, command, input="y\n")
+        assert restored.exit_code == 0, (
+            f"{plain_cli_output(restored.output)}\n{restored.exception!r}"
+        )
+        assert "Restored" in plain_cli_output(restored.output)
+        for table in ("sessions", "daily_stats", "price_versions", "collection_ledger"):
+            assert normalized_records(
+                remote.query(f"SELECT * FROM current_{table}")
+            ) == (normalized_records(local.query(f"SELECT * FROM current_{table}"))), (
+                table
+            )
+        assert remote.query("SELECT * FROM daily_stats").num_rows == (
+            bundle.tables["daily_stats"].num_rows
+        )
+        assert remote.query("SELECT * FROM raw_daily_stats").num_rows == 0
     finally:
-        client.close()
-
-    restored = runner.invoke(
-        app,
-        ["restore", "--config", str(live_settings.config_path)],
-    )
-    assert restored.exit_code == 0
-    source_id = normalized.tables["ingest_runs"].column("source_id").to_pylist()[0]
-    backend = _backend(live_settings)
-    try:
-        assert backend.query(
-            f"SELECT count(*) AS n FROM sessions WHERE source_id = '{source_id}'"
-        ).to_pylist() == [{"n": EXPECTED_REPORT_ROWS}]
-    finally:
-        backend.close()
+        remote.close()
+        local.close()

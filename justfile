@@ -68,7 +68,8 @@ test-bq-live test-name="tests/test_backend_bigquery_live.py" reset="0":
     trap 'rm -rf "$test_log_directory"' EXIT
     {
         echo "[just] $(date -u +%FT%TZ) starting pytest for {{ test-name }}"
-        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{ reset }} {{ pytest }} -vv \
+        PYTHONUNBUFFERED=1 USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" USAGEBASSOON_BIGQUERY_LIVE=1 USAGEBASSOON_BIGQUERY_LIVE_RESET={{ reset }} {{ pytest }} -vv -s \
+        --durations=0 \
         --tb=short \
         --color=no \
         "{{ test-name }}" < /dev/null

@@ -47,9 +47,9 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend.apply_ddl()
     backend.connection.executemany(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, workspace, created_at, last_active, "
-        "first_seen_at, last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
+        "(event_id, source_id, client, session_id, workspace, created_at, last_active, "
+        "first_seen_at, last_seen_at, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
         [
             (
                 LOCAL_SOURCE_ID,
@@ -79,9 +79,10 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.executemany(
         "INSERT INTO daily_stats "
-        "(source_id, day, client, session_id, model, input_tokens, output_tokens, "
-        "cache_read, cache_write, reasoning, total_tokens, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        "(event_id, source_id, day, client, session_id, model, "
+        "input_tokens, output_tokens, "
+        "cache_read, cache_write, reasoning, total_tokens, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         [
             (
                 LOCAL_SOURCE_ID,
@@ -139,11 +140,11 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.executemany(
         "INSERT INTO price_versions "
-        "(source_id, day, model, source, price_input_per_token, "
+        "(event_id, source_id, day, model, source, price_input_per_token, "
         "price_output_per_token, price_cache_read_per_token, "
-        "price_cache_write_per_token, observed_at, updated_at) "
-        "VALUES (?, ?, ?, 'fixture', 0.000001, 0.000002, 0.0000005, "
-        "0.0000007, NOW(), NOW())",
+        "price_cache_write_per_token, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, 'fixture', 0.000001, 0.000002, 0.0000005, "
+        "0.0000007, NOW())",
         [
             (LOCAL_SOURCE_ID, "2026-09-10", "gpt-test"),
             (LOCAL_SOURCE_ID, "2026-09-11", "gpt-mini"),
@@ -153,23 +154,24 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     )
     backend.connection.execute(
         "INSERT INTO tags "
-        "(scope, source_id, client, workspace, session_id, tag, created_at, "
-        "updated_at) "
-        "VALUES ('workspace', ?, '', '/work/atlas', '', 'focused', NOW(), NOW())",
+        "(event_id, scope, source_id, client, workspace, session_id, tag, created_at, "
+        "updated_at, collected_at) "
+        "VALUES (UUID(), 'workspace', ?, '', '/work/atlas', '', "
+        "'focused', NOW(), NOW(), NOW())",
         [LOCAL_SOURCE_ID],
     )
     return config, backend
 
 
-def test_report_group_lists_v1_commands() -> None:
-    """Show report help instead of implicitly rendering the legacy summary."""
+def test_report_group_lists_supported_commands() -> None:
+    """Expose the supported terminal reports in group help."""
     result = CliRunner().invoke(app, ["report", "--help"])
 
     assert result.exit_code == 0
-    assert "daily" in result.output
-    assert "models" in result.output
-    assert "sessions" in result.output
-    assert "graph" in result.output
+    assert "daily" in plain_cli_output(result.output)
+    assert "models" in plain_cli_output(result.output)
+    assert "sessions" in plain_cli_output(result.output)
+    assert "graph" in plain_cli_output(result.output)
 
 
 def test_daily_report_filters_local_tagged_usage(tmp_path: Path) -> None:
@@ -193,14 +195,14 @@ def test_daily_report_filters_local_tagged_usage(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "Daily Token Usage" in result.output
-    assert "Cache \N{MULTIPLICATION SIGN}" in result.output
-    assert "Cache R" in result.output
-    assert "Cost/1M" in result.output
-    assert "2026-09-10" in result.output
-    assert "2026-09-11" in result.output
-    assert "2026-09-12" not in result.output
-    assert "Re-run with --sanitize" not in result.output
+    assert "Daily Token Usage" in plain_cli_output(result.output)
+    assert "Cache \N{MULTIPLICATION SIGN}" in plain_cli_output(result.output)
+    assert "Cache R" in plain_cli_output(result.output)
+    assert "Cost/1M" in plain_cli_output(result.output)
+    assert "2026-09-10" in plain_cli_output(result.output)
+    assert "2026-09-11" in plain_cli_output(result.output)
+    assert "2026-09-12" not in plain_cli_output(result.output)
+    assert "Re-run with --sanitize" not in plain_cli_output(result.output)
 
 
 def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
@@ -236,8 +238,8 @@ def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
     )
 
     assert result.exit_code == 0
-    assert "$1.23" in result.output
-    assert "$6,670.270" in result.output
+    assert "$1.23" in plain_cli_output(result.output)
+    assert "$6,670.270" in plain_cli_output(result.output)
 
 
 def test_models_report_weights_timing_after_source_and_tag_filters(
@@ -295,10 +297,10 @@ def test_models_report_test_mode_uses_daily_fixture_timing() -> None:
     )
 
     assert result.exit_code == 0
-    assert "gemini-3.7-flash" in result.output
-    assert "gpt-5.6-terra" in result.output
-    assert "ms/1K" in result.output
-    assert "—" not in result.output
+    assert "gemini-3.7-flash" in plain_cli_output(result.output)
+    assert "gpt-5.6-terra" in plain_cli_output(result.output)
+    assert "ms/1K" in plain_cli_output(result.output)
+    assert "—" not in plain_cli_output(result.output)
 
 
 def test_models_report_excludes_duration_without_timed_tokens(tmp_path: Path) -> None:
@@ -376,17 +378,17 @@ def test_sessions_report_defaults_to_session_and_can_split_models(
     )
 
     assert session_result.exit_code == 0
-    assert "Session Token Usage" in session_result.output
-    assert "Last Active" in session_result.output
-    assert "Model" in session_result.output
-    assert "Cost/1M" in session_result.output
-    assert "$0.00" in session_result.output
-    assert "+1" in session_result.output
-    assert "…" in session_result.output
+    assert "Session Token Usage" in plain_cli_output(session_result.output)
+    assert "Last Active" in plain_cli_output(session_result.output)
+    assert "Model" in plain_cli_output(session_result.output)
+    assert "Cost/1M" in plain_cli_output(session_result.output)
+    assert "$0.00" in plain_cli_output(session_result.output)
+    assert "+1" in plain_cli_output(session_result.output)
+    assert "…" in plain_cli_output(session_result.output)
     assert model_result.exit_code == 0
-    assert "Session Token Usage by Model" in model_result.output
-    assert "gpt-test" in model_result.output
-    assert "gpt-mini" in model_result.output
+    assert "Session Token Usage by Model" in plain_cli_output(model_result.output)
+    assert "gpt-test" in plain_cli_output(model_result.output)
+    assert "gpt-mini" in plain_cli_output(model_result.output)
 
 
 def test_daily_and_models_date_bounds_compose_with_source_and_client(
@@ -567,12 +569,12 @@ def test_session_values_and_model_counts_remain_whole_at_eighty_columns() -> Non
     )
 
     assert result.exit_code == 0
-    assert "25.1K" in result.output
-    assert "178.2K" in result.output
-    assert "$0.11" in result.output
-    assert "$0.535" in result.output
-    assert "luna+1" in result.output
-    assert "flash+1" in result.output
+    assert "25.1K" in plain_cli_output(result.output)
+    assert "178.2K" in plain_cli_output(result.output)
+    assert "$0.11" in plain_cli_output(result.output)
+    assert "$0.535" in plain_cli_output(result.output)
+    assert "luna+1" in plain_cli_output(result.output)
+    assert "flash+1" in plain_cli_output(result.output)
 
 
 def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
@@ -594,11 +596,11 @@ def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
     )
 
     assert result.exit_code == 0
-    assert "Total Tokens" in result.output
-    assert "2026-09-01" in result.output
-    assert "2026-09-10" in result.output
-    assert "01" in result.output
-    assert "10" in result.output
+    assert "Total Tokens" in plain_cli_output(result.output)
+    assert "2026-09-01" in plain_cli_output(result.output)
+    assert "2026-09-10" in plain_cli_output(result.output)
+    assert "01" in plain_cli_output(result.output)
+    assert "10" in plain_cli_output(result.output)
 
 
 def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
@@ -609,8 +611,8 @@ def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
     )
 
     assert result.exit_code == 0
-    assert "$6.99" in result.output
-    assert "$6.990" not in result.output
+    assert "$6.99" in plain_cli_output(result.output)
+    assert "$6.990" not in plain_cli_output(result.output)
 
 
 def test_report_test_mode_uses_golden_fixture_statistics() -> None:
@@ -628,10 +630,10 @@ def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     )
 
     assert result.exit_code == 0
-    assert "2026-09-10" in result.output
-    assert "391.5K" in result.output
-    assert "6.7M" in result.output
-    assert "$1.12" in result.output
+    assert "2026-09-10" in plain_cli_output(result.output)
+    assert "391.5K" in plain_cli_output(result.output)
+    assert "6.7M" in plain_cli_output(result.output)
+    assert "$1.12" in plain_cli_output(result.output)
 
 
 def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:

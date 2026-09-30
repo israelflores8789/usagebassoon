@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -38,8 +39,9 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     backend.apply_ddl()
     backend.connection.execute(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, first_seen_at, last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, NOW(), NOW(), NOW())",
+        "(event_id, source_id, client, session_id, first_seen_at, "
+        "last_seen_at, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, NOW(), NOW(), NOW())",
         [SOURCE_ID, "codex", "ses_1"],
     )
     backend.close()
@@ -52,7 +54,7 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     with (snapshot_directory / stamps[0] / "manifest.json").open() as handle:
         manifest = json.load(handle)
     assert result.exit_code == 0
-    assert "Created private raw snapshot at" in result.output
+    assert "Created private raw snapshot at" in plain_cli_output(result.output)
     assert manifest["run_id"] == "manual"
     assert manifest["tables"]["sessions"]["rows"] == 1
     assert set(manifest["tables"]) == set(SNAPSHOT_TABLES)

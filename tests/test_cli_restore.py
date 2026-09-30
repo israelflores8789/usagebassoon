@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 
@@ -30,8 +31,9 @@ def _seed_session(database: Path, session_id: str) -> None:
     backend.apply_ddl()
     backend.connection.execute(
         "INSERT INTO sessions "
-        "(source_id, client, session_id, first_seen_at, last_seen_at, updated_at) "
-        "VALUES (?, ?, ?, NOW(), NOW(), NOW())",
+        "(event_id, source_id, client, session_id, first_seen_at, "
+        "last_seen_at, collected_at) "
+        "VALUES (UUID(), ?, ?, ?, NOW(), NOW(), NOW())",
         [SOURCE_ID, "codex", session_id],
     )
     backend.close()
@@ -53,13 +55,16 @@ def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
     destination_config = tmp_path / "destination.toml"
     destination_database = tmp_path / "destination.duckdb"
     _write_config(destination_config, destination_database)
+    target = DuckDBBackend(destination_database)
+    target.apply_ddl()
+    target.close()
     restore_result = runner.invoke(
-        app, ["restore", "--config", str(destination_config)]
+        app, ["restore", "--config", str(destination_config)], input="y\n"
     )
 
     assert snapshot_result.exit_code == 0
     assert restore_result.exit_code == 0
-    assert "sessions=1" in restore_result.output
+    assert "sessions=1" in plain_cli_output(restore_result.output)
     backend = DuckDBBackend(destination_database)
     try:
         assert backend.query("SELECT session_id FROM sessions").to_pylist() == [
@@ -88,10 +93,12 @@ def test_restore_rejects_a_populated_destination(
     destination_database = tmp_path / "destination.duckdb"
     _write_config(destination_config, destination_database)
     _seed_session(destination_database, "ses_existing")
-    result = runner.invoke(app, ["restore", "--config", str(destination_config)])
+    result = runner.invoke(
+        app, ["restore", "--config", str(destination_config)], input="y\n"
+    )
 
     assert result.exit_code != 0
-    assert "restore requires an empty warehouse" in result.output
+    assert "restore requires an empty warehouse" in plain_cli_output(result.output)
     backend = DuckDBBackend(destination_database)
     try:
         assert backend.query("SELECT session_id FROM sessions").to_pylist() == [
@@ -99,3 +106,20 @@ def test_restore_rejects_a_populated_destination(
         ]
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("answer", ["n\n", "\n", ""])
+def test_restore_requires_confirmation_before_opening_warehouse(
+    tmp_path: Path, answer: str
+) -> None:
+    """Declining, accepting the default, or EOF cannot start restoration."""
+    configuration = tmp_path / "missing.toml"
+    result = CliRunner().invoke(
+        app, ["restore", "--config", str(configuration)], input=answer
+    )
+    output = plain_cli_output(result.output)
+    assert result.exit_code != 0
+    assert "stop all UsageBassoon instances" in output
+    assert "[y/N]" in output
+    assert "Aborted" in output
+    assert not configuration.exists()

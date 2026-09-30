@@ -15,6 +15,7 @@ import pytest
 
 from usagebassoon import collector as subprocess_collector
 from usagebassoon import orchestrator as collector
+from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
@@ -262,7 +263,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         """Return a deterministic tokscale executable for this unit test."""
         return ["tokscale"]
 
-    def ingest_status(
+    def collection_status(
         _configuration: UsageBassoonConfig,
     ) -> tuple[
         dict[IngestTarget, IngestStatus],
@@ -301,18 +302,15 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _configuration: UsageBassoonConfig,
         _bundle: NormalizedBundle,
         _logger: logging.Logger,
-        *,
-        lease: object,
     ) -> PersistSummary:
         """Return the persistence outcome used for collection assertions."""
-        assert lease is not None
         return PersistSummary(0, 0, {})
 
     monkeypatch.setattr(collector, "datetime", _FixedDatetime)
     monkeypatch.setattr(collector, "_prefix", prefix)
     monkeypatch.setattr(collector, "_json_command", command)
     monkeypatch.setattr(subprocess_collector, "_json_command", command)
-    monkeypatch.setattr(collector, "load_ingest_status", ingest_status)
+    monkeypatch.setattr(collector, "load_ingest_status", collection_status)
     monkeypatch.setattr(collector, "_fetch_daily_models", daily_models)
     monkeypatch.setattr(collector, "_fetch_pricing", pricing)
     monkeypatch.setattr(collector, "build_collection_bundle", build)
@@ -375,43 +373,39 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
     assert "session report collection failed" in caplog.text
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
 def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
+    error_type: type[Exception],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fail the run when its required graph command is unavailable."""
+    """Record expected and unexpected required graph failures before propagating."""
     monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     configuration = _config(tmp_path / "config.toml")
+    assert configuration.local_database is not None
+    backend = DuckDBBackend(configuration.local_database)
+    backend.apply_ddl()
+    backend.close()
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
         """Raise a transient graph command failure."""
-        raise RuntimeError("graph process failed")
+        raise error_type("graph process failed")
 
     monkeypatch.setattr(collector, "_json_command", command)
 
-    with pytest.raises(RuntimeError, match="graph process failed"):
+    with pytest.raises(error_type, match="graph process failed"):
         collector.collect(configuration)
 
-    log = (tmp_path / "logs" / "usagebassoon.log").read_text()
-    assert "collection cycle failed before completion" in log
-
-
-def test_unexpected_graph_failure_aborts_cycle_and_logs_to_operational_log(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Propagate unexpected required graph failures after recording context."""
-    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
-    configuration = _config(tmp_path / "config.toml")
-
-    def command(*_args: object, **_kwargs: object) -> JsonValue:
-        """Raise an exception outside the normal subprocess error family."""
-        raise TypeError("unexpected graph process failure")
-
-    monkeypatch.setattr(collector, "_json_command", command)
-
-    with pytest.raises(TypeError, match="unexpected graph process failure"):
-        collector.collect(configuration)
+    backend = DuckDBBackend(configuration.local_database)
+    try:
+        rows = backend.query("SELECT * FROM collection_runs").to_pylist()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["failure_code"] == error_type.__name__
+        assert rows[0]["source_id"] == configuration.source_id
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+    finally:
+        backend.close()
 
     log = (tmp_path / "logs" / "usagebassoon.log").read_text()
     assert "collection cycle failed before completion" in log

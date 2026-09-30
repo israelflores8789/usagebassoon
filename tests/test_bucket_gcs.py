@@ -6,11 +6,10 @@
 from __future__ import annotations
 
 import json
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock
 from typing import cast, override
 
 import pyarrow as pa
@@ -275,25 +274,50 @@ def test_gcs_reservation_can_be_renewed_before_expiry() -> None:
 def test_snapshot_renews_reservation_during_long_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Publish a capture that lasts longer than one reservation period."""
+    """Renew the reservation while capture waits for the background heartbeat."""
+    renewed = Event()
+    capturing = Event()
+    started = datetime(2026, 9, 23, tzinfo=UTC)
+    clock = [started]
+    renewal_count = 0
+    monkeypatch.setattr(snapshot_archiver, "_now", lambda: clock[0])
 
-    class SlowBackend(TableBackend):
-        """Make each canonical table capture take measurable time."""
+    class WaitingBackend(TableBackend):
+        """Hold capture open until its reservation has actually renewed."""
 
         @override
         def query(self, sql: str) -> pa.Table:
-            """Pause before returning one table."""
-            time.sleep(0.2)
+            """Coordinate capture with a real renewal instead of a fixed delay."""
+            capturing.set()
+            assert renewed.wait(timeout=5), "capture reservation was not renewed"
             return super().query(sql)
 
     monkeypatch.setattr(snapshot_archiver, "_LEASE_SECONDS", 1)
     archive = MemoryGcsArchive()
     store = SnapshotStore("gs://bucket/archive", gcs_bucket=archive)
-    backend = SlowBackend()
+    original = store._renew_for
 
-    published = store.write(cast(StorageBackend, backend), run_id="slow")
+    def renew(
+        destination: SnapshotBucket, owner: str, fence: int, now: datetime
+    ) -> bool:
+        """Signal only successful renewals performed while capture is pending."""
+        nonlocal renewal_count
+        if capturing.is_set():
+            clock[0] += timedelta(seconds=0.6)
+            now = clock[0]
+        result = original(destination, owner, fence, now)
+        if result and capturing.is_set():
+            renewal_count += 1
+            if renewal_count >= 2:
+                renewed.set()
+        return result
 
+    monkeypatch.setattr(store, "_renew_for", renew)
+    backend = WaitingBackend()
+    published = store.write(cast(StorageBackend, backend), run_id="waiting")
     assert published is not None
+    assert renewed.is_set()
+    assert clock[0] > started + timedelta(seconds=1)
     assert backend.queries == len(SNAPSHOT_TABLES)
     assert store.list_snapshots() == [published.rsplit("/", 1)[-1]]
 
@@ -431,6 +455,20 @@ def test_pending_destination_renews_during_slow_publication(
     )
     original = store._publish_for
     calls = 0
+    first_published = Event()
+    pending_renewed = Event()
+    original_renew = store._renew_for
+
+    def renew(
+        destination: SnapshotBucket, owner: str, fence: int, now: datetime
+    ) -> bool:
+        """Signal renewal of GCS while local publication is held open."""
+        result = original_renew(destination, owner, fence, now)
+        if result and destination is archive and first_published.is_set():
+            pending_renewed.set()
+        return result
+
+    monkeypatch.setattr(store, "_renew_for", renew)
 
     def slow_publish(
         destination: SnapshotBucket,
@@ -441,7 +479,7 @@ def test_pending_destination_renews_during_slow_publication(
         now: datetime,
         published_at: datetime | None = None,
     ) -> bool | None:
-        """Delay completion of the first publication past one lease period."""
+        """Hold the first publication open until the pending archive renews."""
         nonlocal calls
         result = original(
             destination,
@@ -453,13 +491,17 @@ def test_pending_destination_renews_during_slow_publication(
         )
         calls += 1
         if calls == 1:
-            time.sleep(1.2)
+            first_published.set()
+            assert pending_renewed.wait(timeout=5), (
+                "pending destination was not renewed"
+            )
         return result
 
     monkeypatch.setattr(store, "_publish_for", slow_publish)
     published = store.write(cast(StorageBackend, TableBackend()), run_id="slow")
 
     assert published is not None
+    assert pending_renewed.is_set()
     assert len(store.list_snapshots()) == 1
     gcs_catalog, _ = archive.read_json("catalog.json")
     assert gcs_catalog is not None

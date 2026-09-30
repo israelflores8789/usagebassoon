@@ -15,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
+from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 
@@ -33,37 +34,41 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     backend.apply_ddl()
     backend.append(
         "sessions",
-        pa.table(
-            {
-                "source_id": [SOURCE_ID],
-                "client": ["codex"],
-                "session_id": ["ses_private"],
-                "workspace": ["/project-alpha"],
-                "workspace_label": ["project-alpha"],
-                "created_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-                "last_active": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-                "duration_minutes": [1],
-                "message_count": [1],
-                "tokscale_cost_usd": [0.0],
-                "models_used": [["gpt-5"]],
-                "session_label": ["project-alpha · 2026-09-15 · ses_private"],
-                "first_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-                "last_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-                "updated_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": [SOURCE_ID],
+                    "client": ["codex"],
+                    "session_id": ["ses_private"],
+                    "workspace": ["/project-alpha"],
+                    "workspace_label": ["project-alpha"],
+                    "created_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                    "last_active": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                    "duration_minutes": [1],
+                    "message_count": [1],
+                    "tokscale_cost_usd": [0.0],
+                    "models_used": [["gpt-5"]],
+                    "session_label": ["project-alpha · 2026-09-15 · ses_private"],
+                    "first_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                    "last_seen_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                    "collected_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                }
+            )
         ),
     )
     backend.append(
         "notes",
-        pa.table(
-            {
-                "source_id": [SOURCE_ID],
-                "client": ["codex"],
-                "session_id": ["ses_private"],
-                "note": ["Call Ada at example@private.test"],
-                "created_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-                "updated_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": [SOURCE_ID],
+                    "client": ["codex"],
+                    "session_id": ["ses_private"],
+                    "note": ["Call Ada at example@private.test"],
+                    "created_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                    "collected_at": [datetime(2026, 9, 15, 12, tzinfo=UTC)],
+                }
+            )
         ),
     )
     return config, backend
@@ -84,6 +89,8 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
             "client=codex",
             "--limit",
             "1",
+            "--format",
+            "json",
             "--config",
             str(config),
         ],
@@ -94,10 +101,10 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
     )
 
     assert query_result.exit_code == 0
-    assert "ses_private" in query_result.output
-    assert "returns raw data" in query_result.stderr
+    assert "ses_private" in plain_cli_output(query_result.output)
+    assert "returns raw data" in plain_cli_output(query_result.stderr)
     assert delete_result.exit_code != 0
-    assert "not supported" in delete_result.output
+    assert "not supported" in plain_cli_output(delete_result.output)
 
 
 def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:

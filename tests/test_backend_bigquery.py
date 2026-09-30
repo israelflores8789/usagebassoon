@@ -6,24 +6,29 @@
 from __future__ import annotations
 
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from threading import Barrier, Lock
 from types import TracebackType
-from typing import Self, cast
-from uuid import uuid4
+from typing import Self, cast, override
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pytest
-from google.api_core.exceptions import BadRequest
-from google.cloud import bigquery, bigquery_storage_v1
+import sqlglot
+from google.api_core.exceptions import BadRequest, NotFound
+from google.auth.crypt import Signer
+from google.cloud import bigquery, bigquery_datatransfer, bigquery_storage_v1
+from google.cloud.bigquery.table import TableListItem
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
+from google.oauth2.service_account import Credentials
+from sqlglot import exp
 
-from usagebassoon.backends.base import (
-    CuratedIdentity,
-    CurrentStateWrite,
-    PersistenceBatch,
-    SourceLeaseToken,
-)
 from usagebassoon.backends.bigquery import BigQueryBackend, _schema_from_arrow
+from usagebassoon.backends.bigquery_compaction import install_compaction
+from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.persistence import persist_run
+from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 
 
 class _OfflineClient:
@@ -97,7 +102,7 @@ class _BatchClient:
         job_config: bigquery.LoadJobConfig,
         location: str,
     ) -> _Job:
-        """Record one explicit-schema Parquet staging load."""
+        """Record one explicit-schema Parquet publication or restore load."""
         assert location == "US"
         assert "`" not in destination
         assert hasattr(payload, "read")
@@ -114,19 +119,11 @@ class _BatchClient:
         job_config: bigquery.QueryJobConfig,
         location: str,
     ) -> _Job:
-        """Return the script summary expected by one staged current table."""
-        assert job_config.query_parameters
+        """Record maintenance queries without imposing collection DML semantics."""
+        assert job_config.maximum_bytes_billed == 1_073_741_824
         assert location == "US"
         self.queries.append(sql)
-        return _Job(
-            [
-                {
-                    "already_committed": False,
-                    "inserted_daily_activity": 1,
-                    "updated_daily_activity": 0,
-                }
-            ]
-        )
+        return _Job()
 
     def delete_table(self, table: str, *, not_found_ok: bool) -> None:
         """Record best-effort staging cleanup."""
@@ -134,10 +131,10 @@ class _BatchClient:
         assert "`" not in table
         self.deleted.append(table)
 
-    def get_table(self, _: str) -> bigquery.Table:
+    def get_table(self, table_id: str) -> bigquery.Table:
         """Return a table with required fields for direct-append testing."""
         return bigquery.Table(
-            "usagebassoon-test.usagebassoon_emulated.ingest_runs",
+            table_id,
             schema=[
                 bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
                 bigquery.SchemaField("source_id", "STRING", mode="REQUIRED"),
@@ -167,43 +164,6 @@ class _TransactionClient:
         assert location == "US"
         self.statement = statement
         return _Job([{"job_id": "job-1", "transaction_id": "transaction-1"}])
-
-    def close(self) -> None:
-        """Satisfy the BigQuery client close surface."""
-
-
-class _CurationClient:
-    """Offline client recording curation queries and their named parameters."""
-
-    def __init__(self) -> None:
-        """Initialize recorded curation transport calls."""
-        self.queries: list[str] = []
-        self.configurations: list[bigquery.QueryJobConfig] = []
-
-    def query(
-        self,
-        sql: str,
-        *,
-        job_config: bigquery.QueryJobConfig,
-        location: str,
-    ) -> _Job:
-        """Record one curation query and return its intended atomic outcome."""
-        assert location == "US"
-        self.queries.append(sql)
-        self.configurations.append(job_config)
-        if sql.startswith("DELETE"):
-            return _Job(affected_rows=1)
-        if "BEGIN TRANSACTION" in sql:
-            return _Job(
-                [
-                    {
-                        "source_exists": True,
-                        "destination_exists": False,
-                        "deleted_rows": 1,
-                    }
-                ]
-            )
-        return _Job()
 
     def close(self) -> None:
         """Satisfy the BigQuery client close surface."""
@@ -285,11 +245,14 @@ class _StorageReadClient:
 def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
     """Cancel a stuck remote job and expose its identity in the exception."""
     job = _TimeoutJob()
+    backend = _backend()
 
-    with pytest.raises(RuntimeError, match="stuck-job exceeded 120 seconds"):
-        _backend()._wait_for_job(cast(bigquery.job.QueryJob, job))
+    with pytest.raises(RuntimeError, match="stuck-job exceeded 120 seconds") as failure:
+        backend._wait_for_job(cast(bigquery.job.QueryJob, job))
 
     assert job.cancelled
+    assert backend.is_retryable_error(failure.value)
+    assert not backend.is_retryable_error(ValueError("invalid observation"))
 
 
 def test_bigquery_uses_configured_job_timeout() -> None:
@@ -397,196 +360,6 @@ def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:
     ]
 
 
-def test_batch_script_uses_run_scoped_staging_and_a_single_transaction() -> None:
-    """Generate only trusted identifiers and one idempotent batch script."""
-    backend = _backend()
-    run_id = str(uuid4())
-    current = pa.table(
-        {
-            "source_id": ["source"],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
-    )
-    batch = PersistenceBatch(
-        run_id=run_id,
-        current_state=(
-            CurrentStateWrite(
-                "daily_activity",
-                current,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
-            ),
-            CurrentStateWrite(
-                "reconciliation_issues",
-                pa.table(
-                    {
-                        "run_id": [run_id],
-                        "source_id": ["source"],
-                        "check_name": ["models_payload_totals"],
-                        "issue_key": ["total_input_mismatch"],
-                        "message": ["mismatch"],
-                        "created_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-                        "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-                        "detected_run_id": [run_id],
-                        "updated_run_id": [run_id],
-                        "resolved": [False],
-                        "observation_count": [1],
-                    }
-                ),
-                ("source_id", "check_name", "issue_key"),
-                ("message", "updated_at", "updated_run_id", "resolved"),
-            ),
-        ),
-        append_only={},
-        ingest_runs=pa.table(
-            {
-                "run_id": [run_id],
-                "source_id": ["source"],
-                "rows_inserted": [0],
-                "rows_updated": [0],
-            }
-        ),
-        lease=SourceLeaseToken("source", run_id, "owner", 1),
-    )
-    stages = {
-        "daily_activity": backend._stage_ref("daily_activity", run_id),
-        "reconciliation_issues": backend._stage_ref("reconciliation_issues", run_id),
-        "ingest_runs": backend._stage_ref("ingest_runs", run_id),
-    }
-    script = backend._batch_script(
-        batch, stages, SourceLeaseToken("source", run_id, "owner", 1)
-    )
-    assert "BEGIN TRANSACTION;" in script
-    assert "COMMIT TRANSACTION;" in script
-    assert "IF NOT already_committed THEN" in script
-    assert "WHERE `run_id` = @run_id" in script
-    assert script.index("BEGIN TRANSACTION;") < script.index(
-        "SET already_committed = EXISTS("
-    )
-    assert script.index(
-        "UPDATE `usagebassoon-test.usagebassoon_emulated.source_leases`"
-    ) < script.index("MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`")
-    assert "AND owner_id = @owner_id" in script
-    assert "AND run_id = @run_id AND fence = @fence" in script
-    assert "ASSERT lease_guard = 1" in script
-    assert "source.`updated_at` >= target.`updated_at`" in script
-    assert run_id.replace("-", "") in stages["daily_activity"]
-    assert "MERGE `usagebassoon-test.usagebassoon_emulated.daily_activity`" in script
-    assert (
-        "MERGE `usagebassoon-test.usagebassoon_emulated.reconciliation_issues`"
-        in script
-    )
-    assert "COALESCE(target.`detected_run_id`, source.`detected_run_id`)" in script
-    assert (
-        "CASE WHEN source.`resolved` = TRUE THEN target.`message` "
-        "ELSE source.`message` END"
-    ) in script
-    assert (
-        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
-        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
-        "target.`observation_count` + source.`observation_count` END"
-    ) in script
-
-
-def test_merge_qualifies_target_columns_that_match_the_source_alias() -> None:
-    """Keep a column called source distinct from the MERGE source table alias."""
-    backend = _backend()
-    write = CurrentStateWrite(
-        "price_versions",
-        pa.table(
-            {
-                "source_id": ["source-id"],
-                "day": [date(2026, 9, 17)],
-                "model": ["model"],
-                "source": ["tokscale"],
-            }
-        ),
-        ("source_id", "day", "model"),
-        ("source",),
-    )
-
-    statement = backend._merge_from_data(write, "`staged`")
-
-    assert "target.`source` = source.`source`" in statement
-
-
-def test_schema_drift_merge_adds_observation_count_once_per_run() -> None:
-    """Keep BigQuery event counts cumulative and safe for run retries."""
-    backend = _backend()
-    drift = pa.table(
-        {
-            "source_id": ["source"],
-            "domain": ["models"],
-            "tokscale_ver": ["4.15.2"],
-            "drift_key": ["unknown_field:future"],
-            "drift_kind": ["unknown_field"],
-            "path": ["future"],
-            "detail": ["types int; tolerated"],
-            "contract_tokscale_ver": ["4.15.1"],
-            "created_at": [datetime(2026, 9, 17, tzinfo=UTC)],
-            "updated_at": [datetime(2026, 9, 17, tzinfo=UTC)],
-            "detected_run_id": ["first-run"],
-            "updated_run_id": ["first-run"],
-            "resolved": [False],
-            "observation_count": [2],
-        }
-    )
-    write = CurrentStateWrite(
-        "schema_drift_events",
-        drift,
-        ("source_id", "domain", "tokscale_ver", "drift_key"),
-        ("updated_at", "updated_run_id", "resolved"),
-    )
-
-    statement = backend._merge_from_data(write, "`staged`")
-
-    assert (
-        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
-        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
-        "target.`observation_count` + source.`observation_count` END"
-    ) in statement
-
-
-def test_reconciliation_merge_adds_observation_count_once_per_run() -> None:
-    """Keep reconciliation counts cumulative and safe for run retries."""
-    backend = _backend()
-    issue = CurrentStateWrite(
-        "reconciliation_issues",
-        pa.table(
-            {
-                "run_id": ["current-run"],
-                "source_id": ["source"],
-                "check_name": ["models_payload_totals"],
-                "issue_key": ["total_input_mismatch"],
-                "message": ["mismatch"],
-                "created_at": [datetime(2026, 9, 17, tzinfo=UTC)],
-                "updated_at": [datetime(2026, 9, 17, tzinfo=UTC)],
-                "detected_run_id": ["first-run"],
-                "updated_run_id": ["current-run"],
-                "resolved": [False],
-                "observation_count": [1],
-            }
-        ),
-        ("source_id", "check_name", "issue_key"),
-        ("message", "updated_at", "updated_run_id", "resolved"),
-    )
-
-    statement = backend._merge_from_data(issue, "`staged`")
-
-    assert (
-        "CASE WHEN source.`updated_run_id` = target.`updated_run_id` OR "
-        "source.`observation_count` = 0 THEN target.`observation_count` ELSE "
-        "target.`observation_count` + source.`observation_count` END"
-    ) in statement
-    assert (
-        "CASE WHEN source.`resolved` = TRUE THEN target.`message` "
-        "ELSE source.`message` END"
-    ) in statement
-
-
 def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     """Qualify view definitions while retaining portable shipped SQL files."""
     backend = _backend()
@@ -598,32 +371,24 @@ def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
 
     table_prefix = "usagebassoon-test.usagebassoon_emulated"
     assert f"CREATE OR REPLACE VIEW `{table_prefix}.report_summary`" in qualified
-    assert f"FROM `{table_prefix}.sessions` AS sessions" in qualified
-    assert f"JOIN `{table_prefix}.tags` AS tags" in qualified
+    assert f"FROM `{table_prefix}.sessions`" in qualified
+    assert f"JOIN `{table_prefix}.tags`" in qualified
 
     qualified_reports = backend._qualify_view_sql(
         "CREATE OR REPLACE VIEW report_summary AS "
         "SELECT * FROM report_session_models "
         "JOIN report_daily_usage ON TRUE"
     )
-    assert (
-        f"FROM `{table_prefix}.report_session_models` AS report_session_models"
-        in qualified_reports
-    )
-    assert (
-        f"JOIN `{table_prefix}.report_daily_usage` AS report_daily_usage"
-        in qualified_reports
-    )
+    assert f"FROM `{table_prefix}.report_session_models`" in qualified_reports
+    assert f"JOIN `{table_prefix}.report_daily_usage`" in qualified_reports
 
 
-def test_bigquery_classifies_only_concurrent_transaction_aborts_as_retryable() -> None:
-    """Retry the documented transaction-conflict response and no other bad request."""
+def test_bigquery_classifies_transient_publication_failures() -> None:
+    from google.api_core.exceptions import ServiceUnavailable
+
     backend = _backend()
-
-    assert backend.is_retryable_error(
-        BadRequest("Transaction is aborted due to concurrent update against table")
-    )
-    assert not backend.is_retryable_error(BadRequest("invalid query"))
+    assert backend.is_retryable_error(ServiceUnavailable("unavailable"))
+    assert not backend.is_retryable_error(BadRequest("bad schema"))
 
 
 def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
@@ -649,126 +414,373 @@ def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
     assert client.statement.endswith("LIMIT 2")
 
 
-def test_bigquery_curation_operations_use_complete_bound_identities() -> None:
-    """Build typed delete and transactional rename SQL without interpolating values."""
-    client = _CurationClient()
-    backend = BigQueryBackend(
-        "usagebassoon-test",
-        "usagebassoon_emulated",
-        client=cast(bigquery.Client, client),
-    )
-    source = CuratedIdentity(
-        "tags",
-        (
-            ("source_id", "source"),
-            ("scope", "client"),
-            ("client", "codex"),
-            ("workspace", ""),
-            ("session_id", ""),
-            ("tag", "old"),
-        ),
-    )
-    destination = CuratedIdentity(
-        "tags",
-        (
-            ("source_id", "source"),
-            ("scope", "client"),
-            ("client", "codex"),
-            ("workspace", ""),
-            ("session_id", ""),
-            ("tag", "new"),
-        ),
-    )
-
-    assert backend.delete_curated(source) == 1
-    result = backend.rename_curated(
-        source,
-        destination,
-        updated_at=datetime(2026, 9, 17, tzinfo=UTC),
-    )
-
-    assert result.renamed
-    assert "BEGIN TRANSACTION;" in client.queries[1]
-    assert "ASSERT deleted_rows = 1" in client.queries[1]
-    assert "= 'source'" not in client.queries[0]
-    parameters = client.configurations[0].query_parameters
-    assert [parameter.name for parameter in parameters] == [
-        "source_id",
-        "scope",
-        "client",
-        "workspace",
-        "session_id",
-        "tag",
-    ]
-
-
-def test_batch_persistence_loads_explicit_schemas_and_cleans_stages() -> None:
-    """Use one explicit-schema load per table before running the batch script."""
+def test_publication_appends_to_bronze_without_queries_or_stages(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Use direct load jobs with explicit schemas and no synchronous DML."""
     client = _BatchClient()
     backend = BigQueryBackend(
         "usagebassoon-test",
         "usagebassoon_emulated",
         client=cast(bigquery.Client, client),
     )
-    run_id = str(uuid4())
-    current = pa.table(
-        {
-            "source_id": ["source"],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
+    bundle = normalize(collection_bundle)
+    persist_run(backend, bundle)
+    assert client.queries == []
+    assert client.deleted == []
+    assert client.loads[-1][0].endswith(".collection_ledger")
+    expected = {
+        "collection_ledger" if table == "collection_ledger" else "raw_" + table
+        for table, data in bundle.tables.items()
+        if data.num_rows
+    }
+    assert {
+        destination.rsplit(".", 1)[-1] for destination, _ in client.loads
+    } == expected
+    assert all(
+        config.write_disposition == "WRITE_APPEND"
+        and config.create_disposition == "CREATE_NEVER"
+        for _, config in client.loads
     )
-    batch = PersistenceBatch(
-        run_id=run_id,
-        current_state=(
-            CurrentStateWrite(
-                "daily_activity",
-                current,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
-            ),
-        ),
-        append_only={
-            "reconciliation_issues": pa.table(
-                {"run_id": [run_id], "source_id": ["source"]}
-            )
-        },
-        ingest_runs=pa.table(
-            {
-                "run_id": [run_id],
-                "source_id": ["source"],
-                "rows_inserted": [0],
-                "rows_updated": [0],
+
+
+def test_partial_publication_replays_event_ids_and_withholds_coverage(
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent facts finish before coverage is certified, including on retry."""
+    from google.api_core.exceptions import ServiceUnavailable
+
+    backend = _backend()
+    bundle = normalize(collection_bundle)
+    facts = [table for table in bundle.tables if table != "collection_ledger"]
+    barrier = Barrier(len(facts))
+    lock = Lock()
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    failure = True
+
+    def append(table: str, data: pa.Table) -> None:
+        """Require overlapping loads and fail one table on the first attempt."""
+        nonlocal failure
+        if table != "collection_ledger":
+            barrier.wait(timeout=5)
+        with lock:
+            calls.append((table, tuple(data.column("event_id").to_pylist())))
+            if table == "daily_stats" and failure:
+                failure = False
+                raise ServiceUnavailable("controlled append failure")
+
+    monkeypatch.setattr(backend, "append", append)
+    with pytest.raises(ServiceUnavailable):
+        persist_run(backend, bundle)
+    assert "collection_ledger" not in {table for table, _ in calls}
+    first = dict(calls)
+    persist_run(backend, bundle)
+    assert calls[-1][0] == "collection_ledger"
+    assert first == dict(calls[len(facts) : -1])
+
+
+def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
+    """Validate an initialized warehouse without schema or data queries."""
+
+    class Client(_BatchClient):
+        def get_dataset(self, _: str) -> bigquery.Dataset:
+            dataset = bigquery.Dataset("usagebassoon-test.usagebassoon_emulated")
+            dataset.location = "US"
+            return dataset
+
+        @override
+        def get_table(self, table_id: str) -> bigquery.Table:
+            table = super().get_table(table_id)
+            table.labels = {
+                "usagebassoon_schema_version": str(SCHEMA_VERSION),
+                "usagebassoon_schema_hash": schema_hash("bigquery"),
             }
-        ),
-        lease=SourceLeaseToken("source", run_id, "owner", 1),
-    )
-    result = backend.persist_batch(batch)
-    assert (result.inserted, result.updated, result.already_committed) == (1, 0, False)
-    assert len(client.loads) == 3
-    assert len(client.deleted) == 3
-    schema = client.loads[0][1].schema
-    assert schema is not None
-    assert schema[1].field_type == "DATE"
-    assert client.queries[0].count("BEGIN TRANSACTION;") == 1
+            return table
 
-
-def test_direct_append_uses_the_existing_required_schema() -> None:
-    """Preserve destination field modes when restoring or importing data."""
-    client = _BatchClient()
+    client = Client()
     backend = BigQueryBackend(
         "usagebassoon-test",
         "usagebassoon_emulated",
         client=cast(bigquery.Client, client),
     )
+    backend.preflight()
+    assert client.queries == []
+    assert client.loads == []
 
-    backend.append(
-        "ingest_runs",
-        pa.table({"run_id": ["run"], "source_id": ["source"]}),
+
+def test_canonical_required_fields_survive_bigquery_schema_mapping() -> None:
+    """Never relax warehouse keys or event identities during a load."""
+    for schema in CANONICAL_TABLE_SCHEMAS.values():
+        mapped = _schema_from_arrow(pa.Table.from_pylist([], schema=schema))
+        for field, native in zip(schema, mapped, strict=True):
+            if not pa.types.is_list(field.type):
+                assert native.mode == ("NULLABLE" if field.nullable else "REQUIRED")
+
+
+class _InitClient(_BatchClient):
+    """Metadata-backed initialization fake with one interrupted view installation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: dict[str, bigquery.Table] = {}
+        self.created: list[str] = []
+        self.fail_views = True
+
+    def get_dataset(self, _: str) -> bigquery.Dataset:
+        dataset = bigquery.Dataset("usagebassoon-test.usagebassoon_emulated")
+        dataset.location = "US"
+        return dataset
+
+    def list_tables(self, _: str) -> list[bigquery.Table]:
+        return list(self.tables.values())
+
+    @override
+    def get_table(self, table_id: str) -> bigquery.Table:
+        name = table_id.rsplit(".", 1)[-1]
+        if name not in self.tables:
+            raise NotFound("missing initialization object")
+        return bigquery.Table.from_api_repr(self.tables[name].to_api_repr())
+
+    def update_table(self, table: bigquery.Table, _: list[str]) -> bigquery.Table:
+        self.tables[table.table_id] = table
+        return table
+
+    @override
+    def query(
+        self,
+        sql: str,
+        *,
+        job_config: bigquery.QueryJobConfig,
+        location: str,
+    ) -> _Job:
+        assert location == "US" and job_config.default_dataset is not None
+        self.queries.append(sql)
+        if "CREATE OR REPLACE VIEW" in sql:
+            if self.fail_views:
+                self.fail_views = False
+                raise BadRequest("controlled view installation failure")
+            return _Job()
+        for statement in sqlglot.parse(sql, read="bigquery"):
+            if isinstance(statement, exp.Create):
+                name = statement.this.this.name
+                assert name not in self.tables
+                fields = []
+                for column in statement.this.expressions:
+                    kind = column.args["kind"].sql(dialect="bigquery")
+                    required = any(
+                        isinstance(constraint.kind, exp.NotNullColumnConstraint)
+                        for constraint in column.args.get("constraints", [])
+                    )
+                    mode = "REQUIRED" if required else "NULLABLE"
+                    if kind == "ARRAY<STRING>":
+                        kind, mode = "STRING", "REPEATED"
+                    fields.append(bigquery.SchemaField(column.name, kind, mode=mode))
+                table = bigquery.Table(
+                    "usagebassoon-test.usagebassoon_emulated." + name,
+                    schema=fields,
+                )
+                table.expires = datetime.now(UTC) + timedelta(days=1)
+                for partition in statement.find_all(exp.PartitionedByProperty):
+                    field = partition.this.name
+                    table.time_partitioning = bigquery.TimePartitioning(
+                        field=None if field == "_PARTITIONDATE" else field,
+                        expiration_ms=86400000,
+                    )
+                self.tables[name] = table
+                self.created.append(name)
+            elif isinstance(statement, exp.Insert):
+                assert statement.expression.args.get("from_") is not None
+        return _Job()
+
+
+def test_init_replays_an_interruption_without_recreating_tables() -> None:
+    """Block incomplete opens, resume initialization, and clear inherited expiry."""
+    client = _InitClient()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
     )
+    with pytest.raises(BadRequest, match="controlled"):
+        backend.apply_ddl()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        backend.preflight()
+    created = client.created.copy()
+    backend.apply_ddl()
+    assert client.created == created
+    backend.preflight()
+    jobs = len(client.queries)
+    backend.apply_ddl()
+    assert len(client.queries) == jobs
+    for name, table in client.tables.items():
+        assert table.expires is None
+        if table.time_partitioning is not None:
+            expected = 90 * 86400000 if name.startswith("raw_") else None
+            assert table.time_partitioning.expiration_ms == expected
 
-    schema = client.loads[0][1].schema
-    assert schema is not None
-    assert [field.mode for field in schema] == ["REQUIRED", "REQUIRED"]
+
+@pytest.mark.parametrize(
+    ("version", "hash_value", "message"),
+    [
+        (SCHEMA_VERSION + 1, None, "newer UsageBassoon"),
+        (SCHEMA_VERSION, "0" * 63, "schema hash"),
+    ],
+)
+def test_preflight_rejects_unsupported_markers_without_schema_jobs(
+    version: int,
+    hash_value: str | None,
+    message: str,
+) -> None:
+    """Refuse newer warehouses and mismatched baselines without altering data."""
+    client = _InitClient()
+    marker = bigquery.Table("usagebassoon-test.usagebassoon_emulated.schema_marker")
+    marker.labels = {
+        "usagebassoon_schema_version": str(version),
+        "usagebassoon_schema_hash": hash_value or schema_hash("bigquery"),
+    }
+    client.tables["schema_marker"] = marker
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        backend.preflight()
+    assert client.queries == []
+
+
+@pytest.mark.parametrize(
+    ("message", "exception_type"),
+    [
+        ("Query error: restore requires an empty warehouse at [4:1]", ValueError),
+        ("controlled invalid restore SQL", BadRequest),
+    ],
+)
+def test_restore_translates_emptiness_errors_and_cleans_stages(
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    exception_type: type[Exception],
+) -> None:
+    """Surface the destination precondition while preserving unrelated API errors."""
+    failure = BadRequest(message)
+
+    class Client(_BatchClient):
+        """Expose one destination table and reject the restore transaction."""
+
+        def list_tables(self, dataset: str) -> list[TableListItem]:
+            """Return the initialized destination table for emptiness validation."""
+            assert dataset == "usagebassoon-test.usagebassoon_emulated"
+            return [
+                TableListItem(
+                    {
+                        "tableReference": {
+                            "projectId": "usagebassoon-test",
+                            "datasetId": "usagebassoon_emulated",
+                            "tableId": "daily_stats",
+                        },
+                        "id": "usagebassoon-test:usagebassoon_emulated.daily_stats",
+                        "type": "TABLE",
+                    }
+                )
+            ]
+
+        @override
+        def query(
+            self,
+            sql: str,
+            *,
+            job_config: bigquery.QueryJobConfig,
+            location: str,
+        ) -> _Job:
+            """Raise the backend error after all restore assertions are assembled."""
+            assert "restore requires an empty warehouse" in sql
+            assert job_config.default_dataset is not None and location == "US"
+            raise failure
+
+    client = Client()
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+    staged: list[str] = []
+
+    def load(data: pa.Table, destination: str, *, disposition: str) -> None:
+        """Record the staged snapshot without making a cloud call."""
+        assert data.num_rows > 0 and disposition == "WRITE_TRUNCATE"
+        staged.append(destination)
+
+    monkeypatch.setattr(backend, "_load", load)
+    bundle = normalize(collection_bundle)
+    with pytest.raises(exception_type) as raised:
+        backend.restore_tables({"daily_stats": bundle.tables["daily_stats"]})
+    assert client.deleted == staged
+    assert len(staged) == 1
+    if exception_type is ValueError:
+        assert str(raised.value) == "restore requires an empty warehouse"
+        assert raised.value.__cause__ is failure
+    else:
+        assert raised.value is failure
+
+
+def test_nightly_schedule_create_reuse_and_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the service account, reuse matching schedules, and update changed SQL."""
+    credentials = Credentials(
+        signer=cast(Signer, MagicMock(spec=Signer)),
+        service_account_email="collector@example.iam.gserviceaccount.com",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_it",
+        credentials=credentials,
+        client=cast(bigquery.Client, MagicMock(spec=bigquery.Client)),
+    )
+    client = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
+    client.__enter__.return_value = client
+    empty_configs: list[bigquery_datatransfer.TransferConfig] = []
+    client.list_transfer_configs.return_value = empty_configs
+    client.create_transfer_config.return_value = bigquery_datatransfer.TransferConfig(
+        name="projects/1/locations/us/transferConfigs/1"
+    )
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr(bigquery_datatransfer, "DataTransferServiceClient", factory)
+    name = install_compaction(backend)
+    factory.assert_called_with(credentials=credentials)
+    request = client.create_transfer_config.call_args.kwargs["request"]
+    assert request.parent == "projects/usagebassoon-test/locations/us"
+    assert request.service_account_name == credentials.service_account_email
+    assert request.transfer_config.schedule == "every day 02:00"
+    assert "BEGIN TRANSACTION" in request.transfer_config.params["query"]
+    assert (
+        "`usagebassoon-test.usagebassoon_it.raw_daily_stats`"
+        in request.transfer_config.params["query"]
+    )
+    existing = bigquery_datatransfer.TransferConfig(request.transfer_config)
+    existing.name = name
+    client.list_transfer_configs.return_value = [existing]
+    assert install_compaction(backend) == name
+    client.create_transfer_config.assert_called_once()
+    client.update_transfer_config.assert_not_called()
+    existing = bigquery_datatransfer.TransferConfig(
+        name=name,
+        display_name=existing.display_name,
+        data_source_id="scheduled_query",
+        params={"query": "old SQL"},
+    )
+    client.list_transfer_configs.return_value = [existing]
+    client.update_transfer_config.return_value = existing
+    assert install_compaction(backend) == name
+    update = client.update_transfer_config.call_args.kwargs
+    assert list(update["update_mask"].paths) == ["params", "schedule"]
+    assert (
+        update["transfer_config"].params["query"]
+        == request.transfer_config.params["query"]
+    )
+    client.list_transfer_configs.return_value = [existing, existing]
+    with pytest.raises(RuntimeError, match="multiple UsageBassoon"):
+        install_compaction(backend)

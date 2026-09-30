@@ -17,21 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
 - Added support for `tokscale` v4.15.1.
-- Added `tokscale` collection of daily per-session and per-model usage, activity, session metadata, observed pricing, and collector-host metadata.
-- Added schema-drift event persistence of tokscale payload differences into version-scoped `schema_drift_events` current-state rows with stable domain/drift identities, first/latest run metadata, resolution state, and observation counts.
-- Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and idempotent transactional upserts that preserve token usage history.
+- Added `tokscale` collection of daily per-session and per-model usage, session metadata, observed pricing, and collector-host metadata.
+- Added ephemeral append-only schema-drift observations and resolution events with replay-safe identities and deduplicated observation counts.
+- Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and backend-specific idempotent publication that preserves token usage history.
 - Added support for local DuckDB databases using the `StorageBackend` protocol.
-- Added support for BigQuery datasets for remote persistence using the `StorageBackend` protocol.
+- Added support for BigQuery datasets with concurrent append publication, immediately queryable canonical views, and nightly transactional compaction.
 - Added support for MotherDuck databases for remote persistence using the `StorageBackend` protocol.
 - Added terminal summary, model, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
 - Added workspace, client, model, tag, source, and inclusive date filters to daily and model reports, session last-active date filters, and a session creation-date display and filter mode; date bounds combine with all other report filters.
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
-- Added source-scoped workspace, client, and session tags and notes for user-curated reports.
-- Added ingest audits, models payload reconciliation, and diagnostics. Repeated detections update issues by source, check, and issue key while retaining first and latest detection metadata.
-- Added portable Parquet snapshots and restore for local and remote object store archives, with catalog-based publication, integrity checks, retention, and optional collection-triggered cadence.
+- Added global workspace, client, and session tags with mutation provenance and source-scoped session notes for user-curated reports.
+- Added permanent collection audits, models payload reconciliation, and diagnostics using append-only outcomes and issue events.
+- Added portable Parquet snapshots and restore for local and remote object store archives, with consistent warehouse capture, catalog-based publication, integrity checks, retention, optional collection-triggered cadence, and restoration into initialized empty destinations across supported backends.
 - Added support for Google Cloud Storage for snapshot archives.
 - Added scheduled token usage history collection for Linux (systemd), macOS (launchd), and container environments (worker script) with status, log controls, per-operation timeouts, and retries.
 - Added sharing controls: reports are raw by default with `--sanitize`, exports pseudonymize session, workspace, tag, and host fields and redact notes, `doctor` diagnostics output is sanitized by default, and raw queries warn on stderr.
 - Added comprehensive unit test suite that ensures consistent behavior across backends and object stores.
 - Added a live persistence test suite against all implemented remote backends and object stores including BigQuery, MotherDuck, and Google Cloud Storage. Tests are automated in the CI Live GitHub workflow.
 - Added SQL parity test suite that ensures structural and synthetic replay behavior against all SQL dialects using SQLGlot.
+
+- Added explicit, idempotent warehouse initialization and schema-compatibility preflight checks.
+- Added local collector exclusion, replay-safe remote publication, and bounded persistence retries for concurrent ephemeral environments.

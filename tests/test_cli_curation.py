@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import CONFIG_PATH_ENV_VAR
@@ -24,6 +25,11 @@ def _write_config(path: Path, database: Path) -> None:
         f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
         f'local_database = "{database}"\n'
     )
+    backend = DuckDBBackend(database)
+    try:
+        backend.apply_ddl()
+    finally:
+        backend.close()
 
 
 def _command(config: Path, *parts: str) -> list[str]:
@@ -75,17 +81,18 @@ def test_curation_commands_use_only_the_explicit_config(
         backend.close()
 
 
-def test_only_the_new_curation_command_forms_are_available(tmp_path: Path) -> None:
-    """Assert old note and tag positional forms are not compatibility aliases."""
-    config = tmp_path / "config.toml"
-    _write_config(config, tmp_path / "usage.duckdb")
+def test_curation_help_documents_the_supported_operations() -> None:
+    """Expose each supported tag and note operation in command help."""
     runner = CliRunner()
-    old_note = runner.invoke(app, _command(config, "note", "first"))
-    old_tag = runner.invoke(
-        app, _command(config, "tag", "important", "--client", "codex")
-    )
-    assert old_note.exit_code != 0
-    assert old_tag.exit_code != 0
+    for command, operations in (
+        ("tag", ("add", "rename", "remove")),
+        ("note", ("set", "edit", "remove")),
+    ):
+        result = runner.invoke(app, [command, "--help"])
+        assert result.exit_code == 0
+        output = plain_cli_output(result.stdout)
+        for operation in operations:
+            assert operation in output.split()
 
 
 def test_tag_commands_support_each_scope_rename_and_remove(tmp_path: Path) -> None:
@@ -154,7 +161,7 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     backend = DuckDBBackend(database)
     try:
         original = backend.query(
-            "SELECT created_at, updated_at FROM notes"
+            "SELECT created_at, collected_at FROM notes"
         ).to_pylist()[0]
     finally:
         backend.close()
@@ -167,20 +174,20 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} edited")
     edited = runner.invoke(app, _command(config, "note", "edit", *target))
     assert edited.exit_code == 0
-    assert "Updated note" in edited.output
+    assert "Updated note" in plain_cli_output(edited.output)
 
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '   '")
     blank = runner.invoke(app, _command(config, "note", "edit", *target))
     assert blank.exit_code != 0
-    assert "note remove" in blank.output
+    assert "note remove" in plain_cli_output(blank.output)
     backend = DuckDBBackend(database)
     try:
         revised = backend.query(
-            "SELECT note, created_at, updated_at FROM notes"
+            "SELECT note, created_at, collected_at FROM notes"
         ).to_pylist()[0]
         assert revised["note"] == "edited"
         assert revised["created_at"] == original["created_at"]
-        assert revised["updated_at"] > original["updated_at"]
+        assert revised["collected_at"] > original["collected_at"]
     finally:
         backend.close()
 
@@ -198,4 +205,4 @@ def test_note_edit_requires_a_configured_editor(
         _command(config, "note", "edit", "--client", "codex", "--session", "ses_123"),
     )
     assert result.exit_code != 0
-    assert "note set" in result.output
+    assert "note set" in plain_cli_output(result.output)

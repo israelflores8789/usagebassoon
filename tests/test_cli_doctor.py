@@ -13,6 +13,8 @@ import pyarrow as pa
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
+from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.diagnostics import DoctorCheck
@@ -42,11 +44,11 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
     raw = runner.invoke(app, ["doctor", "--raw", "--config", str(missing)])
 
     assert sanitized.exit_code == 1
-    assert str(missing) not in sanitized.output
-    assert "<config-path>" in sanitized.output
+    assert str(missing) not in plain_cli_output(sanitized.output)
+    assert "<config-path>" in plain_cli_output(sanitized.output)
     assert raw.exit_code == 1
-    assert str(missing) in raw.output.replace("\n", "")
-    assert "raw doctor output may contain" in raw.stderr
+    assert str(missing) in plain_cli_output(raw.output).replace("\n", "")
+    assert "raw doctor output may contain" in plain_cli_output(raw.stderr)
 
 
 def test_doctor_strict_fails_when_unresolved_drift_is_present(
@@ -54,25 +56,27 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
 ) -> None:
     """Treat diagnostic warnings as failures only when strict mode is requested."""
     config, backend = _configured_store(tmp_path)
+    observed = datetime.now(UTC)
     backend.append(
         "schema_drift_events",
-        pa.table(
-            {
-                "source_id": [SOURCE_ID],
-                "domain": ["models"],
-                "tokscale_ver": ["4.15.1"],
-                "drift_key": ["unknown_field:entries[].extra"],
-                "drift_kind": ["unknown_field"],
-                "path": ["entries[].extra"],
-                "detail": ["unexpected field"],
-                "contract_tokscale_ver": ["4.15.1"],
-                "created_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                "updated_at": [datetime(2026, 9, 15, tzinfo=UTC)],
-                "detected_run_id": ["run-1"],
-                "updated_run_id": ["run-1"],
-                "resolved": [False],
-                "observation_count": [1],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": [SOURCE_ID],
+                    "domain": ["models"],
+                    "tokscale_ver": ["4.15.1"],
+                    "drift_key": ["unknown_field:entries[].extra"],
+                    "drift_kind": ["unknown_field"],
+                    "path": ["entries[].extra"],
+                    "detail": ["unexpected field"],
+                    "contract_tokscale_ver": ["4.15.1"],
+                    "created_at": [observed],
+                    "collected_at": [observed],
+                    "run_id": ["run-1"],
+                    "resolved": [False],
+                    "observation_count": [1],
+                }
+            )
         ),
     )
     backend.close()
@@ -88,7 +92,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     strict = runner.invoke(app, ["doctor", "--strict", "--config", str(config)])
 
     assert regular.exit_code == 0
-    assert "WARNING schema_drift" in regular.output
+    assert "WARNING schema_drift" in plain_cli_output(regular.output)
     assert strict.exit_code == 1
 
 
@@ -134,14 +138,14 @@ def test_doctor_reports_configured_tokscale_command_and_version(
 
     result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, plain_cli_output(result.output)
     assert calls == [["npx", "tokscale@latest", "--version"]]
     assert (
-        result.output.index("OK usagebassoon: version")
-        < result.output.index("OK tokscale: version 4.15.1")
-        < result.output.index("OK configuration:")
+        plain_cli_output(result.output).index("OK usagebassoon: version")
+        < plain_cli_output(result.output).index("OK tokscale: version 4.15.1")
+        < plain_cli_output(result.output).index("OK configuration:")
     )
-    assert "command: npx tokscale@latest" in result.output
+    assert "command: npx tokscale@latest" in plain_cli_output(result.output)
 
 
 def test_doctor_reports_failed_tokscale_probe(
@@ -161,6 +165,6 @@ def test_doctor_reports_failed_tokscale_probe(
     result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
 
     assert result.exit_code == 1
-    assert "ERROR tokscale:" in result.output
-    assert "command: missing-tokscale" in result.output
-    assert "OK configuration:" in result.output
+    assert "ERROR tokscale:" in plain_cli_output(result.output)
+    assert "command: missing-tokscale" in plain_cli_output(result.output)
+    assert "OK configuration:" in plain_cli_output(result.output)

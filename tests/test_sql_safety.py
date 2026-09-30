@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon import query, query_arrow
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
@@ -120,4 +121,4 @@ def test_cli_query_only_accepts_an_allowlisted_relation(
 
     assert allowed.exit_code == 0
     assert rejected.exit_code != 0
-    assert "not supported" in rejected.output
+    assert "not supported" in plain_cli_output(rejected.output)

@@ -13,6 +13,7 @@ from typing import NoReturn
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
 from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
@@ -143,7 +144,7 @@ def test_doctor_surfaces_missing_native_scheduler(
             "linux",
             "systemd",
             False,
-            "systemd user scheduling is unavailable",
+            "systemd user scheduling is unavailable; run bassoon schedule worker",
         ),
     )
 
@@ -152,26 +153,6 @@ def test_doctor_surfaces_missing_native_scheduler(
     assert check.name == "scheduling"
     assert check.status == "warning"
     assert "systemd user scheduling is unavailable" in check.message
-
-
-def test_missing_scheduler_warning_directs_users_to_worker(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Point container users at the foreground scheduler explicitly."""
-    configuration = _configuration(tmp_path)
-    monkeypatch.setattr(
-        "usagebassoon.scheduling.scheduler_availability",
-        lambda: SchedulerAvailability(
-            "linux",
-            "systemd",
-            False,
-            "Warning: systemd was not found; run `bassoon schedule worker`",
-        ),
-    )
-
-    check = schedule_doctor_check(configuration)
-
     assert "bassoon schedule worker" in check.message
 
 
@@ -224,7 +205,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert "minutes or hours" in result.output
+    assert "minutes or hours" in plain_cli_output(result.output)
 
 
 def test_worker_cli_starts_detached_process_and_reports_pid(
@@ -264,11 +245,11 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, plain_cli_output(result.output)
     assert calls == ["30m"]
-    assert "background" in result.output
-    assert "12345" in result.output
-    assert str(started.log_path) in result.output
+    assert "background" in plain_cli_output(result.output)
+    assert "12345" in plain_cli_output(result.output)
+    assert str(started.log_path) in plain_cli_output(result.output)
 
 
 def test_schedule_install_persists_explicit_interval(
@@ -325,5 +306,5 @@ def test_schedule_install_persists_explicit_interval(
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, plain_cli_output(result.output)
     assert ConfigurationManager(configuration.path).load().schedule.interval == "30m"

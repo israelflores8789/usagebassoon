@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import (
@@ -46,7 +47,7 @@ def test_init_creates_source_config_and_local_schema(
     assert configuration.logging.max_files == 5
     repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
     assert repeated.exit_code == 0
-    assert "Using existing configuration" in repeated.output
+    assert "Using existing configuration" in plain_cli_output(repeated.output)
     assert config_path.read_bytes() == original
     assert configuration.local_database is not None
     backend = DuckDBBackend(configuration.local_database)
@@ -73,7 +74,7 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert ConfigurationManager(config_path).load().source_id == source_id
-    assert "Using existing configuration" in result.output
+    assert "Using existing configuration" in plain_cli_output(result.output)
     backend = DuckDBBackend(database)
     try:
         assert backend.query("SELECT count(*) AS n FROM tags").to_pylist() == [{"n": 0}]
@@ -99,6 +100,6 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
 
     assert result.exit_code != 0
-    assert "backend must be one of" in result.output
+    assert "backend must be one of" in plain_cli_output(result.output)
     log_path = log_directory / "usagebassoon.log"
     assert "backend must be one of" in log_path.read_text()

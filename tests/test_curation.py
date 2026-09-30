@@ -16,6 +16,7 @@ from usagebassoon.curation import (
     NoteAssignment,
     TagAssignment,
     add_tag,
+    get_note,
     remove_note,
     remove_tag,
     rename_tag,
@@ -130,24 +131,24 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
             == 1
         )
         assert backend.query(
-            "SELECT note, note_created_at, note_updated_at FROM noted_sessions "
+            "SELECT note, note_created_at, note_collected_at FROM noted_sessions "
             f"WHERE client = '{target.client}' "
             f"AND session_id = '{target.session_id}'"
         ).to_pylist() == [
             {
                 "note": "Revised annotation",
                 "note_created_at": created,
-                "note_updated_at": updated,
+                "note_collected_at": updated,
             }
         ]
     finally:
         backend.close()
 
 
-def test_tags_do_not_cross_source_namespaces(
+def test_tags_are_global_and_notes_match_source_scoped_sessions(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Assert a client tag resolves only onto sessions from its own source."""
+    """Share tags across sources while joining notes to their exact sessions."""
     backend = DuckDBBackend(":memory:")
     alternate_source = "22222222-2222-4222-8222-222222222222"
     target = collection_bundle.report_rows[0]
@@ -173,9 +174,53 @@ def test_tags_do_not_cross_source_namespaces(
                 tag="source-one-only",
             ),
         )
+        expected_sources = sorted([collection_bundle.source_id, alternate_source])
         assert backend.query(
-            "SELECT DISTINCT source_id FROM session_tags WHERE tag = 'source-one-only'"
-        ).to_pylist() == [{"source_id": collection_bundle.source_id}]
+            "SELECT DISTINCT source_id FROM session_tags "
+            "WHERE tag = 'source-one-only' ORDER BY source_id"
+        ).to_pylist() == [{"source_id": source} for source in expected_sources]
+        set_note(
+            backend,
+            NoteAssignment(
+                collection_bundle.source_id,
+                target.client,
+                target.session_id,
+                "source note",
+            ),
+        )
+        assert backend.query(
+            "SELECT source_id, note FROM noted_sessions "
+            "WHERE client = :client AND session_id = :session_id ORDER BY source_id",
+            {"client": target.client, "session_id": target.session_id},
+        ).to_pylist() == [
+            {"source_id": collection_bundle.source_id, "note": "source note"}
+        ]
+        assert (
+            get_note(
+                backend,
+                source_id=alternate_source,
+                client=target.client,
+                session_id=target.session_id,
+            )
+            is None
+        )
+        set_note(
+            backend,
+            NoteAssignment(
+                alternate_source, target.client, target.session_id, "alternate note"
+            ),
+        )
+        labels = {
+            collection_bundle.source_id: "source note",
+            alternate_source: "alternate note",
+        }
+        assert backend.query(
+            "SELECT source_id, note FROM noted_sessions "
+            "WHERE client = :client AND session_id = :session_id ORDER BY source_id",
+            {"client": target.client, "session_id": target.session_id},
+        ).to_pylist() == [
+            {"source_id": source, "note": labels[source]} for source in expected_sources
+        ]
     finally:
         backend.close()
 
@@ -191,29 +236,6 @@ def test_tag_assignment_rejects_invalid_scope_targets() -> None:
         )
     with pytest.raises(ValueError, match="session tags require"):
         TagAssignment(scope="session", source_id="source", tag="project-alpha")
-
-
-def test_tag_rename_preserves_creation_time_and_updates_timestamp() -> None:
-    """Assert a rename changes only a complete assignment's label and freshness."""
-    backend = DuckDBBackend(":memory:")
-    created = datetime(2026, 9, 14, tzinfo=UTC)
-    renamed = created + timedelta(days=1)
-    assignment = TagAssignment(
-        scope="client",
-        source_id="11111111-1111-4111-8111-111111111111",
-        client="codex",
-        tag="old",
-    )
-    try:
-        backend.apply_ddl()
-        add_tag(backend, assignment, at=created)
-        result = rename_tag(backend, assignment, "new", at=renamed)
-        assert result.renamed
-        assert backend.query(
-            "SELECT tag, created_at, updated_at FROM tags"
-        ).to_pylist() == [{"tag": "new", "created_at": created, "updated_at": renamed}]
-    finally:
-        backend.close()
 
 
 def test_tag_rename_leaves_source_when_destination_exists() -> None:

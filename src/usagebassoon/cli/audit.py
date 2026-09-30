@@ -29,13 +29,13 @@ def audit(
     _, backend = configured_backend(config)
     try:
         data = backend.query(
-            "SELECT run_id, started_at, finished_at, status, rows_in, rows_inserted, "
-            "rows_updated, drift_events FROM ingest_runs "
+            "SELECT run_id, source_id, started_at, finished_at, status "
+            "FROM collection_runs "
             f"ORDER BY finished_at DESC LIMIT {limit}"
         )
     finally:
         backend.close()
-    table = Table(title="Recent ingest audit records")
+    table = Table(title="Recent collection audit records")
     for column in data.column_names:
         table.add_column(column)
     for row in data.to_pylist():

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._cli import plain_cli_output
 from usagebassoon.config import LoggingConfig
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR, configure
 
@@ -57,6 +58,8 @@ def test_unavailable_log_directory_falls_back_to_stderr(
     logger.error("fallback collection error")
 
     captured = capsys.readouterr()
-    assert "WARNING: UsageBassoon logging directory is unavailable" in captured.err
-    assert "operational log" in captured.err
-    assert "fallback collection error" in captured.err
+    assert "WARNING: UsageBassoon logging directory is unavailable" in plain_cli_output(
+        captured.err
+    )
+    assert "operational log" in plain_cli_output(captured.err)
+    assert "fallback collection error" in plain_cli_output(captured.err)

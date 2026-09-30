@@ -1,18 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_atomic_persistence.py — Cross-backend batch persistence invariants."""
+"""test_persistence.py — Transactional writes, append publication, and retries."""
 
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
 from pathlib import Path
-from uuid import uuid4
+from threading import Lock
 
 import pyarrow as pa
 import pytest
+from google.api_core.exceptions import ServiceUnavailable
 
+from tests._bigquery_replay import BigQueryReplayBackend
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.config import UsageBassoonConfig
@@ -21,7 +22,7 @@ from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 
 
-def test_replaying_a_committed_run_is_an_idempotent_no_op(
+def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
     collection_bundle: CollectionBundle,
 ) -> None:
     """Keep current and append-only facts unchanged when a run is retried."""
@@ -33,9 +34,9 @@ def test_replaying_a_committed_run_is_an_idempotent_no_op(
         retry = persist_run(backend, normalized)
         assert first.inserted > 0
         assert (retry.inserted, retry.updated, retry.per_table) == (0, 0, {})
-        assert backend.query("SELECT count(*) AS n FROM ingest_runs").to_pylist() == [
-            {"n": 1}
-        ]
+        assert backend.query(
+            "SELECT count(*) AS n FROM collection_runs"
+        ).to_pylist() == [{"n": 1}]
         price_count = sum(
             len(prices) for prices in collection_bundle.pricing_by_day.values()
         )
@@ -46,42 +47,30 @@ def test_replaying_a_committed_run_is_an_idempotent_no_op(
         backend.close()
 
 
-def test_batch_rolls_back_every_write_when_a_later_append_fails() -> None:
-    """Reject a partial cycle instead of committing its current-state mutation."""
+def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
+    collection_bundle: CollectionBundle,
+) -> None:
+    bundle = normalize(collection_bundle)
     backend = DuckDBBackend(":memory:")
-    run_id = str(uuid4())
-    data = pa.table(
-        {
-            "source_id": ["source"],
-            "day": [date(2026, 9, 16)],
-            "intensity": [1],
-            "active_time_ms": [100],
-            "updated_at": [datetime(2026, 9, 16, tzinfo=UTC)],
-        }
-    )
+    backend.apply_ddl()
     batch = PersistenceBatch(
-        run_id=run_id,
+        run_id=bundle.run_id,
         current_state=(
             CurrentStateWrite(
-                "daily_activity",
-                data,
-                ("source_id", "day"),
-                ("intensity", "active_time_ms"),
+                "daily_stats",
+                bundle.tables["daily_stats"],
+                ("source_id", "day", "client", "session_id", "model"),
+                ("total_tokens",),
             ),
         ),
-        append_only={"missing_history": pa.table({"run_id": [run_id]})},
-        ingest_runs=pa.table({"run_id": [run_id], "source_id": ["source"]}),
+        append_only={"missing_history": bundle.tables["collection_ledger"]},
+        collection_ledger=bundle.tables["collection_ledger"],
     )
     try:
-        backend.apply_ddl()
         with pytest.raises(Exception, match="missing_history"):
             backend.persist_batch(batch)
-        assert backend.query(
-            "SELECT count(*) AS n FROM daily_activity"
-        ).to_pylist() == [{"n": 0}]
-        assert backend.query("SELECT count(*) AS n FROM ingest_runs").to_pylist() == [
-            {"n": 0}
-        ]
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM collection_ledger").num_rows == 0
     finally:
         backend.close()
 
@@ -148,4 +137,45 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     assert result.inserted == 1
     assert attempts == [normalized.run_id, normalized.run_id]
-    assert schema_attempts == [None]
+    assert schema_attempts == []
+
+
+def test_bigquery_partial_publication_never_marks_missing_facts_complete(
+    collection_bundle: CollectionBundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fact and ledger failures leave useful data visible and safe to recollect."""
+    backend = BigQueryReplayBackend()
+    bundle = normalize(collection_bundle)
+    original_append = backend.append
+    lock = Lock()
+    failed_table = "daily_stats"
+
+    def append(table: str, data: pa.Table) -> None:
+        """Serialize the local replay engine while preserving independent loads."""
+        with lock:
+            if table == failed_table:
+                raise ServiceUnavailable("controlled publication failure")
+            original_append(table, data)
+
+    monkeypatch.setattr(backend, "append", append)
+    try:
+        with pytest.raises(ServiceUnavailable):
+            persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM current_sessions").num_rows > 0
+        assert backend.query("SELECT * FROM current_daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM collection_status").num_rows == 0
+        failed_table = "collection_ledger"
+        with pytest.raises(ServiceUnavailable):
+            persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM current_daily_stats").num_rows > 0
+        assert backend.query("SELECT * FROM collection_status").num_rows == 0
+        failed_table = ""
+        persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM collection_runs").num_rows == 1
+        assert backend.query("SELECT * FROM collection_status").num_rows > 0
+        for table in ("sessions", "daily_stats", "price_versions"):
+            assert backend.query(f"SELECT * FROM current_{table}").num_rows == (
+                bundle.tables[table].num_rows
+            )
+    finally:
+        backend.close()

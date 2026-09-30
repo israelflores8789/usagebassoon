@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_merge.py — Daily normalization, cost views, and persistence tests."""
+"""test_normalization.py — Daily normalization, cost views, and persistence tests."""
 
 from __future__ import annotations
 
@@ -14,8 +14,14 @@ import pytest
 
 from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
-    EXPECTED_DAYS,
     EXPECTED_REPORT_ROWS,
+    EXPECTED_TOTAL_CACHE_READ,
+    EXPECTED_TOTAL_CACHE_WRITE,
+    EXPECTED_TOTAL_COST,
+    EXPECTED_TOTAL_INPUT,
+    EXPECTED_TOTAL_MESSAGES,
+    EXPECTED_TOTAL_OUTPUT,
+    EXPECTED_TOTAL_REASONING,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
@@ -24,36 +30,23 @@ from usagebassoon.persistence import persist_run
 from usagebassoon.system_metadata import SystemMetadata
 
 
-def test_normalize_emits_daily_tables_and_ingest_status(
+def test_normalize_emits_daily_tables_and_collection_status(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Emit only base tables needed for daily facts and calculated views."""
     normalized = normalize(collection_bundle)
-    assert "session_model_stats" not in normalized.tables
-    assert normalized.tables["daily_stats"].column_names[-7:] == [
-        "tokscale_cost_usd",
-        "perf_duration_ms",
-        "perf_timed_tokens",
-        "perf_sample_count",
-        "perf_token_coverage",
-        "tokscale_ms_per_1k_tokens",
-        "updated_at",
-    ]
-    assert normalized.tables["price_versions"].column_names[-2:] == [
-        "observed_at",
-        "updated_at",
-    ]
-    assert normalized.tables["ingest_status"].column_names[-4:] == [
-        "last_attempted_run",
-        "last_succeeded_run",
-        "failure_code",
-        "updated_at",
-    ]
-    assert normalized.tables["ingest_runs"].column_names[-3:] == [
-        "rows_inserted",
-        "rows_updated",
-        "drift_events",
-    ]
+    assert set(normalized.tables) == {
+        "sessions",
+        "daily_stats",
+        "price_versions",
+        "collection_ledger",
+    }
+    ledger = normalized.tables["collection_ledger"]
+    assert ledger.num_rows == 1 + len(collection_bundle.ingest_status)
+    assert ledger.column("domain").to_pylist().count("collection") == 1
+    assert ledger.schema == CANONICAL_TABLE_SCHEMAS["collection_ledger"]
+    assert all(
+        table.column("event_id").null_count == 0 for table in normalized.tables.values()
+    )
 
 
 def test_normalize_preserves_canonical_nullable_types(
@@ -75,21 +68,11 @@ def test_normalize_preserves_canonical_nullable_types(
 def test_current_state_freshness_uses_collection_start(
     collection_bundle: CollectionBundle,
 ) -> None:
-    """Order overlapping runs by collection start while retaining audit times."""
     normalized = normalize(collection_bundle)
-    for name in (
-        "sessions",
-        "daily_stats",
-        "daily_activity",
-        "price_versions",
-        "ingest_status",
-    ):
-        assert set(normalized.tables[name].column("updated_at").to_pylist()) == {
+    for name in ("sessions", "daily_stats", "price_versions", "collection_ledger"):
+        assert set(normalized.tables[name].column("collected_at").to_pylist()) == {
             collection_bundle.started_at
         }
-    assert set(
-        normalized.tables["price_versions"].column("observed_at").to_pylist()
-    ) == {collection_bundle.finished_at}
 
 
 def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
@@ -105,11 +88,7 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         )
         expected_status = len(collection_bundle.ingest_status)
         assert (summary.inserted, summary.updated) == (
-            EXPECTED_REPORT_ROWS
-            + EXPECTED_DAILY_STATS_ROWS
-            + EXPECTED_DAYS
-            + expected_prices
-            + expected_status,
+            EXPECTED_REPORT_ROWS + EXPECTED_DAILY_STATS_ROWS + expected_prices,
             0,
         )
         assert backend.query("SELECT count(*) AS n FROM daily_stats").to_pylist() == [
@@ -118,9 +97,9 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         assert backend.query(
             "SELECT count(*) AS n FROM price_versions"
         ).to_pylist() == [{"n": expected_prices}]
-        assert backend.query("SELECT count(*) AS n FROM ingest_status").to_pylist() == [
-            {"n": expected_status}
-        ]
+        assert backend.query(
+            "SELECT count(*) AS n FROM collection_status"
+        ).to_pylist() == [{"n": expected_status}]
         costs = backend.query(
             "SELECT count(*) AS rows, count(cost_usd) AS priced_rows FROM daily_cost"
         ).to_pylist()[0]
@@ -138,36 +117,95 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
             "sum(tokscale_cost_usd) AS tokscale_cost_usd, "
             "sum(cost_usd) AS cost_usd FROM daily_cost"
         ).to_pylist()[0]
+        components = backend.query(
+            "SELECT SUM(input_tokens) AS input, SUM(output_tokens) AS output, "
+            "SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write, "
+            "SUM(reasoning) AS reasoning, SUM(message_count) AS messages "
+            "FROM daily_stats"
+        ).to_pylist()[0]
+        assert components == {
+            "input": EXPECTED_TOTAL_INPUT,
+            "output": EXPECTED_TOTAL_OUTPUT,
+            "cache_read": EXPECTED_TOTAL_CACHE_READ,
+            "cache_write": EXPECTED_TOTAL_CACHE_WRITE,
+            "reasoning": EXPECTED_TOTAL_REASONING,
+            "messages": EXPECTED_TOTAL_MESSAGES,
+        }
+        assert daily["total_tokens"] == (
+            EXPECTED_TOTAL_INPUT
+            + EXPECTED_TOTAL_OUTPUT
+            + EXPECTED_TOTAL_CACHE_READ
+            + EXPECTED_TOTAL_CACHE_WRITE
+            + EXPECTED_TOTAL_REASONING
+        )
+        assert daily["tokscale_cost_usd"] == pytest.approx(EXPECTED_TOTAL_COST)
         assert aggregate["total_tokens"] == daily["total_tokens"]
         assert aggregate["tokscale_cost_usd"] == pytest.approx(
             daily["tokscale_cost_usd"]
         )
         assert aggregate["cost_usd"] == pytest.approx(daily["cost_usd"])
-        assert backend.query(
-            "SELECT status, rows_inserted, rows_updated FROM ingest_runs"
-        ).to_pylist() == [
-            {"status": "ok", "rows_inserted": summary.inserted, "rows_updated": 0}
+        assert backend.query("SELECT status FROM collection_runs").to_pylist() == [
+            {"status": "ok"}
         ]
     finally:
         backend.close()
 
 
-def test_reasoning_uses_the_output_price(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Apply the output rate to reasoning tokens in the calculated daily cost."""
+def test_reasoning_uses_the_output_price() -> None:
+    """Price every token component exactly, with reasoning at the output rate."""
+    from datetime import UTC, date, datetime
+
+    from tests._observations import observations
+
+    stamp = datetime(2026, 9, 10, tzinfo=UTC)
+    identity = {"source_id": "source", "day": date(2026, 9, 10), "model": "model"}
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
-        persist_run(backend, normalize(collection_bundle))
-        row = backend.query(
-            "SELECT output_tokens, reasoning, price_output_per_token, cost_usd "
-            "FROM daily_cost JOIN price_versions USING (source_id, day, model) "
-            "WHERE reasoning > 0 LIMIT 1"
-        ).to_pylist()[0]
-        assert row["cost_usd"] >= (
-            (row["output_tokens"] + row["reasoning"]) * row["price_output_per_token"]
+        backend.append(
+            "daily_stats",
+            observations(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **identity,
+                            "client": "codex",
+                            "session_id": "session",
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                            "reasoning": 5,
+                            "cache_read": 7,
+                            "cache_write": 11,
+                            "total_tokens": 28,
+                            "collected_at": stamp,
+                        }
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
+                )
+            ),
         )
+        backend.append(
+            "price_versions",
+            observations(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **identity,
+                            "source": "synthetic",
+                            "price_input_per_token": 0.01,
+                            "price_output_per_token": 0.02,
+                            "price_cache_read_per_token": 0.03,
+                            "price_cache_write_per_token": 0.04,
+                            "collected_at": stamp,
+                        }
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["price_versions"],
+                )
+            ),
+        )
+        assert backend.query("SELECT cost_usd FROM daily_cost").to_pylist() == [
+            {"cost_usd": pytest.approx(0.83)}
+        ]
     finally:
         backend.close()
 
@@ -221,7 +259,7 @@ def test_refreshed_daily_timing_replaces_the_prior_observation(
         backend.close()
 
 
-def test_ingest_status_is_unchanged_when_no_domains_are_refreshed(
+def test_collection_status_is_unchanged_when_no_domains_are_refreshed(
     collection_bundle: CollectionBundle,
 ) -> None:
     """Skip completed historical targets while allowing explicit refreshes."""
@@ -230,7 +268,7 @@ def test_ingest_status_is_unchanged_when_no_domains_are_refreshed(
         backend.apply_ddl()
         persist_run(backend, normalize(collection_bundle))
         before = backend.query(
-            "SELECT min(updated_at) AS stamp FROM ingest_status"
+            "SELECT min(collected_at) AS stamp FROM collection_status"
         ).to_pylist()[0]["stamp"]
         later = replace(
             collection_bundle,
@@ -242,9 +280,9 @@ def test_ingest_status_is_unchanged_when_no_domains_are_refreshed(
         )
         summary = persist_run(backend, normalize(later))
         after = backend.query(
-            "SELECT min(updated_at) AS stamp FROM ingest_status"
+            "SELECT min(collected_at) AS stamp FROM collection_status"
         ).to_pylist()[0]["stamp"]
-        assert (summary.inserted, summary.updated) == (0, 0)
+        assert summary.inserted == 0
         assert after == before
     finally:
         backend.close()
@@ -272,8 +310,7 @@ def test_older_same_source_run_cannot_regress_completed_status(
                 status,
                 status="partial",
                 succeeded_count=0,
-                last_attempted_run=older_run,
-                last_succeeded_run=None,
+                run_id=older_run,
                 failure_code="fetch",
             ),
         ),
@@ -289,8 +326,7 @@ def test_older_same_source_run_cannot_regress_completed_status(
         ingest_status=(
             replace(
                 status,
-                last_attempted_run=newer_run,
-                last_succeeded_run=newer_run,
+                run_id=newer_run,
             ),
         ),
     )
@@ -300,14 +336,14 @@ def test_older_same_source_run_cannot_regress_completed_status(
         persist_run(backend, normalize(newer))
         persist_run(backend, normalize(older))
         rows = backend.query(
-            "SELECT day, domain, status, last_succeeded_run FROM ingest_status"
+            "SELECT day, domain, status, run_id FROM collection_status"
         ).to_pylist()
         target = next(
             row
             for row in rows
             if row["day"] == status.day and row["domain"] == status.domain
         )
-        assert (target["status"], target["last_succeeded_run"]) == (
+        assert (target["status"], target["run_id"]) == (
             "complete",
             newer_run,
         )
@@ -391,7 +427,7 @@ def test_persist_run_records_collector_system_metadata(
         persist_run(backend, normalized)
         assert backend.query(
             "SELECT os_name, architecture, cpu_count, memory_bytes, shell "
-            "FROM ingest_runs"
+            "FROM collection_runs"
         ).to_pylist() == [
             {
                 "os_name": "Linux",

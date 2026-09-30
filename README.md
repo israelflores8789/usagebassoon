@@ -27,7 +27,7 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 ## Overview
 
 - Collects daily, per-session, and per-model token statistics, costs, pricing versions, session metadata, and collection-host metadata.
-- Merges new and changed facts idempotently without deleting history.
+- Publishes observations idempotently: retries and overlapping collections for the same source do not double-count usage. Separate sources retain separate histories.
 - Provides terminal reports, bounded relation queries, user-managed tags and notes, diagnostics, exports, and portable snapshots.
 - Keeps cloud storage optional: a local DuckDB installation needs no cloud account.
 
@@ -36,12 +36,16 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 - [Getting Started](#getting-started)
 - [Terminal Reports](#terminal-reports)
 - [Config.toml](#configtoml)
+- [Choosing a Backend](#choosing-a-backend)
+- [How Persistence Works](#how-persistence-works)
 - [Automated Scheduling](#automated-scheduling)
 - [Tags and Notes](#tags-and-notes)
 - [Python API](#python-api)
 - [Privacy and sharing](#privacy-and-sharing)
 - [Snapshots](#snapshots)
-- [Google Cloud permissions](#google-cloud-permissions)
+- [MotherDuck setup and permissions](#motherduck-setup-and-permissions)
+- [BigQuery setup and permissions](#bigquery-setup-and-permissions)
+- [Google Cloud Storage setup and permissions](#google-cloud-storage-setup-and-permissions)
 - [Why AGPL?](#why-agpl)
 - [License & Disclaimers](#license--disclaimers)
 
@@ -66,9 +70,9 @@ Then, initialize UsageBassoon.
 bassoon init
 ```
 
-This creates `~/.config/usagebassoon/config.toml` when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB warehouse by default.
+This creates a configuration file at the [platform-specific default path](#configtoml) when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB storage backend by default. Init is safe to repeat. Ordinary commands require an initialized backend and perform a schema preflight. Newer or incompatible schemas fail with an explicit error.
 
-> [!NOTE]
+> [!TIP]
 > Use `bassoon init` after for setting up new environments with an existing `config.toml` as well, especially if using a remote backend. It performs important setup including creating the configured schema, setting `source_id`, and does *not* overwrite your existing configuration file.
 
 Try it out!
@@ -85,14 +89,21 @@ Run `bassoon --help` or `bassoon <command> --help` for the complete command refe
 
 ```bash
 # UsageBassoon uses bun by default
-bunx tokscale --version  # v4.15.1
+bunx tokscale@4.15.1 --version
 ```
 
 > [!IMPORTANT]
 > Version 4.15.1 is officially supported. Verify the exact version with `tokscale --version` and verify your installation against [`tokscale`'s](https://github.com/junhoyeo/tokscale/releases) official checksums.
 
 > [!NOTE]
-> You can set `[tokscale].bin` in the `config.toml` or the `TOKSCALE_BIN` environment variable. Check these before running collection, especially when it invokes a package runner such as `bunx`, `npx`, or `deno`.
+> You can set `[tokscale].bin` in `config.toml` or the `TOKSCALE_BIN` environment variable to choose the command; the configuration value takes precedence. With neither set, UsageBassoon uses a local `tokscale` executable when available, otherwise `bunx tokscale@latest`. Pin the supported release with `bin = "bunx tokscale@4.15.1"`.
+
+### Source identity
+
+`source_id` is a unique identifier (UUID) generated when `bassoon init` creates `config.toml` and separates data collected from different environments, even when their client, workspace, or session names match.
+
+> [!TIP]
+> If you set `source_id` manually, you can reuse it for ephemeral environments that you want to namespace token usage. For example, if you have a container that should be considered the same as a *unique* previous container build for token statistics purposes.
 
 ## Terminal Reports
 
@@ -259,7 +270,7 @@ max_stderr_bytes = 8388608                          # Optional; this and the abo
 
 [bigquery]                                          # Required when backend is `bigquery`.
 project = "my-gcp-project"                          # Required; Google Cloud project ID.
-dataset = "usagebassoon_it"                         # Required; BigQuery dataset ID in the project above.
+dataset = "usagebassoon"                            # Required; BigQuery dataset ID in the project above.
 location = "US"                                     # Optional dataset and job location; defaults to `US`.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
@@ -307,6 +318,28 @@ BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS
 
 If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the platform-specific local archive documented above. If only `gcs.uri` is configured, snapshots go to GCS; if both are configured, snapshots go to both destinations. On Linux, the default archive follows `XDG_DATA_HOME` when set; the default is `~/.local/share/usagebassoon/snapshots/`.
 
+## Choosing a Backend
+
+| | Local DuckDB | MotherDuck | BigQuery |
+|:--|:--|:--|:--|
+| Setup | `bassoon init`; no cloud account | MotherDuck account and `MOTHERDUCK_TOKEN` | Google Cloud project, authentication, APIs, and IAM grants |
+| Best for | One local environment | Shared history across environments | Shared history on Google Cloud |
+| Concurrent collectors | One per local user environment; a second is rejected | Transaction conflicts retried with bounded backoff | Independent appends; duplicates deduplicated by canonical views |
+| Ongoing operations | Local database storage | Account and backend access | Nightly compaction must remain operational |
+
+Snapshot destinations are independent of your storage backend: any backend can archive to local disk, Google Cloud Storage, or both. Complete snapshots can restore into any initialized, empty backend with all destination writers stopped.
+
+## How Persistence Works
+
+**DuckDB and MotherDuck** use direct transactional upserts. Each normalized collection batch applies its changes in one transaction, and current state follows the shared observation ordering. Local DuckDB holds an OS lock for the user environment during collection; retryable MotherDuck transaction conflicts use bounded backoff.
+
+**BigQuery** uses append-and-compact persistence. Collection and curation append observations, and canonical views combine durable gold tables with retained raw observations, deduplicating by logical identity. Accepted loads are queryable without waiting for compaction. Independent remote collectors, including ones sharing a `source_id`, can publish concurrently. Publication across tables can be partial; bounded retries reuse the same observation identities, and collection completion is recorded after fact and diagnostic loads succeed.
+
+- `bassoon init` installs a Scheduled Query at 02:00 UTC and can be rerun to create a missing schedule or update its query and cadence. Verify that the schedule remains enabled and its runs succeed in BigQuery.
+- Raw BigQuery observations use arrival-day partitions with 90-day expiration, including historical backfills. Compaction preserves existing gold plus retained raw data; durable gold never expires. `bassoon doctor` warns about overdue compaction buckets.
+- Collection audit history (`bassoon audit`) is retained permanently. Doctor shows unresolved schema-drift and reconciliation diagnostics from the last 90 days; BigQuery expires raw diagnostics, while DuckDB and MotherDuck prune them opportunistically.
+- Restore requires an initialized, empty destination and all destination writers stopped until completion. BigQuery append loads cannot be excluded by the restore transaction.
+
 ## Automated Scheduling
 
 `bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows Task Scheduler integration is not supported at this time.
@@ -337,41 +370,36 @@ bassoon schedule worker --foreground --interval 15m
 > [!TIP]
 > When using UsageBassoon in a container environment, consider a remote data warehouse like MotherDuck or BigQuery and remote object storage like GCS if you want snapshot archives.
 
-#### Source identity
-
-`source_id` is a unique identifier (UUID) that gets set by `bassoon init` in `config.toml` and separates data collected from different environments, even when their client, workspace, or session names match.
-
-> [!TIP]
-> If you set `source_id` manually, you can reuse it for ephemeral environments that you want to namespace token usage. For example, if you have a container that should be considered the same as previous container builds for token statistics purposes.
->
-> While features are in place to prevent identical concurrent source IDs from colliding, including lease fencing mechanics, multiple environments with the same `source_id` is *not* the intended use case, and we *strongly* recommend you use one `source_id` per logical source agentic environment.
-
 ## Tags and Notes
 
-You can group token usage statistics together by `tag`ging all agentic sessions in a project workspace directory, all session for an agentic client (e.g. Codex), or for individual sessions, and you can generate reports across environments based on your tags!
+You can group token usage statistics together by `tag`ging all agentic sessions in a project workspace directory, all sessions for an agentic client (e.g. Codex), or for individual sessions, and you can generate reports across environments based on your tags!
+
+Tags apply globally to matching client, workspace, and session targets across sources; their `source_id` records the source of the latest mutation. Notes belong to one exact session identified by `(source_id, client, session_id)`; note commands use the source configured in `config.toml`. Renames and note edits preserve creation time; deleting and later re-adding starts a new lifetime. The update time records the latest meaningful change, and unchanged add/set calls are no-ops.
 
 ```bash
-bassoon tag project-alpha --workspace /work/repo
-bassoon tag production --client codex
-bassoon tag important --client codex --session ses_123
+bassoon tag add project-alpha --workspace /work/repo
+bassoon tag add production --client codex
+bassoon tag add important --client codex --session ses_123
 ```
+
+Use `bassoon tag add`, `bassoon tag rename`, and `bassoon tag remove` to manage tags, and `bassoon note set`, `bassoon note edit`, and `bassoon note remove` for notes. `note edit` opens an existing note in `VISUAL` or `EDITOR`. Run any command with `--help` for its full arguments.
 
 You can use `note` to annotate individual agentic sessions to remember things like why token usage was so high, key things about a session important to a project, or add debugging notes, etc!
 
 ```bash
-bassoon note --client codex --session ses_123 "Investigate cache miss"
+bassoon note set "Investigate cache miss" --client codex --session ses_123
 ```
 
 ## Python API
 
-The same configured data warehouse is available from Python. Results are `pandas` DataFrames by default. You can install Polars explicitly with `pipx install "usagebassoon[polars]"` or use Arrow when you need the raw table:
+The same configured storage backend is available from Python. For library use, install UsageBassoon in your Python environment with `pip install usagebassoon`; `pipx` installs the CLI in an isolated environment. Results are `pandas` DataFrames by default. Install the optional Polars extra with `pip install "usagebassoon[polars]"`, or use Arrow when you need the raw table:
 
 ```python
 import usagebassoon
 
-daily = usagebassoon.query("SELECT * FROM daily_cost")
-polars_daily = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")
-arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost")
+daily = usagebassoon.query("SELECT * FROM daily_cost LIMIT 1000")
+polars_daily = usagebassoon.query("SELECT * FROM daily_cost LIMIT 1000", engine="polars")
+arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost LIMIT 1000")
 ```
 
 ## Privacy and sharing
@@ -382,7 +410,7 @@ arrow_daily = usagebassoon.query_arrow("SELECT * FROM daily_cost")
 Your token usage data can contain private information including session IDs, workspace paths, cost information, etc, and UsageBassoon takes that seriously. Some commands are obfuscated by default while others offer a `--sanitize` flag. **Always** use `bassoon doctor` when submitting a bug report, and **always** sanitize your token usage data before sharing it publicly!
 
 > [!IMPORTANT]
-> 🔒 Obfuscation reduces exposure, but it is *not* a guarantee that an artifact is safe for every audience. Review any `bassoon`output for sensitive values before uploading it anywhere.
+> 🔒 Obfuscation reduces exposure, but it is *not* a guarantee that an artifact is safe for every audience. Review any `bassoon` output for sensitive values before uploading it anywhere.
 
 The commands have deliberately different sharing behavior:
 
@@ -401,32 +429,106 @@ The commands have deliberately different sharing behavior:
 You can archive or perform routine backup of your token usage data with `bassoon snapshot`.
 `snapshot` writes a catalog-published Parquet restoration archive.
 
-`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse.
+`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Snapshots are portable across all backends, including BigQuery to local DuckDB. BigQuery snapshots include deduplicated observations that have not yet compacted. Restore validates the entire archive before writing and fails atomically if destination data is already present. Stop all destination writers before starting restore and keep them stopped until it completes. The CLI requires explicit confirmation (default no); library callers must enforce the same condition because concurrent BigQuery append loads cannot be excluded by the restore transaction.
 
-Local archives rotate under `~/.usagebassoon/snapshots/` by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
+Local archives rotate under the platform data directory documented in the configuration section by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
 
 Set `gcs.uri` to use Google Cloud Storage (install with `usagebassoon[gcs]`). You can set both `gcs.uri` and `snapshots.file_uri` to publish the same complete snapshot both locally and remotely.
 
 Snapshot object names are confined to the selected archive and SHA-256 is verified before manifest or Parquet data is parsed. GCS archives use generation-conditional catalog publication and all snapshot archives contain raw private data.
 
-## Google Cloud permissions
+## MotherDuck setup and permissions
+
+- Set `MOTHERDUCK_TOKEN` to a read/write token for the identity that owns the configured `[motherduck].database`. Initialization, collection, curation, and restore need a writable database.
+- **Builder** is required to create and manage service accounts and their tokens through the MotherDuck UI; **Admin** also includes these permissions. MotherDuck's Admin REST API requires an Admin user's read/write token. See [service-account setup](https://motherduck.com/docs/key-tasks/service-accounts-guide/create-and-configure-service-accounts/).
+- Builder is not a blanket requirement for using UsageBassoon with a personal database: MotherDuck's **Explorer** role can create databases and run SQL. Organization roles do not grant write access to another identity's database. See [MotherDuck roles and access control](https://motherduck.com/docs/concepts/roles-and-access-control/).
+
+## BigQuery setup and permissions
 
 > [!IMPORTANT]
-> When using a remote data warehouse or object store, it is best practice to use the most restrictive permissions and least-privilege IAM roles. Use a dedicated service account or user identity scoped to your own project, dataset, and bucket, and avoid broad project-owner permissions.
+> Use the most restrictive permissions and least-privilege IAM roles for BigQuery. Use a dedicated service account or user identity scoped to your project and dataset, and avoid broad project-owner permissions.
 
-The permissions below describe the operations performed by UsageBassoon. Grant only the subset required by the backend and commands you use.
+### BigQuery setup checklist
 
-#### BigQuery
-For the BigQuery backend, UsageBassoon needs `roles/bigquery.jobUser` and `roles/bigquery.readSessionUser` on the project and `roles/bigquery.dataEditor` on the dataset.
+1. Enable the BigQuery, BigQuery Storage, and BigQuery Data Transfer APIs. UsageBassoon does not enable services itself.
+2. Pre-create an empty dataset in the location configured in `config.toml`, or give the setup identity permission to create it. Pre-creating it avoids granting dataset creation to your everyday identity.
+3. Configure a dedicated service account or your own identity through Application Default Credentials, or set `credentials_file` explicitly.
+4. Grant the permissions below, configure `[bigquery]`, and run `bassoon init` with the setup identity.
+5. Run `bassoon collect` and `bassoon doctor` to check access and compaction backlog. Verify the Scheduled Query is enabled and runs successfully in BigQuery; doctor does not inspect the schedule configuration.
 
-See Google's [BigQuery IAM documentation](https://docs.cloud.google.com/iam/docs/roles-permissions/bigquery) and [dataset access controls](https://docs.cloud.google.com/bigquery/docs/access-control).
+### Permissions UsageBassoon may use
 
-#### Google Cloud Storage
-For GCS snapshots, UsageBassoon needs only the bucket metadata and object read/list permissions for restore-only retention. A writer/retention identity also needs create and delete. `roles/storage.objectUser` on the project and `roles/storage.bucketViewer` on the bucket is required for object store operations.
+Each permission notes where it is granted and which identity needs it. Setup means the identity that runs `bassoon init` or applies a registered schema upgrade. Runtime means collection, curation, reports, queries, exports, and snapshots against an already matching schema. Grant only the permissions required by the commands the identity uses.
 
-Use Google's `STANDARD` storage class for an active snapshot archive. UsageBassoon writes, lists, restores, and rotates snapshots, so colder archival classes are a poor default.
+- **BigQuery, project scope**
+  - `bigquery.jobs.create`: run queries, loads, and schema statements. Setup, runtime, restore, and scheduled compaction.
+  - `bigquery.readsessions.create`, `bigquery.readsessions.getData`, `bigquery.readsessions.update`: permissions supplied by the Storage Read API role for Arrow result reads. Runtime reads and snapshot capture.
+  - `bigquery.transfers.get`: find an existing compaction schedule. Setup.
+  - `bigquery.transfers.update`: broader authorization to create or update the compaction schedule. Setup, optional when using Google's ownership-based path described below.
+  - `bigquery.datasets.create`: create the dataset, only if you want `bassoon init` to do it. Setup, optional.
+  - `bigquery.jobs.listAll`: let `bassoon doctor` inspect active transactions; without it doctor warns and continues. Doctor, optional.
+- **BigQuery, dataset scope**
+  - `bigquery.datasets.get`: check dataset metadata. Setup, runtime, and scheduled compaction.
+  - `bigquery.tables.get`, `bigquery.tables.getData`: inspect table metadata and read schema state, reports, diagnostics, and snapshots. Setup, runtime, restore, and scheduled compaction as applicable.
+  - `bigquery.tables.updateData`: append collection and curation data, seed compaction control data, and write restored or compacted state. Setup, runtime writes, restore, and scheduled compaction.
+  - `bigquery.tables.create`, `bigquery.tables.update`: create tables and views, set schema labels and retention settings, replace view definitions, and apply registered schema migrations. Setup.
+  - `bigquery.tables.list`: discover existing relations during init and check destination contents before restore. Setup and restore.
+  - `bigquery.tables.create`, `bigquery.tables.delete`: create and remove temporary restore staging tables. Restore; table creation is also used during setup as noted above.
+- **Service account scope**
+  - `iam.serviceAccounts.actAs`: attach the service account that runs the compaction schedule, granted on that specific account. Setup when assigning a service account; also relevant to accessing an existing account-backed schedule for query changes.
 
-See Google's [Cloud Storage IAM permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage) and [storage classes](https://docs.cloud.google.com/storage/docs/storage-classes).
+### Roles that provide them
+
+- `roles/bigquery.jobUser` on the project: `bigquery.jobs.create`.
+- `roles/bigquery.readSessionUser` on the project: the three `bigquery.readsessions.*` permissions listed above. This role can only be granted at project level or above.
+- `roles/bigquery.dataEditor` on the dataset: `bigquery.datasets.get` and every `bigquery.tables.*` permission listed above, including create, update, updateData, list, and delete. Grant it on the dataset rather than the project; project-level grants also permit dataset creation.
+- `roles/bigquery.dataViewer` on the dataset instead of `dataEditor` for a read-only identity used for reports, queries, exports, and snapshot capture. It supplies dataset metadata and table read/list permissions; the identity still needs `jobUser` and `readSessionUser` on the project.
+- A custom project role containing `bigquery.transfers.get` for setup using Google's ownership-based path, or containing both `bigquery.transfers.get` and `bigquery.transfers.update` for broader transfer management. Avoid granting project-wide BigQuery Admin merely to manage the schedule.
+- `roles/iam.serviceAccountUser` on the schedule's specific service account: `iam.serviceAccounts.actAs`. If the same service account both runs `bassoon init` and is assigned to the new schedule, it needs this grant on itself.
+- `roles/bigquery.resourceViewer` on the project, or a custom role containing only `bigquery.jobs.listAll`, for doctor's optional transaction check.
+
+### Least-privilege notes
+
+- Separate setup and runtime identities where useful. Collection needs no schema or schedule provisioning; apply registered migrations with the setup identity first.
+- Schedule ownership can replace `bigquery.transfers.update`. Editing query text still requires ownership or access to the associated service account. See [scheduled-query permissions](https://docs.cloud.google.com/bigquery/docs/scheduling-queries#required_permissions).
+- New schedules use the initializing service account when identifiable, otherwise the initializing user. Rerunning init preserves the existing execution identity.
+- The compaction identity needs job creation and dataset read/write access, without transfer-management or Storage Read permissions.
+
+See Google's [BigQuery IAM roles and permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/bigquery), [dataset access controls](https://docs.cloud.google.com/bigquery/docs/access-control), and [job-metadata permissions](https://docs.cloud.google.com/bigquery/docs/information-schema-jobs#required_permissions).
+
+## Google Cloud Storage setup and permissions
+
+Google Cloud Storage (GCS) is an optional snapshot destination, independent of the storage backend. Use it with DuckDB, MotherDuck, or BigQuery; GCS snapshots do not require BigQuery or its IAM roles.
+
+### Setup checklist
+
+1. Install the GCS extra with `pipx install "usagebassoon[gcs]"`, or include `gcs` alongside your other required extras.
+2. Create a private snapshot bucket yourself; UsageBassoon never creates buckets.
+3. Configure `[gcs].uri` and `[gcs].project` in `config.toml`. Use Application Default Credentials or set `[gcs].credentials_file` explicitly.
+4. Grant the bucket permissions below to the identity used for snapshots. Keep snapshots private: they contain raw restoration data.
+5. Run `bassoon snapshot` to publish an archive and `bassoon doctor` to inspect bucket lifecycle rules. Configure `[snapshots].interval` for due-only automatic snapshots after collection.
+
+### Permissions UsageBassoon may use
+
+Grant only the permissions needed for archive writes, retention, restore, or diagnostic inspection.
+
+- **Cloud Storage, snapshot bucket scope**
+  - `storage.objects.create`, `storage.objects.delete`, `storage.objects.get`, `storage.objects.list`: publish, read, and rotate snapshot archives and their catalogs. Runtime archive writes and retention.
+  - `storage.objects.get`, `storage.objects.list`: read archives for restore without writing or rotation. Restore-only archive access; the destination backend still needs restore permissions.
+  - `storage.buckets.get`: let `bassoon doctor` read lifecycle rules. Doctor only; without it doctor reports that lifecycle inspection is unavailable.
+
+### Roles that provide them
+
+- `roles/storage.objectUser` on the snapshot bucket for a snapshot writer: object create, get, list, and delete.
+- `roles/storage.objectViewer` on the snapshot bucket for restore-only archive access: object get and list.
+- `roles/storage.bucketViewer` on the snapshot bucket for identities that run doctor's lifecycle checks: `storage.buckets.get`.
+
+### Least-privilege notes
+
+- Scope grants to the snapshot bucket. `storage.buckets.get` is only needed for doctor's lifecycle check.
+- Use `STANDARD` for active archives to avoid colder classes' retrieval and early-deletion costs. See [storage classes](https://docs.cloud.google.com/storage/docs/storage-classes).
+
+See Google's [Cloud Storage IAM roles and permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage).
 
 ## Why AGPL?
 

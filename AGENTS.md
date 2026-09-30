@@ -10,6 +10,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 A Python CLI and library (pipx-installable, import usagebassoon) that persists `tokscale` JSON token usage statistics to DuckDB, MotherDuck, or BigQuery. This allows users to aggregate token usage across agentic environments.
 
 ## Repository Structure
+
 ```
 usagebassoon/
 ├── pyproject.toml            # Hatchling packaging; Python >= 3.12
@@ -23,8 +24,8 @@ usagebassoon/
 │   ├── backends/             # StorageBackend and DuckDB, MotherDuck, BigQuery adapters
 │   ├── buckets/              # SnapshotBucket and local/GCS storage adapters
 │   ├── sql/                  # Dialect-specific packaged SQL assets
-│   │   ├── duckdb/{ddl.sql, migrations.sql, views.sql}  # Also serves motherduck
-│   │   └── bigquery/{ddl.sql, migrations.sql, views.sql}
+│   │   ├── duckdb/           # ddl.sql, views.sql (also serves MotherDuck)
+│   │   └── bigquery/         # ddl.sql, views.sql, compaction.sql
 │   ├── api.py                # Public Python query and connection API
 │   ├── archiver.py           # SnapshotArchiver publication, retention, and restore
 │   ├── collector.py          # tokscale subprocess acquisition and RawCollection
@@ -40,12 +41,13 @@ usagebassoon/
 │   ├── logger.py             # Privacy-conscious rotating operational logging
 │   ├── normalizer.py         # CollectionBundle to canonical Arrow tables
 │   ├── orchestrator.py       # Top-level collection and data shuttling
-│   ├── persistence.py        # Transactional batch persistence and retries
+│   ├── persistence.py        # Batch publication and bounded retries
 │   ├── privacy.py            # Output-time obfuscation for shared artifacts
 │   ├── reconcile.py          # Collection reconciliation and issue record types
 │   ├── scheduling.py         # Native schedulers and collection worker loop
 │   ├── schema_assets.py      # Ordered packaged SQL for schema initialization
-│   ├── source_leases.py       # Source-scoped collection claim and renewal
+│   ├── collection_lock.py    # Local user-environment collection exclusion
+│   ├── storage_model.py      # Shared logical keys and tie-break rules
 │   ├── sql_safety.py         # Public relation query validation and generation
 │   ├── system_metadata.py    # Best-effort collector-host metadata
 │   └── version.py            # Installed distribution version lookup
@@ -59,25 +61,28 @@ Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<pa
 
 ## Architecture
 
-- **Dependencies**: `duckdb`, `pandas`, `pydantic`, `pyarrow`, `typer`, `rich`, `plotext`, `polars` (optional).
+- **Dependencies**: `duckdb`, `pandas`, `pydantic`, `pyarrow`, `typer`, `rich`, `plotext`, `platformdirs`, `sqlglot`.
+  - Optional extras for Polars, BigQuery, and GCS.
 - **Dev Environment**: `uv`, `hatchling`, `twine`, `pyrefly`, `ruff`, `pytest`, `just`, `pre-commit`.
 
-UsageBassoon separates collection, ingest, normalization, warehouse persistence, and snapshot archival. Follow this path when changing collection behavior:
+**Terminology:** Use **storage backend** (or **backend**) for a `StorageBackend` implementation and its configured database destination. Use database, dataset, or warehouse only when referring to a platform-specific resource. A **snapshot bucket** is a `SnapshotBucket` storage adapter; a **snapshot destination** is its configured archive root. Snapshot buckets are independent of storage backends. **Direct transactional upsert** and **Append-and-compact** name persistence architectures, not individual platforms.
+
+UsageBassoon separates collection, ingest, normalization, backend persistence, and snapshot archival. Follow this path when changing collection behavior:
 
 ```text
 scheduling.py / CLI
         → orchestrator.py
-        → source_leases.py      claim and renew one source lease before planning
+        → collection_lock.py    exclude simultaneous local DuckDB collectors
         ↔ collector.py          tokscale subprocess calls and raw acquisition outcomes
         ↔ ingest.py             validated GraphPlan / ModelsPlan for subsequent requests
         → RawCollection
         → ingest.py             contracts.py validation → parsers/ → CollectionBundle
         → normalizer.py         canonical Arrow tables in NormalizedBundle
-        → persistence.py        batch construction, fenced backend transactions, and retries
+        → persistence.py        batch construction, backend-specific publication, and retries
         → backends/base.py      StorageBackend → DuckDB / MotherDuck / BigQuery
-        → sql/                  dialect-specific DDL and views
-        → source_leases.py      release the source lease after persistence
-        → archiver.py           optional consistent warehouse capture after release
+        → sql/                  installed dialect-specific views; no collection DDL
+        → collection_lock.py    release the local collection lock
+        → archiver.py           optional consistent backend capture
         → CLI / Python API
 ```
 
@@ -85,7 +90,7 @@ scheduling.py / CLI
 
 `ingest.py` owns validation and parsing coordination. It produces `GraphPlan` and `ModelsPlan` to guide further collection, constructs `IngestEvidence` from acquisition outcomes and prior status, and builds `CollectionBundle`. `contracts.py` detects contract violations and schema drift; `parsers/` converts validated payloads into typed data. Ingest decides which report and pricing failures can be tolerated while preserving valid token facts. Graph and models remain required.
 
-`normalizer.py` owns `NormalizedBundle` and converts `CollectionBundle` into canonical Arrow tables, including derived columns. It does not execute backend transactions. `persistence.py` reads prior ingest status, assembles and persists batches, and handles bounded transaction retries. `source_leases.py` owns the source lease lifecycle and heartbeat; the orchestrator holds its token from planning through persistence. `backends/base.py` defines `StorageBackend` and `AbstractStorageBackend`; backend implementations execute warehouse-specific lease and batch operations. SQL DDL and views remain dialect-specific under `sql/`.
+`normalizer.py` owns `NormalizedBundle` and converts `CollectionBundle` into canonical Arrow tables, including derived columns. It does not execute backend transactions. `persistence.py` reads collection planning state through one preflight view, assembles batches, and handles bounded retries. `collection_lock.py` excludes simultaneous local DuckDB collectors; remote collectors publish independently. `backends/base.py` defines `StorageBackend` and `AbstractStorageBackend`; implementations execute native publication and restore operations. SQL DDL and views remain dialect-specific under `sql/`.
 
 Snapshot archival is a separate path after persistence:
 
@@ -94,7 +99,7 @@ orchestrator.py → archiver.py         SnapshotArchiver
                 → buckets/base.py     SnapshotBucket → local / GCS
 ```
 
-`SnapshotArchiver` owns capture, Parquet format, catalog publication, retention, and restore semantics. Backends return all snapshot tables from one consistent warehouse read point: a DuckDB transaction or BigQuery time travel at a captured warehouse timestamp. `SnapshotBucket` implementations own version-aware object storage and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`.
+`SnapshotArchiver` owns capture, Parquet format, catalog publication, retention, and restore semantics. Backends return all snapshot tables from one consistent backend read point: a DuckDB/MotherDuck transaction or BigQuery time travel at a captured timestamp. `SnapshotBucket` implementations own version-aware object storage and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`. Current implementations are local files and GCS; future object-store providers must satisfy the same `SnapshotBucket` contract.
 
 Diagnostic inspection is a separate read-only path:
 
@@ -106,7 +111,7 @@ cli/doctor.py → config.py           load configuration and open a StorageBacke
               → cli/doctor.py       render checks and exit status
 ```
 
-`diagnostics.py` owns doctor-specific backend queries for ingest runs, reconciliation issues, and unresolved schema drift, along with health-check coordination and `DoctorReport`. The query results use `IngestIssue` from `ingest.py`, `ReconciliationIssueRecord` from `reconcile.py`, and `SchemaDriftRecord` from `drift.py`. `ingest.py` and `reconcile.py` operate on data passed through the collection pipeline; `persistence.py` handles collection state reads and batch persistence. Diagnostic queries use the backend opened by `cli/doctor.py`.
+`diagnostics.py` owns doctor-specific backend queries for collection runs, reconciliation issues, and unresolved schema drift, along with health-check coordination and `DoctorReport`. The query results use `IngestIssue` from `ingest.py`, `ReconciliationIssueRecord` from `reconcile.py`, and `SchemaDriftRecord` from `drift.py`. `ingest.py` and `reconcile.py` operate on data passed through the collection pipeline; `persistence.py` handles collection state reads and batch persistence. Diagnostic queries use the backend opened by `cli/doctor.py`.
 
 ## Commands
 
@@ -114,15 +119,15 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 
 - USE `just install-dev` to synchronize all uv dependency groups.
 - USE `just test` to run the test suite; pass pytest arguments with `just test <args>`. The recipe sets `USAGEBASSOON_LOG_DIRECTORY` to a temporary `/tmp` directory and removes it afterward, so tests work in restricted environments.
-- USE `just test-bq-live <test-name> <reset>` to run the `bigquery_live` test; `<test-name>` can be the name of the python module `tests/test_backend_bigquery_live.py` or a specific test within (e.g. `tests/test_backend_bigquery_live.py::test_live_batch_matches_duckdb_and_retries_idempotently`); set `<reset>` (defaults to `0`) to `1` to set the `USAGEBASSOON_BIGQUERY_LIVE_RESET` environment variable; `USAGEBASSOON_BIGQUERY_LIVE=1` is always set for this command; if a test run exceeds your execution timeout, inspect `.test_logs/pytest-bq-live.log` to view partial progress or the final failure trace including a UTC timestamp at the start of the file of when the test began for your reference. Do NOT attempt to use `just test` or `uv run pytest` when testing `bigquery_live` which can cause execution timeouts to your environment that are impossible to diagnose.
-- USE `just test-md-live <test-name> <reset>` to run the `motherduck_live` test; test function equivalently to the `bigquery_live` test. Logs are output to `.test_logs/pytest-md-live.log`.
-- USE `just test-gcs-live <test-name>` to run the `gcs_live` test; `<test-name`> can be the name of the python module `tests/test_bucket_gcs_live.py` or a specific test within; `USAGEBASSOON_GCS_LIVE=1` is always set for this command; if a test run exceeds your execution timeout, inspect `.test_logs/pytest-gcs-live.log` to view partial progress or the final failure trace including a UTC timestamp at the start of the file of when the test began for your reference. Do NOT attempt to use `just test` or `uv run pytest` when testing `gcs_live`.
+- USE `just test-bq-live <test-name> <reset>` for `bigquery_live`; the default module is `tests/test_backend_bigquery_live.py`, and individual test selectors are accepted. The recipe sets `USAGEBASSOON_BIGQUERY_LIVE=1`; `<reset>` defaults to `0`, and `1` enables reset. Inspect `.test_logs/pytest-bq-live.log` after timeouts; it includes a UTC start timestamp and partial output. Do NOT use `just test` or `uv run pytest` for these live tests.
+- USE `just test-md-live <test-name>` to run the `motherduck_live` test; this recipe always resets the dedicated integration database. Logs are output to `.test_logs/pytest-md-live.log`.
+- USE `just test-gcs-live <test-name>` for `gcs_live`; the default module is `tests/test_bucket_gcs_live.py`, and individual test selectors are accepted. The recipe sets `USAGEBASSOON_GCS_LIVE=1`. Inspect `.test_logs/pytest-gcs-live.log` after timeouts; it includes a UTC start timestamp and partial output. Do NOT use `just test` or `uv run pytest` for these live tests.
 - USE `just coverage` to run test suite with terminal coverage reporting.
-- USE `just lint` to perform Ruff linting and formatting checks for Python, GitHub action workflows, and YAML files.
+- USE `just lint` for Python Ruff linting and formatting checks; USE `just lint-yaml` for GitHub Actions and YAML checks.
 - USE `just lint-fix` to apply Ruff lint and formatting corrections.
 - USE `just typecheck` to perform Pyrefly type checks.
 - USE `just spell-diff` to run typos spelling checker.
-- PREFER `just ci` for combined test, lint, and typecheck recipes.
+- PREFER `just ci` for unit/local tests, Python lint, and type checks; run SQL parity, YAML checks, and live tests separately when relevant.
 - USE `just build` to clean `dist/` and build an sdist and wheel with Hatchling.
 - USE `just check-dist` to clean, build, and validate artifacts with Twine.
 - USE `just clean` to remove build artifacts and local caches.
@@ -130,22 +135,23 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 ## Rules
 
 - ALL Python code should target Python 3.12+ syntax only.
-- ALL generated/edited Python source code MUST pass Ruff and Pyrefly checks through `just lint` and `just typecheck`, respecitively. You MUST run Ruff and Pyrefly as a matter of routine after generating or editing any Python source code.
+- ALL generated/edited Python source MUST pass Ruff and Pyrefly; RUN `just lint` and `just typecheck` after editing *any* Python code.
 - Do NOT suppress diagnostics to make checks pass. Do NOT introduce implicit `Any` or use bare generic types.
 - PREFER PEP 695 syntax for **all** new generic declarations and type aliases. USE modern built-in generic and union syntax.
 - USE Google-style docstrings for **all** source code.
 - KEEP comments concise yet clear. Do NOT use numbered headers (e.g. "1." or "(1)" etc).
 - FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
-- NO version string is ever hard-coded in source; `hatch-vcs` manages version numbering from git tags (`v0.1.0` → `0.1.0`).
+- NEVER hard-code the application version in source; `hatch-vcs` derives it from git tags (`v0.1.0` → `0.1.0`). Schema versions and pinned external contract versions are separate.
 - Do NOT wrap lines when generating markdown text.
 - USE Keep a Changelog standards in `CHANGELOG.md`; preserve release heading and bullet formatting because `just release` and the GitHub release workflow extract release notes from it.
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
 - ALWAYS use the `usagebassoon_it` database when live testing with MotherDuck. NEVER perform tests on any other database. **NEVER** perform tests on a database called only `usagebassoon`.
 - ALWAYS use the `gs://usagebassoon-test-snapshots-<gcp-project-id>` Google Cloud Storage bucket for GCS testing. **NEVER** perform tests on any other GCS bucket.
-- ALL CLI commands MUST use a dialect-specific SQL view; NEVER hardcode SQL queries that are not dialect agnostic.
+- CLI read queries MUST use the shared views installed for each SQL dialect and dialect-agnostic query construction. Backend adapters own native SQL; schema provisioning and write commands use the corresponding backend operations.
 - FOR CLI output assertions in *tests*, normalize captured stdout or stderr with `tests._cli.plain_cli_output(...)` before comparing text. GitHub Actions color output can insert ANSI escapes inside visible tokens such as `--version`, causing raw substring assertions to fail. Reproduce this environment with `CI=true GITHUB_ACTIONS=true TERM=xterm-256color just test <test>` when diagnosing this failure.
 
 ### Prohibitions
+
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:
 
 - NEVER modify the golden JSON fixtures in `tests/fixtures/`.
@@ -153,9 +159,34 @@ The following actions are **prohibited** and are reserved exclusively for the us
 - NEVER attempt to perform a release to GitHub or invoke any release command.
 - NEVER attempt to push git changes to GitHub.
 
+### Persistence rules
+
+- NEVER issue DDL from a collection path on any backend; DDL runs only in `bassoon init` or registered schema upgrades.
+- NEVER add leases, fencing, or serialization to Append-and-compact collection or curation writes; duplicate work is accepted.
+- ALWAYS reuse a batch's `run_id` and every row's `event_id` across retries of that batch, in both persistence architectures.
+- ALWAYS keep the shared ordering and tie-break policy in `storage_model.py` as the single source; update every dialect and the `sql_parity` tests when it changes.
+- NEVER move `collection_ledger` publication earlier than the fact and debug loads without separating client outcomes from the preflight completion signal.
+- ALWAYS treat restore as requiring a stopped, quiescent destination.
+
+### Append-and-compact rules
+
+- Usage and curation observations MUST append to raw tables; permanent audit streams such as `collection_ledger` append directly to their own tables; NEVER UPDATE, DELETE, or MERGE raw or gold from these paths. Only scheduled compaction and atomic restore write gold.
+- NEVER rebuild a gold unit from raw alone; recompute from existing gold plus retained raw observations.
+- NEVER gate compaction progress or canonical-view pruning on `collected_at` timestamps or a compaction watermark; progress is per-arrival-bucket row counts.
+- NEVER key raw expiration by usage `day` or by a client-supplied timestamp; use backend arrival time.
+- NEVER let a compaction pass read more than one point in time, or commit gold changes without the matching `compaction_ledger` progress.
+- ALWAYS document a new Append-and-compact backend with a mapping block like BigQuery's below. Before implementation, verify every publication, retention, canonical-view, tombstone, compaction, and health requirement in the architecture contracts below; document the platform mechanisms that satisfy them.
+
+### BigQuery-specific rules
+
+- NEVER partition BigQuery raw tables by usage `day` or by `DATE(collected_at)`; use ingestion-time (arrival-day) partitions with 90-day partition expiration.
+- NEVER add staging tables, MERGE, or schema jobs to the BigQuery collection path; publication is Parquet `WRITE_APPEND` load jobs only.
+- ALWAYS read raw and gold at the transaction cutoff with `FOR SYSTEM_TIME AS OF` in `compaction.sql`.
+- ALWAYS import `google-cloud-bigquery-datatransfer` lazily and only in the BigQuery provisioning path.
+
 ## Design Brief
 
-The main **goal** of this project is to *never* lose token-usage history. Users should be able to work from any emphemeral environment (e.g containers, rotating VMs) and be able to persist the token suage statistics from their agents with a single credential (e.g. `MOTHERDUCK_TOKEN`) and zero local secrets. Consequent design goals include:
+The main **goal** is to *never* lose token-usage history. Users in ephemeral environments (containers, rotating VMs) should be able to persist agent usage with a single injected credential or ambient authentication where supported, without local credential files (for example, `MOTHERDUCK_TOKEN`). Design goals include:
 
 - Persist the following statistics:
   - costs
@@ -165,21 +196,17 @@ The main **goal** of this project is to *never* lose token-usage history. Users 
   - session timestamps
   - project attribution
   - system details: OS, CPU, RAM, shell environment
-- Idempotent design, merge-based ingestion — safe to run on a cron from N machines
-- Query anything with SQL; export to `pandas` DataFrame in two lines; `polars` optionally supported
-- User-curated organization: source-scoped workspace/client/session tags and session notes
+- Idempotent design, backend-specific ingestion — safe to run on a cron from N machines
+- Query supported relations with bounded read-only SQL; return a pandas DataFrame in two lines, with optional Polars support
+- User-curated organization: global workspace/client/session tags and source-scoped session notes
 - Terminal-first text-based reporting via `rich` and rendering of charts via `plotext`
-- Pluggable storage: MotherDuck (hosted) or a local DuckDB file (zero deps)
+- Pluggable storage backends: DuckDB (local, no external service), MotherDuck, and BigQuery; independent snapshot buckets: local files and GCS
 
 The following are out-of-scope and/or antithetical to the design goals:
 
 - TUI, web server, or HTML report generator
 - Parsing of agent session files — in v1 we will use `tokscale` to extract token data
-- Persistence of tokscale's generated summary fields which have non-deterministic provenance, including:
-  - `title`,
-  - `task_category`
-  - `description`
-  - `task_group`
+- Persistence of tokscale's generated summary fields with non-deterministic provenance: `title`, `task_category`, `description`, and `task_group`
 
 ### Important Design Decisions
 
@@ -187,39 +214,64 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Daily tokscale pricing:** `price_versions` stores the tokscale rates observed for each model with activity on a processed day. `daily_cost` calculates `cost_usd` from those rates and daily token components; `tokscale_cost_usd` remains diagnostic. Historical price drift before collection is the downstream user's responsibility.
 
-- **No at-rest obfuscation of stored data:** Session data is stored raw at-rest and obfuscated at export-time. The CLI command `bassoon export` will *default* to obfuscating potentially personal information including session IDs, workspace names and paths, project names, and anything similar. For example, a project name may be pseudonymized as "project-alpha". Downstream users may optionally export their raw data as JSON via the flag `--raw-json`.
+- **No at-rest obfuscation of stored data:** Persist full-fidelity data. `bassoon export` obfuscates sensitive fields by default; `--raw` exports original values in any supported format. See Privacy and sharing policy for command-specific behavior.
 
 - **Library + CLI:** Everything the CLI does is importable Python.
 
-- **Source identity:** `source_id` is a UUID in configuration, generated by `usagebassoon init`. It namespaces every collected fact and curation target. Reuse it only for environments intentionally representing one source.
+- **Source identity:** `source_id` is a UUID in configuration, generated by `bassoon init`. It namespaces every collected fact and session note. For global tags it records the source emitting the winning mutation and does not scope the target. Reuse it only for environments intentionally representing one source.
 
-- **Warehouse source-column invariant:** Every persisted warehouse base table, including facts, leases, curation, audit, and history tables, MUST contain a non-null `source_id`. Every source-scoped current-state table's natural key MUST include `source_id`. Append-only tables may use another globally unique key such as `run_id`, but MUST still store `source_id`. Preserve this invariant in both SQL dialects and in normalization, persistence, snapshot, and restore paths.
+- **Persistence architectures:** UsageBassoon uses two persistence architectures according to backend write behavior:
+  - **Direct transactional upsert:** Apply each normalized batch directly to current-state tables in a bounded transaction. This architecture suits backends where batched upserts are inexpensive and practical; append-only audit and debug streams may coexist.
+    - Current implementations: DuckDB and MotherDuck.
+  - **Append-and-compact:** Its defining structure is append-only raw tables, compacted gold tables, tombstones for curation deletes, and scheduled transactional compaction.
+    - Current implementation: BigQuery.
+    - Candidate fits: Redshift and Microsoft Fabric; validate their backend behavior before implementation.
+    - **Append-and-compact contract:** Every Append-and-compact backend provides the same behavior, whatever its native mechanisms.
+      - **Publication:** Collection and curation publish independent atomic table appends with stable observation IDs: usage/curation and diagnostics enter raw, while permanent audit outcomes enter `collection_ledger` directly. Canonical deduplication makes retries logically idempotent. Publication across tables is not a transaction, and it waits for load acceptance, not for compaction. Collection and curation never issue DDL, staging-table workflows, synchronous MERGE or UPDATE, or leases and fencing against raw or gold tables.
+      - **Raw retention:** Raw observations and diagnostic events expire after 90 days by backend arrival time. Usage `day` may be a clustering or sort attribute, never the expiration key; historical backfills therefore arrive in fresh buckets. Durable gold never expires.
+      - **Canonical views:** State views combine gold with all retained raw observations and deduplicate by natural key using `storage_model.py`. They never prune raw by a compaction watermark or `collected_at`. Diagnostic views deduplicate by `event_id` before counting observations or resolving latest state; diagnostic freshness is defined below.
+      - **Gold layout:** Gold layout follows each table's replacement unit: durable usage and price tables are organized by usage day where the platform supports efficient per-day replacement; sessions and curation tables are keyed by natural key. Collection never writes gold.
+      - **Tombstones:** Curation deletes append tombstones. Compaction retains them in gold; canonical views hide winning tombstones, preventing older retained raw values from resurrecting deleted assignments.
+    - **Append-and-compact compaction contract:** Scheduled compaction is the only routine writer of gold; atomic restore is the only other. Every Append-and-compact backend implements these rules, using a platform-native scheduler that `bassoon init` installs or updates idempotently. The default cadence is nightly.
+      - **Atomic pass:** Commit gold changes and progress together. Passes must be safe to rerun and prevent conflicting progress from overlapping runs; use a singleton conflict row or equivalent native overlap control.
+      - **Pinned read point:** All gold, raw, count, and deduplication reads observe one consistent point in time; later arrivals enter the next pass. A platform without point-in-time reads must document an equivalent guarantee before it qualifies.
+      - **Candidacy by counts:** `compaction_ledger` records incorporated counts per `(source_id, domain, usage day, arrival bucket)`, with a sentinel day for domains without usage days. A bucket qualifies when its visible count exceeds its processed count. Never compare counts across buckets or gate progress by timestamps: bucket expiry must not mask new arrivals, and client clock order does not establish backend visibility order.
+      - **Recompute from gold plus raw:** Choose winners from existing gold plus retained raw using the shared ordering. Never rebuild gold from raw alone: raw expires, and gold may hold keys that no longer exist in raw. Compaction preserves usage keys absent from a batch.
+      - **Scope and health:** Raw diagnostic tables are never compacted. `bassoon doctor` reports overdue raw buckets before expiration becomes a history-loss risk, and compaction must continue to succeed within the 90-day retention window. Replayed rows can cause harmless extra work.
 
-- **Same-source concurrency:** The warehouse `source_leases` table permits one live collection per `source_id`. A collection claims its source before reading prior status or invoking tokscale, renews the lease while it works, and releases it after persistence. Claims advance a monotonic fence; a batch must update and validate its owner, run, fence, and expiry inside the same warehouse transaction as its facts and `ingest_runs` row. An expired or replaced owner cannot commit. Distinct source IDs can collect concurrently.
+- **BigQuery (Append-and-compact implementation):** Each platform-neutral concept above maps to BigQuery as follows.
+  - Publication uses Parquet load jobs with `WRITE_APPEND`, one concurrent job per raw table. This reuses the snapshot Arrow-to-Parquet path; duplicate appends are resolved by canonical views. Storage Write API deliberately not adopted; revisit only for sub-minute collection or synchronous read-after-write needs, behind the existing adapter interface.
+  - Arrival bucket: raw tables use ingestion-time (arrival-day) partitions with a 90-day partition expiration. Historical usage `day` is a clustering key where applicable. Initialization clears expiration on durable tables, including expiration inherited from dataset defaults.
+  - Gold layout: usage and price tables partition by usage `day`, the atomic-replacement unit under compaction. Sessions and curation tables are unpartitioned and keep natural keys. Partition keys follow lifecycle axis: arrival for expiring raw data, usage day for durable gold data.
+  - Scheduler: `bassoon init` installs or updates one Scheduled Query at 02:00 UTC from the packaged `sql/bigquery/compaction.sql` through the Data Transfer API (`google-cloud-bigquery-datatransfer`, imported lazily in the provisioning path only; `types-protobuf` is a dev-only dependency for Pyrefly).
+  - Atomic pass and pinned read point: the script runs in one transaction, binds its cutoff to that transaction's `CURRENT_TIMESTAMP()`, and reads raw and gold with `FOR SYSTEM_TIME AS OF` that cutoff. A singleton conflict row guards against overlapping scripts.
+  - Views: `compaction_backlog` exposes overdue arrival buckets to `bassoon doctor`.
 
-  ```text
-  bassoon collect / scheduler
-      → orchestrator.py creates one run_id
-      → source_leases.py initializes the schema, claims source_id, and renews the lease
-      → collector.py fetches graph; ingest.py builds the graph plan
-      → persistence.py reads prior status; orchestrator.py selects targets
-      → collector.py fetches remaining payloads; ingest.py builds the collection bundle
-      → normalizer.py builds canonical Arrow tables
-      → persistence.py retries one batch; the backend validates its fence in the fact transaction
-      → source_leases.py stops renewal and conditionally releases the lease
-      → archiver.py optionally captures one warehouse read point and publishes through catalog CAS
-  ```
+- **Initialization and schema updates:** `bassoon init` provisions idempotently. Missing or incomplete `schema_marker` blocks ordinary backend open. Retrying interrupted non-atomic init validates and preserves managed tables, completes missing objects, then marks readiness. Matching version/hash uses metadata preflight with no schema jobs. Older supported schemas use only registered, hash-gated migrations recorded in `schema_migrations`; newer versions or unexpected hashes fail closed. The migration registry is currently empty, with no migration SQL files; baseline DDL is never a fallback migration. The hash covers installed and scheduled SQL, including compaction. Changing these assets is a schema change; changing existing table shapes requires a version bump and registered migration because idempotent create statements do not reshape tables.
+
+- **Collection and row identity:** Both architectures use a UUID `run_id` for each collection, validated during normalization and stored as canonical text. Compaction generates its own run IDs. Each normalized observation has an `event_id`, retained across retries and used as the final tie-break; natural keys define logical identity. `schema_marker` and `schema_migrations` have no `event_id`.
+
+- **Observation ordering and tie-breaks:** Freshness sorts by `collected_at DESC`. For identical timestamps: tags and notes favor a surviving `upsert` over `delete`; diagnostic issues favor resolution over the raised event; `daily_stats` favors the larger `total_tokens`; `price_versions` favors a non-null, larger output-token rate; `collection_ledger` outcomes favor the later `finished_at`. `event_id DESC` is the final deterministic tie-break. This policy resolves ties; it does not correct clock skew between collection environments. Canonical views, compaction, snapshots, and restore share the policy defined in `storage_model.py`; never reimplement it ad hoc in one dialect without parity coverage.
+
+- **Backend source-column invariant:** Every persisted backend base table, including facts, curation, audit, and history tables, MUST contain a non-null `source_id`. Every source-scoped current-state table's natural key MUST include `source_id`. Tags are global and exclude it from their natural keys and curation joins; their non-null `source_id` is mutation provenance. Notes use `(source_id, client, session_id)`, matching their exact target session, and their session joins MUST include `source_id`. Append-only tables may use another globally unique key such as `run_id`, but MUST still store `source_id`. Preserve this invariant in every SQL dialect and in normalization, persistence, snapshot, and restore paths.
+
+- **Append-and-compact publication policy:** Partial publication across tables is tolerated. Retryable backend publication failures, including partial BigQuery publication, use bounded exponential backoff with jitter in `persistence.py`, preserving the batch's `run_id` and row `event_id` values across retries. Publish `collection_ledger` after fact and debug loads succeed: preflight uses completed outcomes to skip historical work. Ledger failure may cause harmless replay. Never gate facts or compaction on ledger presence, or publish completion earlier without separating client outcomes from the preflight completion signal.
+
+- **Diagnostic freshness:** Doctor reads unresolved drift and reconciliation through `open_schema_drift_events` and `open_reconciliation_issues`, filtering by latest `collected_at` within 90 days. DuckDB/MotherDuck physical pruning remains opportunistic; no background expiry worker is required.
+
+- **Same-source concurrency:** DuckDB collection uses a local OS lock; MotherDuck transaction conflicts retry with bounded jitter and a warning. Append-and-compact accepts independent remote appends under the publication contract above. Same-key curation follows the shared observation ordering; do not add application-level leases or fencing to these writes. Snapshot catalog reservations are a separate requirement.
 
 - **Concurrent collection and snapshot safety:** Independent environments can collect into one backend and compete for snapshot publication without sharing a process lock.
-  - `source_id` namespaces usage facts from different sources. The source lease coordinates collection for that identity; it does not block distinct sources.
-  - Remote data warehouse persistence batches run in a transaction and detect concurrent-update aborts with bounded jittered batch retries. The `run_id` ledger makes retrying that *same* batch idempotent, and collection-start timestamps prevent older observations from replacing newer current-state rows. BigQuery uses run-scoped staging tables and a fenced transaction MERGE script; DuckDB and MotherDuck use fenced transactional batches.
-  - All snapshot destinations require compare-and-swap catalog reservations with owner, expiry, and fence checks. If multiple UsageBassoon instances attempt a snapshot, a writer claims every configured destination before capture. Only the holder of the current reservation and fence can publish. Reservations renew through capture, uploads, and publication of each destination. Remote catalog updates and object deletion use generation preconditions. Local catalog compare-and-swap holds an OS file lock through version check and atomic replacement.
-  - Snapshots are atomic. A snapshot enters the catalog only after every table and its manifest are complete. Failed publication releases owned reservations and cleans up its objects.
-  - Usage facts are persisted with domain-dependent tolerance. `tokscale graph` and `tokscale models` calls establish the collection plan. Pricing failures are tolerated per model; report failures are tolerated per day. Successful results still enter the bundle, and `ingest_status` records complete, partial, or failed outcomes for retry. Historical completed models and pricing work can be skipped on later runs. Required command failures abort before persistence.
+  - `source_id` namespaces usage facts from different sources. Remote collection does not require a source lease.
+  - All snapshot destinations require compare-and-swap catalog reservations with owner, expiry, and fence checks. If multiple UsageBassoon instances attempt a snapshot, a writer claims every configured destination before capture. Only the holder of the current reservation and fence can publish. Reservations renew through capture, uploads, and publication of each destination. Object-store catalog updates and deletion use provider-specific version preconditions. Local catalog compare-and-swap holds an OS file lock through version check and atomic replacement.
+  - Publication is atomic within each destination catalog after all tables and the manifest are complete. Multiple destination catalogs publish sequentially; a failure attempts to roll back published entries, releases owned reservations, and cleans up uploaded objects. There is no transaction across providers.
+  - Required graph/models failures abort usage publication and attempt to append a failed client outcome. Pricing failures are tolerated per model and report failures per day; successful results still enter the bundle. `collection_ledger` records complete, partial, or failed outcomes for retry. Completed historical models/pricing work may be skipped later.
 
-- **Session and curation identity:** A session key is `(source_id, client, session_id)`; workspace remains metadata. Client and workspace are peer scopes, not a hierarchy. Effective session tags combine direct session tags with tags on its source-scoped client and workspace.
+- **Session and curation identity:** Sessions and notes both use `(source_id, client, session_id)`; workspace remains session metadata. Notes belong only to the exact source-scoped session and must never be read, edited, deleted, or joined through another source's matching client/session identifiers. Client and workspace are peer scopes, not a hierarchy. Tags use `(scope, client, workspace, session_id, tag)` globally, so matching targets share tags across sources. Effective session tags combine direct session tags with global client and workspace tags. UsageBassoon mints no surrogate curation target IDs; global session tags assume session IDs are unique within each client. Revisit this assumption if source evidence reveals collisions; schema-shape drift alone cannot establish identity collisions.
 
-- **Daily facts:** `tokscale graph` supplies candidate dates and `daily_activity`. For each candidate day, date-filtered `tokscale models` supplies `daily_stats` at `(source_id, day, client, session_id, model)`. Completed historical targets skip by default; the current day refreshes.
+- **Curation operations and conflicts:** Operations share the `upsert` and `delete` contract across architectures. Append-and-compact retains append history and uses nullable `op_id` to correlate events from one command; in BigQuery, a rename appends an old-key delete and new-key upsert in one load, sharing `op_id` and keeping separate stable `event_id` values. Direct transactional upsert applies renames transactionally and physically deletes removed assignments in DuckDB/MotherDuck. Curation conflicts follow the shared observation ordering; no application-level serialization is added. Views and compaction use the winning row's fields. `created_at` belongs to the assignment lifetime: edits and renames preserve it, explicit deletion followed by re-add starts a fresh lifetime. `updated_at` tracks the latest meaningful mutation; unchanged add/set calls are no-ops. For tags, `source_id` records the source emitting the winning mutation; for notes, it identifies the target session's namespace.
+
+- **Daily facts:** `tokscale graph` supplies candidate dates only. For each candidate day, date-filtered `tokscale models` supplies `daily_stats` at `(source_id, day, client, session_id, model)`. Completed historical targets skip by default; the current day refreshes.
 
 - **Token calculation invariants:**
   - "reasoning" tokens are a component of the total token count such that total_tokens = input + cache_read + cache_write + reasoning + output tokens (fixture-verified against tokscale 4.15.1).
@@ -228,28 +280,35 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Data ingest pipeline:** `bassoon collect`:
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
   2. Run `graph`, use its contribution dates to select daily models work, run date-filtered `models` per required day, then fetch prices for each model used on those days and `report --no-summarize`.
-  3. Validate against the schema contract with pydantic strict mode. Required-field absence **fails the run** with a clear error; *unknown* fields or changed cardinalities are **drift events** — upserted in `schema_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them. Repeated payload sightings increment `observation_count` while preserving first-detection metadata.
-  4. Graph totals are not reconciled with daily models totals; graph is only the activity and candidate-date source.
-  5. Normalize to Arrow tables; compute derived columns. Stage each fact table in one batch.
-  6. Stage the Arrow batch, match rows by natural key, update changed existing rows, insert new rows, and leave absent rows untouched. Use one transactional upsert/MERGE per collection run; **never** delete.
-  7. Optionally: if `snapshots.interval` has elapsed, run `bassoon snapshot`.
+  3. Validate against the schema contract with pydantic strict mode. Invalid required graph/models fields *abort* usage publication; report/pricing validation failures follow the per-day/per-model tolerance above. Unknown fields, type changes, and changed cardinalities produce **drift events** — appended to ephemeral `schema_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them.
+  4. Normalize to Arrow tables, compute derived columns, and assign the stable collection and observation IDs described above.
+  5. Publish through the selected persistence architecture, following its publication and retry rules above.
+  6. If `snapshots.interval` has elapsed, publish a snapshot through `SnapshotArchiver`.
 
-- **Database management:** Locally, data will be managed and stored by DuckDB. Remotely, data will be managed and stored by either MotherDuck or GCP BigQuery. DDL and SQL views will be written natively to their respective dialect (e.g. `sql/duckdb/{ddl,views}.sql` and `sql/bigquery/{ddl,views}.sql`). `SQLGlot` will be used during CI to prevent structural drift. Dedicated pytests will be used during CI to prevent semantic drift against the golden fixtures.
+- **Backend SQL management:** Each backend installs native DDL and views under `sql/<dialect>/`; MotherDuck shares the DuckDB assets. CI checks structural parity with SQLGlot and behavior with synthetic replay and native backend tests.
 
-- **Database CI: `.github/workflows/dialect-parity.yml`** — on every PR that touches `sql/` or `tests/fixtures/`:
+- **CI workflows:** `CI Local` (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and manual dispatch. `CI` (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating local checks and adding protected BigQuery, MotherDuck, and GCS integration tests through the `ci-live` environment. `Release` (`.github/workflows/release.yml`) requires a successful `CI` push run on `main` for the exact tagged commit.
+
+- **Backend SQL CI: `.github/workflows/ci-local.yml` and `.github/workflows/ci.yml`** — structural and synthetic parity checks:
   1. `SQLGlot` parses both dialects' DDL/views.
-  2. Transpiles `bigquery/*` → duckdb dialect, for example, asserts AST-equivalence against the duckdb tree (and vice-versa for the view sets).
-  3. **Structural replay tests:** Use SQLGlot to compare every dialect's table columns and view definitions, then replay transpiled SQL with shared synthetic rows in DuckDB. Keep these checks in sync as tables and views change. Transpiler parity is *structural*, not semantic.
+  2. Compares shared logical table schemas and report view ASTs; backend-specific raw tables, canonical ingestion views, and compaction SQL deliberately differ.
+  3. **Structural replay tests:** Use SQLGlot to compare shared logical table columns and view definitions across dialects, then replay transpiled SQL with shared synthetic rows in DuckDB. Keep these checks in sync as tables and views change. Transpiler parity is *structural*, not semantic.
   4. **Synthetic replay tests:** Run the shared rows through each backend's native SQL and compare every shared view to observe dialect-specific behavior. Update these tests when a view or its input tables change. For tables unused by views, use structural and focused backend tests.
 
-- **Ingest semantics:** Date-filtered `models` rows are upserted at daily session/model grain. `graph` contributions are authoritative only for `daily_activity` and candidate dates. `session_model_stats` is an all-time calculated view over `daily_stats`. Tags and notes are owned by the user and are never touched by merge.
+- **Ingest semantics:** Daily models define session/model usage state; reports add session metadata. `session_model_stats` calculates all-time totals over `daily_stats`. Curation deletion follows the persistence architecture: retained gold tombstones for Append-and-compact, physical deletion for current Direct transactional upsert implementations.
 
-- **Snapshot semantics:** Snapshots are portable normalized-table archives, not raw-payload replay points. Every backend—including BigQuery—reads canonical Arrow tables and writes deterministic Parquet through UsageBassoon; never use a server-side BigQuery-to-GCS export.
-  - The backend materializes every table at one warehouse state and returns its capture timestamp for the manifest. DuckDB reads inside one transaction; BigQuery reads each table at one `FOR SYSTEM_TIME AS OF` timestamp.
+- **Snapshot semantics:** Snapshots are portable normalized-table archives, not raw-payload replay points. Every backend returns canonical Arrow tables; `SnapshotArchiver` serializes deterministic Parquet for any configured snapshot bucket. Backend-native exports must not bypass this portable format.
+  - The backend materializes every table at one consistent backend state and returns its capture timestamp for the manifest. DuckDB/MotherDuck read inside one transaction; BigQuery reads each table at one `FOR SYSTEM_TIME AS OF` timestamp.
   - A snapshot is restorable only after every expected table succeeds, its complete manifest is written, and the manifest is published in the archive catalog. Uncataloged prefixes are staging/orphans, never restore candidates.
-  - The catalog defines `latest`, cadence, and FIFO retention. GCS catalog publication uses generation compare-and-swap plus a short fenced reservation; cleanup is generation-conditional and must never delete the latest published snapshot. Local archives use the same catalog semantics.
-  - Restore validates catalog membership, complete table coverage, and destination schema compatibility before appending any data. The destination must be initialized and empty; a failed restore can leave partial data and must be retried from a fresh/emptied destination.
+  - Each destination catalog defines `latest`, cadence, and FIFO retention. Publication uses the reservations and version preconditions above; cleanup must never delete its latest published snapshot.
+  - Restore validates catalog membership, complete table coverage, and destination schema compatibility before writes. The destination must be initialized, empty, and quiescent: stop all writers, including scheduled compaction. The CLI warns and requires confirmation (default no) before opening the backend; library callers must enforce the same precondition.
   - `interval` is an optional positive minimum publication cadence. It gates both manual and automatic snapshots; only a configured interval enables collection-triggered snapshots. The retention default is 3.
+  - Capture canonical gold-plus-retained-raw state, including uncompacted observations. Snapshots contain usage and curation state, deduplicated `collection_ledger` outcomes, and diagnostic event streams; exclude schema metadata and compaction bookkeeping.
+  - A snapshot from any supported backend *must* restore to any other. Restore to an Append-and-compact backend uses one transaction to assert destination emptiness and insert directly into gold, with ephemeral diagnostic events inserted into raw and permanent audit outcomes into their audit tables. Unexpected destination base tables that contain data also block restore. A failed transaction leaves destination data unchanged. BigQuery uses temporary staging tables for restore and cleans them up; this exception does not apply to collection or curation. Restore into a Direct transactional upsert backend performs the same emptiness check and inserts in one transaction.
+
+- **Snapshot buckets:** `SnapshotBucket` defines provider-neutral version-aware reads, catalog compare-and-swap, exact-version deletion, object listing, and lifecycle warnings. `SnapshotArchiver` owns reservations, capture format, retention, and restore policy. Current implementations: local files and GCS. New object-store providers must satisfy this contract independently of the selected storage backend.
+  - **Local files:** Catalog compare-and-swap uses an OS file lock and atomic replacement; object versions use content hashes.
+  - **GCS (object-store snapshot implementation):** Object generations implement versioned reads, catalog compare-and-swap, and conditional deletion. GCS lifecycle warnings identify policies that could remove published snapshots. GCS is a snapshot bucket provider, independent of BigQuery; any supported backend can archive to it.
 
 - **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift_events` rows and a user-facing warning and asks for a bug report:
 
@@ -264,10 +323,10 @@ $ bassoon collect
     Run `bassoon doctor` for detail. Open an issue: https://github.com/israelflores8789/usagebassoon/issues/new
 ```
 
-- **Data-engine agnostic abstraction:** `DatabaseBackend` in `backends/base.py` is deprecated and will be replaced with `StorageBackend`, a higher-order abstraction using Arrow. Implementations:
+- **Storage backend abstraction:** `StorageBackend` in `backends/base.py` defines publication, queries, consistent snapshot reads, and atomic restore using Arrow. Implementations:
   - `duckdb_local.py` — local file; `register(arrow_table)` is zero-copy
   - `motherduck.py` — identical code path, `md:` connection string
-  - `bigquery.py` — `google-cloud-bigquery`; Arrow staging then one transaction script per collection run. Concurrent-update aborts retry with jitter and active transactions are exposed to `bassoon doctor`.
+  - `bigquery.py` — `google-cloud-bigquery`; Append-and-compact publication and restore. The mapping above defines provisioning, partitioning, and compaction; active transactions are exposed to `bassoon doctor`.
 
   Derived columns (`total_tokens`, `session_label`) are computed **in the normalizer**; calculated costs remain dialect-paired views. The pipeline is:
   ```
@@ -275,34 +334,33 @@ $ bassoon collect
               → pydantic models (typed objects)
               → Arrow normalizer (batch, derived columns, canonical schema)
               → StorageBackend (dialect-specific executor)
-              → pandas/polars/Arrow on the way back via `to_arrow()`
+              → pandas/Polars via `query()`, or Arrow via `query_arrow()`
   ```
 
 - **Notable SQL semantics:**
-  - `run_id` is generated and UUID-validated by Arrow, then stored as canonical text in SQL backends for dialect portability.
-  - `last_seen_at` is metadata from tokscale's `last_active` or similar.
-  - `last_collected_at` is a freshness marker internal to usagebassoon.
+  - `last_active` is tokscale session metadata; `first_seen_at` and `last_seen_at` track UsageBassoon observations.
+  - `collected_at` orders observations; shared tie-break policies and natural keys are in `storage_model.py`.
 
-- **General storage model:** Usage facts, day/model price versions, schema-drift events, and reconciliation issues use current-state upserts. Reconciliation issues are keyed by source, check, and issue, track cumulative `observation_count`, and use a boolean `resolved` state. Existing natural keys are updated in place; new natural keys are inserted; rows absent from later snapshots are **never** deleted. Ingest runs and snapshot artifacts are append-only.
+- **General storage model:** Durable logical state comprises `sessions`, `daily_stats`, `price_versions`, `tags`, and `notes`. `collection_ledger` outcomes are permanent; physical replay appends are deduplicated in canonical views. Diagnostic streams have a 90-day visibility window, with physical pruning as described above. Append-and-compact progress uses per-arrival-bucket counts; BigQuery implements buckets with ingestion-day partitions. Schema and compaction metadata are excluded from snapshots.
 
 ### Canonical Ingest Commands
 
-These are the `tokscale` commands used to generate ingest data. Each command is authoritative for its data domain. Graph supplies activity and candidate dates only; it is not reconciled with daily models totals:
+These are the `tokscale` commands used to generate ingest data. Each command is authoritative for its data domain. Graph supplies candidate dates only; it is not reconciled with daily models totals:
 
 - `tokscale models --json --group-by client,session,model --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for daily statistics with session-level granularity.
 - `tokscale report --json --no-summarize --since <YYYY-MM-DD> --until <YYYY-MM-DD>` — authoritative for session metadata.
-- `tokscale graph` — authoritative for daily activity statistics.
+- `tokscale graph` — authoritative for candidate dates; no activity table is persisted.
 - `tokscale pricing <model-id> --json` — authoritative for the rate observed while processing a daily usage fact.
 
 ### Implemented SQL views (per-dialect: `sql/{duckdb,bigquery}/views.sql`)
 
-The DuckDB/MotherDuck and BigQuery assets implement the same 11 views:
+The DuckDB/MotherDuck and BigQuery assets implement shared canonical, collection planning, diagnostic, and report views; BigQuery additionally exposes `compaction_backlog`:
 
 - `daily_cost` applies the observed source/day/model rates to daily token facts. It returns `NULL` cost when a nonzero token category has no matching rate; reasoning uses the output rate.
 - `session_model_stats` aggregates daily facts across time at source/client/session/model grain. Its cost is `NULL` unless every contributing daily fact has a known cost. `session_model_stats_current` is an alias with identical rows and no current-time filter.
 - `report_daily_usage` exposes daily facts with workspace metadata. `report_session_models` exposes session/model totals with workspace and last-active metadata. These are the filterable report inputs; CLI reporting applies source, client, model, workspace, and effective-tag filters before aggregating.
 - `report_summary` and `report_models` provide global session and model aggregates. They omit source/client/workspace dimensions, and their `SUM(cost_usd)` ignores `NULL` inputs, so totals may be partial when pricing is incomplete.
-- `session_tags` resolves source-scoped client, workspace, and session tags while preserving tag scope. `tagged_sessions` joins those effective tags to session metadata.
+- `session_tags` resolves global client, workspace, and session tags while preserving tag scope. `tagged_sessions` joins those effective tags to session metadata.
 - `noted_sessions` joins notes to sessions, while `session_notes` exposes the stable notes projection used by curation commands.
 
 The report source views retain the dimensions needed for filtering; the pre-aggregated summary views do not. Consumers that need to distinguish incomplete pricing should use the detailed views or explicitly check cost completeness before aggregating.
@@ -313,16 +371,16 @@ The installed command is `bassoon`. The commands below are implemented.
 
 | Command | Purpose |
 |---|---|
-| `bassoon init` | create config + configured DDL + views |
+| `bassoon init` | create config + idempotent schema + BigQuery nightly compaction schedule |
 | `bassoon collect` | one delta-ingest cycle (designed for cron) |
 | `bassoon query <relation>` | bounded query of a supported relation; raw output with sharing warning |
-| `bassoon report summary/sessions/daily/graph` | terminal reports; `--sanitize/--obfuscate` for sharing |
-| `bassoon tag add/rename/remove` | source-aware user curation |
-| `bassoon note set/edit/remove` | source-aware user curation |
-| `bassoon restore` | restore a snapshot into an initialized, empty warehouse |
+| `bassoon report summary/models/sessions/daily/graph` | terminal reports; `--sanitize/--obfuscate` for sharing |
+| `bassoon tag add/rename/remove` | global user curation with source provenance |
+| `bassoon note set/edit/remove` | source-scoped session notes |
+| `bassoon restore` | restore a snapshot into an initialized, empty backend |
 | `bassoon snapshot` | write a private snapshot to configured destinations |
 | `bassoon export <relation> <path>` | export a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for raw data |
-| `bassoon audit` | collection audit log from `ingest_runs` |
+| `bassoon audit` | collection audit log from `collection_runs` |
 | `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
 | `bassoon schedule install/status/start/stop/logs/remove/worker` | install or manage native scheduling, or run the container worker |
 
@@ -336,17 +394,18 @@ The installed command is `bassoon`. The commands below are implemented.
 - Schema-drift identifiers, paths, detail, versions, exact timestamps, and reconciliation messages remain unchanged in sanitized doctor/export output because they are generated structural diagnostics required for actionable bug reports. `client` values (for example `codex` and `opencode`) remain unchanged.
 - Snapshots are raw restoration artifacts, not shareable exports. Treat snapshot storage as private.
 
-### Proposed Python API
+### Python API
 
-`pandas` is the *default*; `polars` is first-class:
+pandas is the default; Polars is supported through the optional extra. `connect()` returns a `StorageBackend` that the caller must close:
 
 ```python
 import usagebassoon
 
-df  = usagebassoon.query("SELECT * FROM report_models")                   # pandas
-df  = usagebassoon.query("SELECT * FROM daily_cost", engine="polars")     # polars
-tbl = usagebassoon.query_arrow("SELECT * FROM sessions")                  # raw Arrow
-con = usagebassoon.connect()          # duckdb conn, or ibis-style BigQuery session
+df = usagebassoon.query("SELECT * FROM report_models LIMIT 1000")  # pandas
+df = usagebassoon.query("SELECT * FROM daily_cost LIMIT 1000", engine="polars")
+tbl = usagebassoon.query_arrow("SELECT * FROM report_session_models LIMIT 1000")
+backend = usagebassoon.connect()      # StorageBackend; caller owns its lifetime
+backend.close()
 ```
 
 ### Default Configuration
@@ -394,8 +453,8 @@ directory = "~/.local/state/usagebassoon/logs"
 max_files = 5
 max_bytes = 5242880
 
-# [snapshots] # optional; absent = feature off
-# file_uri = "/path/to/local/snapshots" # optional local archive; default unset
+# [snapshots] # optional; absent = automatic snapshots off; manual snapshot still available
+# file_uri = "/path/to/local/snapshots" # defaults to platform snapshot directory when no destination is configured
 # max_snapshots = 3 # rotating retention
 # interval = "12h" # taken during collect when elapsed; unset by default
 ```

@@ -10,7 +10,6 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 
 
@@ -25,21 +24,23 @@ def restore(
     ] = None,
 ) -> None:
     """Restore a raw snapshot into an empty configured warehouse."""
+    typer.echo(
+        "Warning: stop all UsageBassoon instances and writers before restoring. "
+        "Concurrent writes can mix new data with the snapshot and prevent a "
+        "consistent restore.",
+        err=True,
+    )
+    typer.confirm(
+        "Have all writers stopped, and do you wish to proceed?",
+        default=False,
+        abort=True,
+    )
     configuration, backend = configured_backend(config)
     try:
-        populated = []
-        for table in SNAPSHOT_TABLES:
-            count = backend.query(f"SELECT count(*) AS count FROM {table}").to_pylist()[
-                0
-            ]["count"]
-            if count:
-                populated.append(table)
-        if populated:
-            raise typer.BadParameter(
-                "restore requires an empty warehouse; populated tables: "
-                + ", ".join(populated)
-            )
-        restored = snapshot_archiver(configuration).restore(backend, snapshot)
+        try:
+            restored = snapshot_archiver(configuration).restore(backend, snapshot)
+        except (RuntimeError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
     finally:
         backend.close()
     details = ", ".join(f"{table}={count}" for table, count in restored.items())

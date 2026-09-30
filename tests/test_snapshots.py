@@ -17,6 +17,7 @@ from typing import cast
 import pyarrow as pa
 import pytest
 
+from tests._observations import observations
 from tests._snapshot_fakes import TableBackend
 from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
@@ -38,15 +39,17 @@ def _append_note(backend: DuckDBBackend) -> None:
     captured_at = datetime(2026, 9, 19, tzinfo=UTC)
     backend.append(
         "notes",
-        pa.table(
-            {
-                "source_id": ["11111111-1111-4111-8111-111111111111"],
-                "client": ["codex"],
-                "session_id": ["private-session"],
-                "note": ["private note"],
-                "created_at": [captured_at],
-                "updated_at": [captured_at],
-            }
+        observations(
+            pa.table(
+                {
+                    "source_id": ["11111111-1111-4111-8111-111111111111"],
+                    "client": ["codex"],
+                    "session_id": ["private-session"],
+                    "note": ["private note"],
+                    "created_at": [captured_at],
+                    "collected_at": [captured_at],
+                }
+            )
         ),
     )
 
