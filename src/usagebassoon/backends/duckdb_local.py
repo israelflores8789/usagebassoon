@@ -380,6 +380,17 @@ class _DuckDBStorage(AbstractStorageBackend):
 class DuckDBBackend(_DuckDBStorage):
     """StorageBackend backed by a local DuckDB database."""
 
+    @property
+    @override
+    def max_concurrent_queries(self) -> int:
+        """Keep independent reads sequential on the owned DuckDB connection."""
+        return 1
+
+    @override
+    def compaction_backlog(self) -> pa.Table | None:
+        """Return None because transactional upserts require no compaction."""
+        return None
+
     def __init__(self, database: str | Path) -> None:
         """Open a local database, creating parent directories as needed.
 

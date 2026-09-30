@@ -157,6 +157,12 @@ class BigQueryBackend(AbstractStorageBackend):
 
     dialect = "bigquery"
 
+    @property
+    @override
+    def max_concurrent_queries(self) -> int:
+        """Return the bounded read-query concurrency supported by this client."""
+        return 8
+
     def __init__(
         self,
         project: str,
@@ -285,6 +291,15 @@ class BigQueryBackend(AbstractStorageBackend):
         return isinstance(
             error,
             (_JobTimeout, ServiceUnavailable, TooManyRequests, InternalServerError),
+        )
+
+    @override
+    def compaction_backlog(self) -> pa.Table | None:
+        """Read every overdue arrival bucket through the installed health view."""
+        return self.query(
+            "SELECT domain, arrival_day, pending_rows, age_days "
+            "FROM compaction_backlog WHERE age_days >= 2 "
+            "ORDER BY age_days DESC"
         )
 
     @override

@@ -206,6 +206,11 @@ def is_simple_identifier(value: str) -> bool:
 class StorageBackend(Protocol):
     """Public capability contract for a dialect-specific Arrow warehouse."""
 
+    @property
+    def max_concurrent_queries(self) -> int:
+        """Return the safe concurrency limit for independent read queries."""
+        ...
+
     def apply_ddl(self) -> None:
         """Create the backend's dialect-native schema and views idempotently."""
         ...
@@ -220,6 +225,14 @@ class StorageBackend(Protocol):
 
     def is_retryable_error(self, error: Exception) -> bool:
         """Return whether an error permits retrying the same collection run."""
+        ...
+
+    def compaction_backlog(self) -> pa.Table | None:
+        """Return overdue arrival buckets, or None when compaction is inapplicable.
+
+        Rows contain domain, arrival_day, pending_rows, and age_days. Return all
+        buckets at least two days old so report limits cannot hide retention risk.
+        """
         ...
 
     def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
@@ -308,6 +321,11 @@ def close_backend(
 class AbstractStorageBackend(ABC):
     """Shared invariant enforcement for concrete storage backends."""
 
+    @property
+    @abstractmethod
+    def max_concurrent_queries(self) -> int:
+        """Return the safe concurrency limit for independent read queries."""
+
     @abstractmethod
     def apply_ddl(self) -> None:
         """Create the backend's dialect-native schema and views idempotently."""
@@ -323,6 +341,10 @@ class AbstractStorageBackend(ABC):
         """
         del error
         return False
+
+    @abstractmethod
+    def compaction_backlog(self) -> pa.Table | None:
+        """Return overdue arrival buckets, or None for direct upsert backends."""
 
     def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
         """Return active write transactions when the backend can inspect them.

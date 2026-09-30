@@ -6,16 +6,20 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
 
+import pyarrow as pa
+
 from usagebassoon import ingest, reconcile
-from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.base import ActiveTransaction, StorageBackend
 from usagebassoon.drift import SchemaDriftRecord, format_drift
 
 CheckStatus = Literal["ok", "warning", "error"]
+type ReadResult[T] = tuple[T | None, Exception | None]
 DRIFT_ISSUE_URL = "https://github.com/israelflores8789/usagebassoon/issues/new"
 _LOG = logging.getLogger("usagebassoon")
 
@@ -149,6 +153,22 @@ def _as_required_int(value: object | None) -> int:
 def _materialized_rows(backend: StorageBackend, sql: str) -> list[dict[str, object]]:
     """Execute a query and normalize its rows for diagnostic parsing."""
     return [cast(dict[str, object], row) for row in backend.query(sql).to_pylist()]
+
+
+def _capture_read[T](operation: Callable[[], T]) -> tuple[T | None, Exception | None]:
+    """Return a concurrent diagnostic result without propagating its failure."""
+    try:
+        return operation(), None
+    except Exception as error:
+        return None, error
+
+
+def _read_value[T](result: ReadResult[T]) -> T:
+    """Return a captured diagnostic value or re-raise its recorded failure."""
+    value, error = result
+    if error is not None:
+        raise error
+    return cast(T, value)
 
 
 def unresolved_schema_drift(
@@ -350,14 +370,43 @@ def run_doctor(
         checks.append(DoctorCheck("backend", "error", f"connectivity failed: {error}"))
         return DoctorReport(tuple(checks))
     checks.append(DoctorCheck("backend", "ok", "connection and query succeeded"))
+    workers = backend.max_concurrent_queries
+    if workers < 1:
+        raise ValueError("backend query concurrency must be positive")
 
-    missing: list[str] = []
-    for table in REQUIRED_RELATIONS:
+    def check_relation(table: str) -> str | None:
         try:
             backend.query(f"SELECT * FROM {table} LIMIT 0")
         except Exception:
             active_logger.exception("doctor schema check failed for %s", table)
-            missing.append(table)
+            return table
+        return None
+
+    probe = " UNION ALL ".join(
+        f"(SELECT '{table}' AS relation FROM {table} LIMIT 0)"
+        for table in REQUIRED_RELATIONS
+    )
+    missing: list[str]
+    try:
+        backend.query(probe)
+    except Exception:
+        if workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(workers, len(REQUIRED_RELATIONS))
+            ) as executor:
+                missing = [
+                    table
+                    for table in executor.map(check_relation, REQUIRED_RELATIONS)
+                    if table is not None
+                ]
+        else:
+            missing = [
+                table
+                for table in (check_relation(name) for name in REQUIRED_RELATIONS)
+                if table is not None
+            ]
+    else:
+        missing = []
     if missing:
         checks.append(
             DoctorCheck(
@@ -376,52 +425,87 @@ def run_doctor(
         )
     )
 
-    if backend_name == "bigquery":
-        try:
-            transactions = backend.active_transactions(limit)
-        except Exception as error:
-            active_logger.exception("doctor transaction inspection failed")
-            checks.append(
-                DoctorCheck(
-                    "transactions",
-                    "warning",
-                    f"could not inspect active BigQuery transactions: {error}",
-                )
+    transactions_result: ReadResult[tuple[ActiveTransaction, ...]] | None = None
+    backlog_result: ReadResult[pa.Table | None] | None = None
+    drift_result: ReadResult[tuple[SchemaDriftRecord, ...]] | None = None
+    ingest_result: ReadResult[tuple[ingest.IngestIssue, ...]] | None = None
+    reconciliation_result: (
+        ReadResult[tuple[reconcile.ReconciliationIssueRecord, ...]] | None
+    ) = None
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, 5)) as executor:
+            transactions_future = executor.submit(
+                _capture_read, lambda: backend.active_transactions(limit)
             )
-        else:
-            checks.append(
-                DoctorCheck(
-                    "transactions",
-                    "warning" if transactions else "ok",
-                    (
-                        f"{len(transactions)} active warehouse transaction(s)"
-                        if transactions
-                        else "no active BigQuery transactions for this dataset"
-                    ),
-                    tuple(
-                        f"job {transaction.job_id}; "
-                        f"transaction {transaction.transaction_id}"
-                        for transaction in transactions
-                    ),
-                )
+            backlog_future = executor.submit(_capture_read, backend.compaction_backlog)
+            drift_future = executor.submit(
+                _capture_read, lambda: unresolved_schema_drift(backend, limit=limit)
             )
+            ingest_future = executor.submit(
+                _capture_read, lambda: ingest_issues(backend, limit=limit)
+            )
+            reconciliation_future = executor.submit(
+                _capture_read, lambda: reconciliation_issues(backend, limit=limit)
+            )
+            transactions_result = transactions_future.result()
+            backlog_result = backlog_future.result()
+            drift_result = drift_future.result()
+            ingest_result = ingest_future.result()
+            reconciliation_result = reconciliation_future.result()
 
-    if backend_name == "bigquery":
-        try:
-            backlog = backend.query(
-                "SELECT domain, arrival_day, pending_rows, age_days "
-                "FROM compaction_backlog WHERE age_days >= 2 "
-                "ORDER BY age_days DESC"
-            ).to_pylist()
-        except Exception as error:
-            checks.append(
-                DoctorCheck(
-                    "compaction",
-                    "error",
-                    f"could not read compaction progress: {error}",
-                )
+    else:
+        transactions_result = _capture_read(lambda: backend.active_transactions(limit))
+        backlog_result = _capture_read(backend.compaction_backlog)
+        drift_result = _capture_read(
+            lambda: unresolved_schema_drift(backend, limit=limit)
+        )
+        ingest_result = _capture_read(lambda: ingest_issues(backend, limit=limit))
+        reconciliation_result = _capture_read(
+            lambda: reconciliation_issues(backend, limit=limit)
+        )
+
+    try:
+        transactions = _read_value(transactions_result)
+    except Exception as error:
+        active_logger.exception("doctor transaction inspection failed")
+        checks.append(
+            DoctorCheck(
+                "transactions",
+                "warning",
+                f"could not inspect active backend transactions: {error}",
             )
-        else:
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                "transactions",
+                "warning" if transactions else "ok",
+                (
+                    f"{len(transactions)} active warehouse transaction(s)"
+                    if transactions
+                    else "no active backend transactions"
+                ),
+                tuple(
+                    f"job {transaction.job_id}; "
+                    f"transaction {transaction.transaction_id}"
+                    for transaction in transactions
+                ),
+            )
+        )
+
+    try:
+        backlog_table = _read_value(backlog_result)
+    except Exception as error:
+        checks.append(
+            DoctorCheck(
+                "compaction",
+                "error",
+                f"could not read compaction progress: {error}",
+            )
+        )
+    else:
+        if backlog_table is not None:
+            backlog = backlog_table.to_pylist()
             at_risk = any(row["age_days"] >= 80 for row in backlog)
             checks.append(
                 DoctorCheck(
@@ -442,7 +526,7 @@ def run_doctor(
             )
 
     try:
-        drift = unresolved_schema_drift(backend, limit=limit)
+        drift = _read_value(drift_result)
     except Exception as error:
         active_logger.exception("doctor schema-drift inspection failed")
         checks.append(
@@ -470,7 +554,7 @@ def run_doctor(
         )
 
     try:
-        issues = ingest_issues(backend, limit=limit)
+        issues = _read_value(ingest_result)
     except Exception as error:
         active_logger.exception("doctor ingest-run inspection failed")
         checks.append(
@@ -498,7 +582,7 @@ def run_doctor(
         )
 
     try:
-        recorded = reconciliation_issues(backend, limit=limit)
+        recorded = _read_value(reconciliation_result)
     except Exception as error:
         active_logger.exception("doctor reconciliation inspection failed")
         checks.append(

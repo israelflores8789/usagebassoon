@@ -281,3 +281,95 @@ def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
         assert read(backend) == ()
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_doctor_uses_backend_capabilities_without_provider_selectors(
+    workers: int,
+) -> None:
+    """Honor concurrency and compaction health for an unfamiliar backend name."""
+    import time
+    from collections.abc import Mapping
+    from threading import Lock
+
+    import pyarrow as pa
+
+    class _FutureBackend(DuckDBBackend):
+        """Exercise the read contract without sharing a DuckDB query cursor."""
+
+        def __init__(self) -> None:
+            super().__init__(":memory:")
+            self.lock = Lock()
+            self.inflight = 0
+            self.peak = 0
+
+        @property
+        @override
+        def max_concurrent_queries(self) -> int:
+            return workers
+
+        @override
+        def query(
+            self, sql: str, parameters: Mapping[str, str] | None = None
+        ) -> pa.Table:
+            del parameters
+            with self.lock:
+                self.inflight += 1
+                self.peak = max(self.peak, self.inflight)
+            try:
+                time.sleep(0.02)
+                if "open_schema_drift_events" in sql:
+                    raise RuntimeError("drift read failed")
+                return pa.table({})
+            finally:
+                with self.lock:
+                    self.inflight -= 1
+
+        @override
+        def compaction_backlog(self) -> pa.Table | None:
+            return pa.table(
+                {
+                    "domain": ["sessions", "daily_stats"],
+                    "arrival_day": ["recent", "at-risk"],
+                    "pending_rows": [1, 1],
+                    "age_days": [2, 81],
+                }
+            )
+
+    backend = _FutureBackend()
+    try:
+        report = run_doctor(
+            backend,
+            backend_name="future_backend",
+            database="integration",
+            snapshot_enabled=False,
+            limit=1,
+        )
+        checks = {check.name: check for check in report.checks}
+        assert backend.peak == workers
+        assert checks["compaction"].status == "error"
+        assert len(checks["compaction"].details) == 1
+        assert checks["schema_drift"].status == "error"
+        assert checks["collection_runs"].status == "ok"
+        assert checks["reconciliation"].status == "ok"
+    finally:
+        backend.close()
+
+
+def test_doctor_schema_fallback_identifies_missing_relation_for_any_backend() -> None:
+    """Keep precise schema errors when the shared combined probe fails."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        backend.connection.execute("DROP VIEW report_models")
+        report = run_doctor(
+            backend,
+            backend_name="unfamiliar_backend",
+            database=":memory:",
+            snapshot_enabled=False,
+        )
+        schema = next(check for check in report.checks if check.name == "schema")
+        assert schema.status == "error"
+        assert schema.details == ("report_models",)
+    finally:
+        backend.close()

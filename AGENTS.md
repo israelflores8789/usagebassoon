@@ -141,7 +141,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - USE Google-style docstrings for **all** source code.
 - KEEP comments concise yet clear. Do NOT use numbered headers (e.g. "1." or "(1)" etc).
 - FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
-- NEVER hard-code the application version in source; `hatch-vcs` derives it from git tags (`v0.1.0` → `0.1.0`). Schema versions and pinned external contract versions are separate.
+- NEVER hard-code the application version in source; `hatch-vcs` derives it from git tags (`v0.1.0` → `0.1.0`). Release tags and versions use Semantic Versioning standards *with* the "v" prefix. Schema versions and pinned external contract versions are separate.
 - Do NOT wrap lines when generating markdown text.
 - USE Keep a Changelog standards in `CHANGELOG.md`; preserve release heading and bullet formatting because `just release` and the GitHub release workflow extract release notes from it.
 - ALWAYS use the `usagebassoon_it` dataset when live testing with BigQuery. NEVER perform tests on any other dataset. **NEVER** perform tests on a dataset called only `usagebassoon`.
@@ -149,6 +149,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - ALWAYS use the `gs://usagebassoon-test-snapshots-<gcp-project-id>` Google Cloud Storage bucket for GCS testing. **NEVER** perform tests on any other GCS bucket.
 - CLI read queries MUST use the shared views installed for each SQL dialect and dialect-agnostic query construction. Backend adapters own native SQL; schema provisioning and write commands use the corresponding backend operations.
 - FOR CLI output assertions in *tests*, normalize captured stdout or stderr with `tests._cli.plain_cli_output(...)` before comparing text. GitHub Actions color output can insert ANSI escapes inside visible tokens such as `--version`, causing raw substring assertions to fail. Reproduce this environment with `CI=true GITHUB_ACTIONS=true TERM=xterm-256color just test <test>` when diagnosing this failure.
+- EVERY change to the `StorageBackend` or `SnapshotBucket` protocol MUST update and verify all current backend or bucket implementations, respectively, in the same change. Explicitly implement supported behavior or documented inapplicability for each provider; do not rely on an inherited default to silently cover an unreviewed provider. Shared orchestration MUST select behavior through protocol operations or capabilities, never provider-name selectors. Future providers must satisfy the complete contract.
 
 ### Prohibitions
 

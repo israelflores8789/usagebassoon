@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import os
+from typing import override
 from urllib.parse import quote
 
 import duckdb
+import pyarrow as pa
 
 from usagebassoon.backends.duckdb_local import _DuckDBStorage
 
@@ -19,6 +21,17 @@ class MotherDuckBackend(_DuckDBStorage):
     MotherDuck uses the DuckDB SQL schema but has distinct credential and URI
     handling, which is kept here rather than in the local DuckDB module.
     """
+
+    @property
+    @override
+    def max_concurrent_queries(self) -> int:
+        """Keep independent reads sequential on the owned DuckDB connection."""
+        return 1
+
+    @override
+    def compaction_backlog(self) -> pa.Table | None:
+        """Return None because transactional upserts require no compaction."""
+        return None
 
     def __init__(self, database: str, *, token: str | None = None) -> None:
         """Connect to a MotherDuck database.
