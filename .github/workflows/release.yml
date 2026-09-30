@@ -21,12 +21,12 @@ defaults:
     shell: bash
 
 jobs:
-  verify-ci-live:
-    name: Verify CI Live for tagged commit
+  verify-ci:
+    name: Verify CI for tagged commit
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
-    - name: Require a successful CI Live run for this commit
+    - name: Require a successful CI run for this commit
       env:
         GH_TOKEN: ${{ github.token }}
         TAG_SHA: ${{ github.sha }}
@@ -35,7 +35,7 @@ jobs:
 
         run_id="$(gh run list \
           --repo "$GITHUB_REPOSITORY" \
-          --workflow ci-live.yml \
+          --workflow ci.yml \
           --event push \
           --branch main \
           --commit "$TAG_SHA" \
@@ -44,16 +44,16 @@ jobs:
           --jq 'map(select(.conclusion == "success")) | .[0].databaseId // empty')"
 
         if [[ -z "$run_id" ]]; then
-          echo "No successful CI Live run found for commit $TAG_SHA." >&2
-          echo "Run CI Live on main or dev before tagging a release." >&2
+          echo "No successful CI run found for commit $TAG_SHA." >&2
+          echo "Run CI on main before tagging a release." >&2
           exit 1
         fi
 
-        echo "Verified successful CI Live run $run_id for commit $TAG_SHA."
+        echo "Verified successful CI run $run_id for commit $TAG_SHA."
 
   prepare:
     name: Verify, test, and build
-    needs: verify-ci-live
+    needs: verify-ci
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
@@ -127,7 +127,7 @@ jobs:
 
     - name: Run test suite (pre-publish gate)
       run: |
-        # CI Live was verified for this exact tag SHA above; re-run the
+        # CI was verified for this exact tag SHA above; re-run the
         # hermetic suite so release preparation has its own local check.
         uv run pytest -m "not (bigquery_live or gcs_live)" -q
 

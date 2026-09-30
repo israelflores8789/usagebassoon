@@ -240,6 +240,8 @@ just spell
 uv run pre-commit run --all-files
 ```
 
+The `CI Local` workflow (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and supports manual dispatch. The `CI` workflow (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating the local checks and adding protected BigQuery, MotherDuck, and GCS integration tests. `Release` requires a successful `CI` push run on `main` for the exact tagged commit.
+
 The project separates local tests from SQL dialect-parity tests:
 
 | Check                     | Purpose                                                      |
@@ -433,13 +435,13 @@ The release sequence is:
 
 1. Open the release pull request against `main`.
    - CLA Assistant,
-   - pull-request `CI` workflow,
+   - pull-request `CI Local` workflow,
    - the separate `sql_parity` check, and
    - code review **must all pass**.
 2. After approval, maintainers merge the pull request into `main`.
-3. `CI Live` workflow runs and **must** complete successfully for the resulting `main` commit. `CI Live` repeats the hermetic checks and runs *protected* BigQuery and GCS integration tests.
-4. If `CI Live` fails, do **not** tag the commit. `Release` will reject it. Diagnose the failure, and repeat steps 1-3.
-5. After `CI Live` succeeds, check out the exact merged `main` commit and create an annotated release tag. **Only authorized maintainers** can push protected release tags:
+3. `CI` workflow runs and **must** complete successfully for the resulting `main` commit. `CI` repeats the hermetic checks and runs *protected* BigQuery, MotherDuck, and GCS integration tests.
+4. If `CI` fails, do **not** tag the commit. `Release` will reject it. Diagnose the failure, and repeat steps 1-3.
+5. After `CI` succeeds, check out the exact merged `main` commit and create an annotated release tag. **Only authorized maintainers** can push protected release tags:
 
 ```bash
 git switch main
@@ -451,7 +453,7 @@ git push origin v1.0.0
 
 The tag points to `main`; pushing it does not replace or bypass the pull-request workflow.
 
-6. The `Release` workflow verifies that the tag is on `main` and that a successful `CI Live` run exists for the exact tagged commit. It:
+6. The `Release` workflow verifies that the tag is on `main` and that a successful `CI` run exists for the exact tagged commit. It:
    - reruns the hermetic tests,
    - runs the build,
    - verifies that the Hatchling-derived version matches the tag, and

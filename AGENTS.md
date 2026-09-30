@@ -287,7 +287,9 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Backend SQL management:** Each backend installs native DDL and views under `sql/<dialect>/`; MotherDuck shares the DuckDB assets. CI checks structural parity with SQLGlot and behavior with synthetic replay and native backend tests.
 
-- **Backend SQL CI: `.github/workflows/ci.yml` and `ci-live.yml`** — structural and synthetic parity checks:
+- **CI workflows:** `CI Local` (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and manual dispatch. `CI` (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating local checks and adding protected BigQuery, MotherDuck, and GCS integration tests through the `ci-live` environment. `Release` (`.github/workflows/release.yml`) requires a successful `CI` push run on `main` for the exact tagged commit.
+
+- **Backend SQL CI: `.github/workflows/ci-local.yml` and `.github/workflows/ci.yml`** — structural and synthetic parity checks:
   1. `SQLGlot` parses both dialects' DDL/views.
   2. Compares shared logical table schemas and report view ASTs; backend-specific raw tables, canonical ingestion views, and compaction SQL deliberately differ.
   3. **Structural replay tests:** Use SQLGlot to compare shared logical table columns and view definitions across dialects, then replay transpiled SQL with shared synthetic rows in DuckDB. Keep these checks in sync as tables and views change. Transpiler parity is *structural*, not semantic.

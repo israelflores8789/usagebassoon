@@ -4,13 +4,19 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  push:
+    branches: [main, dev]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-live-${{ github.ref }}
+  cancel-in-progress: false
+
+# Environment-scoped variables are intentionally used only by the cloud
+# jobs below. The ci-live environment should be restricted to main and dev.
+# Live tests use fixed, protected, pre-provisioned resources:
+#   BigQuery dataset: usagebassoon_it
+#   MotherDuck database: usagebassoon_it
+#   GCS bucket: gs://usagebassoon-test-snapshots-gen-lang-client-0670612427
 
 permissions:
   contents: read
@@ -21,7 +27,7 @@ defaults:
 
 jobs:
   lint:
-    name: Lint and type check
+    name: Live lint and type check
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -42,7 +48,7 @@ jobs:
       run: just typecheck
 
   sql-parity:
-    name: SQL dialect parity
+    name: Live SQL dialect parity
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -61,24 +67,25 @@ jobs:
       uses: pavelzw/pytest-action@v2
       with:
         custom-pytest: just test
+        # Keep workflow arguments free of -q so pytest-md lists test names.
         verbose: true
         emoji: true
         job-summary: true
         click-to-expand: true
-        report-title: SQL dialect parity
+        report-title: Live SQL dialect parity
         custom-arguments: >-
-          -m sql_parity --junitxml=junit-sql-parity.xml -q
+          -m sql_parity --junitxml=junit-live-sql-parity.xml
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v6
       with:
-        name: junit-sql-parity
-        path: junit-sql-parity.xml
+        name: junit-live-sql-parity
+        path: junit-live-sql-parity.xml
         if-no-files-found: warn
         retention-days: 14
 
   unit:
-    name: Unit + local DuckDB (py ${{ matrix.python }})
+    name: Live unit + local DuckDB (py ${{ matrix.python }})
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
@@ -105,20 +112,20 @@ jobs:
         emoji: true
         job-summary: true
         click-to-expand: true
-        report-title: Unit + local DuckDB (Python ${{ matrix.python }})
+        report-title: Live unit + local DuckDB (Python ${{ matrix.python }})
         custom-arguments: >-
-          --junitxml=junit-unit-${{ matrix.python }}.xml -q
+          --junitxml=junit-live-unit-${{ matrix.python }}.xml
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v6
       with:
-        name: junit-unit-py-${{ matrix.python }}
-        path: junit-unit-${{ matrix.python }}.xml
+        name: junit-live-unit-py-${{ matrix.python }}
+        path: junit-live-unit-${{ matrix.python }}.xml
         if-no-files-found: warn
         retention-days: 14
 
   build:
-    name: Build and validate distributions
+    name: Live build and validate distributions
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -137,11 +144,182 @@ jobs:
     - name: Validate distributions
       run: uv run twine check dist/*
 
+  bigquery-live:
+    name: Live BigQuery
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    environment:
+      name: ci-live
+    concurrency:
+      # These tests reset the shared dedicated dataset at module setup.
+      group: usagebassoon-bigquery-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USAGEBASSOON_BIGQUERY_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      USAGEBASSOON_BIGQUERY_DATASET: usagebassoon_it
+      USAGEBASSOON_BIGQUERY_LOCATION: US
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Verify dedicated CI dataset
+      env:
+        GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      run: |
+        set -euo pipefail
+        test -n "$GCP_PROJECT_ID"
+        bq show --project_id "$GCP_PROJECT_ID" \
+          "$GCP_PROJECT_ID:usagebassoon_it" >/dev/null
+    - name: Run bigquery_live tests
+      uses: pavelzw/pytest-action@v2
+      env:
+        USAGEBASSOON_BIGQUERY_LIVE: "1"
+        USAGEBASSOON_BIGQUERY_LIVE_RESET: "1"
+      with:
+        custom-pytest: just test
+        verbose: true
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: BigQuery live tests
+        custom-arguments: >-
+          -m bigquery_live --junitxml=junit-bigquery-live.xml
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-bigquery-live
+        path: junit-bigquery-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  gcs-live:
+    name: Live GCS snapshots
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    environment:
+      name: ci-live
+    concurrency:
+      # The tests use the shared dedicated bucket and must not overlap.
+      group: usagebassoon-gcs-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: ${{ vars.GCP_PROJECT_ID }}
+        workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+        create_credentials_file: true
+    - uses: google-github-actions/setup-gcloud@v3
+    - name: Run gcs_live tests
+      uses: pavelzw/pytest-action@v2
+      env:
+        USAGEBASSOON_GCS_LIVE: "1"
+      with:
+        custom-pytest: just test
+        verbose: true
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: GCS live tests
+        custom-arguments: >-
+          -m gcs_live --junitxml=junit-gcs-live.xml
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-gcs-live
+        path: junit-gcs-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  motherduck-live:
+    name: Live MotherDuck
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    environment:
+      name: ci-live
+    concurrency:
+      # The tests reset the shared dedicated database at module setup.
+      group: usagebassoon-motherduck-live-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Run motherduck_live tests
+      uses: pavelzw/pytest-action@v2
+      env:
+        MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        USAGEBASSOON_MOTHERDUCK_LIVE: "1"
+        USAGEBASSOON_MOTHERDUCK_LIVE_RESET: "1"
+      with:
+        custom-pytest: just test
+        verbose: true
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: MotherDuck live tests
+        custom-arguments: >-
+          -m motherduck_live --junitxml=junit-motherduck-live.xml
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-motherduck-live
+        path: junit-motherduck-live.xml
+        if-no-files-found: warn
+        retention-days: 14
+
   gate:
     name: CI gate
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [lint, sql-parity, unit, build]
+    needs: [lint, sql-parity, unit, build, bigquery-live, gcs-live, motherduck-live]
     if: always()
     steps:
     - name: Evaluate results
@@ -150,9 +328,12 @@ jobs:
         SQL_PARITY: ${{ needs.sql-parity.result }}
         UNIT: ${{ needs.unit.result }}
         BUILD: ${{ needs.build.result }}
+        BQ: ${{ needs.bigquery-live.result }}
+        GCS: ${{ needs.gcs-live.result }}
+        MOTHERDUCK: ${{ needs.motherduck-live.result }}
       run: |
         set -euo pipefail
-        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD"
-        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD"; do
+        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD bigquery_live=$BQ gcs_live=$GCS motherduck_live=$MOTHERDUCK"
+        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD" "$BQ" "$GCS" "$MOTHERDUCK"; do
           [ "$result" = "success" ] || exit 1
         done
