@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -36,23 +37,29 @@ def init(
     try:
         created = write_initial_config(manager.path)
         configuration = manager.load()
-        backend = open_backend(configuration, initialize=True)
+        with spinner(configuration):
+            backend = open_backend(configuration, initialize=True)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
+    schedule = None
     try:
-        backend.apply_ddl()
-        if configuration.backend == "bigquery":
-            from usagebassoon.backends.bigquery import BigQueryBackend
-            from usagebassoon.backends.bigquery_compaction import install_compaction
+        with spinner(configuration):
+            backend.apply_ddl()
+            if configuration.backend == "bigquery":
+                from usagebassoon.backends.bigquery import BigQueryBackend
+                from usagebassoon.backends.bigquery_compaction import install_compaction
 
-            if not isinstance(backend, BigQueryBackend):
-                raise RuntimeError("configured BigQuery backend has an invalid type")
-            schedule = install_compaction(backend)
-            typer.echo(f"Nightly compaction scheduled at 02:00 UTC: {schedule}")
+                if not isinstance(backend, BigQueryBackend):
+                    raise RuntimeError(
+                        "configured BigQuery backend has an invalid type"
+                    )
+                schedule = install_compaction(backend)
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     finally:
         close_backend(backend, context="initializing the schema")
+    if schedule is not None:
+        typer.echo(f"Nightly compaction scheduled at 02:00 UTC: {schedule}")
     action = "Created" if created else "Using existing"
     typer.echo(f"{action} configuration at {manager.path}.")
     typer.echo(f"Initialized {configuration.backend} schema.")

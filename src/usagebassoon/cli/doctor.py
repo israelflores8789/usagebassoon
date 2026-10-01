@@ -15,6 +15,7 @@ from rich.text import Text
 
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import snapshot_archiver
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
 from usagebassoon.config import (
     ConfigurationError,
@@ -128,7 +129,8 @@ def doctor(
     try:
         configuration = manager.load()
         try:
-            command, version = preflight_tokscale(configuration)
+            with spinner(configuration):
+                command, version = preflight_tokscale(configuration)
             tokscale_check = DoctorCheck(
                 "tokscale",
                 "ok",
@@ -150,41 +152,43 @@ def doctor(
         except Exception:
             logger.exception("could not configure doctor logging")
         try:
-            opened = open_backend(configuration)
+            with spinner(configuration):
+                opened = open_backend(configuration)
         except Exception as error:
             logger.exception("could not open the configured backend")
             connection_error = str(error)
     except ConfigurationError as error:
         config_error = str(error)
 
-    report = run_doctor(
-        opened,
-        backend_name=configuration.backend if configuration else "",
-        database=_configured_target(configuration) if configuration else None,
-        config_path=str(manager.path),
-        config_error=config_error,
-        connection_error=connection_error,
-        snapshot_enabled=(
-            configuration.snapshots is not None or configuration.gcs is not None
+    with spinner(configuration):
+        report = run_doctor(
+            opened,
+            backend_name=configuration.backend if configuration else "",
+            database=_configured_target(configuration) if configuration else None,
+            config_path=str(manager.path),
+            config_error=config_error,
+            connection_error=connection_error,
+            snapshot_enabled=(
+                configuration.snapshots is not None or configuration.gcs is not None
+            )
+            if configuration
+            else None,
+            snapshot_warnings=(
+                _snapshot_warnings(configuration)
+                if configuration and configuration.gcs
+                else ()
+            ),
+            limit=limit,
+            logger=logger,
         )
-        if configuration
-        else None,
-        snapshot_warnings=(
-            _snapshot_warnings(configuration)
-            if configuration and configuration.gcs
-            else ()
-        ),
-        limit=limit,
-        logger=logger,
-    )
-    report = DoctorReport(
-        (
-            DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
-            tokscale_check,
-            *report.checks,
-            schedule_doctor_check(configuration),
+        report = DoctorReport(
+            (
+                DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
+                tokscale_check,
+                *report.checks,
+                schedule_doctor_check(configuration),
+            )
         )
-    )
     try:
         if raw:
             output_console(stderr=True).print(

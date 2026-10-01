@@ -10,6 +10,7 @@ from typing import Annotated, NoReturn
 
 import typer
 
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationError,
@@ -77,7 +78,8 @@ def install(
             preflight_tokscale(configuration)
             update_schedule_interval(manager.path, configuration.schedule.interval)
             configuration = manager.load()
-        status = install_native_schedule(configuration, no_linger=no_linger)
+        with spinner(configuration):
+            status = install_native_schedule(configuration, no_linger=no_linger)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         _schedule_error(error)
     typer.echo(f"Installed {status.provider} schedule.")
@@ -122,7 +124,9 @@ def start(
 ) -> None:
     """Start an installed native schedule after tokscale preflight."""
     try:
-        result = start_native_schedule(ConfigurationManager(config).load())
+        configuration = ConfigurationManager(config).load()
+        with spinner(configuration):
+            result = start_native_schedule(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         _schedule_error(error)
     typer.echo(f"Started {result.provider} schedule.")
@@ -140,11 +144,13 @@ def stop(
     try:
         configuration = ConfigurationManager(config).load()
         worker_was_running = worker_status(configuration).running
-        stop_worker(configuration)
+        with spinner(configuration):
+            stop_worker(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         _schedule_error(error)
     try:
-        stop_native_schedule()
+        with spinner(configuration):
+            stop_native_schedule()
     except (OSError, RuntimeError, ValueError) as error:
         if not worker_was_running:
             _schedule_error(error)

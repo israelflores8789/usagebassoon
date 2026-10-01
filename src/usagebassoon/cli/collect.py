@@ -11,6 +11,7 @@ from typing import Annotated
 
 import typer
 
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.logger import LOGGER_NAME
@@ -28,7 +29,8 @@ def collect(
     """Collect daily tokscale observations and publish them to storage."""
     try:
         configuration = ConfigurationManager(config).load()
-        run_id, summary = collect_run(configuration)
+        with spinner(configuration):
+            run_id, summary = collect_run(configuration)
     except CollectionBusy as error:
         typer.echo(f"Collection failed: {error}", err=True)
         raise typer.Exit(code=1) from error

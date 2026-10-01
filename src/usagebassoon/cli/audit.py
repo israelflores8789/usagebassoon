@@ -13,6 +13,7 @@ from rich.table import Table
 
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import configured_backend
+from usagebassoon.cli.spinner import spinner
 
 
 def audit(
@@ -26,13 +27,14 @@ def audit(
     ] = 20,
 ) -> None:
     """Show recent ingestion audit records."""
-    _, backend = configured_backend(config)
+    configuration, backend = configured_backend(config)
     try:
-        data = backend.query(
-            "SELECT run_id, source_id, started_at, finished_at, status "
-            "FROM collection_runs "
-            f"ORDER BY finished_at DESC LIMIT {limit}"
-        )
+        with spinner(configuration):
+            data = backend.query(
+                "SELECT run_id, source_id, started_at, finished_at, status "
+                "FROM collection_runs "
+                f"ORDER BY finished_at DESC LIMIT {limit}"
+            )
     finally:
         backend.close()
     table = Table(title="Recent collection audit records")

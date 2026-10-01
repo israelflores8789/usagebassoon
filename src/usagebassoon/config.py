@@ -27,6 +27,7 @@ from platformdirs import (
     user_log_path,
     user_state_path,
 )
+from yaspin.constants import SPINNER_ATTRS
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -48,6 +49,7 @@ _ROOT_CONFIG_KEYS = frozenset(
     {
         "source_id",
         "backend",
+        "spinner",
         "local_database",
         "tokscale",
         "bigquery",
@@ -134,7 +136,7 @@ def write_initial_config(path: Path) -> bool:
         OSError: If the configuration directory cannot be created or written.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = f'source_id = "{uuid4()}"\nbackend = "duckdb"\n'
+    content = f'source_id = "{uuid4()}"\nbackend = "duckdb"\nspinner = "pong"\n'
     try:
         with path.open("x") as handle:
             handle.write(content)
@@ -254,6 +256,7 @@ class UsageBassoonConfig:
         path: Configuration file from which these values were loaded.
         source_id: Stable UUID namespace for one intentional collection source.
         backend: Selected storage backend.
+        spinner: Yaspin animation name used for interactive CLI waits.
         local_database: Local DuckDB file path, when DuckDB is selected.
         motherduck: MotherDuck settings when that backend is selected.
         bigquery: BigQuery settings when that backend is selected.
@@ -272,6 +275,7 @@ class UsageBassoonConfig:
     path: Path
     source_id: str
     backend: BackendName
+    spinner: str = "pong"
     local_database: Path | None = None
     motherduck: MotherDuckConfig | None = None
     bigquery: BigQueryConfig | None = None
@@ -644,6 +648,11 @@ def _parse_config(
 ) -> UsageBassoonConfig:
     """Validate decoded TOML and create the typed configuration object."""
     _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
+    spinner = _string(payload.get("spinner", "pong"), "spinner", required=True)
+    if spinner is None or spinner not in SPINNER_ATTRS:
+        raise ConfigurationError(
+            f"spinner must be one of: {', '.join(sorted(SPINNER_ATTRS))}"
+        )
     source_id = _string(payload.get("source_id"), "source_id", required=True)
     backend_value = _string(payload.get("backend"), "backend", required=True)
     if backend_value not in SUPPORTED_BACKENDS:
@@ -686,6 +695,7 @@ def _parse_config(
         path=path,
         source_id=canonical_source_id,
         backend=backend,
+        spinner=spinner,
         local_database=local_database,
         motherduck=motherduck,
         bigquery=bigquery,

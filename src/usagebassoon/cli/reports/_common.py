@@ -24,6 +24,7 @@ from rich.cells import cell_len
 
 from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.cli._utils import configured_backend
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonValue
 from usagebassoon.parsers.daily import parse_daily
@@ -427,13 +428,14 @@ def load_configured_daily_usage(
     """Open the configured warehouse and load daily report records."""
     configuration, backend = configured_backend(config)
     try:
-        return load_daily_usage(
-            backend,
-            resolve_filters(filters, configuration.source_id),
-            limit=limit,
-            since=since,
-            until=until,
-        )
+        with spinner(configuration):
+            return load_daily_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                limit=limit,
+                since=since,
+                until=until,
+            )
     finally:
         close_backend(backend, context="rendering a daily report")
 
@@ -448,12 +450,13 @@ def load_configured_model_usage(
     """Open the configured warehouse and load filtered model totals."""
     configuration, backend = configured_backend(config)
     try:
-        return load_model_usage(
-            backend,
-            resolve_filters(filters, configuration.source_id),
-            since=since,
-            until=until,
-        )
+        with spinner(configuration):
+            return load_model_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                since=since,
+                until=until,
+            )
     finally:
         close_backend(backend, context="rendering a models report")
 
@@ -471,15 +474,16 @@ def load_configured_session_usage(
     """Open the configured warehouse and load session report records."""
     configuration, backend = configured_backend(config)
     try:
-        return load_session_usage(
-            backend,
-            resolve_filters(filters, configuration.source_id),
-            by_model=by_model,
-            sort=sort,
-            limit=limit,
-            since=since,
-            until=until,
-        )
+        with spinner(configuration):
+            return load_session_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                by_model=by_model,
+                sort=sort,
+                limit=limit,
+                since=since,
+                until=until,
+            )
     finally:
         close_backend(backend, context="rendering a sessions report")
 

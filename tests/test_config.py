@@ -93,9 +93,33 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     configuration = ConfigurationManager(path).load()
 
     assert configuration.schedule.interval == "15m"
+    assert configuration.spinner == "pong"
     assert configuration.tokscale_timeout_seconds == 180.0
     assert configuration.logging.max_files == 5
     assert configuration.logging.max_bytes == 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize("name", ["pong", "dots", "bouncingBall"])
+def test_spinner_configuration(tmp_path: Path, name: str) -> None:
+    """Accept yaspin's case-sensitive animation names."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        f'backend = "duckdb"\nspinner = "{name}"\n'
+    )
+    assert ConfigurationManager(path).load().spinner == name
+
+
+@pytest.mark.parametrize("value", ['"missing"', '"Pong"', '""', "123", "false"])
+def test_invalid_spinner_configuration(tmp_path: Path, value: str) -> None:
+    """Reject unsupported names and non-string settings with a config error."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        f'backend = "duckdb"\nspinner = {value}\n'
+    )
+    with pytest.raises(ConfigurationError, match="spinner"):
+        ConfigurationManager(path).load()
 
 
 def test_duckdb_local_database_defaults_when_omitted(tmp_path: Path) -> None:

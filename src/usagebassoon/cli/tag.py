@@ -12,6 +12,7 @@ import typer
 
 from usagebassoon.backends.base import CuratedRenameError, close_backend
 from usagebassoon.cli._utils import configured_backend
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.curation import TagAssignment, add_tag, remove_tag, rename_tag
 
 tag_app = typer.Typer(help="Manage user-owned tag assignments.", no_args_is_help=True)
@@ -80,7 +81,8 @@ def add(
         assignment = _assignment(
             configuration.source_id, tag_name, client, workspace, session_id
         )
-        result = add_tag(backend, assignment)
+        with spinner(configuration):
+            result = add_tag(backend, assignment)
     finally:
         close_backend(backend, context="adding a tag")
     action = "Added" if result.inserted else "Already present"
@@ -113,7 +115,8 @@ def rename(
             configuration.source_id, old, client, workspace, session_id
         )
         try:
-            result = rename_tag(backend, assignment, new)
+            with spinner(configuration):
+                result = rename_tag(backend, assignment, new)
         except CuratedRenameError as error:
             typer.echo(f"Warning: {error}; no tag assignment was changed.", err=True)
             raise typer.Exit(1) from error
@@ -149,7 +152,8 @@ def remove(
         assignment = _assignment(
             configuration.source_id, tag_name, client, workspace, session_id
         )
-        deleted = remove_tag(backend, assignment)
+        with spinner(configuration):
+            deleted = remove_tag(backend, assignment)
     finally:
         close_backend(backend, context="removing a tag")
     action = "Removed" if deleted else "No tag exists for"

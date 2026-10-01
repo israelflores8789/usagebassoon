@@ -12,6 +12,7 @@ import typer
 
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
+from usagebassoon.cli.spinner import spinner
 
 
 def snapshot(
@@ -23,14 +24,15 @@ def snapshot(
     """Write a raw private restoration snapshot of the configured warehouse."""
     configuration, backend = configured_backend(config)
     try:
-        archiver = snapshot_archiver(configuration)
-        latest = backend.query(
-            "SELECT run_id FROM collection_runs ORDER BY finished_at DESC LIMIT 1"
-        ).to_pylist()
-        uri = archiver.write(
-            backend,
-            run_id=str(latest[0]["run_id"]) if latest else "manual",
-        )
+        with spinner(configuration):
+            archiver = snapshot_archiver(configuration)
+            latest = backend.query(
+                "SELECT run_id FROM collection_runs ORDER BY finished_at DESC LIMIT 1"
+            ).to_pylist()
+            uri = archiver.write(
+                backend,
+                run_id=str(latest[0]["run_id"]) if latest else "manual",
+            )
     finally:
         close_backend(backend, context="writing a snapshot")
     if uri is None:

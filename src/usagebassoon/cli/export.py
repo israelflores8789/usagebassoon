@@ -16,6 +16,7 @@ import typer
 
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._output import output_console
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.privacy import sanitize_table
 from usagebassoon.sql_safety import PUBLIC_RELATIONS
@@ -76,12 +77,14 @@ def export(
         )
     try:
         configuration = ConfigurationManager(config).load()
-        backend = open_backend(configuration)
+        with spinner(configuration):
+            backend = open_backend(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="--config") from error
     try:
-        relation = "current_" + target if target in _CANONICAL_EXPORTS else target
-        result = backend.query(f"SELECT * FROM {relation}")
+        with spinner(configuration):
+            relation = "current_" + target if target in _CANONICAL_EXPORTS else target
+            result = backend.query(f"SELECT * FROM {relation}")
     finally:
         close_backend(backend, context="exporting data")
     if not raw:

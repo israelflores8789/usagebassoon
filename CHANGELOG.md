@@ -38,6 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added comprehensive unit test suite that ensures consistent behavior across backends and object stores.
 - Added a live persistence test suite against all implemented remote backends and object stores including BigQuery, MotherDuck, and Google Cloud Storage. Tests are automated in the CI Live GitHub workflow.
 - Added SQL parity test suite that ensures structural and synthetic replay behavior against all SQL dialects using SQLGlot.
-
 - Added explicit, idempotent warehouse initialization and schema-compatibility preflight checks.
 - Added local collector exclusion, replay-safe remote publication, and bounded persistence retries for concurrent ephemeral environments.
+- Added configurable yaspin indicators for interactive CLI waits, with Pong by default, 64 randomized messages, and terminal theme colors.

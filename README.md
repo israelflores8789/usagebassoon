@@ -277,9 +277,12 @@ Intensity is relative to this selection. Unfilled squares show zero recorded usa
 # If you use `Even Better TOML` in VSCode, or similar, you can include the schema for linting in your IDE.
 #:schema https://raw.githubusercontent.com/israelflores8789/usagebassoon/main/config.schema.json
 
+# Defaults are shown unless otherwise stated.
+
 source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically generated with `bassoon init`. Set manually
                                                     # for identical environments (e.g. respawning a crashed container).
 backend = "duckdb"                                  # Required; one of `duckdb`, `motherduck`, or `bigquery`.
+spinner = "pong"                                    # Optional; yaspin animation name, e.g. `pong`, `dots`, or `line`.
 local_database = "path/to/your/database.duckdb"     # Optional; local DuckDB file path.
                                                     # Default: Linux: ~/.local/share/usagebassoon/usagebassoon.duckdb
                                                     #          macOS: ~/Library/Application Support/UsageBassoon/usagebassoon.duckdb

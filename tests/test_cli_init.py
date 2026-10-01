@@ -38,10 +38,11 @@ def test_init_creates_source_config_and_local_schema(
 
     assert result.exit_code == 0
     original = config_path.read_bytes()
-    assert set(tomllib.loads(original.decode())) == {"source_id", "backend"}
+    assert set(tomllib.loads(original.decode())) == {"source_id", "backend", "spinner"}
     configuration = ConfigurationManager(config_path).load()
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
+    assert configuration.spinner == "pong"
     assert configuration.local_database == default_local_database_path()
     assert configuration.schedule.interval == "15m"
     assert configuration.logging.max_files == 5

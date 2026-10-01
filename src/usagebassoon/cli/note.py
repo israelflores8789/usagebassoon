@@ -17,6 +17,7 @@ import typer
 
 from usagebassoon.backends.base import UpsertResult, close_backend
 from usagebassoon.cli._utils import configured_backend
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.curation import (
     NoteAssignment,
     edit_note,
@@ -62,10 +63,11 @@ def set(
     """Create or replace a session note."""
     configuration, backend = configured_backend(config)
     try:
-        result = set_note(
-            backend,
-            _assignment(configuration.source_id, client, session_id, note_text),
-        )
+        with spinner(configuration):
+            result = set_note(
+                backend,
+                _assignment(configuration.source_id, client, session_id, note_text),
+            )
     finally:
         close_backend(backend, context="setting a note")
     typer.echo(f"{_note_action(result)} note for session {session_id!r}.")
@@ -100,12 +102,13 @@ def edit(
     configuration, backend = configured_backend(config)
     temporary_path: Path | None = None
     try:
-        existing = get_note(
-            backend,
-            source_id=configuration.source_id,
-            client=client,
-            session_id=session_id,
-        )
+        with spinner(configuration):
+            existing = get_note(
+                backend,
+                source_id=configuration.source_id,
+                client=client,
+                session_id=session_id,
+            )
         if existing is None:
             raise typer.BadParameter(
                 "no note exists for this session; use 'bassoon note set'"
@@ -134,10 +137,11 @@ def edit(
         if edited == existing.note:
             typer.echo(f"Unchanged note for session {session_id!r}.")
             return
-        result = edit_note(
-            backend,
-            _assignment(configuration.source_id, client, session_id, edited),
-        )
+        with spinner(configuration):
+            result = edit_note(
+                backend,
+                _assignment(configuration.source_id, client, session_id, edited),
+            )
     finally:
         if temporary_path is not None:
             try:
@@ -165,7 +169,8 @@ def remove(
     configuration, backend = configured_backend(config)
     try:
         assignment = _assignment(configuration.source_id, client, session_id, "present")
-        deleted = remove_note(backend, assignment)
+        with spinner(configuration):
+            deleted = remove_note(backend, assignment)
     finally:
         close_backend(backend, context="removing a note")
     action = "Removed" if deleted else "No note exists for"

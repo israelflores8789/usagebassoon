@@ -18,6 +18,7 @@ from rich.table import Table
 
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._output import output_console
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.sql_safety import (
@@ -122,11 +123,13 @@ def query(
             dialect=dialect,
         )
         validate_read_only_sql(sql, dialect=dialect)
-        backend = open_backend(configuration)
+        with spinner(configuration):
+            backend = open_backend(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error), param_hint="relation") from error
     try:
-        result = backend.query(sql, parameters)
+        with spinner(configuration):
+            result = backend.query(sql, parameters)
     finally:
         close_backend(backend, context="running a CLI query")
     if format == "table":

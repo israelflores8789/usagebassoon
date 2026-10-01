@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
+from usagebassoon.cli.spinner import spinner
 
 
 def restore(
@@ -37,10 +38,11 @@ def restore(
     )
     configuration, backend = configured_backend(config)
     try:
-        try:
-            restored = snapshot_archiver(configuration).restore(backend, snapshot)
-        except (RuntimeError, ValueError) as error:
-            raise typer.BadParameter(str(error)) from error
+        with spinner(configuration):
+            try:
+                restored = snapshot_archiver(configuration).restore(backend, snapshot)
+            except (RuntimeError, ValueError) as error:
+                raise typer.BadParameter(str(error)) from error
     finally:
         backend.close()
     details = ", ".join(f"{table}={count}" for table, count in restored.items())

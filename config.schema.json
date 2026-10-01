@@ -25,6 +25,12 @@
       ],
       "description": "Storage backend to use. `bassoon init` writes `duckdb` by default; this setting must be present in the file."
     },
+    "spinner": {
+      "type": "string",
+      "minLength": 1,
+      "default": "pong",
+      "description": "Yaspin animation name for interactive CLI waits, for example pong, dots, or line. Names are case-sensitive."
+    },
     "local_database": {
       "default": "~/.local/share/usagebassoon/usagebassoon.duckdb",
       "description": "Optional local DuckDB file path. Used only when `backend` is `duckdb`; otherwise ignored. `~` expands to the home directory, and relative paths resolve from the process working directory. The Linux default is `~/.local/share/usagebassoon/usagebassoon.duckdb`; other platforms use their standard user data directory."

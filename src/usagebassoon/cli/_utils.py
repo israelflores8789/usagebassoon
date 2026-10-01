@@ -11,6 +11,7 @@ import typer
 
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -33,7 +34,8 @@ def configured_backend(
     backend: StorageBackend | None = None
     try:
         configuration = ConfigurationManager(config).load()
-        backend = open_backend(configuration)
+        with spinner(configuration):
+            backend = open_backend(configuration)
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         if backend is not None:
             close_backend(backend, context="backend initialization")
