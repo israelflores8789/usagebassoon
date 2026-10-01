@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from io import BytesIO
 from pathlib import Path
-from typing import NoReturn
+from threading import Event
+from typing import NoReturn, override
 
 import pytest
 from typer.testing import CliRunner
@@ -16,7 +18,8 @@ from typer.testing import CliRunner
 from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
-from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
+from usagebassoon.config import ConfigurationManager, LoggingConfig, UsageBassoonConfig
+from usagebassoon.persistence import PersistSummary
 from usagebassoon.scheduling import (
     SchedulerAvailability,
     ScheduleStatus,
@@ -169,8 +172,8 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
     def fake_preflight(_config: UsageBassoonConfig) -> tuple[str, ...]:
         return ()
 
-    def fake_logging(_logging: object) -> None:
-        return None
+    def fake_logging(_logging: LoggingConfig) -> logging.Logger:
+        return logging.getLogger("test_worker_interval")
 
     monkeypatch.setattr(
         "usagebassoon.scheduling.preflight_tokscale",
@@ -186,6 +189,88 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
         run_worker(configuration.path, schedule_interval="30m")
 
     assert ConfigurationManager(configuration.path).load().schedule.interval == "30m"
+
+
+@pytest.mark.parametrize("change", ["edited", "replaced", "invalid", "deleted", "none"])
+def test_worker_keeps_startup_configuration_until_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    change: str,
+) -> None:
+    """Keep collecting with startup settings after edits during the wait."""
+    configuration = _configuration(tmp_path)
+    changed_content = (
+        'source_id = "22222222-2222-4222-8222-222222222222"\n'
+        'backend = "duckdb"\n'
+        'local_database = "changed.duckdb"\n'
+        '[schedule]\ninterval = "1h"\n'
+        '[tokscale]\nbin = "changed-tokscale"\n'
+        "[logging]\nmax_bytes = 12345\n"
+    )
+    collected: list[UsageBassoonConfig] = []
+    preflighted: list[UsageBassoonConfig] = []
+    waits: list[float | None] = []
+    logger = logging.getLogger("test_worker_configuration")
+
+    class CycleEvent(Event):
+        """Change the file during the first wait and stop after three cycles."""
+
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            waits.append(timeout)
+            if len(waits) == 1:
+                if change == "edited":
+                    configuration.path.write_text(changed_content)
+                elif change == "replaced":
+                    replacement = tmp_path / "replacement.toml"
+                    replacement.write_text(changed_content)
+                    replacement.replace(configuration.path)
+                elif change == "invalid":
+                    configuration.path.write_text("invalid TOML = [")
+                elif change == "deleted":
+                    configuration.path.unlink()
+            if len(waits) == 3:
+                self.set()
+            return self.is_set()
+
+    def fake_collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        collected.append(config)
+        if len(collected) > 1 and change != "none":
+            assert "restart the worker" in caplog.text
+        return "run", PersistSummary(0, 0, {})
+
+    def fake_preflight(config: UsageBassoonConfig) -> tuple[str, ...]:
+        preflighted.append(config)
+        return ()
+
+    def fake_logging(_config: LoggingConfig) -> logging.Logger:
+        return logger
+
+    monkeypatch.setattr("usagebassoon.scheduling.Event", CycleEvent)
+    monkeypatch.setattr("usagebassoon.scheduling.collect_run", fake_collect)
+    monkeypatch.setattr("usagebassoon.scheduling.preflight_tokscale", fake_preflight)
+    monkeypatch.setattr("usagebassoon.scheduling.configure_logging", fake_logging)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        run_worker(configuration.path)
+
+    assert collected == [configuration] * 3
+    assert all(config is collected[0] for config in collected)
+    assert preflighted == [configuration]
+    assert waits == [900.0] * 3
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    stderr = plain_cli_output(capsys.readouterr().err)
+    if change == "none":
+        assert errors == []
+        assert stderr == ""
+    else:
+        assert len(errors) == 1
+        assert "continuing with startup settings" in errors[0].getMessage()
+        assert "restart the worker" in stderr
+        assert SOURCE_ID not in stderr
+        assert "22222222-2222-4222-8222-222222222222" not in stderr
 
 
 def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:

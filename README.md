@@ -390,6 +390,10 @@ bassoon schedule worker --interval 15m
 
 Starts a detached self-contained worker and reports its PID and log path.  Use `bassoon schedule status`, `bassoon schedule logs`, and `bassoon schedule stop` to manage it.
 
+Workers keep the configuration loaded at startup for their entire lifetime, including `source_id`, storage backend, logging, and collection interval. *Configuration files are __never__ hot-swapped*. For a detached worker, run `bassoon schedule stop` before editing the file, then run `bassoon schedule worker` to apply the new settings. Restart a foreground worker through its container or process supervisor.
+
+Native schedules launch a new `bassoon collect` process for each cycle and load the file for that invocation; rerun `bassoon schedule install` to update a native schedule's interval.
+
 #### Container Environments
 Run the worker in the foreground so it remains the container's main process:
 

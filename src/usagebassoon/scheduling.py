@@ -761,6 +761,21 @@ def schedule_logs(config: UsageBassoonConfig | None = None) -> str:
     return log_path.read_text(encoding="utf-8", errors="replace")
 
 
+def _worker_configuration_stamp(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Return file metadata for change detection without reloading settings."""
+    try:
+        metadata = path.stat()
+    except OSError:
+        return None
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def run_worker(
     config_path: Path | None = None,
     *,
@@ -768,14 +783,22 @@ def run_worker(
 ) -> None:
     """Run the foreground self-contained container scheduler.
 
+    Keep startup settings for every cycle. Configuration file changes require
+    a worker restart and are reported without loading or applying them.
+
     Args:
         config_path: Optional configuration file to load.
         schedule_interval: Optional interval to persist before starting.
     """
-    manager = ConfigurationManager(config_path)
     configuration = _worker_configuration(config_path, schedule_interval)
+    configuration_stamp = _worker_configuration_stamp(configuration.path)
+    change_reported = False
+    interval = parse_interval(configuration.schedule.interval)
+    if interval is None:
+        raise SchedulingError("schedule.interval must be positive")
     preflight_tokscale(configuration)
     logger = configure_logging(configuration.logging)
+    logger.info("worker configuration is fixed at startup; restart after file changes")
     stop_requested = Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -786,6 +809,19 @@ def run_worker(
     previous_int = signal.signal(signal.SIGINT, request_stop)
     try:
         while not stop_requested.is_set():
+            if not change_reported and (
+                configuration_stamp is None
+                or _worker_configuration_stamp(configuration.path)
+                != configuration_stamp
+            ):
+                message = (
+                    "worker configuration file changed or is unavailable; "
+                    "continuing with startup settings. Restore a valid configuration "
+                    "file and restart the worker to apply configuration changes."
+                )
+                logger.error(message)
+                print(message, file=sys.stderr, flush=True)
+                change_reported = True
             try:
                 run_id, summary = collect_run(configuration)
             except CollectionBusy as error:
@@ -810,13 +846,6 @@ def run_worker(
                 )
             if stop_requested.is_set():
                 break
-            updated = manager.load()
-            if updated != configuration:
-                preflight_tokscale(updated)
-                configuration = updated
-            interval = parse_interval(configuration.schedule.interval)
-            if interval is None:
-                raise SchedulingError("schedule.interval must be positive")
             stop_requested.wait(interval.total_seconds())
     finally:
         signal.signal(signal.SIGTERM, previous_term)
