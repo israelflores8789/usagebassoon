@@ -239,8 +239,11 @@ $10.12┤               ███████              ███████
 
 ### Daily activity
 
+> [!TIP]
+> The heatmap supports truecolor and 256-color terminals. If neither are detected, it falls back to ASCII shading characters. You can toggle ASCII shading characters yourself with `--use-ascii`. If the color is contradictory to your theme, use `--color` and pass an ANSI color name to change the heatmap color. Note, you may need to set `COLORTERM=truecolor` in your shell!
+
 ```text
-$ bassoon report graph --test
+$ bassoon report activity --test --use-ascii
                       Daily Activity
 
     total (tokens) | 2026-05-14 to 2026-09-10 | linear

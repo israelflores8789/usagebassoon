@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added terminal summary, model, daily, session, and graph reports; bounded read-only SQL queries; CSV, JSON, and Parquet exports; and Python results as pandas, Polars, or Arrow.
 - Added workspace, client, model, tag, source, and inclusive date filters to daily and model reports, session last-active date filters, and a session creation-date display and filter mode; date bounds combine with all other report filters.
 - Added the Daily Activity calendar report with total-token, component, cost, cost-per-million, and agent session-time metrics; shared report filters; linear/log scaling; 3–10 intensity colors.
+- Added solid, terminal-themed Daily Activity colors blended with the terminal background, bounded theme discovery, and `--use-ascii` to force character shading.
 - Added JSON and CSV output to daily, model, activity, and session reports with existing filters, grouping, limits, optional obfuscation, full identifiers, and numeric costs and derived rates.
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
 - Added global workspace, client, and session tags with mutation provenance and source-scoped session notes for user-curated reports.

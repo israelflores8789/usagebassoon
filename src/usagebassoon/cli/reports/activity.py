@@ -7,12 +7,18 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import struct
+import sys
+import time
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
 import typer
+from rich.color import Color, ColorSystem
 from rich.console import Console
 from rich.text import Text
 
@@ -39,6 +45,43 @@ from usagebassoon.cli.reports._render import (
 )
 
 type Scale = Literal["linear", "log"]
+type RGB = tuple[int, int, int]
+type TerminalColors = tuple[RGB, RGB]
+
+_FALLBACK_PURPLE: RGB = (160, 96, 208)
+_FALLBACK_BACKGROUND: RGB = (24, 24, 24)
+_COLOR_QUERY = "\x1b]4;5;?\x1b\\\x1b]11;?\x1b\\"
+_COLOR_RESPONSE = re.compile(
+    r"\x1b\](4;[0-9]{1,2}|11);rgb:([0-9a-fA-F]{1,4})/"
+    r"([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)"
+)
+_SHADES = ("░░", "░▒", "▒▒", "░█", "▒▓", "▓▓", "▒█", "▓█", "██")
+_ANSI_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+_ANSI_COLORS = {
+    name: index
+    for index, name in enumerate(
+        (*_ANSI_NAMES, *(f"bright_{name}" for name in _ANSI_NAMES))
+    )
+}
+
+
+def _ansi_color(value: str) -> str:
+    """Validate a standard ANSI color name and normalize bright-name separators."""
+    name = value.strip().lower().replace("-", "_")
+    if name not in _ANSI_COLORS:
+        raise typer.BadParameter(
+            "Choose an ANSI color: " + ", ".join(_ANSI_COLORS), param_hint="--color"
+        )
+    return name
+
+
+def _fallback_accent(name: str) -> RGB:
+    """Use the selected ANSI hue when the terminal cannot report its theme."""
+    if name == "magenta":
+        return _FALLBACK_PURPLE
+    rgb = Color.parse(name).get_truecolor()
+    return rgb.red, rgb.green, rgb.blue
+
 
 _TOKEN_FIELDS = {
     "total": "total_tokens",
@@ -98,7 +141,7 @@ def _window(
 
 
 def _intensity(
-    value: float | int | None, maximum: float, colors: int, scale: Scale
+    value: float | int | None, maximum: float, bins: int, scale: Scale
 ) -> int | None:
     """Map a known nonnegative value into zero plus positive intensity bands."""
     if value is None:
@@ -108,7 +151,7 @@ def _intensity(
     fraction = (
         math.log1p(value) / math.log1p(maximum) if scale == "log" else value / maximum
     )
-    return min(colors - 1, max(1, math.ceil((colors - 1) * fraction)))
+    return min(bins - 1, max(1, math.ceil((bins - 1) * fraction)))
 
 
 def _daily_records(
@@ -182,8 +225,8 @@ def _daily_records(
     return result
 
 
-def _terminal_purple() -> tuple[int, int, int] | None:
-    """Read Windows' configured magenta slot without changing terminal settings."""
+def _windows_colors(ansi_index: int = 5) -> TerminalColors | None:
+    """Read the selected Windows console color and its current background."""
     if os.name != "nt":
         return None
     import ctypes
@@ -204,48 +247,266 @@ def _terminal_purple() -> tuple[int, int, int] | None:
         struct.pack_into("<I", buffer, 0, 96)
         if not kernel.GetConsoleScreenBufferInfoEx(kernel.GetStdHandle(-11), buffer):
             return None
-        purple = struct.unpack_from("<I", buffer, 32 + 5 * 4)[0]
-        return purple & 255, (purple >> 8) & 255, (purple >> 16) & 255
+        # Windows stores red/blue bits in the opposite order from ANSI.
+        windows_index = (
+            (ansi_index & 8)
+            | ((ansi_index & 1) << 2)
+            | (ansi_index & 2)
+            | ((ansi_index & 4) >> 2)
+        )
+        accent = struct.unpack_from("<I", buffer, 32 + windows_index * 4)[0]
+        attributes = struct.unpack_from("<H", buffer, 12)[0]
+        background = struct.unpack_from(
+            "<I", buffer, 32 + ((attributes >> 4) & 15) * 4
+        )[0]
+        return (
+            (accent & 255, (accent >> 8) & 255, (accent >> 16) & 255),
+            (background & 255, (background >> 8) & 255, (background >> 16) & 255),
+        )
     except (AttributeError, KeyError, OSError, ValueError):
         return None
 
 
-def _palette(colors: int, purple: tuple[int, int, int] | None = None) -> list[str]:
-    """Build a purple gradient; ANSI magenta is the portable themed fallback."""
-    if purple is None:
-        return ["magenta"] * colors
-    light = tuple(round(channel + (255 - channel) * 0.75) for channel in purple)
-    dark = tuple(round(channel * 0.45) for channel in purple)
+def _decode_colors(response: str, ansi_index: int = 5) -> TerminalColors | None:
+    """Decode OSC palette and default-background responses at any RGB precision."""
+    found: dict[str, RGB] = {}
+    for match in _COLOR_RESPONSE.finditer(response):
+        components = tuple(
+            round(int(part, 16) * 255 / (16 ** len(part) - 1))
+            for part in match.groups()[1:]
+        )
+        found[match[1]] = (components[0], components[1], components[2])
+    key = f"4;{ansi_index}"
+    if key not in found or "11" not in found:
+        return None
+    return found[key], found["11"]
+
+
+def _probe_colors(
+    write: Callable[[str], object],
+    read: Callable[[float], str],
+    *,
+    trace: list[str] | None = None,
+    ansi_index: int = 5,
+) -> TerminalColors | None:
+    """Collect bounded terminal replies with one second for SSH round trips."""
+    query = f"\x1b]4;{ansi_index};?\x1b\\\x1b]11;?\x1b\\"
+    write(query)
+    if trace is not None:
+        trace.append(f"query={query!r}")
+    deadline = time.monotonic() + 1.0
+    response = ""
+    while len(response) < 1024:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        chunk = read(remaining)
+        if not chunk:
+            break
+        response += chunk
+        colors = _decode_colors(response, ansi_index)
+        if colors is not None:
+            if trace is not None:
+                trace.append(f"reply={response!r}")
+            return colors
+    if trace is not None:
+        trace.append(f"reply={response!r}")
+        trace.append("No complete palette/background response within one second.")
+    return None
+
+
+def _posix_colors(
+    console: Console, *, trace: list[str] | None = None, ansi_index: int = 5
+) -> TerminalColors | None:
+    """Query an idle terminal, restoring input attributes even after a timeout."""
+    import select
+    import termios
+
+    descriptor = sys.stdin.fileno()
+    output = console.file.fileno()
+    if not os.isatty(descriptor) or not os.isatty(output):
+        if trace is not None:
+            trace.append("Skipped: input or output is not a terminal.")
+        return None
+    # Do not consume input that was already waiting before discovery.
+    if select.select([descriptor], [], [], 0)[0]:
+        if trace is not None:
+            trace.append("Skipped: terminal input was already pending.")
+        return None
+    try:
+        original = termios.tcgetattr(descriptor)
+    except termios.error:
+        if trace is not None:
+            trace.append("Could not read terminal input settings.")
+        return None
+    modified = list(original)
+    modified[3] &= ~(termios.ICANON | termios.ECHO)
+    controls = list(original[6])
+    controls[termios.VMIN] = 0
+    controls[termios.VTIME] = 0
+    modified[6] = controls
+
+    def write(query: str) -> None:
+        """Send only read-only OSC requests through the chart's output terminal."""
+        console.file.write(query)
+        console.file.flush()
+
+    def read(timeout: float) -> str:
+        """Read available replies without extending the probe deadline."""
+        if not select.select([descriptor], [], [], timeout)[0]:
+            return ""
+        return os.read(descriptor, 1024).decode("ascii", errors="replace")
+
+    try:
+        termios.tcsetattr(descriptor, termios.TCSANOW, modified)
+        if select.select([descriptor], [], [], 0)[0]:
+            if trace is not None:
+                trace.append("Skipped: terminal input was pending after mode change.")
+            return None
+        if trace is not None:
+            return _probe_colors(write, read, trace=trace, ansi_index=ansi_index)
+        return _probe_colors(write, read, ansi_index=ansi_index)
+    except termios.error:
+        return None
+    finally:
+        with suppress(termios.error):
+            termios.tcsetattr(descriptor, termios.TCSANOW, original)
+
+
+def _windows_query_colors(
+    console: Console, ansi_index: int = 5
+) -> TerminalColors | None:
+    """Query Windows VT colors with bounded reads and restore console input mode."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kbhit = cast(Callable[[], bool], vars(msvcrt)["kbhit"])
+    getwch = cast(Callable[[], str], vars(msvcrt)["getwch"])
+    ungetwch = cast(Callable[[str], None], vars(msvcrt)["ungetwch"])
+    if kbhit():
+        return None
+    loader = cast(type[ctypes.CDLL], vars(ctypes)["WinDLL"])
+    kernel = loader("kernel32", use_last_error=True)
+    kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+    kernel.GetStdHandle.restype = wintypes.HANDLE
+    kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetConsoleMode.restype = wintypes.BOOL
+    kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.SetConsoleMode.restype = wintypes.BOOL
+    handle = kernel.GetStdHandle(-10)
+    original = wintypes.DWORD()
+    if not kernel.GetConsoleMode(handle, ctypes.byref(original)):
+        return None
+    # Enable VT input and disable line buffering and echo during the query.
+    if not kernel.SetConsoleMode(handle, (original.value & ~6) | 0x200):
+        return None
+
+    def write(query: str) -> None:
+        """Send the color query to the terminal used for chart output."""
+        console.file.write(query)
+        console.file.flush()
+
+    in_response = False
+
+    def read(timeout: float) -> str:
+        """Poll console replies, returning an unrelated initial keystroke to input."""
+        nonlocal in_response
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if kbhit():
+                character = getwch()
+                if not in_response and character != "\x1b":
+                    ungetwch(character)
+                    return ""
+                in_response = character not in {"\x07", "\\"}
+                return character
+            time.sleep(0.002)
+        return ""
+
+    try:
+        return _probe_colors(write, read, ansi_index=ansi_index)
+    finally:
+        kernel.SetConsoleMode(handle, original.value)
+
+
+def _terminal_colors(console: Console, ansi_index: int = 5) -> TerminalColors:
+    """Prefer actual terminal replies, then Windows metadata, then neutral defaults."""
+    if console.is_terminal and sys.stdin.isatty():
+        try:
+            colors = (
+                _windows_query_colors(console, ansi_index)
+                if os.name == "nt"
+                else _posix_colors(console, ansi_index=ansi_index)
+            )
+            if colors is not None:
+                return colors
+        except (AttributeError, KeyError, OSError, ValueError):
+            pass
+    name = next(name for name, index in _ANSI_COLORS.items() if index == ansi_index)
+    return _windows_colors(ansi_index) or (_fallback_accent(name), _FALLBACK_BACKGROUND)
+
+
+def _palette(
+    bins: int,
+    accent: RGB = _FALLBACK_PURPLE,
+    background: RGB = _FALLBACK_BACKGROUND,
+) -> list[str]:
+    """Blend the terminal background toward the selected theme color."""
     return [
         "#"
         + "".join(
-            f"{round(a + (b - a) * level / (colors - 1)):02x}"
-            for a, b in zip(light, dark, strict=True)
+            f"{round(bg + level / (bins - 1) * (fg - bg)):02x}"
+            for bg, fg in zip(background, accent, strict=True)
         )
-        for level in range(colors)
+        for level in range(bins)
     ]
 
 
 def _cell(
-    level: int | None, palette: list[str], color: bool, partial: bool = False
+    level: int | None,
+    palette: list[str],
+    color: bool,
+    partial: bool = False,
+    *,
+    shade_color: bool = False,
+    ansi_color: str = "magenta",
 ) -> Text:
     """Render one square or an unknown marker, retaining intensity without color."""
     if level is None:
         return Text("? ")
     if level == 0:
         return Text("  ")
-    if color and palette[level] == "magenta":
-        # Density preserves each band when the theme exposes one purple color.
-        shades = ("░░", "░▒", "▒▒", "░█", "▒▓", "▓▓", "▒█", "▓█", "██")
-        index = round((level - 1) * 8 / max(1, len(palette) - 2))
-        return Text("· " if partial else shades[index], style="magenta")
     if color:
-        foreground = "white" if level > len(palette) // 2 else "black"
+        rgb = Color.parse(palette[level]).get_truecolor()
+        luminance = 0.2126 * rgb.red + 0.7152 * rgb.green + 0.0722 * rgb.blue
+        foreground = "black" if luminance > 140 else "white"
         return Text(
             "· " if partial else "  ",
             style=f"{foreground} on {palette[level]}",
         )
-    return Text(f"{level}{'*' if partial else ' '}")
+    index = round((level - 1) * 8 / max(1, len(palette) - 2))
+    return Text(
+        "* " if partial else _SHADES[index],
+        style=ansi_color if shade_color else "",
+    )
+
+
+def _activity_console(*, record: bool) -> Console:
+    """Recognize advertised truecolor capabilities missed by Rich's auto mode."""
+    console = output_console(record=record)
+    advertised = bool(os.environ.get("WT_SESSION")) or os.environ.get(
+        "COLORTERM", ""
+    ).strip().lower() in {"truecolor", "24bit"}
+    if (
+        advertised
+        and console.is_terminal
+        and not console.is_dumb_terminal
+        and not console.no_color
+        and console.color_system != "truecolor"
+    ):
+        return output_console(record=record, color_system="truecolor")
+    return console
 
 
 def _render(
@@ -256,9 +517,11 @@ def _render(
     scale: Scale,
     width: int | None,
     save: Path | None,
+    use_ascii: bool = False,
+    ansi_color: str = "magenta",
 ) -> None:
     """Render consecutive week panels and an intensity legend without numbers."""
-    console = output_console(record=save is not None)
+    console = _activity_console(record=save is not None)
     available = (
         min(console.width, width)
         if width is not None
@@ -269,8 +532,21 @@ def _render(
             "--width must be at least 10 for the activity grid", param_hint="--width"
         )
     console.width = available
-    purple = _terminal_purple() if console.color_system == "truecolor" else None
-    palette = _palette(len(palette), purple)
+    plain = (
+        use_ascii
+        or save is not None
+        or not console.is_terminal
+        or console.color_system not in {"truecolor", "256"}
+        or console.no_color
+    )
+    if not plain:
+        accent, background = _terminal_colors(console, _ANSI_COLORS[ansi_color])
+        palette = _palette(len(palette), accent, background)
+        if console.color_system == "256":
+            palette = [
+                f"color({Color.parse(shade).downgrade(ColorSystem.EIGHT_BIT).number})"
+                for shade in palette
+            ]
     _calendar(
         console,
         records,
@@ -278,7 +554,8 @@ def _render(
         end,
         palette,
         scale,
-        plain=save is not None or console.color_system is None or console.no_color,
+        plain=plain,
+        ansi_color=ansi_color,
     )
     if save is not None:
         write_output(console.export_text(), save=save)
@@ -293,6 +570,7 @@ def _calendar(
     scale: Scale,
     *,
     plain: bool,
+    ansi_color: str = "magenta",
 ) -> None:
     """Lay out Sunday-first calendar rows without splitting weeks between panels."""
     first = start.toordinal() - (start.weekday() + 1) % 7
@@ -310,6 +588,12 @@ def _calendar(
     console.print(subtitle)
     by_day = {str(record["day"]): record for record in records}
     color = not plain
+    shade_color = (
+        plain
+        and console.is_terminal
+        and console.color_system is not None
+        and not console.no_color
+    )
     has_january = any(
         date.fromisoformat(str(record["day"])).month == 1 for record in records
     )
@@ -365,21 +649,17 @@ def _calendar(
                             palette,
                             color,
                             record["status"] == "partial",
+                            shade_color=shade_color,
+                            ansi_color=ansi_color,
                         )
                     )
                 row.append(" ")
             console.print(row)
     legend = Text("Less ")
     for level in range(len(palette)):
-        if color:
-            legend.append_text(_cell(level, palette, True))
-        else:
-            shades = "░▒▓█"
-            legend.append(
-                "□ "
-                if level == 0
-                else shades[round(level * 3 / (len(palette) - 1))] * 2
-            )
+        legend.append_text(
+            _cell(level, palette, color, shade_color=shade_color, ansi_color=ansi_color)
+        )
         legend.append(" ")
     legend.append("More")
     console.print()
@@ -399,10 +679,11 @@ def _export(
     start: date,
     end: date,
     scale: Scale,
-    colors: int,
+    bins: int,
     maximum: float,
     format: DataFormat,
     save: Path | None,
+    ansi_color: str = "magenta",
 ) -> None:
     """Serialize identical calendar values to JSON or CSV without terminal styling."""
     metadata: ReportRecord = {
@@ -410,13 +691,20 @@ def _export(
         "since": start.isoformat(),
         "until": end.isoformat(),
         "scale": scale,
-        "colors": colors,
+        "bins": bins,
+        "color": ansi_color,
         "maximum": maximum,
         "metric": records[0]["metric"],
         "unit": records[0]["unit"],
     }
     rows = [
-        {**record, "scale": scale, "colors": colors, "maximum": maximum}
+        {
+            **record,
+            "scale": scale,
+            "bins": bins,
+            "color": ansi_color,
+            "maximum": maximum,
+        }
         for record in records
     ]
     render_records(
@@ -457,15 +745,25 @@ def activity(
         Literal["linear", "log"],
         typer.Option("--scale", help="Intensity normalization: linear or log."),
     ] = "linear",
-    colors: Annotated[
+    bins: Annotated[
         int,
         typer.Option(
-            "--colors",
+            "--bins",
             min=3,
             max=10,
-            help="Number of intensity colors, including zero.",
+            help="Number of intensity bins, including zero.",
         ),
     ] = 7,
+    color: Annotated[
+        str,
+        typer.Option(
+            "--color",
+            help=(
+                "ANSI theme color: black, red, green, yellow, blue, magenta, cyan, "
+                "white, or bright_ variants."
+            ),
+        ),
+    ] = "magenta",
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
     ] = None,
@@ -485,6 +783,13 @@ def activity(
     width: Annotated[
         str, typer.Option("--width", help="Maximum terminal width, or 'max'.")
     ] = "100",
+    use_ascii: Annotated[
+        bool,
+        typer.Option(
+            "--use-ascii",
+            help="Force character shading instead of solid terminal bins.",
+        ),
+    ] = False,
     test: Annotated[
         bool,
         typer.Option(
@@ -510,6 +815,7 @@ def activity(
 ) -> None:
     """Render Daily Activity across all sources, using total tokens by default."""
     format = output_format(json_output, csv_output)
+    ansi_color = _ansi_color(color)
     selected = _metrics(metric)
     today = SAMPLE_LATEST_DAY if test else datetime.now(UTC).date()
     start, end = _window(days, *parse_report_dates(since, until), today)
@@ -530,11 +836,21 @@ def activity(
     )
     for record in daily:
         record["intensity"] = _intensity(
-            numeric_value(record["value"]), maximum, colors, scale
+            numeric_value(record["value"]), maximum, bins, scale
         )
     # Aggregation removes all identifiers and free text, so sanitization is inherent.
     daily = sanitize_records(daily, sanitize)
     if format != "text":
-        _export(daily, start, end, scale, colors, maximum, format, save)
+        _export(daily, start, end, scale, bins, maximum, format, save, ansi_color)
     else:
-        _render(daily, start, end, _palette(colors), scale, parsed_width, save)
+        _render(
+            daily,
+            start,
+            end,
+            _palette(bins, _fallback_accent(ansi_color)),
+            scale,
+            parsed_width,
+            save,
+            use_ascii,
+            ansi_color,
+        )
