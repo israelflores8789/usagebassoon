@@ -5,16 +5,31 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from itertools import pairwise
 from pathlib import Path
 
+import pytest
+from rich.cells import cell_len
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
+from usagebassoon.cli.reports._common import (
+    SAMPLE_LOCAL_SOURCE_ID,
+    ReportFilters,
+    SessionSort,
+    load_session_usage,
+    numeric_value,
+    sample_session_usage,
+    truncate_middle,
+)
 from usagebassoon.cli.reports.graph import _tick_positions
-from usagebassoon.cli.reports.sessions import _model_label
+from usagebassoon.cli.reports.sessions import (
+    _format_duration,
+    _model_label,
+)
 
 LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 REMOTE_SOURCE_ID = "22222222-2222-4222-8222-222222222222"
@@ -22,11 +37,12 @@ REMOTE_SOURCE_ID = "22222222-2222-4222-8222-222222222222"
 
 def test_gemini_flash_model_labels_preserve_the_version_when_width_allows() -> None:
     """Keep Gemini Flash versions identifiable in the bounded session table."""
-    assert _model_label("gemini-3.8-flash", True, 94) == "gemin…-flash"
     assert _model_label("gemini-3.8-flash", True, 100) == "ge…3.8-flash"
     assert _model_label("gemini-3.8-flash", True, 101) == "gem…3.8-flash"
     assert _model_label("gemini-3.8-flash", True, None) == "gemini-3.8-flash"
     assert _model_label("gpt-5.6-terra", True, 100) == "gpt-5…-terra"
+    assert _model_label("gpt-5.6-terra", True, 105) == "gpt-5.6-terra"
+    assert _model_label("gpt-5.6-terra, gpt-5.6-luna", False, 105) == "gpt-5.6-terra+1"
     assert (
         _model_label("gemini-3.8-flash, gemini-3.7-flash", False, 100)
         == "ge…3.8-flash+1"
@@ -384,7 +400,6 @@ def test_sessions_report_defaults_to_session_and_can_split_models(
     assert "Cost/1M" in plain_cli_output(session_result.output)
     assert "$0.00" in plain_cli_output(session_result.output)
     assert "+1" in plain_cli_output(session_result.output)
-    assert "…" in plain_cli_output(session_result.output)
     assert model_result.exit_code == 0
     assert "Session Token Usage by Model" in plain_cli_output(model_result.output)
     assert "gpt-test" in plain_cli_output(model_result.output)
@@ -468,7 +483,8 @@ def test_session_date_bounds_select_whole_sessions_and_creation_mode(
         app,
         [
             *options,
-            "--by-created-at",
+            "--sort",
+            "created-at",
             "--since",
             "2026-09-08",
             "--until",
@@ -480,7 +496,8 @@ def test_session_date_bounds_select_whole_sessions_and_creation_mode(
         [
             *options,
             "--by-model",
-            "--by-created-at",
+            "--sort",
+            "created-at",
             "--since",
             "2026-09-08",
             "--until",
@@ -489,7 +506,7 @@ def test_session_date_bounds_select_whole_sessions_and_creation_mode(
     )
     created_at_excluded = runner.invoke(
         app,
-        [*options, "--by-created-at", "--since", "2026-09-11"],
+        [*options, "--sort", "created-at", "--since", "2026-09-11"],
     )
 
     assert last_active.exit_code == 0
@@ -538,7 +555,7 @@ def test_session_creation_mode_changes_ordering(tmp_path: Path) -> None:
     ]
 
     active = runner.invoke(app, options)
-    created = runner.invoke(app, [*options, "--by-created-at"])
+    created = runner.invoke(app, [*options, "--sort", "created-at"])
 
     assert active.exit_code == 0
     active_text = plain_cli_output(active.output)
@@ -552,7 +569,7 @@ def test_session_creation_mode_changes_ordering(tmp_path: Path) -> None:
     )
 
 
-def test_session_values_and_model_counts_remain_whole_at_eighty_columns() -> None:
+def test_session_values_and_model_counts_remain_whole_at_floor() -> None:
     """Protect numeric values and aggregate-model counts at the minimum width."""
     result = CliRunner().invoke(
         app,
@@ -561,7 +578,7 @@ def test_session_values_and_model_counts_remain_whole_at_eighty_columns() -> Non
             "sessions",
             "--test",
             "--width",
-            "80",
+            "100",
             "--limit",
             "8",
             "--sanitize",
@@ -655,3 +672,392 @@ def test_report_test_mode_saves_without_sharing_reminder(tmp_path: Path) -> None
     assert result.exit_code == 0
     assert "Re-run with --sanitize" not in saved.read_text()
     assert "Daily Token Usage" in saved.read_text()
+
+
+@pytest.mark.parametrize(
+    ("milliseconds", "expected"),
+    [
+        (None, "—"),
+        (0, "00s"),
+        (89999, "89s"),
+        (90000, "01m30s"),
+        (5399999, "89m59s"),
+        (5400000, "1h30m00s"),
+        (36000000, "10h00m00s"),
+    ],
+)
+def test_session_duration_thresholds(milliseconds: int | None, expected: str) -> None:
+    """Use whole seconds and omit units below their requested thresholds."""
+    assert _format_duration(milliseconds) == expected
+
+
+@pytest.mark.parametrize("by_model", [False, True])
+def test_session_duration_aggregation_and_sorting(
+    tmp_path: Path, by_model: bool
+) -> None:
+    """Sum all daily durations and sort before limiting, independent of display."""
+    config, backend = _configured_store(tmp_path)
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = CASE model "
+        "WHEN 'gpt-test' THEN 60000 WHEN 'gpt-mini' THEN 30000 "
+        "ELSE 5400000 END WHERE source_id = ?",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.connection.execute(
+        "INSERT INTO daily_stats "
+        "(event_id, source_id, day, client, session_id, model, total_tokens, "
+        "perf_duration_ms, collected_at) "
+        "VALUES (UUID(), ?, '2026-09-09', 'codex', "
+        "'ses_local_demonstration_identifier', 'gpt-test', 1, 30000, NOW())",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.close()
+    runner = CliRunner()
+    command = [
+        "report",
+        "sessions",
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--width",
+        "max",
+    ]
+    if by_model:
+        command.append("--by-model")
+    default = runner.invoke(app, command)
+    assert default.exit_code == 0
+    assert "Duration" not in plain_cli_output(default.output)
+    displayed = runner.invoke(app, [*command, "--with-duration"])
+    assert displayed.exit_code == 0
+    text = plain_cli_output(displayed.output)
+    assert text.index("Total") < text.index("Duration") < text.index("Cost")
+    assert ("01m30s" if by_model else "02m00s") in text
+    if by_model:
+        assert "30s" in text
+    sorted_result = runner.invoke(app, [*command, "--sort", "duration", "--limit", "1"])
+    assert sorted_result.exit_code == 0
+    sorted_text = plain_cli_output(sorted_result.output)
+    assert "ses_local_other" in sorted_text
+    assert "ses_local_demonstration_identifier" not in sorted_text
+    assert "Duration" not in sorted_text
+    bounded = runner.invoke(
+        app,
+        [
+            *command,
+            "--sort",
+            "duration",
+            "--with-duration",
+            "--since",
+            "2026-09-11",
+            "--until",
+            "2026-09-11",
+        ],
+    )
+    assert bounded.exit_code == 0
+    bounded_text = plain_cli_output(bounded.output)
+    assert ("01m30s" if by_model else "02m00s") in bounded_text
+    assert "ses_local_other" not in bounded_text
+
+
+def test_sessions_reject_width_below_floor() -> None:
+    """Fail before opening a backend when session width is below 100."""
+    result = CliRunner().invoke(app, ["report", "sessions", "--width", "99"])
+    assert result.exit_code == 2
+    assert "at least 100" in plain_cli_output(result.output)
+
+
+@pytest.mark.parametrize(
+    ("width", "metrics", "by_model"),
+    [
+        pytest.param(105, (), False, id="models-expand"),
+        pytest.param(100, ("--with-duration",), False, id="compact-dates"),
+        pytest.param(104, ("--with-duration",), False, id="compact-upper-bound"),
+        pytest.param(105, ("--with-duration",), False, id="timestamps-resume"),
+        pytest.param(105, ("--with-duration",), True, id="model-detail"),
+        pytest.param(100, ("--with-performance",), False, id="performance-at-floor"),
+        pytest.param(
+            100,
+            ("--with-duration", "--with-performance"),
+            False,
+            id="both-metrics-width-floor",
+        ),
+        pytest.param(
+            140,
+            ("--with-duration", "--with-performance"),
+            False,
+            id="both-metrics-wide",
+        ),
+    ],
+)
+def test_session_optional_metric_layout(
+    tmp_path: Path, by_model: bool, width: int, metrics: tuple[str, ...]
+) -> None:
+    """Preserve model versions/counts and timestamps at the supported widths."""
+    saved = tmp_path / "sessions.txt"
+    command = [
+        "report",
+        "sessions",
+        "--test",
+        "--sanitize",
+        "--limit",
+        "8",
+        "--width",
+        str(width),
+        "--save",
+        str(saved),
+        *metrics,
+    ]
+    if by_model:
+        command.append("--by-model")
+    result = CliRunner().invoke(app, command)
+    assert result.exit_code == 0
+    text = plain_cli_output(result.output)
+    effective_width = max(width, 120) if len(metrics) == 2 else width
+    compact = "--with-duration" in metrics and effective_width < 105
+    assert ("Active" if compact else "Last Active") in text
+    rows = [line.split() for line in text.splitlines() if "$" in line]
+    assert len(rows) == 8
+    for row in rows:
+        for identifier in row[:2]:
+            assert not identifier.endswith("…")
+    if width >= 105 or len(metrics) == 2:
+        assert "gpt-5.6-terra" in text
+    if compact:
+        header = next(line for line in text.splitlines() if "Active" in line)
+        active_end = header.index("Active") + len("Active")
+        assert all(
+            line.rstrip().endswith(line[active_end - 5 : active_end])
+            and "-" in line[active_end - 5 : active_end]
+            for line in text.splitlines()
+            if "$" in line
+        )
+        assert "Last Active" not in text
+        assert all(len(row[-1]) == 5 and "-" in row[-1] for row in rows)
+    else:
+        assert all(len(row[-1]) == 5 and ":" in row[-1] for row in rows)
+    assert "3.8-flash" in text
+    if not by_model:
+        assert "luna+1" in text
+        assert "flash+1" in text
+    if "--with-performance" in metrics:
+        assert "ms/1K" in text
+    assert all(len(line) <= effective_width for line in saved.read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    ("sort", "column"),
+    [
+        (SessionSort.LAST_ACTIVE, "last_active"),
+        (SessionSort.CREATED_AT, "created_at"),
+        (SessionSort.DURATION, "perf_duration_ms"),
+        (SessionSort.INPUT, "input_tokens"),
+        (SessionSort.OUTPUT, "output_tokens"),
+        (SessionSort.CACHE_READ, "cache_read"),
+        (SessionSort.CACHE_WRITE, "cache_write"),
+        (SessionSort.REASONING, "reasoning_tokens"),
+        (SessionSort.TOTAL, "total_tokens"),
+        (SessionSort.COST, "cost_usd"),
+        (SessionSort.COST_PER_MILLION, "cost_per_million"),
+        (SessionSort.PERFORMANCE, "ms_per_1k_tokens"),
+    ],
+)
+def test_session_sort_orders_metric_before_limit(
+    tmp_path: Path, sort: SessionSort, column: str
+) -> None:
+    """Order every supported metric without relying on optional visible columns."""
+    _, backend = _configured_store(tmp_path)
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = CASE model "
+        "WHEN 'gpt-test' THEN 11 WHEN 'gpt-mini' THEN 0 ELSE 12 END, "
+        "perf_timed_tokens = CASE model WHEN 'gpt-mini' THEN 0 ELSE 10000 END"
+    )
+    filters = ReportFilters(source=LOCAL_SOURCE_ID)
+    records = load_session_usage(backend, filters, by_model=False, sort=sort)
+    limited = load_session_usage(backend, filters, by_model=False, sort=sort, limit=1)
+    backend.close()
+
+    def value_as_number(value: object) -> float | None:
+        """Compare numeric and timestamp sort values without formatting."""
+        return (
+            value.timestamp() if isinstance(value, datetime) else numeric_value(value)
+        )
+
+    values = [value_as_number(record[column]) for record in records]
+    assert all(value is not None for value in values)
+    assert values == sorted(
+        (value for value in values if value is not None), reverse=True
+    )
+    if sort == SessionSort.PERFORMANCE:
+        # Both rates display as 1; ordering must retain their fractional values.
+        assert values == [1.2, 1.1]
+        assert records[0]["session_id"] == "ses_local_other"
+    assert limited == records[:1]
+    samples = sample_session_usage(
+        ReportFilters(source=SAMPLE_LOCAL_SOURCE_ID), by_model=False, sort=sort
+    )
+    sample_values = [value_as_number(record[column]) for record in samples]
+    present = [value for value in sample_values if value is not None]
+    assert sample_values == sorted(present, reverse=True) + [None] * (
+        len(sample_values) - len(present)
+    )
+
+
+@pytest.mark.parametrize("by_model", [False, True])
+def test_session_performance_weights_only_paired_components(
+    tmp_path: Path, by_model: bool
+) -> None:
+    """Keep execution duration separate from timing pairs used for performance."""
+    config, backend = _configured_store(tmp_path)
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 100, perf_timed_tokens = 100 "
+        "WHERE source_id = ? AND model = 'gpt-test'",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.connection.execute(
+        "UPDATE daily_stats SET perf_duration_ms = 90000, perf_timed_tokens = 0 "
+        "WHERE source_id = ? AND model = 'gpt-mini'",
+        [LOCAL_SOURCE_ID],
+    )
+    backend.connection.execute(
+        "INSERT INTO daily_stats "
+        "(event_id, source_id, day, client, session_id, model, total_tokens, "
+        "perf_duration_ms, perf_timed_tokens, collected_at) "
+        "VALUES (UUID(), ?, '2026-09-09', 'codex', "
+        "'ses_local_demonstration_identifier', 'gpt-test', 1, 900, 9900, NOW())",
+        [LOCAL_SOURCE_ID],
+    )
+    records = load_session_usage(
+        backend,
+        ReportFilters(source=LOCAL_SOURCE_ID, client="codex"),
+        by_model=by_model,
+        sort=SessionSort.PERFORMANCE,
+    )
+    backend.close()
+    timed = records[0]
+    assert timed["ms_per_1k_tokens"] == 100
+    assert timed["perf_duration_ms"] == (1000 if by_model else 91000)
+    if by_model:
+        assert records[1]["ms_per_1k_tokens"] is None
+    command = [
+        "report",
+        "sessions",
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--client",
+        "codex",
+        "--with-performance",
+        "--with-duration",
+        "--sort",
+        "performance",
+        "--width",
+        "max",
+    ]
+    if by_model:
+        command.append("--by-model")
+    result = CliRunner().invoke(app, command)
+    assert result.exit_code == 0
+    text = plain_cli_output(result.output)
+    assert "ms/1K" in text
+    timed_line = next(
+        line
+        for line in text.splitlines()
+        if "ses_local_demonstration_identifier" in line
+        and (not by_model or "gpt-test" in line)
+    )
+    assert timed_line.split()[9] == "100"
+    assert ("01s" if by_model else "01m31s") in text
+
+
+def test_session_sort_choices_and_removed_flags() -> None:
+    """Expose validated sort choices and remove the obsolete boolean switches."""
+    runner = CliRunner()
+    help_result = runner.invoke(app, ["report", "sessions", "--help"])
+    help_text = plain_cli_output(help_result.output)
+    assert "--sort" in help_text
+    assert "--with-performance" in help_text
+    assert "--by-created-at" not in help_text
+    assert "--by-duration" not in help_text
+    for args in [["--sort", "invalid"], ["--by-created-at"], ["--by-duration"]]:
+        assert (
+            runner.invoke(app, ["report", "sessions", "--test", *args]).exit_code == 2
+        )
+
+
+def test_session_identifiers_expand_client_before_session(tmp_path: Path) -> None:
+    """Reveal full identifiers progressively while retaining both ends when cut."""
+    config, backend = _configured_store(tmp_path)
+    session = "session-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-end"
+    client = "client-ABCDEFGHIJKLM-end"
+    for table in ["sessions", "daily_stats"]:
+        backend.connection.execute(
+            f"UPDATE {table} SET session_id = ?, client = ? "
+            "WHERE source_id = ? AND session_id = 'ses_local_demonstration_identifier'",
+            [session, client, LOCAL_SOURCE_ID],
+        )
+    backend.close()
+    command = [
+        "report",
+        "sessions",
+        "--config",
+        str(config),
+        "--source",
+        "local",
+        "--model",
+        "gpt-test",
+        "--with-duration",
+        "--with-performance",
+    ]
+    values: list[tuple[str, str]] = []
+    widths = [120, 122, 130, 180]
+    for width in widths:
+        result = CliRunner().invoke(app, [*command, "--width", str(width)])
+        assert result.exit_code == 0
+        text = plain_cli_output(result.output)
+        line = next(line for line in text.splitlines() if "$" in line)
+        rendered_session, rendered_client = line.split()[:2]
+        for full, rendered in [(session, rendered_session), (client, rendered_client)]:
+            if "…" in rendered:
+                prefix, suffix = rendered.split("…")
+                assert prefix and suffix
+                assert full.startswith(prefix) and full.endswith(suffix)
+            else:
+                assert rendered == full
+        values.append((rendered_session, rendered_client))
+        assert len(line) == width
+    assert values[-1] == (session, client)
+    for previous, current in pairwise(values):
+        if current[1] != client:
+            assert current[0] == previous[0]
+        assert len(current[0]) >= len(previous[0])
+        assert len(current[1]) >= len(previous[1])
+
+
+def test_middle_truncation_counts_terminal_cells() -> None:
+    """Keep Unicode identifiers within their allotted terminal cell width."""
+    value = "開始ABCDEFGHIJK終了"
+    rendered = truncate_middle(value, 100, 12)
+    assert cell_len(rendered) <= 12
+    prefix, suffix = rendered.split("…")
+    assert prefix and suffix
+    assert value.startswith(prefix) and value.endswith(suffix)
+
+
+def test_session_empty_results_support_explicit_widths() -> None:
+    """Render an empty bounded session report without losing its message."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "sessions",
+            "--test",
+            "--client",
+            "missing-client",
+            "--sanitize",
+            "--with-duration",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "No matching usage data." in plain_cli_output(result.output)

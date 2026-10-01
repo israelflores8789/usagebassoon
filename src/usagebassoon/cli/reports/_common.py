@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from enum import StrEnum
 from functools import cache
 from importlib.resources import files
 from importlib.resources.abc import Traversable
@@ -20,6 +21,7 @@ from uuid import UUID
 import pyarrow as pa
 import typer
 from rich import box
+from rich.cells import cell_len
 from rich.table import Table
 
 from usagebassoon.backends.base import StorageBackend, close_backend
@@ -42,6 +44,41 @@ _RAW_REPORT_WARNING = (
     "Sharing this report? Re-run with --sanitize to obfuscate identifiers "
     "and free text."
 )
+
+
+class SessionSort(StrEnum):
+    """Validated descending sort choices for session reports."""
+
+    LAST_ACTIVE = "last-active"
+    CREATED_AT = "created-at"
+    DURATION = "duration"
+    INPUT = "input"
+    OUTPUT = "output"
+    CACHE_READ = "cache-read"
+    CACHE_WRITE = "cache-write"
+    REASONING = "reasoning"
+    TOTAL = "total"
+    COST = "cost"
+    COST_PER_MILLION = "cost-per-million"
+    PERFORMANCE = "performance"
+
+    @property
+    def column(self) -> str:
+        """Return the trusted query/result column for this choice."""
+        return {
+            self.LAST_ACTIVE: "last_active",
+            self.CREATED_AT: "created_at",
+            self.DURATION: "perf_duration_ms",
+            self.INPUT: "input_tokens",
+            self.OUTPUT: "output_tokens",
+            self.CACHE_READ: "cache_read",
+            self.CACHE_WRITE: "cache_write",
+            self.REASONING: "reasoning_tokens",
+            self.TOTAL: "total_tokens",
+            self.COST: "cost_usd",
+            self.COST_PER_MILLION: "cost_per_million",
+            self.PERFORMANCE: "ms_per_1k_tokens",
+        }[self]
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +298,7 @@ def load_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
-    by_created_at: bool = False,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
     limit: int | None = None,
     since: date | None = None,
     until: date | None = None,
@@ -272,15 +309,15 @@ def load_session_usage(
         backend: Initialized storage backend.
         filters: Resolved report filters.
         by_model: Keep one row per session/model instead of one session row.
-        by_created_at: Filter and order by session creation time.
-        limit: Maximum rows after timestamp ordering, when requested.
+        sort: Descending sort metric; creation sorting uses creation date bounds.
+        limit: Maximum rows after ordering, when requested.
         since: Inclusive lower date bound on the selected timestamp.
         until: Inclusive upper date bound on the selected timestamp.
 
     Returns:
         Aggregated session report records.
     """
-    timestamp = "created_at" if by_created_at else "last_active"
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "last_active"
     where, parameters = report_where(
         filters, since=since, until=until, date_column=timestamp
     )
@@ -295,13 +332,14 @@ def load_session_usage(
         "facts.cache_read AS cache_read, "
         "facts.cache_write AS cache_write, "
         "facts.total_tokens AS total_tokens, "
+        "facts.perf_duration_ms AS perf_duration_ms, "
+        "facts.perf_timed_duration_ms AS perf_timed_duration_ms, "
+        "facts.perf_timed_tokens AS perf_timed_tokens, "
         "COALESCE(facts.cost_usd, facts.tokscale_cost_usd) AS cost_usd, "
         "facts.last_active AS last_active, "
         "facts.created_at AS created_at "
         "FROM report_session_models AS facts"
         f"{where} "
-        f"ORDER BY facts.{timestamp} DESC NULLS LAST, facts.client, "
-        "facts.session_id, facts.model"
     )
     session_select = (
         "STRING_AGG(facts.model, ', ' ORDER BY facts.model) AS model, "
@@ -313,6 +351,9 @@ def load_session_usage(
         "SUM(COALESCE(facts.cache_read, 0)) AS cache_read, "
         "SUM(COALESCE(facts.cache_write, 0)) AS cache_write, "
         "SUM(COALESCE(facts.total_tokens, 0)) AS total_tokens, "
+        "SUM(facts.perf_duration_ms) AS perf_duration_ms, "
+        "SUM(facts.perf_timed_duration_ms) AS perf_timed_duration_ms, "
+        "SUM(facts.perf_timed_tokens) AS perf_timed_tokens, "
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
         "THEN SUM(facts.cost_usd) "
         "ELSE SUM(facts.tokscale_cost_usd) END AS cost_usd, "
@@ -321,10 +362,22 @@ def load_session_usage(
         "FROM report_session_models AS facts"
         f"{where} "
         "GROUP BY facts.source_id, facts.client, facts.session_id "
-        f"ORDER BY {timestamp} DESC NULLS LAST, facts.client, facts.session_id"
     )
     select = model_select if by_model else session_select
-    sql = f"SELECT facts.source_id, facts.client, facts.session_id, {select}{limit_sql}"
+    sql = (
+        "SELECT usage.*, "
+        "CASE WHEN usage.perf_timed_tokens > 0 "
+        "THEN 1000.0 * usage.perf_timed_duration_ms / usage.perf_timed_tokens "
+        "END AS ms_per_1k_tokens, "
+        "CASE WHEN usage.total_tokens > 0 "
+        "THEN 1000000.0 * usage.cost_usd / usage.total_tokens "
+        "END AS cost_per_million "
+        "FROM (SELECT facts.source_id, facts.client, facts.session_id, "
+        f"{select}) AS usage "
+        f"ORDER BY {sort.column} DESC NULLS LAST, "
+        "last_active DESC NULLS LAST, source_id, client, session_id, model"
+        f"{limit_sql}"
+    )
     result = backend.query(sql, parameters)
     return [dict(record) for record in result.to_pylist()]
 
@@ -413,7 +466,7 @@ def load_configured_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
-    by_created_at: bool = False,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
     limit: int | None = None,
     since: date | None = None,
     until: date | None = None,
@@ -425,7 +478,7 @@ def load_configured_session_usage(
             backend,
             resolve_filters(filters, configuration.source_id),
             by_model=by_model,
-            by_created_at=by_created_at,
+            sort=sort,
             limit=limit,
             since=since,
             until=until,
@@ -454,7 +507,7 @@ def sample_session_usage(
     filters: ReportFilters,
     *,
     by_model: bool,
-    by_created_at: bool = False,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
     limit: int | None = None,
     since: date | None = None,
     until: date | None = None,
@@ -473,7 +526,7 @@ def sample_session_usage(
         _session_record(source_id, client, session_id, facts)
         for (source_id, client, session_id, _), facts in grouped.items()
     ]
-    timestamp = "created_at" if by_created_at else "last_active"
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "last_active"
     if since is not None or until is not None:
         bounded: list[ReportRecord] = []
         for record in records:
@@ -485,11 +538,18 @@ def sample_session_usage(
                 bounded.append(record)
         records = bounded
 
-    def sort_key(record: ReportRecord) -> tuple[datetime, str, str, str]:
-        """Sort sample sessions by the selected timestamp and identity."""
-        return _session_sort_key(record, timestamp)
+    def sort_key(record: ReportRecord) -> tuple[float, float, str, str, str, str]:
+        """Match descending SQL metrics and ascending identity tie-breakers."""
+        return (
+            -_session_sort_value(record, sort),
+            -_session_sort_value(record, SessionSort.LAST_ACTIVE),
+            str(record["source_id"]),
+            str(record["client"]),
+            str(record["session_id"]),
+            str(record["model"]),
+        )
 
-    records.sort(key=sort_key, reverse=True)
+    records.sort(key=sort_key)
     return records if limit is None else records[:limit]
 
 
@@ -625,11 +685,22 @@ def format_timestamp(value: object, *, compact: bool = False) -> str:
 def truncate_middle(value: object, width: int | None, maximum: int) -> str:
     """Truncate one display value in the middle when bounded report width applies."""
     text = sanitize_display(value)
-    if width is None or len(text) <= maximum:
+    if width is None or cell_len(text) <= maximum:
         return text
-    prefix = max(1, (maximum - 1) // 2)
-    suffix = max(1, maximum - prefix - 1)
-    return f"{text[:prefix]}…{text[-suffix:]}"
+    if maximum < 3:
+        return "…"
+    prefix_budget = max((maximum - 1) // 2, cell_len(text[0]))
+    prefix_end = 0
+    while prefix_end < len(text) and cell_len(text[: prefix_end + 1]) <= prefix_budget:
+        prefix_end += 1
+    suffix_budget = maximum - cell_len(text[:prefix_end]) - 1
+    suffix_start = len(text)
+    while (
+        suffix_start > prefix_end
+        and cell_len(text[suffix_start - 1 :]) <= suffix_budget
+    ):
+        suffix_start -= 1
+    return f"{text[:prefix_end]}…{text[suffix_start:]}"
 
 
 def render_table(
@@ -640,6 +711,7 @@ def render_table(
     width: int | None,
     save: Path | None,
     sanitize: bool,
+    column_widths: Mapping[str, int] | None = None,
 ) -> None:
     """Render one bounded Rich report table and optionally save its plain text.
 
@@ -650,8 +722,15 @@ def render_table(
         width: Maximum terminal width, or ``None`` for unbounded output.
         save: Optional destination for captured plain text.
         sanitize: Whether identifiers have been intentionally obfuscated.
+        column_widths: Optional explicit widths for preformatted column contents.
     """
-    render_tables(((title, columns, rows),), width=width, save=save, sanitize=sanitize)
+    render_tables(
+        ((title, columns, rows),),
+        width=width,
+        save=save,
+        sanitize=sanitize,
+        column_widths=column_widths,
+    )
 
 
 def render_tables(
@@ -660,6 +739,7 @@ def render_tables(
     width: int | None,
     save: Path | None,
     sanitize: bool,
+    column_widths: Mapping[str, int] | None = None,
 ) -> None:
     """Render related report tables through one console and one saved artifact.
 
@@ -668,6 +748,7 @@ def render_tables(
         width: Maximum terminal width, or ``None`` for unbounded output.
         save: Optional destination for captured plain text.
         sanitize: Whether identifiers have been intentionally obfuscated.
+        column_widths: Optional explicit widths for preformatted column contents.
     """
     console = output_console(
         width=width if width is not None else 10_000,
@@ -676,6 +757,7 @@ def render_tables(
     for title, columns, rows in tables:
         table = Table(
             title=title,
+            width=width if column_widths is not None else None,
             box=box.SIMPLE_HEAVY,
             pad_edge=False,
             padding=(0, 0),
@@ -691,16 +773,24 @@ def render_tables(
             table.add_column(
                 header,
                 justify=justify,
-                min_width=protected_width,
+                width=column_widths[header] if column_widths is not None else None,
+                min_width=(
+                    column_widths[header]
+                    if column_widths is not None
+                    else protected_width
+                ),
+                max_width=column_widths[header] if column_widths is not None else None,
                 no_wrap=True,
                 overflow="ellipsis",
             )
         if rows:
             for row in rows:
                 table.add_row(*(row[header] for header, _ in columns))
-        else:
+        elif column_widths is None:
             table.add_row("No matching usage data.", *("" for _ in columns[1:]))
         console.print(table)
+        if not rows and column_widths is not None:
+            console.print("No matching usage data.")
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
     if save is not None:
@@ -877,6 +967,23 @@ def _session_record(
         },
         facts,
     )
+    durations = [
+        fact.perf_duration_ms for fact in facts if fact.perf_duration_ms is not None
+    ]
+    record["perf_duration_ms"] = sum(durations) if durations else None
+    timed = _model_record("", client, facts)
+    record["perf_timed_duration_ms"] = timed["perf_duration_ms"]
+    record["perf_timed_tokens"] = timed["perf_timed_tokens"]
+    duration = numeric_value(timed["perf_duration_ms"])
+    tokens = integer_value(timed["perf_timed_tokens"])
+    record["ms_per_1k_tokens"] = (
+        1000 * duration / tokens if duration is not None and tokens > 0 else None
+    )
+    cost = numeric_value(record["cost_usd"])
+    total = integer_value(record["total_tokens"])
+    record["cost_per_million"] = (
+        1000000 * cost / total if cost is not None and total > 0 else None
+    )
     return record
 
 
@@ -925,17 +1032,15 @@ def _daily_sort_key(record: ReportRecord) -> date:
     return _as_date(record["day"])
 
 
-def _session_sort_key(
-    record: ReportRecord, timestamp: str
-) -> tuple[datetime, str, str, str]:
-    """Return the descending sort values for one sample session record."""
-    value = record[timestamp]
-    return (
-        _as_datetime(value) if value is not None else datetime.min.replace(tzinfo=UTC),
-        _as_text(record["client"]),
-        _as_text(record["session_id"]),
-        _as_text(record["model"]),
-    )
+def _session_sort_value(record: ReportRecord, sort: SessionSort) -> float:
+    """Return an unrounded sort metric, placing missing values last."""
+    value = record[sort.column]
+    if value is None:
+        return float("-inf")
+    if sort in {SessionSort.LAST_ACTIVE, SessionSort.CREATED_AT}:
+        return _as_datetime(value).timestamp()
+    number = numeric_value(value)
+    return number if number is not None else float("-inf")
 
 
 def integer_value(value: object) -> int:

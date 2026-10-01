@@ -20,6 +20,11 @@ from tests._sql_parity import (
     view_names,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.cli.reports._common import (
+    ReportFilters,
+    SessionSort,
+    load_session_usage,
+)
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
 from usagebassoon.storage_model import DEBUG_TABLES, EVENT_KEYS, STATE_KEYS
@@ -135,7 +140,7 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
         local.apply_ddl()
         seed_synthetic_data(local)
         seed_synthetic_data(remote)
-        stamp = datetime(2026, 10, 1, tzinfo=UTC)
+        stamp = datetime.now(UTC) + timedelta(days=1)
         ledger = normalize(collection_bundle).tables["collection_ledger"]
         local.append("collection_ledger", ledger)
         remote.append("collection_ledger", ledger)
@@ -219,6 +224,32 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
             rows = local.query(f"SELECT * FROM current_{table}").to_pylist()
             assert any(row["event_id"] == preferred["event_id"] for row in rows), table
             assert not any(row["event_id"] == other["event_id"] for row in rows), table
+    finally:
+        local.close()
+        remote.close()
+
+
+@pytest.mark.parametrize("by_model", [False, True])
+def test_session_report_sorting_matches_both_sql_dialects(by_model: bool) -> None:
+    """Keep generated report sorting, missing rates, and limits dialect agnostic."""
+    local = DuckDBBackend(":memory:")
+    remote = BigQueryReplayBackend()
+    try:
+        local.apply_ddl()
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        for sort in SessionSort:
+            left = load_session_usage(
+                local, ReportFilters(), by_model=by_model, sort=sort, limit=2
+            )
+            right = load_session_usage(
+                remote, ReportFilters(), by_model=by_model, sort=sort, limit=2
+            )
+            assert normalized_records(
+                pa.Table.from_pylist(left), preserve_order=True
+            ) == (
+                normalized_records(pa.Table.from_pylist(right), preserve_order=True)
+            ), sort
     finally:
         local.close()
         remote.close()

@@ -5,21 +5,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich.cells import cell_len
 
 from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
+    ReportColumn,
     ReportFilters,
+    SessionSort,
     format_cache_multiplier,
     format_cost,
     format_cost_per_million,
+    format_ms_per_1k_tokens,
     format_timestamp,
     format_tokens,
     load_configured_session_usage,
+    numeric_value,
     parse_report_dates,
     parse_width,
     render_table,
@@ -28,6 +34,7 @@ from usagebassoon.cli.reports._common import (
     sanitize_records,
     truncate_middle,
 )
+from usagebassoon.display import sanitize_display
 
 
 def sessions(
@@ -36,18 +43,25 @@ def sessions(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, help="Maximum most-recent sessions to display."),
+        typer.Option("--limit", min=1, help="Maximum rows after sorting."),
     ] = 16,
     by_model: Annotated[
         bool,
         typer.Option("--by-model", help="Show one row per session and model."),
     ] = False,
-    by_created_at: Annotated[
+    with_duration: Annotated[
+        bool, typer.Option("--with-duration", help="Show aggregated session duration.")
+    ] = False,
+    with_performance: Annotated[
         bool,
         typer.Option(
-            "--by-created-at", help="Filter and sort by session creation time."
+            "--with-performance", help="Show milliseconds per 1K timed tokens."
         ),
     ] = False,
+    sort: Annotated[
+        SessionSort,
+        typer.Option("--sort", help="Sort descending; missing values last."),
+    ] = SessionSort.LAST_ACTIVE,
     since: Annotated[
         str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
     ] = None,
@@ -72,7 +86,10 @@ def sessions(
     ] = None,
     width: Annotated[
         str,
-        typer.Option("--width", help="Maximum terminal width, or 'max'."),
+        typer.Option(
+            "--width",
+            help="Report width (minimum 100), or 'max'; both metrics need 120.",
+        ),
     ] = "100",
     test: Annotated[
         bool,
@@ -90,7 +107,15 @@ def sessions(
         Path | None, typer.Option("--save", help="Write the rendered report as text.")
     ] = None,
 ) -> None:
-    """Render newest-first session usage, optionally split by model."""
+    """Render sortable session usage, optionally split by model."""
+    output_width = parse_width(width)
+    if output_width is not None:
+        if output_width < 100:
+            raise typer.BadParameter(
+                "sessions width must be at least 100", param_hint="--width"
+            )
+        if with_duration and with_performance:
+            output_width = max(output_width, 120)
     start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
@@ -103,7 +128,7 @@ def sessions(
         sample_session_usage(
             resolve_filters(filters, SAMPLE_LOCAL_SOURCE_ID),
             by_model=by_model,
-            by_created_at=by_created_at,
+            sort=sort,
             limit=limit,
             since=start,
             until=end,
@@ -113,21 +138,24 @@ def sessions(
             config,
             filters,
             by_model=by_model,
-            by_created_at=by_created_at,
+            sort=sort,
             limit=limit,
             since=start,
             until=end,
         )
     )
     records = sanitize_records(records, sanitize)
-    output_width = parse_width(width)
-    timestamp_column = "Created At" if by_created_at else "Last Active"
-    timestamp_key = "created_at" if by_created_at else "last_active"
+    created = sort == SessionSort.CREATED_AT
+    date_only = with_duration and output_width is not None and output_width < 105
+    timestamp_column = "Created At" if created else "Last Active"
+    if date_only:
+        timestamp_column = "Created" if created else "Active"
+    timestamp_key = "created_at" if created else "last_active"
     rows: list[dict[str, str]] = []
     for record in records:
         row = {
-            "Session": truncate_middle(record["session_id"], output_width, 10),
-            "Client": truncate_middle(record["client"], output_width, 7),
+            "Session": sanitize_display(record["session_id"]),
+            "Client": sanitize_display(record["client"]),
             "Model": _model_label(record["model"], by_model, output_width),
             "Input": format_tokens(record["input_tokens"]),
             "Output": format_tokens(record["output_tokens"]),
@@ -144,6 +172,14 @@ def sessions(
                 record[timestamp_key], compact=output_width is not None
             ),
         }
+        if with_duration:
+            row["Duration"] = _format_duration(record["perf_duration_ms"])
+        if with_performance:
+            row["ms/1K"] = format_ms_per_1k_tokens(
+                record["perf_timed_duration_ms"], record["perf_timed_tokens"]
+            )
+        if date_only:
+            row[timestamp_column] = row[timestamp_column].split(" ")[0]
         rows.append(row)
     columns = (
         ("Session", "left"),
@@ -154,10 +190,13 @@ def sessions(
         ("Cache R", "right"),
         (CACHE_MULTIPLIER_HEADER, "right"),
         ("Total", "right"),
+        *(("Duration", "right"),) * with_duration,
+        *(("ms/1K", "right"),) * with_performance,
         ("Cost", "right"),
         ("Cost/1M", "right"),
-        (timestamp_column, "left"),
+        (timestamp_column, "right" if date_only else "left"),
     )
+    column_widths = _identifier_layout(rows, columns, output_width)
     render_table(
         "Session Token Usage by Model" if by_model else "Session Token Usage",
         columns,
@@ -165,20 +204,20 @@ def sessions(
         width=output_width,
         save=save,
         sanitize=sanitize,
+        column_widths=column_widths,
     )
 
 
 def _model_label(value: object, by_model: bool, width: int | None) -> str:
     """Render one model, adding the count of additional session models when needed."""
-    models = str(value).split(", ")
+    models = sanitize_display(value).split(", ")
     model = models[0]
     additional = "" if by_model or len(models) == 1 else f"+{len(models) - 1}"
     if width is None:
         return f"{model}{additional}"
 
-    gemini_label = _gemini_flash_label(model, width) if width >= 95 else None
-    maximum = 12 if width >= 95 else max(1, 12 - len(additional))
-    identifier = gemini_label or truncate_middle(model, width, maximum)
+    gemini_label = _gemini_flash_label(model, width)
+    identifier = gemini_label or truncate_middle(model, width, 12 + max(0, width - 100))
     return f"{identifier}{additional}"
 
 
@@ -197,3 +236,85 @@ def _gemini_flash_label(model: str, width: int) -> str | None:
     if visible_prefix == len("gemini"):
         return model
     return f"{model[:visible_prefix]}…{version}{suffix}"
+
+
+def _identifier_layout(
+    rows: list[dict[str, str]], columns: Sequence[ReportColumn], width: int | None
+) -> dict[str, int] | None:
+    """Budget identifiers once, revealing Client before Session as width grows.
+
+    Args:
+        rows: Formatted rows whose full identifiers are shortened in place.
+        columns: Ordered report headers and alignments.
+        width: Requested terminal width, or None for complete identifiers.
+
+    Returns:
+        Exact column widths, or None for unbounded rendering.
+    """
+    if width is None:
+        return None
+    widths = {
+        header: max((cell_len(header), *(cell_len(row[header]) for row in rows)))
+        for header, _ in columns
+    }
+    # SIMPLE_HEAVY uses one separator between columns and two outer edges.
+    available = (
+        width
+        - (len(columns) + 1)
+        - sum(
+            size
+            for header, size in widths.items()
+            if header not in {"Session", "Client"}
+        )
+    )
+    session_width = min(widths["Session"], 10)
+    client_width = min(widths["Client"], 7)
+    minimums = {
+        header: max(
+            (
+                3,
+                *(
+                    cell_len(row[header][:1]) + cell_len(row[header][-1:]) + 1
+                    for row in rows
+                ),
+            )
+        )
+        for header in ("Session", "Client")
+    }
+    deficit = max(0, session_width + client_width - available)
+    shrink = min(deficit, session_width - minimums["Session"])
+    session_width -= shrink
+    deficit -= shrink
+    client_width -= min(deficit, client_width - minimums["Client"])
+    if session_width + client_width > available:
+        raise typer.BadParameter(
+            "width is too small for the displayed metrics; increase --width",
+            param_hint="--width",
+        )
+    extra = available - session_width - client_width
+    grow = min(extra, widths["Client"] - client_width)
+    client_width += grow
+    extra -= grow
+    session_width += extra
+    widths["Session"] = session_width
+    widths["Client"] = client_width
+    for row in rows:
+        row["Session"] = truncate_middle(row["Session"], width, session_width)
+        row["Client"] = truncate_middle(row["Client"], width, client_width)
+    return widths
+
+
+def _format_duration(value: object) -> str:
+    """Format milliseconds as whole seconds with 90-second/minute thresholds."""
+    duration = numeric_value(value)
+    if duration is None:
+        return "—"
+    seconds = int(duration / 1000)
+    if seconds < 90:
+        return f"{seconds:02d}s"
+    if seconds < 90 * 60:
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes:02d}m{seconds:02d}s"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}h{minutes:02d}m{seconds:02d}s"

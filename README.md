@@ -115,7 +115,7 @@ bunx tokscale@4.15.1 --version
 
 All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only.
 
-All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--by-created-at`.
+All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 
@@ -189,6 +189,8 @@ $ bassoon report daily --test
 
 ```text
 $ bassoon report sessions --test    # add --by-model for per-model detail
+                                    # add --with-duration to see session execution time
+                                    # add --with-performance to see reasoning latency
                                        Session Token Usage
 
  Session    Client  Model           Input Output Cache R Cache ×  Total  Cost Cost/1M Last Active

@@ -233,7 +233,13 @@ SELECT
     session_model_stats.cache_write,
     session_model_stats.reasoning,
     session_model_stats.total_tokens,
-    session_model_stats.perf_duration_ms,
+    (SELECT SUM(duration_facts.perf_duration_ms)
+     FROM current_daily_stats AS duration_facts
+     WHERE duration_facts.source_id = session_model_stats.source_id
+       AND duration_facts.client = session_model_stats.client
+       AND duration_facts.session_id = session_model_stats.session_id
+       AND duration_facts.model = session_model_stats.model) AS perf_duration_ms,
+    session_model_stats.perf_duration_ms AS perf_timed_duration_ms,
     session_model_stats.perf_timed_tokens,
     session_model_stats.perf_sample_count,
     session_model_stats.ms_per_1k_tokens,
