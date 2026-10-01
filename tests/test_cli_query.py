@@ -95,16 +95,12 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
             str(config),
         ],
     )
-    delete_result = runner.invoke(
-        app,
-        ["query", "notes", "--config", str(config)],
-    )
-
     assert query_result.exit_code == 0
     assert "ses_private" in plain_cli_output(query_result.output)
     assert "returns raw data" in plain_cli_output(query_result.stderr)
-    assert delete_result.exit_code != 0
-    assert "not supported" in plain_cli_output(delete_result.output)
+    rejected = runner.invoke(app, ["query", "notes", "--config", str(config)])
+    assert rejected.exit_code != 0
+    assert "not supported" in plain_cli_output(rejected.output)
 
 
 def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:

@@ -109,11 +109,6 @@ def test_daily_models_reuse_the_models_contract(
     assert parse_daily(daily_raws[min(daily_raws)], day=min(daily_raws)).entries
 
 
-def test_report_shape(report_rows: list[SessionRow]) -> None:
-    """Assert the report payload carries the expected fixture shape."""
-    assert len(report_rows) == EXPECTED_REPORT_ROWS
-
-
 def test_daily_reports_are_partitioned_by_session_creation_date(
     report_raws: dict[date, JsonArray],
 ) -> None:
@@ -125,8 +120,9 @@ def test_daily_reports_are_partitioned_by_session_creation_date(
         )
 
 
-def test_report_timestamps_parsed(report_rows: list[SessionRow]) -> None:
-    """Assert epoch-millis fields become timezone-aware datetimes."""
+def test_report_rows_and_timestamps(report_rows: list[SessionRow]) -> None:
+    """Preserve all golden sessions and parse timestamps as aware UTC values."""
+    assert len(report_rows) == EXPECTED_REPORT_ROWS
     row = report_rows[0]
     assert isinstance(row.created_at, datetime)
     assert row.created_at.tzinfo is not None

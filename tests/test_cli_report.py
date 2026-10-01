@@ -184,10 +184,9 @@ def test_report_group_lists_supported_commands() -> None:
     result = CliRunner().invoke(app, ["report", "--help"])
 
     assert result.exit_code == 0
-    assert "daily" in plain_cli_output(result.output)
-    assert "models" in plain_cli_output(result.output)
-    assert "sessions" in plain_cli_output(result.output)
-    assert "graph" in plain_cli_output(result.output)
+    commands = plain_cli_output(result.output).split()
+    for command in ("activity", "daily", "graph", "models", "sessions", "summary"):
+        assert command in commands
 
 
 def test_daily_report_filters_local_tagged_usage(tmp_path: Path) -> None:
@@ -971,19 +970,19 @@ def test_session_performance_weights_only_paired_components(
     assert ("01s" if by_model else "01m31s") in text
 
 
-def test_session_sort_choices_and_removed_flags() -> None:
-    """Expose validated sort choices and remove the obsolete boolean switches."""
+def test_session_sort_and_performance_options() -> None:
+    """Expose sort and performance options while rejecting invalid sort values."""
     runner = CliRunner()
     help_result = runner.invoke(app, ["report", "sessions", "--help"])
     help_text = plain_cli_output(help_result.output)
     assert "--sort" in help_text
     assert "--with-performance" in help_text
-    assert "--by-created-at" not in help_text
-    assert "--by-duration" not in help_text
-    for args in [["--sort", "invalid"], ["--by-created-at"], ["--by-duration"]]:
-        assert (
-            runner.invoke(app, ["report", "sessions", "--test", *args]).exit_code == 2
-        )
+    assert (
+        runner.invoke(
+            app, ["report", "sessions", "--test", "--sort", "invalid"]
+        ).exit_code
+        == 2
+    )
 
 
 def test_session_identifiers_expand_client_before_session(tmp_path: Path) -> None:

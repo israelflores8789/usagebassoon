@@ -170,16 +170,14 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     editor.write_text(
         "from pathlib import Path\nimport sys\n"
         "Path(sys.argv[-1]).write_text(sys.argv[1])\n"
+        "sys.exit(1 if sys.argv[1] == 'failed content' else 0)\n"
     )
+    monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} edited")
     edited = runner.invoke(app, _command(config, "note", "edit", *target))
     assert edited.exit_code == 0
     assert "Updated note" in plain_cli_output(edited.output)
 
-    monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '   '")
-    blank = runner.invoke(app, _command(config, "note", "edit", *target))
-    assert blank.exit_code != 0
-    assert "note remove" in plain_cli_output(blank.output)
     backend = DuckDBBackend(database)
     try:
         revised = backend.query(
@@ -190,6 +188,20 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
         assert revised["collected_at"] > original["collected_at"]
     finally:
         backend.close()
+
+    for content in ("   ", "failed content"):
+        monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '{content}'")
+        rejected = runner.invoke(app, _command(config, "note", "edit", *target))
+        assert rejected.exit_code != 0
+        if not content.strip():
+            assert "note remove" in plain_cli_output(rejected.output)
+        backend = DuckDBBackend(database)
+        try:
+            assert backend.query(
+                "SELECT note, created_at, collected_at FROM notes"
+            ).to_pylist() == [revised]
+        finally:
+            backend.close()
 
 
 def test_note_edit_requires_a_configured_editor(

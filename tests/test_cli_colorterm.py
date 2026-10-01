@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from itertools import pairwise
 
 import pytest
 from rich.console import Console
@@ -14,15 +15,13 @@ from usagebassoon.cli._colorterm import blend_palette
 
 
 @pytest.mark.parametrize("ending", ["\x07", "\x1b\\"])
-def test_theme_reply_decoding_and_light_background(ending: str) -> None:
-    """Decode either OSC terminator and blend from light as well as dark themes."""
+def test_theme_reply_decoding(ending: str) -> None:
+    """Decode light backgrounds with either OSC terminator."""
     from usagebassoon.cli._colorterm import _decode_colors
 
     response = f"\x1b]11;rgb:ffff/ffff/ffff{ending}\x1b]4;5;rgb:8080/4040/c0c0{ending}"
     assert _decode_colors(response) == ((128, 64, 192), (255, 255, 255))
     assert _decode_colors("\x1b]4;5;rgb:80/40/c0\x07") is None
-    palette = blend_palette(3, (128, 64, 192), (255, 255, 255))
-    assert palette == ["#ffffff", "#c0a0e0", "#8040c0"]
 
 
 def test_fragmented_theme_replies_and_timeout() -> None:
@@ -128,6 +127,22 @@ def test_shared_blending_and_contrast() -> None:
     assert blend_color((0, 0, 0), (200, 100, 50), 2) == "#c86432"
     assert contrasting_foreground("#ffffff") == "black"
     assert contrasting_foreground("#000000") == "white"
+    assert blend_palette(3, (128, 64, 192), (255, 255, 255)) == [
+        "#ffffff",
+        "#c0a0e0",
+        "#8040c0",
+    ]
+    fallback = blend_palette(10)
+    assert fallback[0] == "#181818"
+    assert fallback[-1] == "#a060d0"
+    for bins in (3, 7, 10):
+        palette = blend_palette(bins, (160, 110, 210))
+        assert len(palette) == bins
+        luminance = [
+            sum(int(color[index : index + 2], 16) for index in (1, 3, 5))
+            for color in palette
+        ]
+        assert all(left < right for left, right in pairwise(luminance))
     with pytest.raises(ValueError, match="at least two"):
         blend_palette(1)
 

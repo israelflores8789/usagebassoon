@@ -100,9 +100,12 @@ def test_python_query_apis_apply_the_public_validator(
 def test_cli_query_only_accepts_an_allowlisted_relation(
     initialized_config: Path,
 ) -> None:
-    """Generate a bounded relation query rather than accepting arbitrary SQL."""
-    runner = CliRunner()
+    """Generate bounded relation queries and reject external data readers.
 
+    Deliberately kept in this security-focused module so audits preserve explicit
+    CLI security-boundary coverage despite overlap with general CLI tests.
+    """
+    runner = CliRunner()
     allowed = runner.invoke(
         app,
         ["query", "report_models", "--limit", "1", "--config", str(initialized_config)],
@@ -118,7 +121,6 @@ def test_cli_query_only_accepts_an_allowlisted_relation(
             str(initialized_config),
         ],
     )
-
     assert allowed.exit_code == 0
     assert rejected.exit_code != 0
     assert "not supported" in plain_cli_output(rejected.output)

@@ -5,6 +5,16 @@
 
 Run with ``just test-md-live`` against the disposable ``usagebassoon_it`` database.
 The recipe enables live access and resets the dedicated integration schema.
+
+Raw developer invocation, with ``MOTHERDUCK_TOKEN`` already set::
+
+    export USAGEBASSOON_MOTHERDUCK_LIVE=1
+    export USAGEBASSOON_MOTHERDUCK_LIVE_RESET=1
+    uv run pytest -m motherduck_live tests/test_backend_motherduck_live.py
+
+Both live-access and reset variables must equal ``1``; the module resets the
+dedicated database at setup and cleanup. ``MOTHERDUCK_TOKEN`` supplies credentials.
+The test database is fixed to ``usagebassoon_it`` and has no environment override.
 """
 
 from __future__ import annotations

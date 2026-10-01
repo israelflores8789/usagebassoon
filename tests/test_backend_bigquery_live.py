@@ -3,6 +3,15 @@
 
 """test_backend_bigquery_live.py — Opt-in live BigQuery integration tests.
 
+Raw developer invocation::
+
+    export USAGEBASSOON_BIGQUERY_LIVE=1
+    export USAGEBASSOON_BIGQUERY_LIVE_RESET=1
+    uv run pytest -m bigquery_live tests/test_backend_bigquery_live.py
+
+``just test-bq-live tests/test_backend_bigquery_live.py 1`` is a convenience
+wrapper that also retains partial logs after timeouts.
+
 Set ``USAGEBASSOON_BIGQUERY_LIVE=1`` to enable these ``bigquery_live`` tests against
 the dedicated ``usagebassoon_it`` dataset.
 
@@ -13,6 +22,9 @@ and cleans up the dedicated dataset schema for every live run.
 ``USAGEBASSOON_BIGQUERY_PROJECT`` selects the ADC-backed project, and
 ``USAGEBASSOON_BIGQUERY_LOCATION`` selects its dataset location (default ``US``).
 ``USAGEBASSOON_BIGQUERY_DATASET`` must be ``usagebassoon_it`` when provided.
+
+Credentials use application default authentication, including
+``GOOGLE_APPLICATION_CREDENTIALS`` when configured.
 """
 
 from __future__ import annotations
@@ -457,6 +469,8 @@ def test_live_append_publication_is_visible_and_replay_safe(
             )
     finally:
         remote.close()
+    # Performance guard: the persistence refactor cut publication from >72s to <8s.
+    # Keep the 15s ceiling to detect regressions with service-latency headroom.
     assert elapsed < 15.0, f"BigQuery publication took {elapsed:.3f}s"
 
 

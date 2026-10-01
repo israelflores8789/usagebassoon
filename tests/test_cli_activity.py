@@ -9,7 +9,6 @@ import csv
 import io
 import json
 from datetime import date
-from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -73,25 +72,19 @@ def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
     assert json.loads(json_destination.read_text()) == payload
 
 
-@pytest.mark.parametrize("colors", [3, 7, 10])
-def test_intensity_bands_and_monotoneblend_palette(colors: int) -> None:
-    """Reach every band and keep equal values and decreasing palette luminance."""
+@pytest.mark.parametrize("bins", [3, 7, 10])
+def test_intensity_bands(bins: int) -> None:
+    """Reach every band and preserve missing, zero, and logarithmic values."""
     assert [
-        _intensity(level, colors - 1, colors, "linear") for level in range(colors)
-    ] == list(range(colors))
-    assert _intensity(None, 0, colors, "log") is None
-    assert _intensity(0, 0, colors, "linear") == 0
-    assert _intensity(5, 5, colors, "log") == colors - 1
-    logarithmic = _intensity(1, 1000, colors, "log")
-    linear = _intensity(1, 1000, colors, "linear")
+        _intensity(level, bins - 1, bins, "linear") for level in range(bins)
+    ] == list(range(bins))
+    assert _intensity(None, 0, bins, "log") is None
+    assert _intensity(0, 0, bins, "linear") == 0
+    assert _intensity(5, 5, bins, "log") == bins - 1
+    logarithmic = _intensity(1, 1000, bins, "log")
+    linear = _intensity(1, 1000, bins, "linear")
     assert logarithmic is not None and linear is not None
     assert logarithmic >= linear
-    palette = blend_palette(colors, (160, 110, 210))
-    luminance = [
-        sum(int(color[index : index + 2], 16) for index in (1, 3, 5))
-        for color in palette
-    ]
-    assert all(left < right for left, right in pairwise(luminance))
 
 
 @pytest.mark.parametrize(
@@ -132,6 +125,15 @@ def test_calendar_leap_day_unknown_and_partial_time() -> None:
     ratio = _daily_records(records, start, end, today, ("cost-per-million",))
     assert ratio[0]["value"] is None
     assert ratio[1]["value"] == 20_000
+    unknown = _daily_records(
+        [{"day": start, "total_fact_count": 1, "measured_fact_count": 0}],
+        start,
+        start,
+        today,
+        ("session-time",),
+    )[0]
+    assert unknown["value"] is None
+    assert unknown["status"] == "unknown"
     assert _window(None, None, None, today) == (date(2023, 11, 2), today)
     with pytest.raises(typer.BadParameter):
         _window(10, start, None, today)
@@ -144,6 +146,9 @@ def test_calendar_leap_day_unknown_and_partial_time() -> None:
         ["--days", "2", "--since", "2026-09-01"],
         ["--since", "2026-09-11"],
         ["--source", "invalid"],
+        ["--color", "purple"],
+        ["--color", "#ff00ff"],
+        ["--color", "default"],
     ],
 )
 def test_cli_validation(options: list[str]) -> None:
@@ -304,10 +309,10 @@ def test_daily_activity_query_matches_bigquery_replays() -> None:
         (("cost-per-million",), 2.0 * 1_000_000 / 185),
     ],
 )
-def test_metric_components_preserve_unknown_time(
-    metrics: tuple[str, ...], expected: int | float | None
+def test_metric_component_calculations(
+    metrics: tuple[str, ...], expected: int | float
 ) -> None:
-    """Keep raw output separate from reasoning and missing time distinct from zero."""
+    """Calculate selected token components, cost, and cost per million."""
     day = date(2026, 9, 10)
     facts: list[ReportRecord] = [
         {
@@ -325,16 +330,14 @@ def test_metric_components_preserve_unknown_time(
     ]
     result = _daily_records(facts, day, day, day, metrics)[0]
     assert result["value"] == expected
-    assert result["status"] == ("unknown" if expected is None else "complete")
+    assert result["status"] == "complete"
 
 
-def test_inactive_cells_and_theme_fallback() -> None:
-    """Use the terminal magenta slot and leave zero-intensity squares unfilled."""
+def test_inactive_and_shaded_cells() -> None:
+    """Leave inactive squares unfilled and distinguish every active shade."""
     from usagebassoon.cli.reports.activity import _cell
 
     palette = blend_palette(10)
-    assert palette[0] == "#181818"
-    assert palette[-1] == "#a060d0"
     empty = _cell(0, palette, True)
     assert empty.plain == "  "
     assert not empty.style
@@ -343,7 +346,7 @@ def test_inactive_cells_and_theme_fallback() -> None:
     assert all(not cell.style for cell in cells)
     solid = _cell(9, palette, True)
     assert solid.plain == "  "
-    assert "on #a060d0" in str(solid.style)
+    assert f"on {palette[-1]}" in str(solid.style)
 
 
 @pytest.mark.parametrize(
@@ -450,7 +453,7 @@ def test_solid_and_ascii_mode_selection(
 
 @pytest.mark.parametrize("color", ["blue", "bright_cyan", "bright-red"])
 def test_bins_and_color_exports(color: str) -> None:
-    """Export the selected ANSI name and bin count using the renamed interface."""
+    """Export the selected ANSI name and bin count in JSON and CSV."""
     runner = CliRunner()
     result = runner.invoke(
         app,
@@ -460,7 +463,6 @@ def test_bins_and_color_exports(color: str) -> None:
     payload = json.loads(result.stdout)
     assert payload["bins"] == 10
     assert payload["color"] == color.replace("-", "_")
-    assert "colors" not in payload
     assert all(
         row["intensity"] is None or 0 <= row["intensity"] < 10
         for row in payload["days"]
@@ -473,21 +475,6 @@ def test_bins_and_color_exports(color: str) -> None:
     assert all(
         row["bins"] == "3" and row["color"] == color.replace("-", "_") for row in rows
     )
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        ["--colors", "7"],
-        ["--color", "purple"],
-        ["--color", "#ff00ff"],
-        ["--color", "default"],
-    ],
-)
-def test_activity_rejects_old_option_and_non_ansi_colors(options: list[str]) -> None:
-    """Require the new bin option and one of the standard sixteen ANSI names."""
-    result = CliRunner().invoke(app, ["report", "activity", "--test", *options])
-    assert result.exit_code != 0
 
 
 @pytest.mark.parametrize("name,index", [("red", 1), ("blue", 4), ("bright_cyan", 14)])

@@ -329,22 +329,48 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
 
 
 def test_daily_models_failure_aborts_collection(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
 ) -> None:
     """Treat a required daily models failure as a failed collection run."""
+    configuration = _config(tmp_path / "config.toml")
+    assert configuration.local_database is not None
+    backend = DuckDBBackend(configuration.local_database)
+    backend.apply_ddl()
+    backend.close()
+    calls: list[tuple[str, ...]] = []
 
-    def command(*_args: object, **_kwargs: object) -> JsonValue:
-        """Raise the kind of process-start failure a scheduled run can see."""
+    def command(
+        _configuration: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Supply the required graph, then fail mandatory model acquisition."""
+        calls.append(arguments)
+        if arguments == ("graph",):
+            return graph_raw
         raise OSError("tokscale executable unavailable")
 
+    monkeypatch.setattr(collector, "_json_command", command)
     monkeypatch.setattr(subprocess_collector, "_json_command", command)
 
     with pytest.raises(OSError, match="tokscale executable unavailable"):
-        subprocess_collector._fetch_daily_models(
-            _config(Path("config.toml")),
-            ["tokscale"],
-            [date(2026, 9, 10)],
-        )
+        collector.collect(configuration)
+    assert len(calls) == 2
+    assert calls[0] == ("graph",)
+    assert calls[1][0] == "models"
+    backend = DuckDBBackend(configuration.local_database)
+    try:
+        rows = backend.query("SELECT * FROM collection_runs").to_pylist()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["failure_code"] == "OSError"
+        assert rows[0]["source_id"] == configuration.source_id
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+    finally:
+        backend.close()
 
 
 def test_report_failure_is_logged_and_does_not_abort_collection(

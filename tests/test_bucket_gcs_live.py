@@ -4,10 +4,20 @@
 """test_bucket_gcs_live.py — Opt-in live GCS snapshot integration tests.
 
 Run with ``just test-gcs-live`` against a disposable bucket.
-Or, run with ``USAGEBASSOON_GCS_LIVE=1 uv run pytest -m gcs_live``.
+
+Raw developer invocation::
+
+    export USAGEBASSOON_GCS_LIVE=1
+    uv run pytest -m gcs_live tests/test_bucket_gcs_live.py
 
 The ``gcs_live`` marker selects these tests, and ``USAGEBASSOON_GCS_LIVE=1``
 enables access to a preconfigured GCS test bucket.
+
+The test bucket is fixed by ``_TEST_BUCKET`` and has no environment override.
+Each test creates and removes its own prefix, without a bucket reset control.
+
+Credentials use application default authentication, including
+``GOOGLE_APPLICATION_CREDENTIALS`` when configured.
 """
 
 from __future__ import annotations

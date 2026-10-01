@@ -31,7 +31,7 @@ def test_log_directory_environment_override(
     assert not (tmp_path / "configured-logs" / "usagebassoon.log").exists()
 
 
-def test_rotating_log_sink_writes_under_the_configured_state_directory(
+def test_log_sink_writes_under_the_configured_state_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

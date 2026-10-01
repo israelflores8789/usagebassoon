@@ -31,7 +31,7 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def test_unresolved_schema_drift_returns_newest_events_first() -> None:
-    """Load only unresolved events and preserve their diagnostic fields."""
+    """Filter resolved events and order remaining diagnostic records by freshness."""
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
@@ -41,31 +41,35 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
             observations(
                 pa.table(
                     {
-                        "source_id": ["source", "source"],
-                        "domain": ["models", "pricing"],
-                        "tokscale_ver": ["4.15.1", "4.15.2"],
+                        "source_id": ["source"] * 3,
+                        "domain": ["models", "pricing", "report"],
+                        "tokscale_ver": ["4.15.1", "4.15.2", "4.15.1"],
                         "drift_key": [
                             "unknown_field:future",
                             "type_change:resolution.price",
+                            "unknown_field:extra",
                         ],
-                        "drift_kind": ["unknown_field", "type_change"],
-                        "path": ["future", "resolution.price"],
-                        "detail": ["additive", "changed"],
-                        "contract_tokscale_ver": ["4.15.1", "4.15.1"],
-                        "created_at": [now, now],
-                        "collected_at": [now, now + timedelta(seconds=1)],
-                        "run_id": [str(uuid4()), str(uuid4())],
-                        "resolved": [True, False],
-                        "observation_count": [1, 3],
+                        "drift_kind": ["unknown_field", "type_change", "unknown_field"],
+                        "path": ["future", "resolution.price", "extra"],
+                        "detail": ["additive", "changed", "additive report"],
+                        "contract_tokscale_ver": ["4.15.1"] * 3,
+                        "created_at": [now] * 3,
+                        "collected_at": [
+                            now + timedelta(seconds=2),
+                            now,
+                            now + timedelta(seconds=1),
+                        ],
+                        "run_id": [str(uuid4()) for _ in range(3)],
+                        "resolved": [True, False, False],
+                        "observation_count": [1, 3, 2],
                     }
                 )
             ),
         )
         records = unresolved_schema_drift(backend)
-        assert len(records) == 1
-        assert records[0].domain == "pricing"
-        assert records[0].drift_kind == "type_change"
-        assert records[0].observation_count == 3
+        assert [record.domain for record in records] == ["report", "pricing"]
+        assert records[1].drift_kind == "type_change"
+        assert records[1].observation_count == 3
     finally:
         backend.close()
 
