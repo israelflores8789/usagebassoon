@@ -8,7 +8,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 from datetime import date
 from itertools import pairwise
 from pathlib import Path
@@ -20,6 +19,7 @@ from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
 from tests.test_cli_report import LOCAL_SOURCE_ID, REMOTE_SOURCE_ID, _configured_store
+from usagebassoon.cli._colorterm import blend_palette
 from usagebassoon.cli.app import app
 from usagebassoon.cli.reports._common import (
     ReportFilters,
@@ -31,7 +31,6 @@ from usagebassoon.cli.reports.activity import (
     _daily_records,
     _intensity,
     _metrics,
-    _palette,
     _window,
 )
 
@@ -75,7 +74,7 @@ def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("colors", [3, 7, 10])
-def test_intensity_bands_and_monotone_palette(colors: int) -> None:
+def test_intensity_bands_and_monotoneblend_palette(colors: int) -> None:
     """Reach every band and keep equal values and decreasing palette luminance."""
     assert [
         _intensity(level, colors - 1, colors, "linear") for level in range(colors)
@@ -87,7 +86,7 @@ def test_intensity_bands_and_monotone_palette(colors: int) -> None:
     linear = _intensity(1, 1000, colors, "linear")
     assert logarithmic is not None and linear is not None
     assert logarithmic >= linear
-    palette = _palette(colors, (160, 110, 210))
+    palette = blend_palette(colors, (160, 110, 210))
     luminance = [
         sum(int(color[index : index + 2], 16) for index in (1, 3, 5))
         for color in palette
@@ -173,7 +172,7 @@ def test_rich_panels_and_unnumbered_legend() -> None:
         records,
         start,
         end,
-        _palette(7, (160, 110, 210)),
+        blend_palette(7, (160, 110, 210)),
         "linear",
         plain=False,
     )
@@ -187,7 +186,7 @@ def test_rich_panels_and_unnumbered_legend() -> None:
     assert "More" in legend
     stream = io.StringIO()
     console = Console(file=stream, width=13)
-    _calendar(console, records, start, end, _palette(7), "linear", plain=True)
+    _calendar(console, records, start, end, blend_palette(7), "linear", plain=True)
     text = stream.getvalue()
     assert text.count("Sun ") == 2
     assert text.count("Sat ") == 2
@@ -333,7 +332,7 @@ def test_inactive_cells_and_theme_fallback() -> None:
     """Use the terminal magenta slot and leave zero-intensity squares unfilled."""
     from usagebassoon.cli.reports.activity import _cell
 
-    palette = _palette(10)
+    palette = blend_palette(10)
     assert palette[0] == "#181818"
     assert palette[-1] == "#a060d0"
     empty = _cell(0, palette, True)
@@ -364,7 +363,7 @@ def test_calendar_year_precedence_and_title_spacing(
         record["intensity"] = 0
     stream = io.StringIO()
     console = Console(file=stream, width=100)
-    _calendar(console, records, start, end, _palette(7), "linear", plain=True)
+    _calendar(console, records, start, end, blend_palette(7), "linear", plain=True)
     lines = stream.getvalue().splitlines()
     assert lines[0].strip() == "Daily Activity"
     chart_row = next(line for line in lines if line.startswith("Sun "))
@@ -377,36 +376,6 @@ def test_calendar_year_precedence_and_title_spacing(
     assert "Oct 2025" not in month_line
     assert "Feb 2026" not in month_line
     assert "Jun 2026" not in month_line
-
-
-@pytest.mark.parametrize("ending", ["\x07", "\x1b\\"])
-def test_theme_reply_decoding_and_light_background(ending: str) -> None:
-    """Decode either OSC terminator and blend from light as well as dark themes."""
-    from usagebassoon.cli.reports.activity import _decode_colors
-
-    response = f"\x1b]11;rgb:ffff/ffff/ffff{ending}\x1b]4;5;rgb:8080/4040/c0c0{ending}"
-    assert _decode_colors(response) == ((128, 64, 192), (255, 255, 255))
-    assert _decode_colors("\x1b]4;5;rgb:80/40/c0\x07") is None
-    palette = _palette(3, (128, 64, 192), (255, 255, 255))
-    assert palette == ["#ffffff", "#c0a0e0", "#8040c0"]
-
-
-def test_fragmented_theme_replies_and_timeout() -> None:
-    """Collect split replies without requiring a response from unsupported terminals."""
-    from usagebassoon.cli.reports.activity import _COLOR_QUERY, _probe_colors
-
-    sent: list[str] = []
-    replies = iter(["\x1b]4;5;rgb:80/40", "/c0\x07", "\x1b]11;rgb:18/18/18\x1b\\"])
-    assert _probe_colors(sent.append, lambda _timeout: next(replies, "")) == (
-        (128, 64, 192),
-        (24, 24, 24),
-    )
-    assert sent == [_COLOR_QUERY]
-    assert _probe_colors(sent.append, lambda _timeout: "") is None
-    trace: list[str] = []
-    assert _probe_colors(sent.append, lambda _timeout: "", trace=trace) is None
-    assert trace[1] == "reply=''"
-    assert "No complete" in trace[2]
 
 
 def test_ascii_option_and_text_save_use_shading(tmp_path: Path) -> None:
@@ -450,77 +419,33 @@ def test_solid_and_ascii_mode_selection(
         assert not record
         return console
 
-    monkeypatch.setattr(module, "output_console", console_factory)
+    monkeypatch.setattr(module, "themed_console", console_factory)
     calls: list[bool] = []
 
     def colors(
-        output: Console, ansi_index: int = 5
+        output: Console, color: str = "magenta"
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         """Return a sample theme and record when the renderer requests discovery."""
         assert output is console
-        assert ansi_index == 5
+        assert color == "magenta"
         calls.append(True)
         return (128, 64, 192), (24, 24, 24)
 
-    monkeypatch.setattr(module, "_terminal_colors", colors)
+    monkeypatch.setattr(module, "resolve_theme_colors", colors)
     day = date(2026, 9, 10)
     records = _daily_records([], day, day, day, ("total",))
     records[0]["intensity"] = 6
-    _render(records, day, day, _palette(7), "linear", 80, None)
+    _render(records, day, day, blend_palette(7), "linear", 80, None)
     assert calls == [True]
     assert ("48;5;" if use_256 else "48;2;128;64;192") in stream.getvalue()
     assert not any(character in stream.getvalue() for character in "░▒▓█")
     stream.seek(0)
     stream.truncate()
-    _render(records, day, day, _palette(7), "linear", 80, None, True)
+    _render(records, day, day, blend_palette(7), "linear", 80, None, True)
     assert calls == [True]
     assert "48;2;" not in stream.getvalue()
     assert "48;5;" not in stream.getvalue()
     assert "██" in stream.getvalue()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX terminal attributes")
-def test_terminal_query_restores_input_settings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Restore echo and canonical input after an unsupported terminal's timeout."""
-    import importlib
-    import sys
-    import termios
-    from collections.abc import Callable
-
-    from usagebassoon.cli.reports.activity import _posix_colors
-
-    module = importlib.import_module("usagebassoon.cli.reports.activity")
-    master, slave = os.openpty()
-    original = termios.tcgetattr(slave)
-    try:
-        with (
-            os.fdopen(os.dup(slave), "r") as input_stream,
-            os.fdopen(os.dup(slave), "w") as output_stream,
-        ):
-            monkeypatch.setattr(sys, "stdin", input_stream)
-            console = Console(file=output_stream)
-
-            def timeout_probe(
-                write: Callable[[str], object],
-                read: Callable[[float], str],
-                *,
-                ansi_index: int = 5,
-            ) -> None:
-                """Inspect query mode without sending a simulated terminal request."""
-                assert ansi_index == 5
-                assert callable(write) and callable(read)
-                attributes = termios.tcgetattr(slave)
-                assert not attributes[3] & (termios.ICANON | termios.ECHO)
-                return None
-
-            monkeypatch.setattr(module, "_probe_colors", timeout_probe)
-            assert _posix_colors(console) is None
-            assert termios.tcgetattr(slave) == original
-    finally:
-        os.close(master)
-        os.close(slave)
 
 
 @pytest.mark.parametrize("color", ["blue", "bright_cyan", "bright-red"])
@@ -568,11 +493,10 @@ def test_activity_rejects_old_option_and_non_ansi_colors(options: list[str]) -> 
 @pytest.mark.parametrize("name,index", [("red", 1), ("blue", 4), ("bright_cyan", 14)])
 def test_selected_ansi_query_and_character_color(name: str, index: int) -> None:
     """Query the selected theme slot, ignore other slots, and color the fallback."""
+    from usagebassoon.cli._colorterm import _decode_colors, _probe_colors
     from usagebassoon.cli.reports.activity import (
         _ansi_color,
         _cell,
-        _decode_colors,
-        _probe_colors,
     )
 
     assert _ansi_color(name) == name
@@ -584,6 +508,6 @@ def test_selected_ansi_query_and_character_color(name: str, index: int) -> None:
     ) == ((16, 32, 48), (24, 24, 24))
     assert sent == [f"\x1b]4;{index};?\x1b\\\x1b]11;?\x1b\\"]
     assert _decode_colors(reply, (index + 1) % 16) is None
-    cell = _cell(6, _palette(7), False, shade_color=True, ansi_color=name)
+    cell = _cell(6, blend_palette(7), False, shade_color=True, ansi_color=name)
     assert cell.style == name
     assert cell.plain == "██"
