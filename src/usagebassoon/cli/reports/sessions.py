@@ -14,19 +14,40 @@ from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
     ReportFilters,
+    ReportRecord,
     format_cache_multiplier,
     format_cost,
     format_cost_per_million,
     format_timestamp,
     format_tokens,
     load_configured_session_usage,
+    numeric_ratio,
     parse_report_dates,
     parse_width,
-    render_table,
     resolve_filters,
     sample_session_usage,
     sanitize_records,
     truncate_middle,
+)
+from usagebassoon.cli.reports._render import output_format, render_records, render_table
+
+_EXPORT_COLUMNS = (
+    "source_id",
+    "client",
+    "session_id",
+    "model",
+    "raw_output_tokens",
+    "reasoning_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_read",
+    "cache_write",
+    "total_tokens",
+    "cost_usd",
+    "cache_multiplier",
+    "cost_per_million",
+    "created_at",
+    "last_active",
 )
 
 
@@ -87,10 +108,18 @@ def sessions(
         ),
     ] = False,
     save: Annotated[
-        Path | None, typer.Option("--save", help="Write the rendered report as text.")
+        Path | None,
+        typer.Option("--save", help="Save the selected text, JSON, or CSV format."),
     ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Output report rows as JSON.")
+    ] = False,
+    csv_output: Annotated[
+        bool, typer.Option("--csv", help="Output report rows as CSV.")
+    ] = False,
 ) -> None:
     """Render newest-first session usage, optionally split by model."""
+    format = output_format(json_output, csv_output)
     start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
@@ -119,6 +148,14 @@ def sessions(
             until=end,
         )
     )
+    if format != "text":
+        render_records(
+            sanitize_records(_export_rows(records), sanitize),
+            columns=_EXPORT_COLUMNS,
+            format=format,
+            save=save,
+        )
+        return
     records = sanitize_records(records, sanitize)
     output_width = parse_width(width)
     timestamp_column = "Created At" if by_created_at else "Last Active"
@@ -197,3 +234,20 @@ def _gemini_flash_label(model: str, width: int) -> str | None:
     if visible_prefix == len("gemini"):
         return model
     return f"{model[:visible_prefix]}…{version}{suffix}"
+
+
+def _export_rows(records: list[ReportRecord]) -> list[ReportRecord]:
+    """Build numeric report rows with full identifiers and unrounded rates."""
+    rows: list[ReportRecord] = []
+    for record in records:
+        enriched = {
+            **record,
+            "cache_multiplier": numeric_ratio(
+                record.get("cache_read"), record.get("input_tokens")
+            ),
+            "cost_per_million": numeric_ratio(
+                record.get("cost_usd"), record.get("total_tokens"), 1_000_000
+            ),
+        }
+        rows.append({column: enriched.get(column) for column in _EXPORT_COLUMNS})
+    return rows

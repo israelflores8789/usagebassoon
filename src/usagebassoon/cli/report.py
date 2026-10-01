@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import typer
 
+from usagebassoon.cli.reports.activity import activity
 from usagebassoon.cli.reports.daily import daily
 from usagebassoon.cli.reports.graph import graph
 from usagebassoon.cli.reports.models import models
@@ -19,6 +20,7 @@ report_app = typer.Typer(
 )
 
 report_app.command("daily")(daily)
+report_app.command("activity")(activity)
 report_app.command("models")(models)
 report_app.command("sessions")(sessions)
 report_app.command("graph")(graph)

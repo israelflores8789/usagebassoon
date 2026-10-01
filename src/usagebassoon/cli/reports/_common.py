@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -19,11 +19,8 @@ from uuid import UUID
 
 import pyarrow as pa
 import typer
-from rich import box
-from rich.table import Table
 
 from usagebassoon.backends.base import StorageBackend, close_backend
-from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import configured_backend
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonValue
@@ -32,16 +29,11 @@ from usagebassoon.parsers.report import parse_report
 from usagebassoon.privacy import sanitize_table
 
 type ReportRecord = dict[str, object]
-type ReportColumn = tuple[str, Literal["left", "right"]]
 
 SAMPLE_LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 SAMPLE_LATEST_DAY = date(2026, 9, 10)
 _MULTIPLICATION_SIGN = "\N{MULTIPLICATION SIGN}"
 CACHE_MULTIPLIER_HEADER = f"Cache {_MULTIPLICATION_SIGN}"
-_RAW_REPORT_WARNING = (
-    "Sharing this report? Re-run with --sanitize to obfuscate identifiers "
-    "and free text."
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +235,11 @@ def load_daily_usage(
         "SUM(COALESCE(facts.cache_read, 0)) AS cache_read, "
         "SUM(COALESCE(facts.cache_write, 0)) AS cache_write, "
         "SUM(COALESCE(facts.total_tokens, 0)) AS total_tokens, "
+        "SUM(facts.perf_duration_ms) AS perf_duration_ms, "
+        "COUNT(facts.perf_duration_ms) AS measured_fact_count, "
+        "COUNT(*) AS total_fact_count, "
+        "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
+        "THEN 'calculated' ELSE 'tokscale' END AS cost_basis, "
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
         "THEN SUM(facts.cost_usd) "
         "ELSE SUM(facts.tokscale_cost_usd) END AS cost_usd "
@@ -632,96 +629,6 @@ def truncate_middle(value: object, width: int | None, maximum: int) -> str:
     return f"{text[:prefix]}…{text[-suffix:]}"
 
 
-def render_table(
-    title: str,
-    columns: Sequence[ReportColumn],
-    rows: Sequence[Mapping[str, str]],
-    *,
-    width: int | None,
-    save: Path | None,
-    sanitize: bool,
-) -> None:
-    """Render one bounded Rich report table and optionally save its plain text.
-
-    Args:
-        title: Human-readable table title.
-        columns: Header and alignment pairs, where alignment is ``left`` or ``right``.
-        rows: Already formatted display rows.
-        width: Maximum terminal width, or ``None`` for unbounded output.
-        save: Optional destination for captured plain text.
-        sanitize: Whether identifiers have been intentionally obfuscated.
-    """
-    render_tables(((title, columns, rows),), width=width, save=save, sanitize=sanitize)
-
-
-def render_tables(
-    tables: Sequence[tuple[str, Sequence[ReportColumn], Sequence[Mapping[str, str]]]],
-    *,
-    width: int | None,
-    save: Path | None,
-    sanitize: bool,
-) -> None:
-    """Render related report tables through one console and one saved artifact.
-
-    Args:
-        tables: Titles, column specifications, and formatted display rows.
-        width: Maximum terminal width, or ``None`` for unbounded output.
-        save: Optional destination for captured plain text.
-        sanitize: Whether identifiers have been intentionally obfuscated.
-    """
-    console = output_console(
-        width=width if width is not None else 10_000,
-        record=save is not None,
-    )
-    for title, columns, rows in tables:
-        table = Table(
-            title=title,
-            box=box.SIMPLE_HEAVY,
-            pad_edge=False,
-            padding=(0, 0),
-            show_header=True,
-        )
-        for header, justify in columns:
-            protected_width = (
-                max((len(header), *(len(row[header]) for row in rows)))
-                if width is None
-                or (width >= 80 and (justify == "right" or header == "Model"))
-                else None
-            )
-            table.add_column(
-                header,
-                justify=justify,
-                min_width=protected_width,
-                no_wrap=True,
-                overflow="ellipsis",
-            )
-        if rows:
-            for row in rows:
-                table.add_row(*(row[header] for header, _ in columns))
-        else:
-            table.add_row("No matching usage data.", *("" for _ in columns[1:]))
-        console.print(table)
-    if save is None and not sanitize:
-        console.print(_RAW_REPORT_WARNING, style="yellow")
-    if save is not None:
-        save.write_text(console.export_text(), encoding="utf-8")
-
-
-def render_graph(
-    text: str,
-    *,
-    save: Path | None,
-    sanitize: bool,
-) -> None:
-    """Print one pre-rendered terminal graph and optionally save it as text."""
-    console = output_console()
-    console.print(text, end="")
-    if save is None and not sanitize:
-        console.print(_RAW_REPORT_WARNING, style="yellow")
-    if save is not None:
-        save.write_text(text, encoding="utf-8")
-
-
 def _sample_usage(
     filters: ReportFilters, *, since: date | None = None, until: date | None = None
 ) -> list[_SampleUsage]:
@@ -912,6 +819,14 @@ def _usage_record(base: ReportRecord, facts: Sequence[_SampleUsage]) -> ReportRe
         "cache_read": sum(fact.cache_read for fact in facts),
         "cache_write": sum(fact.cache_write for fact in facts),
         "total_tokens": sum(fact.total_tokens for fact in facts),
+        "perf_duration_ms": (
+            sum(fact.perf_duration_ms or 0 for fact in facts)
+            if any(fact.perf_duration_ms is not None for fact in facts)
+            else None
+        ),
+        "measured_fact_count": sum(fact.perf_duration_ms is not None for fact in facts),
+        "total_fact_count": len(facts),
+        "cost_basis": "calculated",
         "cost_usd": (
             None
             if any(fact.cost_usd is None for fact in facts)
@@ -973,3 +888,14 @@ def _as_datetime(value: object) -> datetime:
 def _as_text(value: object) -> str:
     """Return a report text value, using an empty string for absent values."""
     return "" if value is None else str(value)
+
+
+def numeric_ratio(
+    numerator: object, denominator: object, scale: int = 1
+) -> float | None:
+    """Calculate an unrounded rate, preserving missing or undefined values."""
+    amount = numeric_value(numerator)
+    divisor = numeric_value(denominator)
+    if amount is None or divisor is None or divisor <= 0:
+        return None
+    return amount * scale / divisor
