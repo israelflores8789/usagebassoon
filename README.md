@@ -119,6 +119,8 @@ All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 
+Daily, models, and sessions reports also support mutually exclusive `--json` and `--csv` flags. These output the same filtered and grouped results as an array of JSON objects or a CSV table,
+
 > [!IMPORTANT]
 > Reports are raw by default. Use `--sanitize` before sharing or `--save <path>` to write a text artifact.
 
@@ -151,10 +153,10 @@ $ bassoon report models --test
 
  Model            Client    Input Output Cache R Cache ×  Total  ms/1K Cost/1M   Cost
  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- gemini-3.7-flash opencode  52.4M   1.6M  239.5M   4.57× 293.4M 110.03  $0.215 $63.13
- gemini-3.8-flash opencode  25.2M   1.4M  244.3M   9.70× 270.9M  60.20  $0.157 $42.58
- gpt-5.6-terra    codex    436.8K  80.6K    8.8M  20.12×   9.3M 303.89  $0.387  $3.60
- gpt-5.6-luna     codex    308.7K  22.1K    4.4M  14.09×   4.7M 104.61  $0.037  $0.18
+ gemini-3.7-flash opencode  52.4M   1.6M  239.5M   4.57× 293.4M    110  $0.215 $63.13
+ gemini-3.8-flash opencode  25.2M   1.4M  244.3M   9.70× 270.9M     60  $0.157 $42.58
+ gpt-5.6-terra    codex    436.8K  80.6K    8.8M  20.12×   9.3M    304  $0.387  $3.60
+ gpt-5.6-luna     codex    308.7K  22.1K    4.4M  14.09×   4.7M    105  $0.037  $0.18
 ```
 
 `ms/1K` is calculated from the total measured milliseconds and timed tokens for each model and client. `Cache ×` is cache-read tokens divided by input tokens. Output includes reasoning tokens.
@@ -217,7 +219,6 @@ $ bassoon report sessions --test    # add --by-model for per-model detail
 
 ```text
 $ bassoon report graph --test       # shows USD cost by default. use `--metric` for token metrics.
-
                        Cost (USD): 2026-09-01 to 2026-09-10
       ┌────────────────────────────────────────────────────────────────────────┐
 $20.23┤               ███████                                                  │
@@ -236,6 +237,30 @@ $10.12┤               ███████              ███████
  $0.00┤ ██████ ██████ ██████████████████████████████████████████ ██████ ██████ │
       └────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬────┘
            01     02     03     04     05     06     07     08     09     10
+```
+
+### Daily activity
+
+> [!TIP]
+> The heatmap supports truecolor and 256-color terminals. If neither are detected, it falls back to ASCII shading characters. You can toggle ASCII shading characters yourself with `--use-ascii`. If the color is contradictory to your theme, use `--color` and pass an ANSI color name to change the heatmap color. Note, you may need to set `COLORTERM=truecolor` in your shell!
+
+```text
+$ bassoon report activity --test --use-ascii
+                      Daily Activity
+
+    total (tokens) | 2026-05-14 to 2026-09-10 | linear
+
+    May 2026    Jun         Jul         Aug            Sep
+Sun                                              ░░ ▒▒ ██
+Mon                                              ░░ ░░ ▒█
+Tue                                                 ░░ ▒▒
+Wed                                              ░░ ░░ ░░
+Thu                                              ░░ ▓▓ ░░
+Fri                                                 ▒▒
+Sat                                           ░░ ▒▒ ▒▒
+
+Less    ░░ ▒▒ ░█ ▓▓ ▒█ ██ More
+Intensity is relative to this selection. Unfilled squares show zero recorded usage.
 ```
 
 ## Config.toml

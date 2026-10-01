@@ -22,10 +22,10 @@ from usagebassoon.cli.reports._common import (
     load_configured_daily_usage,
     numeric_value,
     parse_width,
-    render_graph,
     resolve_filters,
     sample_daily_usage,
 )
+from usagebassoon.cli.reports._render import render_graph
 
 _METRICS: dict[str, tuple[str, str]] = {
     "cost": ("cost_usd", "Cost (USD)"),

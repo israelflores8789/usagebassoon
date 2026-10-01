@@ -14,19 +14,37 @@ from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
     ReportFilters,
+    ReportRecord,
     format_cache_multiplier,
     format_cost,
     format_cost_per_million,
     format_ms_per_1k_tokens,
     format_tokens,
     load_configured_model_usage,
+    numeric_ratio,
     parse_report_dates,
     parse_width,
-    render_table,
     resolve_filters,
     sample_model_usage,
     sanitize_records,
     truncate_middle,
+)
+from usagebassoon.cli.reports._render import output_format, render_records, render_table
+
+_EXPORT_COLUMNS = (
+    "model",
+    "client",
+    "input_tokens",
+    "output_tokens",
+    "cache_read",
+    "cache_write",
+    "total_tokens",
+    "cost_usd",
+    "cache_multiplier",
+    "cost_per_million",
+    "perf_duration_ms",
+    "perf_timed_tokens",
+    "ms_per_1k_tokens",
 )
 
 
@@ -73,10 +91,18 @@ def models(
         ),
     ] = False,
     save: Annotated[
-        Path | None, typer.Option("--save", help="Write the rendered report as text.")
+        Path | None,
+        typer.Option("--save", help="Save the selected text, JSON, or CSV format."),
     ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Output report rows as JSON.")
+    ] = False,
+    csv_output: Annotated[
+        bool, typer.Option("--csv", help="Output report rows as CSV.")
+    ] = False,
 ) -> None:
     """Render token, cost, and timing totals for each model and client."""
+    format = output_format(json_output, csv_output)
     start, end = parse_report_dates(since, until)
     filters = ReportFilters(
         source=source,
@@ -92,6 +118,14 @@ def models(
         if test
         else load_configured_model_usage(config, filters, since=start, until=end)
     )
+    if format != "text":
+        render_records(
+            sanitize_records(_export_rows(records), sanitize),
+            columns=_EXPORT_COLUMNS,
+            format=format,
+            save=save,
+        )
+        return
     report_width = parse_width(width)
     rows = [
         {
@@ -133,3 +167,23 @@ def models(
         save=save,
         sanitize=sanitize,
     )
+
+
+def _export_rows(records: list[ReportRecord]) -> list[ReportRecord]:
+    """Build numeric report rows with full identifiers and unrounded rates."""
+    rows: list[ReportRecord] = []
+    for record in records:
+        enriched = {
+            **record,
+            "cache_multiplier": numeric_ratio(
+                record.get("cache_read"), record.get("input_tokens")
+            ),
+            "cost_per_million": numeric_ratio(
+                record.get("cost_usd"), record.get("total_tokens"), 1_000_000
+            ),
+            "ms_per_1k_tokens": numeric_ratio(
+                record.get("perf_duration_ms"), record.get("perf_timed_tokens"), 1_000
+            ),
+        }
+        rows.append({column: enriched.get(column) for column in _EXPORT_COLUMNS})
+    return rows

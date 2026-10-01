@@ -15,8 +15,8 @@ from rich.cells import cell_len
 from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
-    ReportColumn,
     ReportFilters,
+    ReportRecord,
     SessionSort,
     format_cache_multiplier,
     format_cost,
@@ -25,16 +25,41 @@ from usagebassoon.cli.reports._common import (
     format_timestamp,
     format_tokens,
     load_configured_session_usage,
+    numeric_ratio,
     numeric_value,
     parse_report_dates,
     parse_width,
-    render_table,
     resolve_filters,
     sample_session_usage,
     sanitize_records,
     truncate_middle,
 )
+from usagebassoon.cli.reports._render import (
+    ReportColumn,
+    output_format,
+    render_records,
+    render_table,
+)
 from usagebassoon.display import sanitize_display
+
+_EXPORT_COLUMNS = (
+    "source_id",
+    "client",
+    "session_id",
+    "model",
+    "raw_output_tokens",
+    "reasoning_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_read",
+    "cache_write",
+    "total_tokens",
+    "cost_usd",
+    "cache_multiplier",
+    "cost_per_million",
+    "created_at",
+    "last_active",
+)
 
 
 def sessions(
@@ -104,11 +129,19 @@ def sessions(
         ),
     ] = False,
     save: Annotated[
-        Path | None, typer.Option("--save", help="Write the rendered report as text.")
+        Path | None,
+        typer.Option("--save", help="Save the selected text, JSON, or CSV format."),
     ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Output report rows as JSON.")
+    ] = False,
+    csv_output: Annotated[
+        bool, typer.Option("--csv", help="Output report rows as CSV.")
+    ] = False,
 ) -> None:
     """Render sortable session usage, optionally split by model."""
-    output_width = parse_width(width)
+    format = output_format(json_output, csv_output)
+    output_width = parse_width(width) if format == "text" else None
     if output_width is not None:
         if output_width < 100:
             raise typer.BadParameter(
@@ -144,6 +177,14 @@ def sessions(
             until=end,
         )
     )
+    if format != "text":
+        render_records(
+            sanitize_records(_export_rows(records), sanitize),
+            columns=_EXPORT_COLUMNS,
+            format=format,
+            save=save,
+        )
+        return
     records = sanitize_records(records, sanitize)
     created = sort == SessionSort.CREATED_AT
     date_only = with_duration and output_width is not None and output_width < 105
@@ -318,3 +359,20 @@ def _format_duration(value: object) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}h{minutes:02d}m{seconds:02d}s"
+
+
+def _export_rows(records: list[ReportRecord]) -> list[ReportRecord]:
+    """Build numeric report rows with full identifiers and unrounded rates."""
+    rows: list[ReportRecord] = []
+    for record in records:
+        enriched = {
+            **record,
+            "cache_multiplier": numeric_ratio(
+                record.get("cache_read"), record.get("input_tokens")
+            ),
+            "cost_per_million": numeric_ratio(
+                record.get("cost_usd"), record.get("total_tokens"), 1_000_000
+            ),
+        }
+        rows.append({column: enriched.get(column) for column in _EXPORT_COLUMNS})
+    return rows

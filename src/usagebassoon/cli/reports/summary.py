@@ -20,10 +20,10 @@ from usagebassoon.cli.reports._common import (
     load_configured_session_usage,
     numeric_value,
     parse_width,
-    render_tables,
     resolve_filters,
     sample_session_usage,
 )
+from usagebassoon.cli.reports._render import render_tables
 
 
 def _model_rows(model_records: list[ReportRecord]) -> list[dict[str, str]]:
