@@ -45,6 +45,7 @@ import pyarrow as pa
 import pytest
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, bigquery_datatransfer
+from google.protobuf.field_mask_pb2 import FieldMask
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
@@ -176,6 +177,97 @@ def _require_live_access() -> None:
         )
 
 
+def _wait_for_compaction_jobs(
+    client: bigquery.Client,
+    dataset_id: str,
+    *,
+    timeout_seconds: float = _LIVE_TEST_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for pending and running dataset queries before destructive cleanup.
+
+    Args:
+        client: Authenticated integration client with its configured location.
+        dataset_id: Dedicated integration dataset to make quiescent.
+        timeout_seconds: Maximum time to wait without mutating any tables.
+
+    Raises:
+        TimeoutError: If background work does not finish within the bound.
+    """
+    project, dataset = dataset_id.split(".")
+    if dataset != _DATASET:
+        raise ValueError("compaction waits require the dedicated integration dataset")
+    location = client.location or _LOCATION
+    deadline = time.monotonic() + timeout_seconds
+    sql = (
+        "SELECT job_id FROM "
+        f"`{project}.region-{location.lower()}.INFORMATION_SCHEMA.JOBS_BY_PROJECT` "
+        "WHERE state IN ('PENDING', 'RUNNING') "
+        "AND (STRPOS(query, @dataset_reference) > 0 "
+        "OR (destination_table.project_id = @project "
+        "AND destination_table.dataset_id = @dataset))"
+    )
+    config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "dataset_reference", "STRING", f"`{dataset_id}."
+            ),
+            bigquery.ScalarQueryParameter("project", "STRING", project),
+            bigquery.ScalarQueryParameter("dataset", "STRING", dataset),
+        ]
+    )
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("background BigQuery jobs did not finish before cleanup")
+        jobs = list(
+            client.query(sql, job_config=config, location=location).result(
+                timeout=remaining
+            )
+        )
+        if not jobs:
+            return
+        print(
+            "Waiting for BigQuery jobs before cleanup: "
+            + ", ".join(str(row["job_id"]) for row in jobs),
+            flush=True,
+        )
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
+
+def _drain_compaction_schedule(
+    client: bigquery_datatransfer.DataTransferServiceClient,
+    name: str,
+    *,
+    timeout_seconds: float = _LIVE_TEST_TIMEOUT_SECONDS,
+) -> None:
+    """Disable new launches and await queued/running transfers before deletion."""
+    client.update_transfer_config(
+        transfer_config=bigquery_datatransfer.TransferConfig(name=name, disabled=True),
+        update_mask=FieldMask(paths=["disabled"]),
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("scheduled compaction did not finish before cleanup")
+        runs = list(
+            client.list_transfer_runs(
+                request=bigquery_datatransfer.ListTransferRunsRequest(
+                    parent=name,
+                    states=[
+                        bigquery_datatransfer.TransferState.PENDING,
+                        bigquery_datatransfer.TransferState.RUNNING,
+                    ],
+                ),
+                timeout=remaining,
+            )
+        )
+        if not runs:
+            return
+        print(f"Waiting for {len(runs)} scheduled compaction run(s)", flush=True)
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
+
 def _reset_test_schema(client: bigquery.Client, dataset_id: str) -> None:
     """Remove leftover relations from the dedicated integration dataset.
 
@@ -183,6 +275,7 @@ def _reset_test_schema(client: bigquery.Client, dataset_id: str) -> None:
         client: Authenticated BigQuery client for the test project.
         dataset_id: Fully qualified dedicated integration dataset identifier.
     """
+    _wait_for_compaction_jobs(client, dataset_id)
     try:
         relations = list(client.list_tables(dataset_id))
     except NotFound:
@@ -269,6 +362,11 @@ def managed_compaction_schedule(
             yield
         finally:
             for name in created:
+                _drain_compaction_schedule(client, name)
+                with bigquery.Client(
+                    project=live_settings.project, location=live_settings.location
+                ) as query_client:
+                    _wait_for_compaction_jobs(query_client, live_settings.dataset_id)
                 client.delete_transfer_config(name=name)
 
 
@@ -298,6 +396,7 @@ def empty_live_warehouse(live_settings: LiveSettings) -> None:
     )
     try:
         with _phase("test row cleanup"):
+            _wait_for_compaction_jobs(backend.client, live_settings.dataset_id)
             backend._wait_for_job(
                 backend.client.query(
                     script,
@@ -398,6 +497,26 @@ def test_live_cli_commands_including_models_report(
     )
     assert export_path.is_file()
     assert SnapshotArchiver.from_config(configuration).list_snapshots()
+
+
+@pytest.mark.usefixtures("managed_compaction_schedule")
+def test_live_doctor_schedule_lifecycle(
+    live_settings: LiveSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drain compaction launched by init before the following test cleans rows."""
+
+    def preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Keep the read/scheduler regression independent of local tokscale."""
+        return ("tokscale",), "4.15.1"
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", preflight)
+    runner = CliRunner()
+    for command in ("init", "doctor"):
+        with _phase("CLI " + command):
+            result = runner.invoke(
+                app, [command, "--config", str(live_settings.config_path)]
+            )
+        assert result.exit_code == 0, plain_cli_output(result.output)
 
 
 def test_live_location_and_credential_errors_are_actionable(
@@ -892,3 +1011,66 @@ def test_live_restore_requires_an_explicit_disposable_reset(
     finally:
         remote.close()
         local.close()
+
+
+def test_live_consistent_read_preserves_state_across_compaction_and_late_append(
+    live_settings: LiveSettings,
+) -> None:
+    """Keep gold/raw joins and doctor ledger reads at the first query's instant."""
+    remote = _backend(live_settings)
+
+    def append_observations() -> None:
+        """Seed fixture observations directly, independent of publication latency."""
+        source_id = str(uuid4())
+        script = (
+            f"INSERT INTO {remote._table_ref('raw_daily_stats')} "
+            "(event_id, source_id, day, client, session_id, model, input_tokens, "
+            "output_tokens, cache_read, cache_write, reasoning, "
+            "total_tokens, collected_at) "
+            "VALUES (GENERATE_UUID(), @source_id, DATE '2026-09-10', "
+            "'test', 'session', "
+            "'model', 10, 20, 0, 0, 0, 30, CURRENT_TIMESTAMP()); "
+            f"INSERT INTO {remote._table_ref('raw_price_versions')} "
+            "(event_id, source_id, day, model, source, price_input_per_token, "
+            "price_output_per_token, collected_at) "
+            "VALUES (GENERATE_UUID(), @source_id, DATE '2026-09-10', 'model', 'test', "
+            "0.001, 0.002, CURRENT_TIMESTAMP()); "
+            f"INSERT INTO {remote._table_ref('collection_ledger')} "
+            "(event_id, source_id, run_id, day, domain, collected_at, "
+            "started_at, finished_at, status) "
+            "VALUES (GENERATE_UUID(), @source_id, GENERATE_UUID(), DATE '2026-09-10', "
+            "'collection', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), "
+            "CURRENT_TIMESTAMP(), 'failed');"
+        )
+        remote._wait_for_job(
+            remote.client.query(
+                script,
+                job_config=remote._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter("source_id", "STRING", source_id)
+                    ]
+                ),
+                location=remote.location,
+            )
+        )
+
+    try:
+        append_observations()
+        usage_sql = (
+            "SELECT source_id, day, client, session_id, model, total_tokens, cost_usd "
+            "FROM daily_cost ORDER BY source_id, day, client, session_id, model"
+        )
+        ledger_sql = "SELECT run_id, status FROM collection_runs ORDER BY run_id"
+        with remote.consistent_read() as read:
+            usage_before = read.query(usage_sql)
+            ledger_before = read.query(ledger_sql)
+            assert usage_before.num_rows == 1
+            assert ledger_before.num_rows == 1
+            _compact(remote)
+            append_observations()
+            assert read.query(usage_sql).equals(usage_before)
+            assert read.query(ledger_sql).equals(ledger_before)
+            assert remote.query(usage_sql).num_rows == 2
+            assert remote.query(ledger_sql).num_rows == 2
+    finally:
+        remote.close()

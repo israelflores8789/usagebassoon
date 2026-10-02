@@ -91,3 +91,27 @@ def test_motherduck_requires_token_before_connecting(
     monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="MOTHERDUCK_TOKEN"):
         MotherDuckBackend("usagebassoon")
+
+
+@pytest.mark.parametrize("backend_type", [DuckDBBackend, MotherDuckBackend])
+def test_transactional_read_session_preserves_snapshot_after_external_commit(
+    backend_type: type[DuckDBBackend] | type[MotherDuckBackend],
+) -> None:
+    """Verify both providers' explicit read scopes with the shared DuckDB engine."""
+    connection_backend = DuckDBBackend(":memory:")
+    # Avoid MotherDuck credentials while exercising its explicit scope implementation.
+    backend = object.__new__(backend_type)
+    backend.connection = connection_backend.connection
+    writer = backend.connection.cursor()
+    try:
+        backend.apply_ddl()
+        backend.query("CREATE TABLE values_at_read (value INTEGER)")
+        backend.query("INSERT INTO values_at_read VALUES (1)")
+        with backend.consistent_read() as read:
+            assert read.query("SELECT * FROM values_at_read").num_rows == 1
+            writer.execute("INSERT INTO values_at_read VALUES (2)")
+            assert read.query("SELECT * FROM values_at_read").num_rows == 1
+        assert backend.query("SELECT * FROM values_at_read").num_rows == 2
+    finally:
+        writer.close()
+        backend.close()

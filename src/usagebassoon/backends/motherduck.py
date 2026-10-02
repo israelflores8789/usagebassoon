@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import override
 from urllib.parse import quote
 
 import duckdb
 import pyarrow as pa
 
+from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import _DuckDBStorage
 
 
@@ -21,6 +24,15 @@ class MotherDuckBackend(_DuckDBStorage):
     MotherDuck uses the DuckDB SQL schema but has distinct credential and URI
     handling, which is kept here rather than in the local DuckDB module.
     """
+
+    @contextmanager
+    @override
+    def consistent_read(self) -> Generator[StorageBackend]:
+        """Pin the remote database before yielding transactional diagnostic reads."""
+        with self.transaction():
+            # Constant queries can execute locally without starting a remote snapshot.
+            self.query("SELECT version FROM schema_marker LIMIT 1")
+            yield self
 
     @property
     @override

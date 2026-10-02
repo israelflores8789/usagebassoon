@@ -23,6 +23,7 @@ from usagebassoon.backends.base import (
     CuratedRenameError,
     CuratedRenameResult,
     SnapshotRead,
+    StorageBackend,
     UpsertResult,
     is_simple_identifier,
 )
@@ -379,6 +380,13 @@ class _DuckDBStorage(AbstractStorageBackend):
 
 class DuckDBBackend(_DuckDBStorage):
     """StorageBackend backed by a local DuckDB database."""
+
+    @contextmanager
+    @override
+    def consistent_read(self) -> Generator[StorageBackend]:
+        """Keep diagnostic queries on the owned connection in one transaction."""
+        with self.transaction():
+            yield self
 
     @property
     @override

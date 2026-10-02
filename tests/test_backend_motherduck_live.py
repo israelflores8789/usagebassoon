@@ -54,6 +54,7 @@ from usagebassoon.backends.base import (
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
 from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
+from usagebassoon.diagnostics import run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
@@ -381,6 +382,87 @@ def test_live_snapshot_reads_one_transaction_state(
             "SELECT count(*) AS n FROM notes WHERE source_id = :source_id",
             {"source_id": source_id},
         ).to_pylist() == [{"n": 1}]
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_live_doctor_keeps_first_query_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclude drift committed after doctor's first query until its next report."""
+    reader = _backend()
+    writer = _backend()
+    source_id = str(uuid4())
+    original_query = reader.query
+    committed = False
+
+    def read_then_commit_drift(
+        sql: str, parameters: Mapping[str, str] | None = None
+    ) -> pa.Table:
+        """Commit through another connection once the diagnostic snapshot exists."""
+        nonlocal committed
+        result = original_query(sql, parameters)
+        if sql == "SELECT 1 AS doctor_ok" and not committed:
+            stamp = datetime.now(UTC)
+            with writer.transaction():
+                writer.append(
+                    "schema_drift_events",
+                    observations(
+                        pa.table(
+                            {
+                                "source_id": [source_id],
+                                "run_id": [str(uuid4())],
+                                "domain": ["models"],
+                                "tokscale_ver": ["4.15.1"],
+                                "drift_key": ["unknown_field:entries[].extra"],
+                                "drift_kind": ["unknown_field"],
+                                "path": ["entries[].extra"],
+                                "detail": ["committed after first doctor query"],
+                                "contract_tokscale_ver": ["4.15.1"],
+                                "created_at": [stamp],
+                                "collected_at": [stamp],
+                                "resolved": [False],
+                                "observation_count": [1],
+                            }
+                        )
+                    ),
+                )
+            committed = True
+        return result
+
+    monkeypatch.setattr(reader, "query", read_then_commit_drift)
+    try:
+        first_report = run_doctor(
+            reader,
+            backend_name="motherduck",
+            database=_DATABASE,
+            snapshot_enabled=False,
+        )
+        assert committed
+        assert first_report.status == "ok", first_report.checks
+        first_drift = next(
+            check for check in first_report.checks if check.name == "schema_drift"
+        )
+        assert first_drift.status == "ok"
+        assert first_drift.message == "no unresolved events"
+        assert reader.query(
+            "SELECT count(*) AS n FROM open_schema_drift_events "
+            "WHERE source_id = :source_id",
+            {"source_id": source_id},
+        ).to_pylist() == [{"n": 1}]
+        next_report = run_doctor(
+            reader,
+            backend_name="motherduck",
+            database=_DATABASE,
+            snapshot_enabled=False,
+        )
+        assert not next_report.errors, next_report.checks
+        next_drift = next(
+            check for check in next_report.checks if check.name == "schema_drift"
+        )
+        assert next_drift.status == "warning"
+        assert next_drift.message == "1 unresolved event(s)"
     finally:
         reader.close()
         writer.close()

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime, timedelta
+from importlib import resources
 from threading import Barrier, Lock
 from types import TracebackType
 from typing import Self, cast, override
@@ -23,8 +24,17 @@ from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from google.oauth2.service_account import Credentials
 from sqlglot import exp
 
-from usagebassoon.backends.bigquery import BigQueryBackend, _schema_from_arrow
+from tests.test_backend_bigquery_live import (
+    _drain_compaction_schedule,
+    _reset_test_schema,
+)
+from usagebassoon.backends.bigquery import (
+    BigQueryBackend,
+    _pinned_query,
+    _schema_from_arrow,
+)
 from usagebassoon.backends.bigquery_compaction import install_compaction
+from usagebassoon.diagnostics import REQUIRED_RELATIONS, run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
 from usagebassoon.persistence import persist_run
@@ -784,3 +794,188 @@ def test_nightly_schedule_create_reuse_and_update(
     client.list_transfer_configs.return_value = [existing, existing]
     with pytest.raises(RuntimeError, match="multiple UsageBassoon"):
         install_compaction(backend)
+
+
+def _views() -> dict[str, str]:
+    """Read canonical view definitions for SQL-generation regression coverage."""
+    statements = sqlglot.parse(
+        resources.files("usagebassoon.sql.bigquery").joinpath("views.sql").read_text(),
+        read="bigquery",
+    )
+    return {
+        statement.this.name: statement.expression.sql(dialect="bigquery")
+        for statement in statements
+        if isinstance(statement, exp.Create) and statement.expression is not None
+    }
+
+
+@pytest.mark.parametrize(
+    "relation",
+    (
+        *REQUIRED_RELATIONS,
+        "open_schema_drift_events",
+        "open_reconciliation_issues",
+        "compaction_backlog",
+    ),
+)
+def test_pinned_diagnostics_expand_every_installed_view_input(relation: str) -> None:
+    """Cover nested gold/raw joins, ledger, debug, and backlog dependencies."""
+    sql = _pinned_query(
+        f"SELECT * FROM {relation}", _views(), "usagebassoon-test.usagebassoon_it"
+    )
+    tree = sqlglot.parse_one(sql, read="bigquery")
+    tables = list(tree.find_all(exp.Table))
+    ctes = {cte.alias for cte in tree.find_all(exp.CTE)}
+    assert tables
+    for table in tables:
+        if table.catalog:
+            assert table.catalog == "usagebassoon-test"
+            assert table.db == "usagebassoon_it"
+            assert table.args.get("version") is not None
+        else:
+            assert table.name in ctes
+    assert "CURRENT_TIMESTAMP" not in sql
+    assert "CURRENT_DATE" not in sql
+    assert "@doctor_read_at" in sql
+
+
+def test_pinned_query_distinguishes_cte_from_same_named_physical_table() -> None:
+    """Only the CTE's actual raw-table input receives time travel."""
+    sql = _pinned_query(
+        "WITH daily_stats AS (SELECT * FROM raw_daily_stats) SELECT * FROM daily_stats",
+        {},
+        "usagebassoon-test.usagebassoon_it",
+    )
+    tree = sqlglot.parse_one(sql, read="bigquery")
+    inputs = {table.name: table for table in tree.find_all(exp.Table)}
+    assert inputs["daily_stats"].args.get("version") is None
+    assert inputs["raw_daily_stats"].args.get("version") is not None
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM daily_stats",
+        "SELECT * FROM missing_view",
+        "SELECT * FROM other.dataset.daily_stats",
+    ],
+)
+def test_pinned_query_fails_closed(sql: str) -> None:
+    """Never silently replace an unavailable or foreign relation with live reads."""
+    with pytest.raises(ValueError):
+        _pinned_query(sql, {}, "usagebassoon-test.usagebassoon_it")
+
+
+def test_bigquery_read_session_uses_first_server_timestamp_without_leaking_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later queries share one timestamp and the original backend stays unpinned."""
+    stamp = datetime(2026, 10, 1, 22, 0, tzinfo=UTC)
+    client = MagicMock(spec=bigquery.Client)
+    job = client.query.return_value
+    job.result.return_value = [
+        {
+            "captured_at": stamp,
+            "views": [
+                {
+                    "table_name": "installed",
+                    "view_definition": "SELECT * FROM daily_stats",
+                }
+            ],
+        }
+    ]
+    backend = BigQueryBackend("usagebassoon-test", "usagebassoon_it", client=client)
+
+    def arrow_result(_job: bigquery.QueryJob) -> pa.Table:
+        """Avoid the transport while recording bound query jobs."""
+        return pa.table({})
+
+    monkeypatch.setattr(backend, "_read_query_arrow", arrow_result)
+    with backend.consistent_read() as read:
+        read.query("SELECT * FROM installed")
+        read.query("SELECT * FROM raw_daily_stats")
+    calls = client.query.call_args_list
+    assert "CURRENT_TIMESTAMP() AS captured_at" in calls[0].args[0]
+    for call in calls[1:]:
+        assert "FOR SYSTEM_TIME AS OF @doctor_read_at" in call.args[0]
+        parameters = call.kwargs["job_config"].query_parameters
+        assert len(parameters) == 1 and parameters[0].value == stamp
+    backend.query("SELECT * FROM daily_stats")
+    assert "FOR SYSTEM_TIME" not in client.query.call_args.args[0]
+
+
+def test_cleanup_waits_for_background_job_before_deleting_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running compactor delays schema removal until its job is terminal."""
+    client = MagicMock(spec=bigquery.Client)
+    client.location = "US"
+    job_results: list[list[dict[str, str]]] = [[{"job_id": "compactor"}], []]
+    client.query.return_value.result.side_effect = job_results
+    table = MagicMock()
+    table.table_type = "TABLE"
+    client.list_tables.return_value = [table]
+    sleeps: list[float] = []
+    monkeypatch.setattr("tests.test_backend_bigquery_live.time.sleep", sleeps.append)
+    _reset_test_schema(client, "usagebassoon-test.usagebassoon_it")
+    assert sleeps and client.query.call_count == 2
+    names = [call[0] for call in client.mock_calls]
+    assert names.index("delete_table") > max(
+        i for i, name in enumerate(names) if name == "query"
+    )
+
+
+def test_cleanup_timeout_leaves_schema_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failure to establish quiescence must never drop or truncate tables."""
+    client = MagicMock(spec=bigquery.Client)
+    client.location = "US"
+    client.query.return_value.result.return_value = [{"job_id": "compactor"}]
+    clock = iter([0.0, 0.0, 601.0, 601.0])
+    monkeypatch.setattr(
+        "tests.test_backend_bigquery_live.time.monotonic", lambda: next(clock)
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr("tests.test_backend_bigquery_live.time.sleep", sleeps.append)
+    with pytest.raises(TimeoutError):
+        _reset_test_schema(client, "usagebassoon-test.usagebassoon_it")
+    client.list_tables.assert_not_called()
+    client.delete_table.assert_not_called()
+
+
+def test_schedule_drain_disables_launches_and_waits_for_pending_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloud transfers can remain queued after the test body has finished."""
+    client = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
+    runs: list[list[bigquery_datatransfer.TransferRun]] = [
+        [
+            bigquery_datatransfer.TransferRun(
+                state=bigquery_datatransfer.TransferState.PENDING
+            )
+        ],
+        [],
+    ]
+    client.list_transfer_runs.side_effect = runs
+    sleeps: list[float] = []
+    monkeypatch.setattr("tests.test_backend_bigquery_live.time.sleep", sleeps.append)
+    _drain_compaction_schedule(client, "projects/1/locations/us/transferConfigs/1")
+    assert sleeps and client.list_transfer_runs.call_count == 2
+    request = client.list_transfer_runs.call_args.kwargs["request"]
+    assert set(request.states) == {
+        bigquery_datatransfer.TransferState.PENDING,
+        bigquery_datatransfer.TransferState.RUNNING,
+    }
+    config = client.update_transfer_config.call_args.kwargs["transfer_config"]
+    assert config.disabled
+
+
+def test_doctor_snapshot_failure_never_falls_back_to_live_reads() -> None:
+    """Report initialization failure instead of silently weakening consistency."""
+    backend = MagicMock(spec=BigQueryBackend)
+    backend.consistent_read.return_value.__enter__.side_effect = RuntimeError(
+        "snapshot unavailable"
+    )
+    report = run_doctor(backend, backend_name="bigquery", database="usagebassoon_it")
+    assert report.status == "error"
+    assert "snapshot unavailable" in report.errors[0].message
+    backend.query.assert_not_called()

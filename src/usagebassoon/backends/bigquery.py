@@ -11,6 +11,7 @@ from collections.abc import Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from copy import copy
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
@@ -37,6 +38,7 @@ from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from google.oauth2 import service_account
 from pandas_gbq.arrow import from_read_rows_response
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
@@ -46,6 +48,7 @@ from usagebassoon.backends.base import (
     CuratedRenameResult,
     PersistenceBatch,
     SnapshotRead,
+    StorageBackend,
     UpsertResult,
     is_simple_identifier,
 )
@@ -68,6 +71,84 @@ _LOCATION_ID = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}\Z")
 _LOG = logging.getLogger("usagebassoon")
 _CONCURRENT_TRANSACTION_MESSAGE = "transaction is aborted due to concurrent update"
 _VIEW_RELATIONS = tuple(STATE_KEYS) + tuple(EVENT_KEYS)
+_READ_TIMESTAMP_PARAMETER = "doctor_read_at"
+
+
+def _pinned_query(sql: str, views: Mapping[str, str], dataset_ref: str) -> str:
+    """Expand installed views and pin their physical inputs and freshness clock.
+
+    Args:
+        sql: Read-only BigQuery query.
+        views: Installed view definitions captured with the read timestamp.
+        dataset_ref: Fully qualified backend dataset.
+
+    Returns:
+        SQL using one timestamp parameter for all physical reads.
+
+    Raises:
+        ValueError: If a query writes, uses foreign tables, or has cyclic views.
+    """
+    project, dataset = dataset_ref.split(".")
+    physical = (
+        set(STATE_KEYS)
+        | {"raw_" + name for name in set(STATE_KEYS) | DEBUG_TABLES}
+        | {
+            "collection_ledger",
+            "compaction_ledger",
+            "schema_marker",
+            "schema_migrations",
+        }
+    )
+
+    def expand(statement: str, ancestors: tuple[str, ...]) -> exp.Query:
+        """Resolve view dependencies without confusing CTEs with base tables."""
+        tree = sqlglot.parse_one(statement, read="bigquery")
+        if not isinstance(tree, exp.Query):
+            raise ValueError("consistent reads require a SELECT query")
+        for scope in traverse_scope(tree):
+            for source in scope.sources.values():
+                if not isinstance(source, exp.Table):
+                    continue
+                if source.catalog not in {"", project} or source.db not in {
+                    "",
+                    dataset,
+                }:
+                    raise ValueError("consistent reads require backend dataset tables")
+                name = source.name
+                if name in views:
+                    if name in ancestors:
+                        raise ValueError(f"cyclic installed view {name!r}")
+                    definition = expand(views[name], (*ancestors, name))
+                    source.replace(definition.subquery(alias=source.alias_or_name))
+                elif name in physical:
+                    source.set("catalog", exp.to_identifier(project, quoted=True))
+                    source.set("db", exp.to_identifier(dataset, quoted=True))
+                    source.set(
+                        "version",
+                        exp.Version(
+                            this="TIMESTAMP",
+                            kind="AS OF",
+                            expression=exp.Parameter(
+                                this=exp.Var(this=_READ_TIMESTAMP_PARAMETER)
+                            ),
+                        ),
+                    )
+                else:
+                    raise ValueError(f"unavailable diagnostic relation {name!r}")
+        return tree
+
+    tree = expand(sql, ())
+
+    def pin_clock(node: exp.Expression) -> exp.Expression:
+        """Keep retention and arrival-age calculations at the same read instant."""
+        stamp = exp.Parameter(this=exp.Var(this=_READ_TIMESTAMP_PARAMETER))
+        if isinstance(node, exp.CurrentTimestamp):
+            return stamp
+        if isinstance(node, exp.CurrentDate):
+            return exp.Date(this=stamp, zone=node.this)
+        return node
+
+    return tree.transform(pin_clock).sql(dialect="bigquery")
 
 
 class _JobTimeout(RuntimeError):
@@ -211,6 +292,8 @@ class BigQueryBackend(AbstractStorageBackend):
                 raise RuntimeError(
                     "BigQuery credentials file could not be loaded"
                 ) from error
+        self._read_at: datetime | None = None
+        self._read_views: dict[str, str] = {}
         self.project = project
         self.dataset = dataset
         self.location = location
@@ -232,6 +315,41 @@ class BigQueryBackend(AbstractStorageBackend):
             raise RuntimeError(
                 "BigQuery authentication failed; configure ADC or credentials_file"
             ) from error
+
+    @contextmanager
+    @override
+    def consistent_read(self) -> Generator[StorageBackend]:
+        """Capture server time and installed views in the first diagnostic query.
+
+        Concurrent workers share a scoped copy, leaving ordinary backend reads
+        unaffected. Transaction-job metadata remains a live operational check.
+        """
+        rows = self._wait_for_job(
+            self.client.query(
+                "SELECT CURRENT_TIMESTAMP() AS captured_at, ARRAY("
+                "SELECT AS STRUCT table_name, view_definition FROM "
+                f"`{self.dataset_ref}.INFORMATION_SCHEMA.VIEWS`) AS views",
+                job_config=self._query_config(),
+                location=self.location,
+            )
+        )
+        row = next(iter(rows))
+        timestamp = row["captured_at"]
+        definitions = row["views"]
+        if not isinstance(timestamp, datetime) or not isinstance(definitions, list):
+            raise RuntimeError("BigQuery did not return diagnostic snapshot metadata")
+        views: dict[str, str] = {}
+        for definition in definitions:
+            if not isinstance(definition, Mapping):
+                raise RuntimeError("BigQuery returned invalid installed view metadata")
+            name, sql = definition.get("table_name"), definition.get("view_definition")
+            if not isinstance(name, str) or not isinstance(sql, str):
+                raise RuntimeError("BigQuery returned invalid installed view metadata")
+            views[name] = sql
+        scoped = copy(self)
+        scoped._read_at = timestamp
+        scoped._read_views = views
+        yield scoped
 
     def _wait_for_job(
         self, job: bigquery.job.QueryJob | bigquery.job.LoadJob
@@ -931,14 +1049,22 @@ class BigQueryBackend(AbstractStorageBackend):
         if invalid:
             raise ValueError(f"invalid BigQuery parameter names: {invalid!r}")
         statement = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"@\1", sql)
+        query_parameters = [
+            bigquery.ScalarQueryParameter(name, "STRING", value)
+            for name, value in bindings.items()
+        ]
+        if self._read_at is not None:
+            if _READ_TIMESTAMP_PARAMETER in bindings:
+                raise ValueError("diagnostic timestamp parameter is reserved")
+            statement = _pinned_query(statement, self._read_views, self.dataset_ref)
+            query_parameters.append(
+                bigquery.ScalarQueryParameter(
+                    _READ_TIMESTAMP_PARAMETER, "TIMESTAMP", self._read_at
+                )
+            )
         job = self.client.query(
             statement,
-            job_config=self._query_config(
-                parameters=[
-                    bigquery.ScalarQueryParameter(name, "STRING", value)
-                    for name, value in bindings.items()
-                ]
-            ),
+            job_config=self._query_config(parameters=query_parameters),
             location=self.location,
         )
         self._wait_for_job(job)

@@ -211,6 +211,14 @@ class StorageBackend(Protocol):
         """Return the safe concurrency limit for independent read queries."""
         ...
 
+    def consistent_read(self) -> AbstractContextManager[StorageBackend]:
+        """Open reads at the first query's snapshot; job metadata stays live.
+
+        The returned backend pins all table reads and freshness calculations to
+        one instant. Callers must finish every worker before leaving the scope.
+        """
+        ...
+
     def apply_ddl(self) -> None:
         """Create the backend's dialect-native schema and views idempotently."""
         ...
@@ -325,6 +333,10 @@ class AbstractStorageBackend(ABC):
     @abstractmethod
     def max_concurrent_queries(self) -> int:
         """Return the safe concurrency limit for independent read queries."""
+
+    @abstractmethod
+    def consistent_read(self) -> AbstractContextManager[StorageBackend]:
+        """Return a scoped backend with one snapshot for all table reads."""
 
     @abstractmethod
     def apply_ddl(self) -> None:
