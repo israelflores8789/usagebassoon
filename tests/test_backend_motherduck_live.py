@@ -15,24 +15,31 @@ Raw developer invocation, with ``MOTHERDUCK_TOKEN`` already set::
 Both live-access and reset variables must equal ``1``; the module resets the
 dedicated database at setup and cleanup. ``MOTHERDUCK_TOKEN`` supplies credentials.
 The test database is fixed to ``usagebassoon_it`` and has no environment override.
+
+Scenarios cover configured credentials/CLI/library access, publication and retries,
+source identity and curation, consistent reads, and portable atomic recovery.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 from sqlglot import exp
+from typer.testing import CliRunner
 
+from tests._cli import plain_cli_output
 from tests._observations import observations
 from tests._sql_parity import (
     assert_view_results_match,
@@ -45,6 +52,8 @@ from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_REPORT_ROWS,
 )
+from usagebassoon.api import connect, query_arrow
+from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import (
     CurrentStateWrite,
     PersistenceBatch,
@@ -53,12 +62,14 @@ from usagebassoon.backends.base import (
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
+from usagebassoon.cli.app import app
 from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
+from usagebassoon.curation import NoteAssignment, TagAssignment, add_tag, set_note
 from usagebassoon.diagnostics import run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
-from usagebassoon.storage_model import SNAPSHOT_TABLES
+from usagebassoon.storage_model import SNAPSHOT_TABLES, STATE_KEYS
 
 pytestmark = [pytest.mark.motherduck_live, pytest.mark.usefixtures("live_settings")]
 
@@ -172,6 +183,19 @@ def _normalized_bundle(
     )
 
 
+def _snapshot_config(settings: LiveSettings, directory: Path, source_id: str) -> Path:
+    """Configure an explicit source and private local archive for a live scenario."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"config-{source_id}.toml"
+    path.write_text(
+        settings.config_path.read_text().replace(
+            f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
+        )
+        + f'\n[snapshots]\nfile_uri = "{directory / "snapshots"}"\n'
+    )
+    return path
+
+
 def _rows_for_source(
     backend: StorageBackend, table: str, source_id: str
 ) -> list[dict[str, object]]:
@@ -220,7 +244,7 @@ def test_live_synthetic_views_match_duckdb() -> None:
 def test_live_batch_matches_duckdb_and_retries_idempotently(
     live_settings: LiveSettings, collection_bundle: CollectionBundle
 ) -> None:
-    """Compare a full remote ingest with DuckDB and retry its run ID."""
+    """Compare inserts, later/stale updates, retained history, and run replay."""
     normalized = _normalized_bundle(collection_bundle, live_settings.source_id)
     configuration = ConfigurationManager(live_settings.config_path).load()
     local = DuckDBBackend(":memory:")
@@ -251,6 +275,127 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             "SELECT count(*) AS n FROM collection_runs WHERE run_id = :run_id",
             {"run_id": normalized.run_id},
         ).to_pylist() == [{"n": 1}]
+
+        later = _normalized_bundle(
+            replace(
+                collection_bundle,
+                started_at=collection_bundle.started_at + timedelta(hours=1),
+                finished_at=collection_bundle.finished_at + timedelta(hours=1),
+            ),
+            live_settings.source_id,
+        )
+        prices = cast(
+            list[dict[str, object]], later.tables["price_versions"].to_pylist()
+        )
+        price = next(row for row in prices if row["price_output_per_token"] is not None)
+        daily_rows = cast(
+            list[dict[str, object]], later.tables["daily_stats"].to_pylist()
+        )
+        daily = next(
+            row
+            for row in daily_rows
+            if row["day"] == price["day"] and row["model"] == price["model"]
+        )
+        sessions = cast(list[dict[str, object]], later.tables["sessions"].to_pylist())
+        session = next(
+            row
+            for row in sessions
+            if row["client"] == daily["client"]
+            and row["session_id"] == daily["session_id"]
+        )
+        targets = {"sessions": session, "daily_stats": daily, "price_versions": price}
+
+        def selected(bundle: NormalizedBundle) -> NormalizedBundle:
+            """Reobserve one key per domain, leaving other historical facts absent."""
+            tables = dict(bundle.tables)
+            for table, target in targets.items():
+                keys = STATE_KEYS[table]
+                records = cast(list[dict[str, object]], tables[table].to_pylist())
+                matching = [
+                    row
+                    for row in records
+                    if all(row[key] == target[key] for key in keys)
+                ]
+                assert len(matching) == 1
+                tables[table] = pa.Table.from_pylist(
+                    matching, schema=tables[table].schema
+                )
+            return replace(bundle, tables=tables)
+
+        later = selected(later)
+        input_tokens, total_tokens = daily["input_tokens"], daily["total_tokens"]
+        output_rate = price["price_output_per_token"]
+        assert isinstance(input_tokens, int) and isinstance(total_tokens, int)
+        assert isinstance(output_rate, float)
+        changed = {
+            "daily_stats": {
+                **daily,
+                "input_tokens": input_tokens + 10,
+                "total_tokens": total_tokens + 10,
+            },
+            "price_versions": {**price, "price_output_per_token": output_rate + 0.0001},
+        }
+        later = replace(
+            later,
+            tables={
+                **later.tables,
+                **{
+                    table: pa.Table.from_pylist(
+                        [row], schema=later.tables[table].schema
+                    )
+                    for table, row in changed.items()
+                },
+            },
+        )
+        first_seen = normalized.tables["sessions"].to_pylist()
+        original_session = next(
+            row
+            for row in first_seen
+            if row["client"] == daily["client"]
+            and row["session_id"] == daily["session_id"]
+        )
+        expected_update = persist_run(local, later)
+        actual_update = persist_with_retries(configuration, later, _LOG)
+        assert actual_update == expected_update
+        assert actual_update.inserted == 0 and actual_update.updated > 0
+        assert (
+            remote.query("SELECT * FROM daily_stats").num_rows
+            == normalized.tables["daily_stats"].num_rows
+        )
+        assert remote.query(
+            "SELECT first_seen_at, last_seen_at FROM sessions "
+            "WHERE source_id = :source_id AND client = :client "
+            "AND session_id = :session_id",
+            {
+                "source_id": live_settings.source_id,
+                "client": str(daily["client"]),
+                "session_id": str(daily["session_id"]),
+            },
+        ).to_pylist() == [
+            {
+                "first_seen_at": original_session["first_seen_at"],
+                "last_seen_at": session["last_seen_at"],
+            }
+        ]
+        for table in (*targets, "daily_cost", "collection_status", "collection_ledger"):
+            assert _rows_for_source(
+                remote, table, live_settings.source_id
+            ) == _rows_for_source(local, table, live_settings.source_id), table
+        before_stale = {
+            table: _rows_for_source(remote, table, live_settings.source_id)
+            for table in targets
+        }
+        stale = selected(_normalized_bundle(collection_bundle, live_settings.source_id))
+        stale_result = persist_with_retries(configuration, stale, _LOG)
+        assert (stale_result.inserted, stale_result.updated) == (0, 0)
+        for table, before in before_stale.items():
+            assert _rows_for_source(remote, table, live_settings.source_id) == before
+        later_retry = persist_with_retries(configuration, later, _LOG)
+        assert (later_retry.inserted, later_retry.updated) == (0, 0)
+        assert remote.query(
+            "SELECT count(*) AS n FROM collection_runs WHERE source_id = :source_id",
+            {"source_id": live_settings.source_id},
+        ).to_pylist() == [{"n": 3}]
     finally:
         local.close()
         remote.close()
@@ -466,3 +611,308 @@ def test_live_doctor_keeps_first_query_snapshot(
     finally:
         reader.close()
         writer.close()
+
+
+def test_live_configured_clients_and_curation_preserve_source_identity(
+    live_settings: LiveSettings,
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise ambient auth, real CLI/library reads, global tags, and scoped notes."""
+    source_a, source_b = live_settings.source_id, str(uuid4())
+    config_a = _snapshot_config(live_settings, tmp_path, source_a)
+    config_b = _snapshot_config(live_settings, tmp_path, source_b)
+    remote = _backend()
+    session = collection_bundle.report_rows[0]
+    target = {"client": session.client, "session_id": session.session_id}
+    options = ("--client", session.client, "--session", session.session_id)
+    tag = "motherduck-" + str(uuid4())
+    renamed, reserved = tag + "-renamed", tag + "-reserved"
+    runner = CliRunner()
+
+    def invoke(*parts: str, config: Path = config_a) -> str:
+        """Open the configured remote backend through the real command path."""
+        result = runner.invoke(app, [*parts, "--config", str(config)])
+        output = plain_cli_output(result.output)
+        assert result.exit_code == 0, f"{parts!r}: {output}\n{result.exception!r}"
+        return output
+
+    def preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Keep backend coverage independent of the installed tokscale binary."""
+        return ("tokscale",), collection_bundle.graph.meta.version
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", preflight)
+    try:
+        persist_run(remote, _normalized_bundle(collection_bundle, source_a))
+        persist_run(remote, _normalized_bundle(collection_bundle, source_b))
+        facts_before = normalized_records(remote.query("SELECT * FROM daily_stats"))
+        assert "Initialized motherduck schema" in invoke("init")
+        assert normalized_records(remote.query("SELECT * FROM daily_stats")) == (
+            facts_before
+        )
+        library = connect(config_a)
+        try:
+            assert isinstance(library, MotherDuckBackend)
+            assert library.query("SELECT current_database() AS name").to_pylist() == [
+                {"name": _DATABASE}
+            ]
+        finally:
+            library.close()
+        result = query_arrow(
+            "SELECT source_id, session_id FROM report_daily_usage "
+            f"WHERE source_id = '{source_a}' LIMIT 1000",
+            config=config_a,
+        )
+        assert result.num_rows > 0
+        assert set(result.column("source_id").to_pylist()) == {source_a}
+        query_path = tmp_path / "query.json"
+        invoke(
+            "query",
+            "report_daily_usage",
+            "--filter",
+            f"source_id={source_a}",
+            "--format",
+            "json",
+            "--output",
+            str(query_path),
+        )
+        queried = cast(list[dict[str, object]], json.loads(query_path.read_text()))
+        assert len(queried) == result.num_rows
+        assert {row["source_id"] for row in queried} == {source_a}
+        assert "Model Token Usage" in invoke("report", "models", "--source", source_a)
+        export_path = tmp_path / "sessions.json"
+        invoke("export", "sessions", str(export_path), "--format", "json", "--raw")
+        exported = cast(list[dict[str, object]], json.loads(export_path.read_text()))
+        assert {row["source_id"] for row in exported} == {source_a, source_b}
+
+        invoke("tag", "add", tag, *options)
+        first_tag = remote.query(
+            "SELECT source_id, created_at FROM current_tags "
+            "WHERE client = :client AND session_id = :session_id AND tag = :tag",
+            {**target, "tag": tag},
+        ).to_pylist()[0]
+        assert first_tag["source_id"] == source_a
+        assert "Already present" in invoke("tag", "add", tag, *options, config=config_b)
+        invoke("tag", "add", reserved, *options)
+        assert "already assigned" in invoke(
+            "tag", "rename", tag, reserved, *options, config=config_b
+        )
+        assert remote.query(
+            "SELECT tag FROM current_tags "
+            "WHERE client = :client AND session_id = :session_id ORDER BY tag",
+            target,
+        ).to_pylist() == [{"tag": tag}, {"tag": reserved}]
+        assert "Renamed" in invoke(
+            "tag", "rename", tag, renamed, *options, config=config_b
+        )
+        assert remote.query(
+            "SELECT source_id, created_at FROM current_tags "
+            "WHERE client = :client AND session_id = :session_id AND tag = :tag",
+            {**target, "tag": renamed},
+        ).to_pylist() == [
+            {"source_id": source_b, "created_at": first_tag["created_at"]}
+        ]
+        assert remote.query(
+            "SELECT source_id FROM session_tags "
+            "WHERE client = :client AND session_id = :session_id AND tag = :tag "
+            "ORDER BY source_id",
+            {**target, "tag": renamed},
+        ).to_pylist() == [
+            {"source_id": value} for value in sorted((source_a, source_b))
+        ]
+
+        invoke("note", "set", "first source note", *options)
+        invoke("note", "set", "second source note", *options, config=config_b)
+        invoke("note", "set", "edited first source note", *options)
+        expected_notes = {
+            source_a: "edited first source note",
+            source_b: "second source note",
+        }
+        assert {
+            row["source_id"]: row["note"]
+            for row in remote.query(
+                "SELECT source_id, note FROM noted_sessions "
+                "WHERE client = :client AND session_id = :session_id",
+                target,
+            ).to_pylist()
+        } == expected_notes
+        invoke("doctor")
+        invoke("audit")
+        invoke("note", "remove", *options)
+        assert remote.query(
+            "SELECT source_id, note FROM session_notes "
+            "WHERE client = :client AND session_id = :session_id",
+            target,
+        ).to_pylist() == [{"source_id": source_b, "note": "second source note"}]
+        invoke("note", "remove", *options, config=config_b)
+        invoke("tag", "remove", renamed, *options)
+        invoke("tag", "remove", reserved, *options, config=config_b)
+        assert (
+            remote.query(
+                "SELECT * FROM session_notes "
+                "WHERE client = :client AND session_id = :session_id",
+                target,
+            ).num_rows
+            == 0
+        )
+        assert (
+            remote.query(
+                "SELECT * FROM session_tags "
+                "WHERE client = :client AND session_id = :session_id",
+                target,
+            ).num_rows
+            == 0
+        )
+        with monkeypatch.context() as missing_credentials:
+            missing_credentials.delenv("MOTHERDUCK_TOKEN")
+            rejected = runner.invoke(
+                app, ["query", "report_summary", "--config", str(config_a)]
+            )
+        assert rejected.exit_code != 0
+        assert "MOTHERDUCK_TOKEN" in plain_cli_output(rejected.output)
+        assert normalized_records(remote.query("SELECT * FROM daily_stats")) == (
+            facts_before
+        )
+    finally:
+        remote.close()
+
+
+def test_live_portable_snapshots_and_atomic_restore(
+    live_settings: LiveSettings,
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify both snapshot directions, restore safety, and transaction rollback."""
+    source_a, source_b = live_settings.source_id, str(uuid4())
+    capture_config = _snapshot_config(live_settings, tmp_path, source_a)
+    restore_config = _snapshot_config(live_settings, tmp_path / "restore", source_a)
+    captured = SnapshotArchiver.from_config(ConfigurationManager(capture_config).load())
+    portable = SnapshotArchiver.from_config(ConfigurationManager(restore_config).load())
+    remote = _backend()
+    local = DuckDBBackend(":memory:")
+    runner = CliRunner()
+    session = collection_bundle.report_rows[0]
+
+    def rows(backend: StorageBackend) -> dict[str, list[dict[str, object]]]:
+        """Compare every persisted fact, curation row, and audit/debug stream."""
+        return {
+            table: normalized_records(backend.query(f'SELECT * FROM "{table}"'))
+            for table in SNAPSHOT_TABLES
+        }
+
+    try:
+        local.apply_ddl()
+        persist_run(remote, _normalized_bundle(collection_bundle, source_a))
+        persist_run(remote, _normalized_bundle(collection_bundle, source_b))
+        add_tag(
+            remote,
+            TagAssignment(
+                "session",
+                source_a,
+                "restored-tag",
+                client=session.client,
+                session_id=session.session_id,
+            ),
+        )
+        for source_id in (source_a, source_b):
+            set_note(
+                remote,
+                NoteAssignment(
+                    source_id,
+                    session.client,
+                    session.session_id,
+                    f"note for {source_id}",
+                ),
+            )
+        stamp = datetime.now(UTC)
+        debug_common: dict[str, list[object]] = {
+            "source_id": [source_a],
+            "run_id": [str(uuid4())],
+            "created_at": [stamp],
+            "collected_at": [stamp],
+            "resolved": [False],
+            "observation_count": [1],
+        }
+        debug_payloads: dict[str, dict[str, list[object]]] = {
+            "schema_drift_events": {
+                "domain": ["models"],
+                "tokscale_ver": [collection_bundle.graph.meta.version],
+                "drift_key": ["unknown_field:entries[].archive"],
+                "drift_kind": ["unknown_field"],
+                "path": ["entries[].archive"],
+                "detail": ["live archive drift"],
+                "contract_tokscale_ver": [collection_bundle.graph.meta.version],
+            },
+            "reconciliation_issues": {
+                "check_name": ["tokens"],
+                "issue_key": ["archive-check"],
+                "message": ["live archive reconciliation"],
+            },
+        }
+        for table, payload in debug_payloads.items():
+            remote.append(table, observations(pa.table({**debug_common, **payload})))
+        expected = rows(remote)
+        snapshot = runner.invoke(app, ["snapshot", "--config", str(capture_config)])
+        assert snapshot.exit_code == 0, plain_cli_output(snapshot.output)
+        assert len(captured.list_snapshots()) == 1
+        captured.restore(local)
+        assert rows(local) == expected
+        assert portable.write(local, run_id=str(uuid4())) is not None
+
+        command = ["restore", "--config", str(restore_config)]
+        declined = runner.invoke(app, command, input="n\n")
+        assert declined.exit_code != 0
+        assert "Aborted" in plain_cli_output(declined.output)
+        assert rows(remote) == expected
+        rejected = runner.invoke(app, command, input="y\n")
+        assert rejected.exit_code != 0
+        assert "restore requires an empty warehouse" in plain_cli_output(
+            rejected.output
+        )
+        assert rows(remote) == expected
+
+        # All test writers are stopped before resetting the dedicated destination.
+        _reset_test_schema(remote)
+        uninitialized = runner.invoke(
+            app, ["query", "report_summary", "--config", str(restore_config)]
+        )
+        assert uninitialized.exit_code != 0
+        assert "not initialized" in plain_cli_output(uninitialized.output)
+        initialized = runner.invoke(app, ["init", "--config", str(restore_config)])
+        assert initialized.exit_code == 0, plain_cli_output(initialized.output)
+        original_append = remote.append
+        written: list[str] = []
+
+        def fail_after_first_table(table: str, data: pa.Table) -> None:
+            """Inject a late failure after a real remote table has been restored."""
+            if written:
+                raise RuntimeError("injected restore failure")
+            original_append(table, data)
+            written.append(table)
+            assert remote.query(f'SELECT * FROM "{table}"').num_rows == data.num_rows
+
+        with monkeypatch.context() as failed_restore:
+            failed_restore.setattr(remote, "append", fail_after_first_table)
+            with pytest.raises(RuntimeError, match="injected restore failure"):
+                portable.restore(remote)
+        assert len(written) == 1
+        assert all(not records for records in rows(remote).values())
+        restored = runner.invoke(app, command, input="y\n")
+        assert restored.exit_code == 0, (
+            f"{plain_cli_output(restored.output)}\n{restored.exception!r}"
+        )
+        assert "Restored" in plain_cli_output(restored.output)
+        assert rows(remote) == expected
+        assert remote.query(
+            "SELECT source_id, note FROM noted_sessions "
+            "WHERE client = :client AND session_id = :session_id ORDER BY source_id",
+            {"client": session.client, "session_id": session.session_id},
+        ).to_pylist() == [
+            {"source_id": value, "note": f"note for {value}"}
+            for value in sorted((source_a, source_b))
+        ]
+    finally:
+        remote.close()
+        local.close()
