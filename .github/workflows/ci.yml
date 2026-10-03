@@ -16,7 +16,7 @@ concurrency:
 # Live tests use fixed, protected, pre-provisioned resources:
 #   BigQuery dataset: usagebassoon_it
 #   MotherDuck database: usagebassoon_it
-#   GCS bucket: gs://usagebassoon-test-snapshots-gen-lang-client-0670612427
+#   GCS bucket: gs://usagebassoon-test-snapshots-usagebassoon-510501
 
 permissions:
   contents: read

@@ -49,7 +49,7 @@ from usagebassoon.storage_model import (
 
 pytestmark = pytest.mark.gcs_live
 
-_TEST_BUCKET = "usagebassoon-test-snapshots-gen-lang-client-0670612427"
+_TEST_BUCKET = "usagebassoon-test-snapshots-usagebassoon-510501"
 
 
 @pytest.fixture
