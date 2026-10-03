@@ -88,6 +88,12 @@ usagebassoon/
 │   ├── curation.py         # User-owned tags and notes
 │   ├── diagnostics.py      # Doctor checks and read-only diagnostic queries
 │   ├── archiver.py         # Portable Parquet snapshot and restore coordination
+│   ├── audit.py            # Importable backend/archive run and source evidence
+│   ├── snapshot/           # Snapshot feature implementation; never imports archiver
+│   │   ├── format.py       # Immutable documents, readers, forward transformations
+│   │   ├── catalog.py      # Shared policy, reservations, retention, pins, repair
+│   │   ├── reader.py       # Global selection and verified file/batch access
+│   │   └── restore.py      # Provider-neutral recovery preparation and restore
 │   ├── config.py           # config.toml manager
 │   ├── scheduling.py       # Scheduled collection execution
 │   ├── api.py              # Public Python query and connection API
@@ -175,7 +181,30 @@ Required-field absence from a required payload is a collection error. Unknown fi
 
 `persistence.py` prepares the normalized batch and delegates publication to the backend: transactional upserts for DuckDB/MotherDuck, or concurrent replay-safe raw appends for BigQuery with the collection ledger written last. Absent later rows are *never* deleted. Dialect-specific SQL views calculate costs and provide report and query data.
 
-`archiver.py` independently coordinates portable Parquet snapshots through a configured `SnapshotBucket`.
+`archiver.py` independently orchestrates the `snapshot/` feature. Backends stream canonical Arrow batches at one consistent read point; the archiver incrementally writes private temporary Parquet files, and `SnapshotBucket` implementations transfer files with bounded memory. `snapshot/reader.py` downloads and validates before `snapshot/restore.py` delegates atomic publication to the backend. `audit.py` reads canonical backend audit views or verified archive batches without depending on the destination backend. `storage_model.py` stays in the core library: it owns canonical Arrow schemas, natural keys, observation ordering, and the portable data version shared by normalization, persistence, curation, compaction, and recovery.
+
+## Snapshot and recovery contracts
+
+A complete snapshot directory contains immutable `manifest.json`, immutable `COMPLETE` evidence, portable mutable `state.json`, and referenced Parquet objects. Relative names and content hashes define portable contents; provider generations are only storage concurrency metadata. Copies retain the same ID and immutable contents. `catalog.json` is a reconstructible discovery index; independent `control.json` owns authoritative retention policy and current owner/expiry/fence. Repair must preserve corrupt evidence and active claims. Retirement tombstones prevent interrupted deletion from being rediscovered.
+
+Archive capture, pinning, deletion, retention, copying, repair, and downloads use fenced destination reservations. Claim all participating destinations in deterministic order before reading; renew through streaming and publication. Never retire unverified lifecycle state or clean active staging based only on its age. Local writes flush and sync files and directories around atomic publication. Partial cross-location publication attempts rollback under still-owned claims; no transaction spans destinations. Retention starts only after every participating copy verifies successfully.
+
+Manual snapshots bypass cadence and pin by default. Scheduled retention counts unpinned recovery points; four successful UTC weekly slots remain independent. Pins are exempt from both. Weekly execution requires an operational scheduler and remains independent of collection success. Archive policy cannot be silently weakened by another instance's configuration. Deletion requires explicit selected locations and the CLI's `DELETE` confirmation; partial cleanup stays retired and retryable.
+
+Recovery validates and, where registered, transforms an archive before changing destination maintenance or application data. Destination emptiness covers unexpected populated tables. Stop every writer; helper checks and receipts do not constitute a collection mutex. `init --restore` provisions with maintenance disabled; restore independently pauses applicable maintenance and awaits running jobs with a bound. The native transaction rechecks emptiness and commits data with a completion receipt. BigQuery restore stages require explicit ownership and expiry metadata; inspection and cleanup never infer ownership from a name prefix. Plain `init` is the recovery operator's explicit maintenance-resumption command.
+
+| Version responsibility | Owner | Meaning |
+|---|---|---|
+| Producing application version | `version.py`, Git tags | Identifies the implementation; follows application SemVer |
+| Portable data-schema version | `storage_model.py` | Canonical tables, field meanings, identities, and values |
+| Snapshot-format version | `snapshot/format.py` | Manifest and file packaging/interpretation |
+| Physical backend schema version/hash | `schema_assets.py` | Installed native SQL, including scheduled compaction |
+
+Persisted data and archives are public compatibility interfaces. Incompatible public changes require a major application release; compatible additions and fixes do not automatically require one. Backend SQL upgrades and portable snapshot transformations are separate registries. Physical upgrades require dedicated native assets, complete per-dialect previous/target hashes, contiguous steps, and migration-ledger recording; baseline DDL is never a fallback migration. Automatic upgrades must preserve deliberate maintenance pauses.
+
+Every publicly released archive format and data contract retains a tested recovery path. Register historical format readers, immutable Arrow contracts, forward transformations into separate files, and semantic validators in `snapshot/format.py`. Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented tested conversion path; a major release does not abandon recoverability. Historical released packages are an emergency fallback. The current prerelease baseline has no legacy migration obligation or invented conversion scripts.
+
+Extend existing test modules before adding files. The recovery drill seeds multiple sources and every logical table, relocates local/GCS copies, removes the copied index, restores into another supported backend, compares independent expected logical data, and resumes collection with preserved source identity. Use only the dedicated `usagebassoon_it` BigQuery dataset/MotherDuck database and the mandated GCS test bucket; execute shared-destination destructive phases serially.
 
 ## Architectural mandates
 

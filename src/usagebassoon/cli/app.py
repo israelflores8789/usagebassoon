@@ -7,7 +7,7 @@ from typing import Annotated
 
 import typer
 
-from usagebassoon.cli.audit import audit
+from usagebassoon.cli.audit import audit_app
 from usagebassoon.cli.collect import collect
 from usagebassoon.cli.doctor import doctor
 from usagebassoon.cli.export import export
@@ -17,7 +17,7 @@ from usagebassoon.cli.query import query
 from usagebassoon.cli.report import report_app
 from usagebassoon.cli.restore import restore
 from usagebassoon.cli.schedule import schedule_app
-from usagebassoon.cli.snapshot import snapshot
+from usagebassoon.cli.snapshot import snapshot_app
 from usagebassoon.cli.tag import tag_app
 from usagebassoon.version import __version__
 
@@ -59,6 +59,6 @@ app.add_typer(note_app, name="note")
 app.command(name="query")(query)
 app.add_typer(report_app, name="report")
 app.command(name="restore")(restore)
-app.command(name="audit")(audit)
-app.command(name="snapshot")(snapshot)
+app.add_typer(audit_app, name="audit")
+app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(schedule_app, name="schedule")

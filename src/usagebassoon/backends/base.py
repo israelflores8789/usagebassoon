@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -87,6 +88,14 @@ class SnapshotRead:
 
     captured_at: datetime
     tables: Mapping[str, pa.Table]
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotStream:
+    """Canonical Arrow batches consumed while a consistent read remains open."""
+
+    captured_at: datetime
+    tables: Mapping[str, Iterable[pa.RecordBatch]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +215,8 @@ def is_simple_identifier(value: str) -> bool:
 class StorageBackend(Protocol):
     """Public capability contract for a dialect-specific Arrow warehouse."""
 
+    dialect: str
+
     @property
     def max_concurrent_queries(self) -> int:
         """Return the safe concurrency limit for independent read queries."""
@@ -229,6 +240,50 @@ class StorageBackend(Protocol):
 
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
         """Read all requested tables from one warehouse state."""
+        ...
+
+    def stream_snapshot(
+        self, tables: Sequence[str]
+    ) -> AbstractContextManager[SnapshotStream]:
+        """Yield canonical Arrow batches pinned to one backend read point."""
+        ...
+
+    def check_restore_empty(self) -> None:
+        """Reject populated managed or unexpected destination base tables."""
+        ...
+
+    def snapshot_provenance(self) -> dict[str, object]:
+        """Return logical provider and physical schema provenance for an archive."""
+        ...
+
+    def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
+        """Disable applicable maintenance and await its bounded completion."""
+        ...
+
+    def configure_maintenance(self, *, enabled: bool) -> str | None:
+        """Provision native maintenance in the explicit initialization path."""
+        ...
+
+    def maintenance_status(self) -> tuple[bool, str] | None:
+        """Inspect scheduled maintenance, or report explicit inapplicability."""
+        ...
+
+    def restore_snapshot(
+        self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        """Atomically restore verified files and record a completion receipt."""
+        ...
+
+    def restore_committed(self, operation_id: str) -> bool:
+        """Resolve an ambiguous restore acknowledgement from its atomic receipt."""
+        ...
+
+    def restore_stages(self) -> list[dict[str, object]]:
+        """Inspect provider-owned restore stages, excluding unrelated tables."""
+        ...
+
+    def cleanup_restore_stages(self) -> None:
+        """Remove only expired, verifiably owned abandoned restore stages."""
         ...
 
     def is_retryable_error(self, error: Exception) -> bool:
@@ -378,6 +433,50 @@ class AbstractStorageBackend(ABC):
     @abstractmethod
     def has_committed_run(self, run_id: str) -> bool:
         """Return whether a complete collection cycle has this run identifier."""
+
+    def stream_snapshot(
+        self, tables: Sequence[str]
+    ) -> AbstractContextManager[SnapshotStream]:
+        """Require a consistent provider streaming read."""
+        raise NotImplementedError
+
+    def check_restore_empty(self) -> None:
+        """Require native inspection of every destination base table."""
+        raise NotImplementedError
+
+    def snapshot_provenance(self) -> dict[str, object]:
+        """Require the provider to identify its physical installation contract."""
+        raise NotImplementedError
+
+    def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
+        """Require explicit provider maintenance behavior."""
+        raise NotImplementedError
+
+    def configure_maintenance(self, *, enabled: bool) -> str | None:
+        """Require explicit provisioning or documented inapplicability."""
+        raise NotImplementedError
+
+    def maintenance_status(self) -> tuple[bool, str] | None:
+        """Require explicit provider maintenance inspection behavior."""
+        raise NotImplementedError
+
+    def restore_snapshot(
+        self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        """Require atomic file-based restore and completion receipts."""
+        raise NotImplementedError
+
+    def restore_committed(self, operation_id: str) -> bool:
+        """Require provider-specific receipt inspection."""
+        raise NotImplementedError
+
+    def restore_stages(self) -> list[dict[str, object]]:
+        """Require explicit provider stage inspection behavior."""
+        raise NotImplementedError
+
+    def cleanup_restore_stages(self) -> None:
+        """Require explicit provider stage cleanup behavior."""
+        raise NotImplementedError
 
     @abstractmethod
     def upsert(

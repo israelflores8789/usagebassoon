@@ -51,7 +51,9 @@ def _snapshot_after_collect(
 ) -> None:
     """Attempt a due optional archive without invalidating persisted usage data."""
     settings = config.snapshots
-    if settings is None or settings.interval is None:
+    if (
+        settings is None or (settings.interval is None and settings.file_uri is None)
+    ) and config.gcs is None:
         return
     backend: StorageBackend | None = None
     try:
@@ -189,11 +191,12 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     try:
         with collection_lock(config):
             summary = _collect_locked(config, run_id, datetime.now(UTC), logger)
-        _snapshot_after_collect(config, run_id, logger)
     except CollectionBusy:
         logger.info("collection skipped because source %s is busy", config.source_id)
         raise
     except Exception:
         logger.exception("collection cycle failed before completion")
         raise
+    finally:
+        _snapshot_after_collect(config, run_id, logger)
     return run_id, summary

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import UUID
 
@@ -19,8 +20,51 @@ from usagebassoon.config import (
     CONFIG_PATH_ENV_VAR,
     ConfigurationManager,
     default_local_database_path,
+    write_initial_config,
 )
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
+
+
+def test_missing_source_identity_is_repaired_atomically_without_reformatting(
+    tmp_path: Path,
+) -> None:
+    """Simultaneous initialization preserves comments and one shared new identity."""
+    path = tmp_path / "config.toml"
+    content = (
+        '# Keep this comment.\nbackend = "duckdb"\n\n[snapshots]\nmax_snapshots = 8\n'
+    )
+    path.write_text(content)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        created = list(executor.map(write_initial_config, [path] * 3))
+    assert created == [False, False, False]
+    text = path.read_text()
+    parsed = tomllib.loads(text)
+    assert str(UUID(parsed["source_id"])) == parsed["source_id"]
+    assert text.endswith(content)
+    assert parsed["snapshots"]["max_snapshots"] == 8
+    assert write_initial_config(path) is False
+    assert path.read_text() == text
+
+
+def test_recovery_init_rejects_data_and_leaves_configuration_identity_intact(
+    tmp_path: Path,
+) -> None:
+    """Recovery initialization never bypasses destination-emptiness validation."""
+    path = tmp_path / "config.toml"
+    database = tmp_path / "destination.duckdb"
+    source = "11111111-1111-4111-8111-111111111111"
+    path.write_text(
+        f'source_id = "{source}"\nbackend = "duckdb"\nlocal_database = "{database}"\n'
+    )
+    backend = DuckDBBackend(database)
+    backend.apply_ddl()
+    backend.connection.execute("CREATE TABLE foreign_data (value INTEGER)")
+    backend.connection.execute("INSERT INTO foreign_data VALUES (7)")
+    backend.close()
+    result = CliRunner().invoke(app, ["init", "--restore", "--config", str(path)])
+    assert result.exit_code != 0
+    assert "restore requires an empty warehouse" in plain_cli_output(result.output)
+    assert tomllib.loads(path.read_text())["source_id"] == source
 
 
 def test_init_creates_source_config_and_local_schema(

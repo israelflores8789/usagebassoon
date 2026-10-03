@@ -130,6 +130,7 @@ lint-yaml:
     exit "$status"
 
 lint-fix:
+    uv run ruff format {{ src_dir }} {{ test_dir }}
     uv run ruff check --fix {{ src_dir }} {{ test_dir }}
     uv run ruff format {{ src_dir }} {{ test_dir }}
 

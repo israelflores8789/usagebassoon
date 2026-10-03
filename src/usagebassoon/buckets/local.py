@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +21,49 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
+
+
+def sync_directory(path: Path) -> None:
+    """Sync directory entries on platforms that support directory descriptors."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def durable_directory(path: Path) -> None:
+    """Persist links for newly created directory ancestors before publishing files."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True)
+        sync_directory(directory.parent)
+        sync_directory(directory)
+
+
+def durable_replace(path: Path, payload: bytes) -> None:
+    """Flush a same-filesystem temporary object before atomic replacement."""
+    durable_directory(path.parent)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -102,7 +147,7 @@ class LocalSnapshotBucket:
         process-shared filesystem lock.
         """
         path = self._path(relative_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        durable_directory(path.parent)
         lock_path = path.with_name(f".{path.name}.lock")
         with _catalog_lock(lock_path):
             current = path.read_bytes() if path.exists() else None
@@ -110,12 +155,7 @@ class LocalSnapshotBucket:
             if actual_version != expected_version:
                 raise SnapshotPreconditionError("local snapshot object version changed")
             raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
-            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-            try:
-                temporary.write_bytes(raw)
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            durable_replace(path, raw)
         version = self._version(raw)
         return SnapshotObject(
             name=validate_relative_name(relative_name),
@@ -134,8 +174,8 @@ class LocalSnapshotBucket:
         """Write one local snapshot object and return its immutable metadata."""
         del content_type
         path = self._path(relative_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
+        durable_directory(path.parent)
+        durable_replace(path, payload)
         version = self._version(payload)
         return SnapshotObject(
             name=validate_relative_name(relative_name),
@@ -149,14 +189,45 @@ class LocalSnapshotBucket:
         del version
         return self._path(relative_name).read_bytes()
 
+    def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Durably publish a file without buffering its complete contents."""
+        target = self._path(relative_name)
+        durable_directory(target.parent)
+        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        try:
+            with path.open("rb") as source, temporary.open("xb") as destination:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
+                destination.flush()
+                os.fsync(destination.fileno())
+            # Hard-link publication is atomic and fails if the identity exists.
+            os.link(temporary, target)
+            sync_directory(target.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+        with target.open("rb") as stream:
+            version = hashlib.file_digest(stream, "sha256").hexdigest()
+        return SnapshotObject(relative_name, version, target.stat().st_size, version)
+
+    def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Copy from one open revision, retaining bounded memory."""
+        with self._path(relative_name).open("rb") as source, path.open("wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        with path.open("rb") as stream:
+            version = hashlib.file_digest(stream, "sha256").hexdigest()
+        return SnapshotObject(relative_name, version, path.stat().st_size, version)
+
     def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
         """Delete a local object only when its content version still matches."""
         path = self._path(relative_name)
         if not path.exists():
             raise SnapshotPreconditionError("local snapshot object is absent")
-        if self._version(path.read_bytes()) != version:
-            raise SnapshotPreconditionError("local snapshot object version changed")
-        path.unlink()
+        with _catalog_lock(path.with_name(f".{path.name}.lock")):
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != version:
+                raise SnapshotPreconditionError("local snapshot object version changed")
+            path.unlink()
+            sync_directory(path.parent)
 
     def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List local snapshot objects below one safe relative prefix."""
@@ -165,16 +236,18 @@ class LocalSnapshotBucket:
         if not root.exists():
             return ()
         objects: list[SnapshotObject] = []
-        for path in root.rglob("*"):
+        for path in (root,) if root.is_file() else root.rglob("*"):
             if not path.is_file():
                 continue
-            raw = path.read_bytes()
-            version = self._version(raw)
+            if path.name.startswith("."):
+                continue
+            with path.open("rb") as stream:
+                version = hashlib.file_digest(stream, "sha256").hexdigest()
             objects.append(
                 SnapshotObject(
                     name=path.relative_to(self._root).as_posix(),
                     version=version,
-                    size=len(raw),
+                    size=path.stat().st_size,
                     checksum=version,
                 )
             )

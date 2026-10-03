@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added permanent collection audits, models payload reconciliation, and diagnostics using append-only outcomes and issue events.
 - Added portable Parquet snapshots and restore for local and remote object store archives, with consistent warehouse capture, catalog-based publication, integrity checks, retention, optional collection-triggered cadence, and restoration into initialized empty destinations across supported backends.
 - Added support for Google Cloud Storage for snapshot archives.
+- Added self-contained disk-backed snapshots, catalog reconstruction, cross-location copying, pinned manual recovery points, independent four-week retention, global latest selection, and explicit archive paths/URIs with warned automatic fallback.
+- Added snapshot listing, inspection, integrity audits and aliases, protected pin/delete operations, source/run audits directly from archives, recovery initialization, scheduled maintenance shutdown, and atomic restore completion receipts.
 - Added scheduled token usage history collection for Linux (systemd), macOS (launchd), and container environments (worker script) with status, log controls, per-operation timeouts, and retries.
 - Added sharing controls: reports are raw by default with `--sanitize`, exports pseudonymize session, workspace, tag, and host fields and redact notes, `doctor` diagnostics output is sanitized by default, and raw queries warn on stderr.
 - Added comprehensive unit test suite that ensures consistent behavior across backends and object stores.

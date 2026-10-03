@@ -8,6 +8,13 @@
 
 
 -- Client collection outcomes and execution-environment metadata, retained forever.
+CREATE TABLE restore_receipts (
+    source_id TEXT NOT NULL,
+    operation_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    committed_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE collection_ledger (
     event_id TEXT NOT NULL,
     run_id TEXT NOT NULL,

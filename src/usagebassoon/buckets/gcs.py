@@ -30,6 +30,18 @@ class GcsBlob(Protocol):
     size: int | None
     crc32c: str | None
 
+    def upload_from_filename(
+        self, filename: str, *, if_generation_match: int, timeout: float
+    ) -> None:
+        """Upload a file through the SDK's resumable transfer."""
+        ...
+
+    def download_to_filename(
+        self, filename: str, *, if_generation_match: int, timeout: float
+    ) -> None:
+        """Download one stable revision through the SDK."""
+        ...
+
     def reload(self, *, timeout: float) -> None:
         """Refresh object metadata."""
         ...
@@ -267,6 +279,33 @@ class GcsSnapshotBucket:
             self._raise_precondition(error)
         return self._object(blob)
 
+    def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Upload a file with create-only generation fencing."""
+        blob = self.bucket.blob(self.key(relative_name))
+        try:
+            blob.upload_from_filename(
+                str(path), if_generation_match=0, timeout=self.timeout_seconds
+            )
+            blob.reload(timeout=self.timeout_seconds)
+        except Exception as error:
+            self._raise_precondition(error)
+        return self._object(blob)
+
+    def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Resolve this location's generation and download that exact revision."""
+        blob = self.bucket.blob(self.key(relative_name))
+        blob.reload(timeout=self.timeout_seconds)
+        ref = self._object(blob)
+        try:
+            blob.download_to_filename(
+                str(path),
+                if_generation_match=self._generation(ref.version),
+                timeout=self.timeout_seconds,
+            )
+        except Exception as error:
+            self._raise_precondition(error, exact_generation=True)
+        return ref
+
     def read_json(
         self, relative_name: str
     ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
@@ -277,7 +316,10 @@ class GcsSnapshotBucket:
             if not blob.exists(timeout=self.timeout_seconds):
                 return None, None
             blob.reload(timeout=self.timeout_seconds)
-            payload = json.loads(blob.download_as_text(timeout=self.timeout_seconds))
+            reference = self._object(blob)
+            payload = json.loads(
+                self.read_bytes(relative_name, version=reference.version)
+            )
         except Exception as error:
             self._raise_precondition(error)
         if not isinstance(payload, dict):

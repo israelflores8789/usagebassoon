@@ -25,6 +25,7 @@ from usagebassoon.cli._colorterm import (
     supports_gradients,
     themed_console,
 )
+from usagebassoon.cli._output import render_records
 from usagebassoon.cli.reports._common import (
     SAMPLE_LATEST_DAY,
     SAMPLE_LOCAL_SOURCE_ID,
@@ -42,7 +43,6 @@ from usagebassoon.cli.reports._common import (
 from usagebassoon.cli.reports._render import (
     DataFormat,
     output_format,
-    render_records,
     write_output,
 )
 

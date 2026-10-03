@@ -10,14 +10,17 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal, cast
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Literal, cast
 
 import pyarrow as pa
 
 from usagebassoon import ingest, reconcile
 from usagebassoon.backends.base import ActiveTransaction, StorageBackend
 from usagebassoon.drift import SchemaDriftRecord, format_drift
+
+if TYPE_CHECKING:
+    from usagebassoon.config import UsageBassoonConfig
 
 CheckStatus = Literal["ok", "warning", "error"]
 type ReadResult[T] = tuple[T | None, Exception | None]
@@ -97,6 +100,104 @@ class DoctorReport:
             Zero when the report meets the requested policy, otherwise one.
         """
         return int(bool(self.errors or (strict and self.warnings)))
+
+
+def maintenance_health(backend: StorageBackend | None) -> DoctorCheck:
+    """Inspect native maintenance without enabling or disabling any schedule."""
+    if backend is None:
+        return DoctorCheck("maintenance", "warning", "backend unavailable")
+    try:
+        result = backend.maintenance_status()
+    except Exception as error:
+        return DoctorCheck("maintenance", "warning", f"inspection unavailable: {error}")
+    if result is None:
+        return DoctorCheck("maintenance", "ok", "scheduled compaction is not required")
+    ready, message = result
+    return DoctorCheck("maintenance", "ok" if ready else "warning", message)
+
+
+def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
+    """Report recovery coverage and last creation verification for each archive."""
+    if configuration is None:
+        return DoctorCheck("backup_freshness", "warning", "configuration unavailable")
+    settings, cloud = configuration.snapshots, configuration.gcs
+    if settings is None and cloud is None:
+        return DoctorCheck(
+            "backup_freshness", "ok", "automatic snapshots are not configured"
+        )
+    from usagebassoon.archiver import SnapshotArchiver
+    from usagebassoon.config import parse_interval
+    from usagebassoon.snapshot.catalog import Catalog
+    from usagebassoon.snapshot.format import timestamp
+
+    details: list[str] = []
+    warnings: list[str] = []
+    try:
+        archiver = SnapshotArchiver.from_config(configuration)
+        rows = archiver.reader.listing()
+        now = datetime.now(UTC)
+        for bucket in archiver.reader.buckets:
+            control, _ = Catalog(bucket).control()
+            last_failure = control.get("last_failure")
+            if isinstance(last_failure, dict):
+                warnings.append(
+                    f"last snapshot attempt failed at {bucket.uri} "
+                    f"({last_failure.get('at')}): {last_failure.get('error')}"
+                )
+            available = [
+                r
+                for r in rows
+                if str(r.get("uri", "")).startswith(bucket.uri + "/")
+                and "error" not in r
+            ]
+            if not available:
+                warnings.append(f"no complete recovery point at {bucket.uri}")
+                continue
+            points = [timestamp(r["captured_at"]) for r in available]
+            verified = [
+                str(r["verified_at"]) for r in available if r.get("verified_at")
+            ]
+            details.append(
+                f"{bucket.uri}: {len(available)} copies, captures "
+                f"{min(points).isoformat()} through {max(points).isoformat()}, "
+                "last creation verification "
+                f"{max(verified) if verified else 'unavailable'}"
+            )
+            weekly = (
+                cloud is not None
+                and bucket.uri == cloud.uri
+                and not cloud.disable_weekly_snapshots
+            ) or (
+                settings is not None
+                and bucket.uri == settings.file_uri
+                and not settings.disable_weekly_snapshots
+            )
+            interval = parse_interval(settings.interval) if settings else None
+            deadlines = [
+                delta
+                for delta in (interval, timedelta(days=7) if weekly else None)
+                if delta is not None
+            ]
+            automatic = [
+                timestamp(r["captured_at"])
+                for r in available
+                if isinstance(r.get("roles"), list)
+                and any(role in r["roles"] for role in ("scheduled", "weekly"))
+            ]
+            if deadlines and (not automatic or now > max(automatic) + min(deadlines)):
+                warnings.append(
+                    f"automatic recovery capture is overdue at {bucket.uri}; "
+                    "check scheduler and operational logs"
+                )
+        warnings.extend(str(r["error"]) for r in rows if "error" in r)
+    except Exception as error:
+        warnings.append(f"archive inspection unavailable: {error}")
+    return DoctorCheck(
+        "backup_freshness",
+        "warning" if warnings else "ok",
+        "; ".join(warnings) if warnings else "recovery points are available",
+        tuple(details),
+    )
 
 
 def _row_value(row: dict[str, object], key: str) -> object | None:

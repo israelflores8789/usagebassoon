@@ -460,16 +460,53 @@ The commands have deliberately different sharing behavior:
 
 ## Snapshots
 
-You can archive or perform routine backup of your token usage data with `bassoon snapshot`.
-`snapshot` writes a catalog-published Parquet restoration archive.
+`bassoon snapshot` creates a private, whole-backend Parquet archive and pins it by default. It preserves all sources, including uncompacted BigQuery observations. A manual request bypasses automatic cadence; use `--no-pin` to make it eligible for rotation. Pins do not change immutable manifests or data hashes.
 
-`bassoon restore --from-snapshot latest` restores only complete published snapshots into an initialized empty warehouse. Snapshots are portable across all backends, including BigQuery to local DuckDB. BigQuery snapshots include deduplicated observations that have not yet compacted. Restore validates the entire archive before writing and fails atomically if destination data is already present. Stop all destination writers before starting restore and keep them stopped until it completes. The CLI requires explicit confirmation (default no); library callers must enforce the same condition because concurrent BigQuery append loads cannot be excluded by the restore transaction.
+```bash
+bassoon snapshot
+bassoon snapshot list                     # YAML, newest capture first; --json available
+bassoon snapshot inspect --from-snapshot SNAPSHOT_ID
+bassoon snapshot audit --from-snapshot SNAPSHOT_ID
+bassoon snapshot pin SNAPSHOT_ID
+bassoon snapshot copy /new/archive --from-snapshot SNAPSHOT_ID
+bassoon snapshot delete SNAPSHOT_ID        # displays all selected copies; type DELETE
+```
 
-Local archives rotate under the platform data directory documented in the configuration section by default. You can configure `snapshots.max_snapshots` and `snapshots.interval` in your `config.toml` to manage how many archives are rotated and how often, respectively. An interval also enables due-only automatic snapshots after collection.
+`bassoon audit snapshot` and `bassoon audit snapshots` are aliases for `bassoon snapshot audit`. Integrity auditing downloads and checks every table without opening a destination backend. `inspect` shows producer version, data-schema version, archive-format version, backend schema version/hash, capture time, and cadence. Listing is discovery, not a full integrity audit. Snapshot commands emit structured YAML or JSON on stdout; notices and warnings go to stderr.
 
-Set `gcs.uri` to use Google Cloud Storage (install with `usagebassoon[gcs]`). You can set both `gcs.uri` and `snapshots.file_uri` to publish the same complete snapshot both locally and remotely.
+Local manual snapshots use the platform data directory by default. Set `snapshots.file_uri` or `gcs.uri` to choose archive destinations; GCS requires `usagebassoon[gcs]`. Both can be configured for redundant publication. `snapshots.interval` enables automatic user-cadence captures, and `snapshots.max_snapshots` limits unpinned scheduled/manual recovery points (default three). Explicitly configured destinations also capture the current UTC calendar-week slot and retain four successful weekly slots. Set `[snapshots].disable_weekly_snapshots = true` or `[gcs].disable_weekly_snapshots = true` to opt out for that destination. Pins are exempt from both retention classes and consume storage until explicitly deleted. Manual captures do not advance automatic cadence clocks.
 
-Snapshot object names are confined to the selected archive and SHA-256 is verified before manifest or Parquet data is parsed. GCS archives use generation-conditional catalog publication and all snapshot archives contain raw private data.
+Weekly checks run on scheduler collection ticks even if collection fails. They require a running systemd/launchd schedule, container worker, cron invocation, or another invocation of collection. A stopped host cannot capture missing weeks: the next invocation serves the current slot. A capture can fulfill scheduled and weekly obligations together; failed publication does not evict older recovery points. Four weekly slots provide roughly three to four weeks of coverage. Use pins for longer-lived recovery points, and stop rotation during an incident. Instances sharing an archive obey its recorded retention policy; reconcile intentional changes with `bassoon snapshot policy --max-snapshots N` and update their configuration to match.
+
+> [!TIP]
+> The portable recovery unit is the complete snapshot directory: `manifest.json`, `COMPLETE`, `state.json`, and every referenced Parquet file. Copy the entire directory with its ID unchanged between local and GCS locations. Preserve `catalog.json` when copying a whole archive; a missing catalog can be discovered from complete directories and rebuilt with `bassoon snapshot repair`. Incomplete and retired directories are excluded. Pin metadata travels in `state.json`; missing or unreadable state never silently authorizes rotation.
+
+> [!NOTE]
+> Snapshots preserve logical state at capture time, not every revision, original agent session files, or original tokscale payloads. Deleted tags and notes are absent from snapshot state. Archives contain original private values and should remain private.
+
+## Restoring your data
+
+Stop all destination writers before recovery: collectors in every environment, systemd/launchd schedules (`bassoon schedule stop`), container workers, cron jobs, and external writers. Keep them stopped through verification. Restore requires an initialized, empty destination and rejects populated unexpected base tables too. Keep the damaged backend and a separate copy of the recovery archive until recovery is verified.
+
+Create a separate recovery configuration pointing to a fresh storage destination and the existing archive. Changing destinations does not change a continuing collection environment's identity: preserve its original `source_id` to avoid collecting the same history into a second namespace. Restore preserves every archived source ID; the recovery configuration's ID does not filter or rewrite the archive. If the ID is lost, inspect `bassoon audit sources --from-snapshot /path/to/SNAPSHOT_ID` or a GCS URI. `bassoon audit runs --from-snapshot …` also works without a working backend or source ID. Host metadata is evidence for identifying a source, not proof of identity.
+
+```bash
+bassoon init --restore --config recovery.toml
+bassoon snapshot list --config recovery.toml
+bassoon snapshot audit --config recovery.toml --from-snapshot SNAPSHOT_ID
+bassoon restore --config recovery.toml --from-snapshot SNAPSHOT_ID
+bassoon doctor --config recovery.toml
+```
+
+`init --restore` repairs a missing source ID, provisions the destination without collecting, checks emptiness, and disables applicable scheduled maintenance. Ordinary `init` also repairs a missing ID while preserving an existing valid ID and configuration settings. GCS configuration alone never installs BigQuery maintenance.
+
+`--from-snapshot` accepts `latest`, an exact snapshot ID, a snapshot directory, its manifest path, a GCS directory/manifest URI, or an archive root. Explicit locations override configured archive roots and use configured GCS credentials or ambient authentication. `latest` chooses the newest capture across all configured locations; an archive root chooses within that root. Corrupt or unavailable automatic candidates produce warnings and fallback to another copy of the same snapshot, then an older capture. Exact IDs/directories fail explicitly on error. The selected URI and capture time are reported. Fallback finishes before destination writes; a destination failure never selects older data.
+
+Restore independently validates the complete archive, checks destination emptiness, asks for confirmation (default No), disables applicable maintenance, and checks emptiness again inside the atomic restore transaction. BigQuery prints and logs “Disabling scheduled compaction...” and briefly waits for active maintenance to finish. Applicable maintenance remains disabled on success or failure. Completion receipts distinguish a committed restore from a lost acknowledgement; owned BigQuery restore stages have expiry metadata and best-effort cleanup. All restore paths stream verified Parquet through Arrow batches or native Parquet staging instead of buffering the whole archive in memory.
+
+Verify table counts, source IDs, date coverage, token components, pricing, tags, and notes against the archive. `doctor` checks operational health, not equality with your chosen recovery point. Then run `bassoon init --config recovery.toml` to resume applicable maintenance, redirect continuing collectors to the recovered destination while preserving their IDs, and restart their schedules. Dispose of the damaged destination at your discretion after verification.
+
+New releases retain registered forward recovery paths for publicly released archive contracts. Application, portable data, archive packaging, and physical SQL installation versions serve distinct purposes. Physical backend changes do not automatically make a portable snapshot incompatible. Preserve original archives throughout recovery; a compatible historical released package is the documented emergency fallback when needed.
 
 ## MotherDuck setup and permissions
 

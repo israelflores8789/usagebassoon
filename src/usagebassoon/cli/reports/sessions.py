@@ -12,6 +12,7 @@ from typing import Annotated
 import typer
 from rich.cells import cell_len
 
+from usagebassoon.cli._output import render_records
 from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
@@ -37,7 +38,6 @@ from usagebassoon.cli.reports._common import (
 from usagebassoon.cli.reports._render import (
     ReportColumn,
     output_format,
-    render_records,
     render_table,
 )
 from usagebassoon.display import sanitize_display

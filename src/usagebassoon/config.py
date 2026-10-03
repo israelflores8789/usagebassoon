@@ -78,8 +78,12 @@ _MOTHERDUCK_CONFIG_KEYS = frozenset({"database"})
 _COLLECTION_CONFIG_KEYS = frozenset({"max_retries", "retry_initial_seconds"})
 _SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes"})
-_GCS_CONFIG_KEYS = frozenset({"uri", "project", "credentials_file", "timeout"})
-_SNAPSHOT_CONFIG_KEYS = frozenset({"file_uri", "max_snapshots", "interval"})
+_GCS_CONFIG_KEYS = frozenset(
+    {"uri", "project", "credentials_file", "timeout", "disable_weekly_snapshots"}
+)
+_SNAPSHOT_CONFIG_KEYS = frozenset(
+    {"file_uri", "max_snapshots", "interval", "disable_weekly_snapshots"}
+)
 DEFAULT_SCHEDULE_INTERVAL = "15m"
 DEFAULT_TOKSCALE_TIMEOUT = "180s"
 DEFAULT_BIGQUERY_TIMEOUT = "120s"
@@ -136,13 +140,35 @@ def write_initial_config(path: Path) -> bool:
         OSError: If the configuration directory cannot be created or written.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = f'source_id = "{uuid4()}"\nbackend = "duckdb"\nspinner = "pong"\n'
-    try:
-        with path.open("x") as handle:
-            handle.write(content)
-    except FileExistsError:
-        return False
-    return True
+    from usagebassoon.buckets.local import _catalog_lock, sync_directory
+
+    with _catalog_lock(path.with_name(f".{path.name}.lock")):
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            payload = tomllib.loads(content)
+            if "source_id" in payload:
+                value = payload["source_id"]
+                if not isinstance(value, str) or _UUID_PATTERN.fullmatch(value) is None:
+                    raise ConfigurationError("source_id must be a UUID")
+                return False
+            _atomic_replace(path, f'source_id = "{uuid4()}"\n' + content)
+            sync_directory(path.parent)
+            return False
+        content = f'source_id = "{uuid4()}"\nbackend = "duckdb"\nspinner = "pong"\n'
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}."
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            sync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +207,7 @@ class GcsConfig:
     project: str
     credentials_file: Path | None = None
     timeout_seconds: float = 60.0
+    disable_weekly_snapshots: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +273,7 @@ class SnapshotConfig:
     file_uri: str | None = None
     max_snapshots: int = 3
     interval: str | None = None
+    disable_weekly_snapshots: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,7 +378,16 @@ def _snapshot_config(value: object | None) -> SnapshotConfig | None:
         file_uri=file_uri,
         max_snapshots=max_snapshots,
         interval=interval,
+        disable_weekly_snapshots=_weekly_disabled(table, "snapshots"),
     )
+
+
+def _weekly_disabled(table: Mapping[str, object], name: str) -> bool:
+    """Validate an archive destination's explicit weekly opt-out."""
+    value = table.get("disable_weekly_snapshots", False)
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"{name}.disable_weekly_snapshots must be a Boolean")
+    return value
 
 
 def parse_interval(value: str | None, *, units: str = "smhd") -> timedelta | None:
@@ -637,6 +674,7 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
         if credentials_file
         else None,
         timeout_seconds=timeout.total_seconds(),
+        disable_weekly_snapshots=_weekly_disabled(table, "gcs"),
     )
 
 

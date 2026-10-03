@@ -7,7 +7,8 @@ This harness excludes provider time travel, progress accounting, and scheduling;
 native BigQuery integration tests exercise those warehouse behaviors.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib import resources
 from typing import cast, override
@@ -19,7 +20,7 @@ from google.cloud import bigquery
 from sqlglot import exp
 
 from tests._sql_parity import statements
-from usagebassoon.backends.base import SnapshotRead
+from usagebassoon.backends.base import SnapshotRead, SnapshotStream
 from usagebassoon.backends.bigquery import BigQueryBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
@@ -123,6 +124,13 @@ class BigQueryReplayBackend(BigQueryBackend):
                 for table in tables
             }
         return SnapshotRead(captured, materialized)
+
+    @contextmanager
+    @override
+    def stream_snapshot(self, tables: Sequence[str]) -> Generator[SnapshotStream]:
+        """Exercise canonical batches through the replay engine's read point."""
+        with self.engine.stream_snapshot(tables) as stream:
+            yield stream
 
     @override
     def close(self) -> None:

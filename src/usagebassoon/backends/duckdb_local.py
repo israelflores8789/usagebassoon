@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from importlib import resources
@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
@@ -23,17 +24,22 @@ from usagebassoon.backends.base import (
     CuratedRenameError,
     CuratedRenameResult,
     SnapshotRead,
+    SnapshotStream,
     StorageBackend,
     UpsertResult,
     is_simple_identifier,
 )
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.schema_assets import (
     RUNTIME_SCHEMA_ASSETS,
     SCHEMA_VERSION,
     schema_hash,
 )
-from usagebassoon.storage_model import DEBUG_TABLES, newer_observation
+from usagebassoon.storage_model import (
+    CANONICAL_TABLE_SCHEMAS,
+    DEBUG_TABLES,
+    SNAPSHOT_TABLES,
+    newer_observation,
+)
 
 
 def _identifier(value: str) -> str:
@@ -152,6 +158,144 @@ class _DuckDBStorage(AbstractStorageBackend):
         return SnapshotRead(
             captured_at=cast(datetime, captured["stamp"]), tables=result
         )
+
+    @contextmanager
+    @override
+    def stream_snapshot(self, tables: Sequence[str]) -> Generator[SnapshotStream]:
+        """Hold one transactional read point while each Arrow stream is consumed.
+
+        Yields:
+            Lazy sequential streams from the owned connection.
+        """
+        from collections.abc import Iterable
+
+        def batches(table: str) -> Iterable[pa.RecordBatch]:
+            """Consume one canonical relation without whole-table materialization."""
+            if table not in SNAPSHOT_TABLES:
+                raise ValueError(f"unsupported snapshot table: {table}")
+            relation = ("replay_" if table in DEBUG_TABLES else "current_") + table
+            schema = CANONICAL_TABLE_SCHEMAS[table]
+            reader = self.connection.execute(
+                f"SELECT * FROM {_identifier(relation)}"
+            ).to_arrow_reader(65536)
+            for batch in reader:
+                yield from (
+                    pa.Table.from_batches([batch])
+                    .select(schema.names)
+                    .cast(schema)
+                    .to_batches(max_chunksize=65536)
+                )
+
+        with self.consistent_read():
+            captured = cast(
+                datetime,
+                self.query("SELECT CURRENT_TIMESTAMP AS stamp").to_pylist()[0]["stamp"],
+            )
+            yield SnapshotStream(captured, {table: batches(table) for table in tables})
+
+    @override
+    def check_restore_empty(self) -> None:
+        """Inspect all destination base tables, including unexpected tables."""
+        names = self.connection.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_catalog = current_database() AND table_type = 'BASE TABLE'"
+        ).fetchall()
+        for namespace, name in names:
+            if namespace == "main" and name in {
+                "schema_marker",
+                "schema_migrations",
+                "restore_receipts",
+            }:
+                continue
+            quoted_schema = '"' + str(namespace).replace('"', '""') + '"'
+            quoted_name = '"' + str(name).replace('"', '""') + '"'
+            if (
+                self.connection.execute(
+                    f"SELECT 1 FROM {quoted_schema}.{quoted_name} LIMIT 1"
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError(
+                    f"restore requires an empty warehouse: populated {namespace}.{name}"
+                )
+
+    @override
+    def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
+        """Transactional upsert storage has no scheduled maintenance to disable."""
+        del notice
+
+    @override
+    def snapshot_provenance(self) -> dict[str, object]:
+        """Identify a DuckDB producer and its installed physical schema."""
+        return {
+            "source_backend": "duckdb",
+            "backend_schema_version": SCHEMA_VERSION,
+            "backend_schema_hash": schema_hash("duckdb"),
+        }
+
+    @override
+    def configure_maintenance(self, *, enabled: bool) -> str | None:
+        """Report inapplicability of maintenance for transactional upsert storage."""
+        del enabled
+        return None
+
+    @override
+    def maintenance_status(self) -> tuple[bool, str] | None:
+        """DuckDB transactional upserts need no scheduled maintenance."""
+        return None
+
+    @override
+    def restore_stages(self) -> list[dict[str, object]]:
+        """DuckDB restores batches directly in a transaction without staging."""
+        return []
+
+    @override
+    def cleanup_restore_stages(self) -> None:
+        """DuckDB creates no persistent restore stages."""
+
+    @override
+    def restore_committed(self, operation_id: str) -> bool:
+        """Read the atomic completion receipt for a restore operation."""
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM restore_receipts WHERE operation_id = ?", [operation_id]
+            ).fetchone()
+            is not None
+        )
+
+    @override
+    def restore_snapshot(
+        self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        """Insert verified canonical batches and a receipt in one transaction."""
+        if set(files) - set(SNAPSHOT_TABLES):
+            raise ValueError("unsupported restore tables")
+        with self.transaction():
+            if self.restore_committed(operation_id):
+                return
+            self.check_restore_empty()
+            for table, path in files.items():
+                for batch in pq.ParquetFile(path).iter_batches(batch_size=65536):
+                    self.append(
+                        table,
+                        pa.Table.from_batches([batch]).cast(
+                            CANONICAL_TABLE_SCHEMAS[table]
+                        ),
+                    )
+            self.connection.execute(
+                "INSERT INTO restore_receipts VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                ["00000000-0000-0000-0000-000000000000", operation_id, snapshot_id],
+            )
+
+    @override
+    def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
+        """Restore importable Arrow tables with the same complete emptiness check."""
+        if set(tables) - set(SNAPSHOT_TABLES):
+            raise ValueError("unsupported restore tables")
+        with self.transaction():
+            self.check_restore_empty()
+            for table, data in tables.items():
+                self.append(table, data)
 
     @override
     def upsert(

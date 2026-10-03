@@ -705,6 +705,8 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
             location: str,
         ) -> _Job:
             """Raise the backend error after all restore assertions are assembled."""
+            if sql.startswith("SELECT 1 FROM") and "restore_receipts" in sql:
+                return _Job()
             assert "restore requires an empty warehouse" in sql
             assert job_config.default_dataset is not None and location == "US"
             raise failure
@@ -717,12 +719,14 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
     )
     staged: list[str] = []
 
-    def load(data: pa.Table, destination: str, *, disposition: str) -> None:
-        """Record the staged snapshot without making a cloud call."""
-        assert data.num_rows > 0 and disposition == "WRITE_TRUNCATE"
-        staged.append(destination)
+    def create(table: bigquery.Table) -> bigquery.Table:
+        """Record ownership and expiry before a verified Parquet load."""
+        assert table.labels["usagebassoon_kind"] == "restore_stage"
+        assert table.expires is not None
+        staged.append(str(table.reference))
+        return table
 
-    monkeypatch.setattr(backend, "_load", load)
+    monkeypatch.setattr(client, "create_table", create, raising=False)
     bundle = normalize(collection_bundle)
     with pytest.raises(exception_type) as raised:
         backend.restore_tables({"daily_stats": bundle.tables["daily_stats"]})
@@ -786,7 +790,7 @@ def test_nightly_schedule_create_reuse_and_update(
     client.update_transfer_config.return_value = existing
     assert install_compaction(backend) == name
     update = client.update_transfer_config.call_args.kwargs
-    assert list(update["update_mask"].paths) == ["params", "schedule"]
+    assert list(update["update_mask"].paths) == ["params", "schedule", "disabled"]
     assert (
         update["transfer_config"].params["query"]
         == request.transfer_config.params["query"]
@@ -794,6 +798,91 @@ def test_nightly_schedule_create_reuse_and_update(
     client.list_transfer_configs.return_value = [existing, existing]
     with pytest.raises(RuntimeError, match="multiple UsageBassoon"):
         install_compaction(backend)
+
+
+def test_recovery_schedule_pause_waits_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disable future runs and wait for active work without changing query contents."""
+    import usagebassoon.backends.bigquery_compaction as module
+
+    backend = _backend()
+    config = bigquery_datatransfer.TransferConfig(
+        name="projects/1/locations/us/transferConfigs/1",
+        display_name=f"UsageBassoon nightly compaction: {backend.dataset}",
+        data_source_id="scheduled_query",
+        disabled=False,
+    )
+    client = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
+    client.__enter__.return_value = client
+    client.list_transfer_configs.return_value = [config]
+    run = bigquery_datatransfer.TransferRun(
+        state=bigquery_datatransfer.TransferState.RUNNING
+    )
+    no_runs: list[bigquery_datatransfer.TransferRun] = []
+    client.list_transfer_runs.side_effect = [[run], no_runs]
+    monkeypatch.setattr(
+        bigquery_datatransfer,
+        "DataTransferServiceClient",
+        MagicMock(return_value=client),
+    )
+
+    def no_sleep(_seconds: float) -> None:
+        """Keep bounded-wait behavior deterministic without wall-clock pauses."""
+
+    monkeypatch.setattr(module.time, "sleep", no_sleep)
+    module.pause_compaction(backend)
+    update = client.update_transfer_config.call_args.kwargs
+    assert update["transfer_config"].disabled is True
+    assert list(update["update_mask"].paths) == ["disabled"]
+    assert client.list_transfer_runs.call_count == 2
+    client.list_transfer_runs.side_effect = None
+    client.list_transfer_runs.return_value = [run]
+    times = iter((0.0, 2.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(times))
+    with pytest.raises(RuntimeError, match="run remains active"):
+        module.pause_compaction(backend, timeout=1.0)
+
+
+def test_bigquery_snapshot_stream_handles_empty_pages() -> None:
+    """Bounded Arrow streams ignore zero-row pages while retaining real observations."""
+    client = MagicMock(spec=bigquery.Client)
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_emulated",
+        client=cast(bigquery.Client, client),
+    )
+    stamp = datetime.now(UTC)
+    timestamp_job = MagicMock(spec=bigquery.QueryJob)
+    timestamp_job.result.return_value = [{"captured_at": stamp}]
+    data_job = MagicMock(spec=bigquery.QueryJob)
+    schema = CANONICAL_TABLE_SCHEMAS["notes"]
+    empty = pa.RecordBatch.from_arrays(
+        [pa.array([], type=field.type) for field in schema], schema=schema
+    )
+    data = pa.Table.from_pylist(
+        [
+            {
+                "event_id": "event",
+                "source_id": "source",
+                "client": "codex",
+                "session_id": "session",
+                "note": "note",
+                "created_at": stamp,
+                "updated_at": stamp,
+                "collected_at": stamp,
+                "op": "upsert",
+            }
+        ],
+        schema=schema,
+    ).to_batches()[0]
+    data_job.result.return_value.to_arrow_iterable.return_value = (empty, data)
+    client.query.side_effect = (timestamp_job, data_job)
+    with backend.stream_snapshot(("notes",)) as captured:
+        assert captured.captured_at == stamp
+        batches = list(captured.tables["notes"])
+        assert len(batches) == 1 and batches[0].num_rows == 1
+        assert batches[0].schema.equals(schema)
 
 
 def _views() -> dict[str, str]:

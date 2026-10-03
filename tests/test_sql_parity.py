@@ -69,7 +69,7 @@ def test_logical_gold_and_event_schemas_match() -> None:
     for table in STATE_KEYS:
         assert _columns(bigquery[table]) == _columns(bigquery["raw_" + table])
     logical = set(STATE_KEYS) | set(EVENT_KEYS)
-    metadata = {"schema_marker", "schema_migrations"}
+    metadata = {"schema_marker", "schema_migrations", "restore_receipts"}
     assert set(duckdb) == logical | metadata
     assert set(bigquery) == (
         set(STATE_KEYS)

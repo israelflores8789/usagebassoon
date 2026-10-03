@@ -47,6 +47,7 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     backend.close()
 
     result = CliRunner().invoke(app, ["snapshot", "--config", str(config)])
+    assert result.exit_code == 0, plain_cli_output(result.output)
 
     snapshot_directory = default_snapshot_directory()
     store = SnapshotStore(str(snapshot_directory))
@@ -58,3 +59,123 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     assert manifest["run_id"] == "manual"
     assert manifest["tables"]["sessions"]["rows"] == 1
     assert set(manifest["tables"]) == set(SNAPSHOT_TABLES)
+
+
+def test_snapshot_management_and_audit_aliases_share_structured_results(
+    tmp_path: Path,
+) -> None:
+    """Use one shared integrity handler without requiring a destination config."""
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(backend, run_id="manual", manual=True, pin=True)
+        assert uri is not None
+    finally:
+        backend.close()
+    runner = CliRunner()
+    for command in (
+        ["snapshot", "audit"],
+        ["audit", "snapshot"],
+        ["audit", "snapshots"],
+    ):
+        result = runner.invoke(
+            app,
+            [
+                *command,
+                "--from-snapshot",
+                uri,
+                "--json",
+                "--config",
+                str(tmp_path / "lost.toml"),
+            ],
+        )
+        assert result.exit_code == 0, plain_cli_output(result.output)
+        payload = json.loads(plain_cli_output(result.stdout))
+        assert payload["id"] == Path(uri).name
+        assert payload["valid"] is True
+        assert set(payload["rows"]) == set(SNAPSHOT_TABLES)
+    listed = runner.invoke(
+        app,
+        [
+            "snapshot",
+            "list",
+            "--from-snapshot",
+            str(tmp_path / "archive"),
+            "--json",
+            "--config",
+            str(tmp_path / "lost.toml"),
+        ],
+    )
+    assert listed.exit_code == 0
+    record = json.loads(plain_cli_output(listed.stdout))["snapshots"][0]
+    assert record["pinned"] is True and record["latest"] is True
+    assert all(
+        record[field] is not None
+        for field in (
+            "usagebassoon_version",
+            "data_schema_version",
+            "snapshot_format_version",
+            "backend_schema_version",
+            "backend_schema_hash",
+        )
+    )
+    refused = runner.invoke(
+        app,
+        ["snapshot", "delete", uri, "--config", str(tmp_path / "lost.toml")],
+        input="no\n",
+    )
+    assert refused.exit_code != 0
+    assert (Path(uri) / "COMPLETE").exists()
+    deleted = runner.invoke(
+        app,
+        ["snapshot", "delete", uri, "--config", str(tmp_path / "lost.toml")],
+        input="DELETE\n",
+    )
+    assert deleted.exit_code == 0, plain_cli_output(deleted.output)
+    assert not (Path(uri) / "COMPLETE").exists()
+
+
+def test_snapshot_delete_does_not_include_copies_created_during_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Delete only the locations displayed before the operator types DELETE."""
+    import typer
+
+    from tests.test_bucket_gcs import MemoryGcsArchive
+    from usagebassoon.buckets.local import LocalSnapshotBucket
+
+    source = DuckDBBackend(":memory:")
+    source.apply_ddl()
+    cloud = MemoryGcsArchive()
+    local = tmp_path / "archive"
+    store = SnapshotStore(
+        file_uri=str(local), gcs_archive_uri=cloud.uri, gcs_bucket=cloud
+    )
+    try:
+        uri = SnapshotStore(str(local)).write(
+            source, run_id="manual", manual=True, pin=True
+        )
+        assert uri is not None
+    finally:
+        source.close()
+    identifier = Path(uri).name
+
+    def confirm(_text: str, *, default: str, show_default: bool) -> str:
+        del default, show_default
+        bucket = LocalSnapshotBucket(str(local))
+        for obj in bucket.list(identifier):
+            cloud.write_bytes(
+                obj.name, bucket.read_bytes(obj.name, version=obj.version)
+            )
+        return "DELETE"
+
+    def archiver_for_config(_config: Path | None) -> SnapshotStore:
+        return store
+
+    monkeypatch.setattr("usagebassoon.cli.snapshot.read_archiver", archiver_for_config)
+    monkeypatch.setattr(typer, "prompt", confirm)
+    result = CliRunner().invoke(app, ["snapshot", "delete", identifier])
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    assert not (local / identifier / "COMPLETE").exists()
+    assert f"archive/{identifier}/COMPLETE" in cloud.objects

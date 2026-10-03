@@ -49,6 +49,43 @@ class SchemaMigration:
 SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = ()
 
 
+def validate_migration_registry() -> None:
+    """Require native, hash-gated upgrades for every supported SQL installation."""
+    dialects = {"duckdb", "bigquery"}
+    versions: set[int] = set()
+    previous = 0
+    for step in SCHEMA_MIGRATIONS:
+        if (
+            step.version in versions
+            or step.version <= previous
+            or step.version > SCHEMA_VERSION
+        ):
+            raise RuntimeError("schema migration versions must be unique and ordered")
+        if any(
+            set(mapping) != dialects
+            for mapping in (step.previous_hashes, step.target_hashes, step.assets)
+        ):
+            raise RuntimeError(
+                "schema migrations must explicitly cover every SQL dialect"
+            )
+        if any(
+            not value
+            for mapping in (step.previous_hashes, step.target_hashes)
+            for value in mapping.values()
+        ):
+            raise RuntimeError("schema migrations require original and target hashes")
+        if any(
+            name in {*RUNTIME_SCHEMA_ASSETS, "compaction.sql"}
+            or not name.endswith(".sql")
+            or ".." in name
+            or name.startswith("/")
+            for name in step.assets.values()
+        ):
+            raise RuntimeError("schema migrations require dedicated forward SQL assets")
+        versions.add(step.version)
+        previous = step.version
+
+
 def pending_migrations(
     version: int, stored_hash: str, dialect: str
 ) -> tuple[SchemaMigration, ...]:
@@ -59,6 +96,7 @@ def pending_migrations(
         if stored_hash != schema_hash(dialect):
             raise RuntimeError("warehouse schema hash does not match this package")
         return ()
+    validate_migration_registry()
     steps = tuple(step for step in SCHEMA_MIGRATIONS if step.version > version)
     for step in steps:
         if step.version != version + 1 or step.previous_hashes[dialect] != stored_hash:

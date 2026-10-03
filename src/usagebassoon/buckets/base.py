@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 type SnapshotVersion = int | str
@@ -70,6 +71,14 @@ class SnapshotBucket(Protocol):
     """
 
     uri: str
+
+    def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Upload a file with bounded memory and create-only semantics."""
+        ...
+
+    def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Download the current stable revision into a file with bounded memory."""
+        ...
 
     def read_json(
         self, relative_name: str

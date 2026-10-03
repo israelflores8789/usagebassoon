@@ -23,7 +23,13 @@ from usagebassoon.config import (
     UsageBassoonConfig,
     open_backend,
 )
-from usagebassoon.diagnostics import DoctorCheck, DoctorReport, run_doctor
+from usagebassoon.diagnostics import (
+    DoctorCheck,
+    DoctorReport,
+    maintenance_health,
+    run_doctor,
+    snapshot_health,
+)
 from usagebassoon.display import sanitize_display
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.logger import configure as configure_logging
@@ -186,6 +192,8 @@ def doctor(
                 DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
                 tokscale_check,
                 *report.checks,
+                maintenance_health(opened),
+                snapshot_health(configuration),
                 schedule_doctor_check(configuration),
             )
         )

@@ -5,12 +5,7 @@
 
 from __future__ import annotations
 
-import csv
-import io
-import json
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -18,8 +13,7 @@ import typer
 from rich import box
 from rich.table import Table
 
-from usagebassoon.cli._output import output_console
-from usagebassoon.cli.reports._common import ReportRecord
+from usagebassoon.cli._output import output_console, write_output
 
 type ReportColumn = tuple[str, Literal["left", "right"]]
 type OutputFormat = Literal["text", "json", "csv"]
@@ -38,67 +32,6 @@ def output_format(json_output: bool, csv_output: bool) -> OutputFormat:
     if json_output:
         return "json"
     return "csv" if csv_output else "text"
-
-
-def write_output(payload: str, *, save: Path | None) -> None:
-    """Write a completed report payload to a UTF-8 file or unstyled stdout."""
-    if save is None:
-        typer.echo(payload, nl=False)
-    else:
-        save.write_text(payload, encoding="utf-8")
-
-
-def _json_default(value: object) -> str | float:
-    """Serialize dates as ISO text and decimal amounts as JSON numbers."""
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    raise TypeError(f"Unsupported report value: {type(value).__name__}")
-
-
-def render_records(
-    rows: list[ReportRecord],
-    *,
-    columns: Sequence[str],
-    format: DataFormat,
-    save: Path | None,
-    json_payload: Mapping[str, object] | None = None,
-) -> None:
-    """Serialize report-owned rows using shared JSON/CSV and destination handling.
-
-    Args:
-        rows: Prepared records, including any requested obfuscation.
-        columns: Stable CSV columns, including for empty results.
-        format: Explicit JSON or CSV selection.
-        save: Optional output path; otherwise write to stdout.
-        json_payload: Optional report-specific JSON envelope instead of a row array.
-    """
-    if format == "json":
-        payload = (
-            json.dumps(
-                rows if json_payload is None else json_payload,
-                default=_json_default,
-                allow_nan=False,
-                indent=2,
-            )
-            + "\n"
-        )
-    else:
-        stream = io.StringIO(newline="")
-        writer = csv.DictWriter(stream, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(
-            {
-                column: value.isoformat()
-                if isinstance(value, (date, datetime))
-                else value
-                for column, value in row.items()
-            }
-            for row in rows
-        )
-        payload = stream.getvalue()
-    write_output(payload, save=save)
 
 
 def render_table(

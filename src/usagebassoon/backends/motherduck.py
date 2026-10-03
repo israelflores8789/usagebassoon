@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import override
 from urllib.parse import quote
@@ -44,6 +44,36 @@ class MotherDuckBackend(_DuckDBStorage):
     def compaction_backlog(self) -> pa.Table | None:
         """Return None because transactional upserts require no compaction."""
         return None
+
+    @override
+    def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
+        """MotherDuck transactional upserts have no scheduled compaction."""
+        del notice
+
+    @override
+    def snapshot_provenance(self) -> dict[str, object]:
+        """Identify MotherDuck while recording its shared DuckDB SQL contract."""
+        return {**super().snapshot_provenance(), "source_backend": "motherduck"}
+
+    @override
+    def configure_maintenance(self, *, enabled: bool) -> str | None:
+        """Explicitly report that MotherDuck requires no native maintenance."""
+        del enabled
+        return None
+
+    @override
+    def maintenance_status(self) -> tuple[bool, str] | None:
+        """MotherDuck transactional upserts need no scheduled maintenance."""
+        return None
+
+    @override
+    def restore_stages(self) -> list[dict[str, object]]:
+        """MotherDuck restores directly in a transaction without staging."""
+        return []
+
+    @override
+    def cleanup_restore_stages(self) -> None:
+        """MotherDuck creates no persistent restore stages."""
 
     def __init__(self, database: str, *, token: str | None = None) -> None:
         """Connect to a MotherDuck database.

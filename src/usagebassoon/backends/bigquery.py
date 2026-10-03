@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from copy import copy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
-from tempfile import TemporaryFile
+from tempfile import TemporaryDirectory, TemporaryFile
 from typing import Protocol, cast, override
 from uuid import uuid4
 
@@ -48,17 +48,18 @@ from usagebassoon.backends.base import (
     CuratedRenameResult,
     PersistenceBatch,
     SnapshotRead,
+    SnapshotStream,
     StorageBackend,
     UpsertResult,
     is_simple_identifier,
 )
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.schema_assets import (
     SCHEMA_VERSION,
     pending_migrations,
     schema_hash,
 )
 from usagebassoon.storage_model import (
+    CANONICAL_TABLE_SCHEMAS,
     DEBUG_TABLES,
     EVENT_KEYS,
     SNAPSHOT_TABLES,
@@ -719,7 +720,7 @@ class BigQueryBackend(AbstractStorageBackend):
             if step.version == SCHEMA_VERSION:
                 from usagebassoon.backends.bigquery_compaction import install_compaction
 
-                install_compaction(self)
+                install_compaction(self, enabled=None)
             marker.labels = {
                 **labels,
                 "usagebassoon_schema_version": str(step.version),
@@ -727,9 +728,8 @@ class BigQueryBackend(AbstractStorageBackend):
             }
             self.client.update_table(marker, ["labels"])
 
-    @override
-    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
-        """Materialize gold and the deduplicated raw tail at one warehouse instant."""
+    def _snapshot_stream(self, tables: Sequence[str]) -> SnapshotStream:
+        """Pin canonical gold and raw query streams to one warehouse instant."""
         timestamp = next(
             iter(
                 self._wait_for_job(
@@ -748,7 +748,7 @@ class BigQueryBackend(AbstractStorageBackend):
             .joinpath("views.sql")
             .read_text()
         )
-        result: dict[str, pa.Table] = {}
+        result: dict[str, Iterable[pa.RecordBatch]] = {}
         for table in tables:
             if table not in SNAPSHOT_TABLES:
                 raise ValueError(f"unsupported snapshot table {table!r}")
@@ -801,83 +801,287 @@ class BigQueryBackend(AbstractStorageBackend):
             )
             self._wait_for_job(job)
             schema = CANONICAL_TABLE_SCHEMAS[table]
-            result[table] = (
-                self._read_query_arrow(job).select(schema.names).cast(schema)
-            )
-        return SnapshotRead(captured_at=timestamp, tables=result)
+
+            def batches(
+                query_job: bigquery.QueryJob = job, canonical: pa.Schema = schema
+            ) -> Iterable[pa.RecordBatch]:
+                """Read bounded result pages as canonical Arrow batches."""
+                rows = query_job.result(timeout=self.timeout_seconds, page_size=65536)
+                for batch in rows.to_arrow_iterable(
+                    max_queue_size=1, max_stream_count=1
+                ):
+                    yield from (
+                        pa.Table.from_batches([batch])
+                        .select(canonical.names)
+                        .cast(canonical)
+                        .to_batches(max_chunksize=65536)
+                    )
+
+            result[table] = batches()
+        return SnapshotStream(captured_at=timestamp, tables=result)
+
+    @contextmanager
+    @override
+    def stream_snapshot(self, tables: Sequence[str]) -> Generator[SnapshotStream]:
+        """Yield streams pinned to the same BigQuery time-travel timestamp.
+
+        Yields:
+            Canonical Arrow batch streams.
+        """
+        yield self._snapshot_stream(tables)
 
     @override
-    def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
-        """Assert destination emptiness and restore staged gold in one transaction."""
-        unknown = set(tables) - set(SNAPSHOT_TABLES)
-        if unknown:
-            raise ValueError(f"unsupported restore tables: {sorted(unknown)}")
-        restore_id = str(uuid4())
-        stages: dict[str, str] = {}
-        try:
-            for table, data in tables.items():
-                if not data.num_rows:
-                    continue
-                stage = self._stage_id(table, restore_id)
-                stages[table] = stage
-                schema = CANONICAL_TABLE_SCHEMAS[table]
-                self._load(
-                    data.select(schema.names).cast(schema),
-                    stage,
-                    disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
+        """Materialize a consistent read for callers explicitly requesting tables."""
+        with self.stream_snapshot(tables) as stream:
+            result = {
+                name: pa.Table.from_batches(
+                    list(batches), schema=CANONICAL_TABLE_SCHEMAS[name]
                 )
-            statements = ["BEGIN TRANSACTION;"]
-            statements.append(
-                "UPDATE compaction_ledger SET compacted_at = CURRENT_TIMESTAMP() "
-                "WHERE domain = '__lock__';"
+                for name, batches in stream.tables.items()
+            }
+            return SnapshotRead(stream.captured_at, result)
+
+    @override
+    def configure_maintenance(self, *, enabled: bool) -> str | None:
+        """Provision the native maintenance schedule in the requested state."""
+        from usagebassoon.backends.bigquery_compaction import install_compaction
+
+        return install_compaction(self, enabled=enabled)
+
+    @override
+    def snapshot_provenance(self) -> dict[str, object]:
+        """Identify BigQuery and its installed scheduled-SQL contract."""
+        return {
+            "source_backend": "bigquery",
+            "backend_schema_version": SCHEMA_VERSION,
+            "backend_schema_hash": schema_hash("bigquery"),
+        }
+
+    @override
+    def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
+        """Disable scheduled compaction and wait briefly for existing runs."""
+        from usagebassoon.backends.bigquery_compaction import pause_compaction
+
+        if notice:
+            notice("Disabling scheduled compaction...")
+        pause_compaction(self, timeout=min(60.0, self.timeout_seconds))
+
+    @override
+    def maintenance_status(self) -> tuple[bool, str] | None:
+        """Inspect native schedule state through the authorized lazy SDK path."""
+        from usagebassoon.backends.bigquery_compaction import compaction_status
+
+        return compaction_status(self)
+
+    @override
+    def check_restore_empty(self) -> None:
+        """Reject populated gold, raw, progress, and unexpected base tables."""
+        for item in self.client.list_tables(self.dataset_ref):
+            if item.table_type == "VIEW" or item.table_id in {
+                "schema_marker",
+                "schema_migrations",
+                "restore_receipts",
+            }:
+                continue
+            predicate = (
+                " WHERE domain <> '__lock__'"
+                if item.table_id == "compaction_ledger"
+                else ""
             )
-            statements.append(
-                "ASSERT (SELECT COUNT(*) FROM compaction_ledger "
-                "WHERE domain = '__lock__') = 1 "
-                "AS 'restore control row is missing';"
-            )
-            # Include both gold and bronze, diagnostics, progress, and foreign tables.
-            # The schema/control bootstrap is metadata and deliberately exempt.
-            for item in self.client.list_tables(self.dataset_ref):
-                if (
-                    item.table_type == "VIEW"
-                    or item.full_table_id.replace(":", ".") in stages.values()
-                ):
-                    continue
-                name = item.table_id
-                if name in {"schema_migrations", "schema_marker"}:
-                    continue
-                predicate = (
-                    " WHERE domain <> '__lock__'" if name == "compaction_ledger" else ""
-                )
-                statements.append(
-                    "ASSERT NOT EXISTS(SELECT 1 FROM "
-                    f"{self._table_ref(name)}{predicate}) "
-                    "AS 'restore requires an empty warehouse';"
-                )
-            for table, stage in stages.items():
-                destination = "raw_" + table if table in DEBUG_TABLES else table
-                columns = ", ".join(
-                    self._column(name) for name in CANONICAL_TABLE_SCHEMAS[table].names
-                )
-                statements.append(
-                    f"INSERT INTO {self._table_ref(destination)} ({columns}) "
-                    f"SELECT {columns} FROM {f'`{stage}`'};"
-                )
-            statements.append("COMMIT TRANSACTION;")
-            self._wait_for_job(
+            rows = self._wait_for_job(
                 self.client.query(
-                    "\n".join(statements),
+                    f"SELECT 1 FROM {self._table_ref(item.table_id)}{predicate} "
+                    "LIMIT 1",
                     job_config=self._query_config(),
                     location=self.location,
                 )
             )
+            if next(iter(rows), None) is not None:
+                raise ValueError("restore requires an empty warehouse")
+
+    @override
+    def restore_committed(self, operation_id: str) -> bool:
+        """Resolve restore completion from the receipt committed with its rows."""
+        rows = self._wait_for_job(
+            self.client.query(
+                f"SELECT 1 FROM {self._table_ref('restore_receipts')} "
+                "WHERE operation_id = @operation_id LIMIT 1",
+                job_config=self._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "operation_id", "STRING", operation_id
+                        )
+                    ]
+                ),
+                location=self.location,
+            )
+        )
+        return next(iter(rows), None) is not None
+
+    @override
+    def restore_stages(self) -> list[dict[str, object]]:
+        """Inspect only label-owned restore stages, including their expiry."""
+        result: list[dict[str, object]] = []
+        for item in self.client.list_tables(self.dataset_ref):
+            table = self.client.get_table(item.reference)
+            labels = table.labels or {}
+            if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
+                "usagebassoon_restore"
+            ):
+                result.append(
+                    {
+                        "table": str(table.reference),
+                        "operation_id": labels["usagebassoon_restore"],
+                        "expires_at": table.expires,
+                    }
+                )
+        return result
+
+    @override
+    def cleanup_restore_stages(self) -> None:
+        """Remove only expired label-owned stages after checking operation status."""
+        for stage in self.restore_stages():
+            expires = stage["expires_at"]
+            operation = stage["operation_id"]
+            if (
+                isinstance(expires, datetime)
+                and isinstance(operation, str)
+                and expires <= datetime.now(UTC)
+            ):
+                self.restore_committed(operation)
+                self.client.delete_table(str(stage["table"]), not_found_ok=True)
+
+    @override
+    def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
+        """Restore library-owned Arrow data through the verified file path."""
+        with TemporaryDirectory(prefix="usagebassoon-restore-") as temporary:
+            files: dict[str, Path] = {}
+            for table, data in tables.items():
+                if table not in SNAPSHOT_TABLES:
+                    raise ValueError(f"unsupported restore table: {table}")
+                if data.num_rows:
+                    files[table] = Path(temporary) / f"{table}.parquet"
+                    pq.write_table(data, files[table])
+            self.restore_snapshot(
+                files, operation_id=str(uuid4()), snapshot_id="library"
+            )
+
+    @override
+    def restore_snapshot(
+        self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        """Stage verified Parquet then publish gold and the receipt atomically."""
+        if set(files) - set(SNAPSHOT_TABLES):
+            raise ValueError("unsupported restore tables")
+        if self.restore_committed(operation_id):
+            return
+        stages: dict[str, str] = {}
+        try:
+            for table, path in files.items():
+                stage = self._stage_id(table, operation_id)
+                schema = CANONICAL_TABLE_SCHEMAS[table]
+                owned = bigquery.Table(
+                    stage,
+                    schema=_schema_from_arrow(pa.Table.from_batches([], schema=schema)),
+                )
+                owned.labels = {
+                    "usagebassoon_kind": "restore_stage",
+                    "usagebassoon_restore": operation_id,
+                }
+                owned.expires = datetime.now(UTC) + timedelta(days=1)
+                self.client.create_table(owned)
+                stages[table] = stage
+                options = bigquery.ParquetOptions()
+                options.enable_list_inference = True
+                with path.open("rb") as payload:
+                    self._wait_for_job(
+                        self.client.load_table_from_file(
+                            payload,
+                            stage,
+                            job_config=bigquery.LoadJobConfig(
+                                source_format=bigquery.SourceFormat.PARQUET,
+                                parquet_options=options,
+                                schema=owned.schema,
+                                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                                create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
+                            ),
+                            location=self.location,
+                        )
+                    )
+            self._commit_restore(stages, operation_id, snapshot_id)
         except BadRequest as error:
             if "restore requires an empty warehouse" in str(error):
                 raise ValueError("restore requires an empty warehouse") from error
             raise
         finally:
             self._delete_stages(tuple(stages.values()))
+
+    def _commit_restore(
+        self, stages: Mapping[str, str], operation_id: str, snapshot_id: str
+    ) -> None:
+        """Recheck emptiness and commit state with its unambiguous receipt."""
+        statements = ["BEGIN TRANSACTION;"]
+        statements.append(
+            "UPDATE compaction_ledger SET compacted_at = CURRENT_TIMESTAMP() "
+            "WHERE domain = '__lock__';"
+        )
+        statements.append(
+            "ASSERT (SELECT COUNT(*) FROM compaction_ledger "
+            "WHERE domain = '__lock__') = 1 "
+            "AS 'restore control row is missing';"
+        )
+        # Include both gold and bronze, diagnostics, progress, and foreign tables.
+        # The schema/control bootstrap is metadata and deliberately exempt.
+        for item in self.client.list_tables(self.dataset_ref):
+            if (
+                item.table_type == "VIEW"
+                or item.full_table_id.replace(":", ".") in stages.values()
+            ):
+                continue
+            name = item.table_id
+            if name in {"schema_migrations", "schema_marker", "restore_receipts"}:
+                continue
+            predicate = (
+                " WHERE domain <> '__lock__'" if name == "compaction_ledger" else ""
+            )
+            statements.append(
+                "ASSERT NOT EXISTS(SELECT 1 FROM "
+                f"{self._table_ref(name)}{predicate}) "
+                "AS 'restore requires an empty warehouse';"
+            )
+        for table, stage in stages.items():
+            destination = "raw_" + table if table in DEBUG_TABLES else table
+            columns = ", ".join(
+                self._column(name) for name in CANONICAL_TABLE_SCHEMAS[table].names
+            )
+            statements.append(
+                f"INSERT INTO {self._table_ref(destination)} ({columns}) "
+                f"SELECT {columns} FROM {f'`{stage}`'};"
+            )
+        statements.append(
+            f"INSERT INTO {self._table_ref('restore_receipts')} "
+            "(source_id, operation_id, snapshot_id, committed_at) VALUES "
+            "('00000000-0000-0000-0000-000000000000', "
+            "@operation_id, @snapshot_id, CURRENT_TIMESTAMP());"
+        )
+        statements.append("COMMIT TRANSACTION;")
+        self._wait_for_job(
+            self.client.query(
+                "\n".join(statements),
+                job_config=self._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "operation_id", "STRING", operation_id
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "snapshot_id", "STRING", snapshot_id
+                        ),
+                    ]
+                ),
+                location=self.location,
+            )
+        )
 
     def _load(
         self,

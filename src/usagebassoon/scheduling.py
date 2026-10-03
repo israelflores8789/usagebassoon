@@ -796,8 +796,14 @@ def run_worker(
     interval = parse_interval(configuration.schedule.interval)
     if interval is None:
         raise SchedulingError("schedule.interval must be positive")
-    preflight_tokscale(configuration)
     logger = configure_logging(configuration.logging)
+    try:
+        preflight_tokscale(configuration)
+    except RuntimeError:
+        logger.exception(
+            "tokscale preflight failed; worker will retry collection "
+            "and continue independent snapshot checks"
+        )
     logger.info("worker configuration is fixed at startup; restart after file changes")
     stop_requested = Event()
 

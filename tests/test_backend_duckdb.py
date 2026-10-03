@@ -32,7 +32,11 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
             .column("table_name")
             .to_pylist()
         )
-        assert tables == set(SNAPSHOT_TABLES) | {"schema_marker", "schema_migrations"}
+        assert tables == set(SNAPSHOT_TABLES) | {
+            "schema_marker",
+            "schema_migrations",
+            "restore_receipts",
+        }
     finally:
         backend.close()
 

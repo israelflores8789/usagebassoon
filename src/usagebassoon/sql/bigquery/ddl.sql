@@ -1,6 +1,13 @@
 -- SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 -- SPDX-License-Identifier: AGPL-3.0-only
 
+CREATE TABLE IF NOT EXISTS restore_receipts (
+    source_id STRING NOT NULL,
+    operation_id STRING NOT NULL,
+    snapshot_id STRING NOT NULL,
+    committed_at TIMESTAMP NOT NULL
+);
+
 -- Permanent gold state shares the DuckDB logical schema.
 CREATE TABLE sessions (
     event_id STRING NOT NULL,

@@ -49,6 +49,7 @@ from google.protobuf.field_mask_pb2 import FieldMask
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
+from tests._snapshot_fakes import seed_recovery_data
 from tests._sql_parity import normalized_records, seed_synthetic_data, view_names
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.bigquery import BigQueryBackend
@@ -265,7 +266,7 @@ def _drain_compaction_schedule(
         if not runs:
             return
         print(f"Waiting for {len(runs)} scheduled compaction run(s)", flush=True)
-        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        time.sleep(min(10.0, max(0.0, deadline - time.monotonic())))
 
 
 def _reset_test_schema(client: bigquery.Client, dataset_id: str) -> None:
@@ -348,9 +349,11 @@ def managed_compaction_schedule(
         }
         created: set[str] = set()
 
-        def install(backend: BigQueryBackendCompaction) -> str:
+        def install(
+            backend: BigQueryBackendCompaction, *, enabled: bool | None = True
+        ) -> str:
             """Run real provisioning and track any newly created configuration."""
-            name = install_compaction(backend)
+            name = install_compaction(backend, enabled=enabled)
             if name not in existing:
                 created.add(name)
             return name
@@ -488,7 +491,7 @@ def test_live_cli_commands_including_models_report(
         session.session_id,
     )
     invoke("doctor")
-    invoke("audit")
+    invoke("audit", "runs")
     invoke("snapshot")
     invoke("tag", "rename", tag, tag + "-renamed", "--client", session.client)
     invoke("tag", "remove", tag + "-renamed", "--client", session.client)
@@ -943,6 +946,7 @@ def test_live_global_tags_and_source_scoped_notes_survive_compaction_and_snapsho
         local.close()
 
 
+@pytest.mark.usefixtures("managed_compaction_schedule")
 def test_live_restore_requires_an_explicit_disposable_reset(
     live_settings: LiveSettings,
     collection_bundle: CollectionBundle,
@@ -962,18 +966,21 @@ def test_live_restore_requires_an_explicit_disposable_reset(
     command = ["restore", "--config", str(config_path)]
     parameters = {"source_id": source_id}
     try:
-        persist_run(local, bundle)
+        sources = (source_id, str(uuid4()))
+        expected = seed_recovery_data(local, collection_bundle, sources)
         persist_run(remote, bundle)
-        assert archive.write(local, run_id=bundle.run_id) is not None
+        captured = archive.write(local, run_id=bundle.run_id, manual=True, pin=True)
+        assert captured is not None
+        relocated_root = tmp_path / "relocated"
+        copied = archive.copy(captured, str(relocated_root))
+        (relocated_root / "catalog.json").unlink()
+        command.extend(["--from-snapshot", copied])
         before = normalized_records(
             remote.query(
                 "SELECT * FROM current_daily_stats WHERE source_id = :source_id",
                 parameters,
             )
         )
-        declined = runner.invoke(app, command, input="n\n")
-        assert declined.exit_code != 0
-        assert "Aborted" in plain_cli_output(declined.output)
         with _phase("populated BigQuery CLI restore rejection"):
             rejected = runner.invoke(app, command, input="y\n")
         assert rejected.exit_code != 0
@@ -992,22 +999,41 @@ def test_live_restore_requires_an_explicit_disposable_reset(
         with _phase("explicit disposable schema reset"):
             _reset_test_schema(remote.client, remote.dataset_ref)
             remote.apply_ddl()
+        initialized = runner.invoke(
+            app, ["init", "--restore", "--config", str(config_path)]
+        )
+        assert initialized.exit_code == 0, plain_cli_output(initialized.output)
+        state = remote.maintenance_status()
+        assert state is not None and not state[0]
+        initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+        assert initialized.exit_code == 0, plain_cli_output(initialized.output)
+        state = remote.maintenance_status()
+        assert state is not None and state[0]
+        declined = runner.invoke(app, command, input="n\n")
+        assert declined.exit_code != 0
+        assert "Aborted" in plain_cli_output(declined.output)
         with _phase("BigQuery CLI restore"):
             restored = runner.invoke(app, command, input="y\n")
         assert restored.exit_code == 0, (
             f"{plain_cli_output(restored.output)}\n{restored.exception!r}"
         )
         assert "Restored" in plain_cli_output(restored.output)
-        for table in ("sessions", "daily_stats", "price_versions", "collection_ledger"):
-            assert normalized_records(
-                remote.query(f"SELECT * FROM current_{table}")
-            ) == (normalized_records(local.query(f"SELECT * FROM current_{table}"))), (
-                table
-            )
+        for table in SNAPSHOT_TABLES:
+            relation = ("replay_" if table in DEBUG_TABLES else "current_") + table
+            assert (
+                normalized_records(remote.query(f"SELECT * FROM {relation}"))
+                == expected[table]
+            ), table
         assert remote.query("SELECT * FROM daily_stats").num_rows == (
-            bundle.tables["daily_stats"].num_rows
+            len(expected["daily_stats"])
         )
         assert remote.query("SELECT * FROM raw_daily_stats").num_rows == 0
+        state = remote.maintenance_status()
+        assert state is not None and not state[0]
+        initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+        assert initialized.exit_code == 0, plain_cli_output(initialized.output)
+        state = remote.maintenance_status()
+        assert state is not None and state[0]
     finally:
         remote.close()
         local.close()

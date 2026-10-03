@@ -109,17 +109,33 @@ def test_restore_rejects_a_populated_destination(
 
 
 @pytest.mark.parametrize("answer", ["n\n", "\n", ""])
-def test_restore_requires_confirmation_before_opening_warehouse(
+def test_restore_requires_confirmation_before_writing_warehouse(
     tmp_path: Path, answer: str
 ) -> None:
     """Declining, accepting the default, or EOF cannot start restoration."""
-    configuration = tmp_path / "missing.toml"
+    configuration = tmp_path / "config.toml"
+    database = tmp_path / "destination.duckdb"
+    _write_config(configuration, database)
+    backend = DuckDBBackend(database)
+    backend.apply_ddl()
+    from usagebassoon.archiver import SnapshotArchiver
+
+    archive = tmp_path / "archive"
+    uri = SnapshotArchiver(str(archive)).write(backend, run_id="manual", manual=True)
+    assert uri is not None
+    backend.close()
     result = CliRunner().invoke(
-        app, ["restore", "--config", str(configuration)], input=answer
+        app,
+        ["restore", "--config", str(configuration), "--from-snapshot", uri],
+        input=answer,
     )
     output = plain_cli_output(result.output)
     assert result.exit_code != 0
     assert "stop all UsageBassoon instances" in output
     assert "[y/N]" in output
     assert "Aborted" in output
-    assert not configuration.exists()
+    backend = DuckDBBackend(database)
+    try:
+        assert backend.query("SELECT * FROM restore_receipts").num_rows == 0
+    finally:
+        backend.close()

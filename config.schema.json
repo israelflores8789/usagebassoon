@@ -247,6 +247,11 @@
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
           "default": "60s",
           "description": "Maximum wait for one GCS request, in seconds or minutes. Defaults to `60s`; snapshots have no overall timeout."
+        },
+        "disable_weekly_snapshots": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable automatic weekly snapshots for this explicitly configured destination. Otherwise retain four successful UTC calendar-week recovery slots in addition to scheduled retention."
         }
       }
     },
@@ -316,12 +321,17 @@
           "type": "integer",
           "minimum": 1,
           "default": 3,
-          "description": "Maximum number of retained snapshots. Defaults to 3 when [snapshots] is configured."
+          "description": "Maximum unpinned scheduled/manual snapshots retained under the shared archive policy. Pinned snapshots and four weekly recovery slots are independent."
         },
         "interval": {
           "type": "string",
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhHdD]$",
           "description": "Optional positive snapshot cadence, such as `30m`, `12h`, or `7d`; units are minutes, hours, or days."
+        },
+        "disable_weekly_snapshots": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable automatic weekly snapshots for this explicitly configured destination. Otherwise retain four successful UTC calendar-week recovery slots in addition to scheduled retention."
         }
       }
     }

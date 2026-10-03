@@ -9,22 +9,21 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Event, Lock
+from threading import Barrier, Event
 from typing import cast, override
 
 import pyarrow as pa
 import pytest
 
 from tests._snapshot_fakes import TableBackend
-from usagebassoon import archiver as snapshot_archiver
 from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
-from usagebassoon.buckets.base import SnapshotBucket
 from usagebassoon.buckets.base import SnapshotObject as GcsObject
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
 from usagebassoon.buckets.gcs import GcsClient
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
+from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
 
 class _RecordingBucket:
@@ -172,6 +171,16 @@ class MemoryGcsArchive:
         """Return an injectable lifecycle warning."""
         return ("a GCS Delete lifecycle rule could match the snapshot archive",)
 
+    def upload_file(self, relative_name: str, path: Path) -> GcsObject:
+        """Simulate a create-only file upload."""
+        return self.write_bytes(relative_name, path.read_bytes(), if_generation_match=0)
+
+    def download_file(self, relative_name: str, path: Path) -> GcsObject:
+        """Resolve this copy's current provider generation before downloading."""
+        generation, payload = self.objects[f"archive/{relative_name}"]
+        path.write_bytes(payload)
+        return GcsObject(relative_name, generation, len(payload), None)
+
 
 @pytest.mark.parametrize(
     "unsafe_name",
@@ -217,320 +226,177 @@ def test_gcs_archive_uses_configured_request_timeout() -> None:
 
 
 def test_gcs_reservation_expires_during_slow_snapshot() -> None:
-    """Reject a stale publisher after another writer claims the expired lease."""
+    """Reject a stale publisher after another writer replaces an expired claim."""
     archive = MemoryGcsArchive()
-    store = SnapshotStore("gs://bucket/archive", gcs_bucket=archive)
-    started = datetime(2026, 9, 23, tzinfo=UTC)
-    first_fence = store._claim_for(archive, started, "slow-writer")
-
-    assert first_fence is not None
+    first, second = Catalog(archive), Catalog(archive)
+    first._update_reservation(claim=True)
+    document, version = first.control()
+    reservation = document["reservation"]
+    assert isinstance(reservation, dict)
+    reservation["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    archive.write_json_cas("control.json", document, expected_version=version)
+    second._update_reservation(claim=True)
     assert (
-        store._claim_for(archive, started + timedelta(minutes=4), "contender") is None
+        first.fence is not None
+        and second.fence is not None
+        and second.fence > first.fence
     )
-    second_fence = store._claim_for(
-        archive, started + timedelta(minutes=5, seconds=1), "new-writer"
-    )
-    assert second_fence is not None and second_fence > first_fence
-    assert (
-        store._publish_for(
-            archive,
-            {},
-            owner="slow-writer",
-            fence=first_fence,
-            now=started + timedelta(minutes=5, seconds=1),
-        )
-        is None
-    )
-    catalog, _ = archive.read_json("catalog.json")
-    assert catalog is not None and catalog["entries"] == []
+    with pytest.raises(ArchiveBusy, match="lost"):
+        first.publish("stale", datetime.now(UTC).isoformat())
+    assert first.entries() == []
 
 
 def test_gcs_reservation_can_be_renewed_before_expiry() -> None:
-    """Keep the current writer's fence while extending its reservation."""
+    """Retain the same fence during renewal and block competing mutations."""
     archive = MemoryGcsArchive()
-    store = SnapshotStore("gs://bucket/archive", gcs_bucket=archive)
-    started = datetime(2026, 9, 23, tzinfo=UTC)
-    fence = store._claim_for(archive, started, "slow-writer")
-
-    assert fence is not None
-    assert store._renew_for(
-        archive, "slow-writer", fence, started + timedelta(minutes=4)
-    )
-    assert (
-        store._claim_for(
-            archive, started + timedelta(minutes=5, seconds=1), "contender"
-        )
-        is None
-    )
-    assert store._publish_for(
-        archive,
-        {"snapshot_id": "long-capture"},
-        owner="slow-writer",
-        fence=fence,
-        now=started + timedelta(minutes=6),
-    )
+    with Catalog(archive).hold() as catalog:
+        fence = catalog.fence
+        catalog.check()
+        assert catalog.fence == fence
+        with pytest.raises(ArchiveBusy), Catalog(archive).hold():
+            pytest.fail("second archive owner entered")
 
 
 def test_snapshot_renews_reservation_during_long_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Renew the reservation while capture waits for the background heartbeat."""
+    """Renew a claimed archive while canonical capture waits for the heartbeat."""
+    import usagebassoon.snapshot.catalog as catalog_module
+
     renewed = Event()
     capturing = Event()
-    started = datetime(2026, 9, 23, tzinfo=UTC)
-    clock = [started]
-    renewal_count = 0
-    monkeypatch.setattr(snapshot_archiver, "_now", lambda: clock[0])
+    original = Catalog._update_reservation
+    monkeypatch.setattr(catalog_module, "LEASE_SECONDS", 1)
+
+    def renew(self: Catalog, *, claim: bool = False) -> None:
+        original(self, claim=claim)
+        if capturing.is_set() and not claim:
+            renewed.set()
 
     class WaitingBackend(TableBackend):
-        """Hold capture open until its reservation has actually renewed."""
-
         @override
         def query(self, sql: str) -> pa.Table:
-            """Coordinate capture with a real renewal instead of a fixed delay."""
             capturing.set()
-            assert renewed.wait(timeout=5), "capture reservation was not renewed"
+            assert renewed.wait(timeout=5)
             return super().query(sql)
 
-    monkeypatch.setattr(snapshot_archiver, "_LEASE_SECONDS", 1)
+    monkeypatch.setattr(Catalog, "_update_reservation", renew)
     archive = MemoryGcsArchive()
-    store = SnapshotStore("gs://bucket/archive", gcs_bucket=archive)
-    original = store._renew_for
-
-    def renew(
-        destination: SnapshotBucket, owner: str, fence: int, now: datetime
-    ) -> bool:
-        """Signal only successful renewals performed while capture is pending."""
-        nonlocal renewal_count
-        if capturing.is_set():
-            clock[0] += timedelta(seconds=0.6)
-            now = clock[0]
-        result = original(destination, owner, fence, now)
-        if result and capturing.is_set():
-            renewal_count += 1
-            if renewal_count >= 2:
-                renewed.set()
-        return result
-
-    monkeypatch.setattr(store, "_renew_for", renew)
     backend = WaitingBackend()
-    published = store.write(cast(StorageBackend, backend), run_id="waiting")
-    assert published is not None
+    store = SnapshotStore(archive.uri, gcs_bucket=archive)
+    assert store.write(cast(StorageBackend, backend), run_id="waiting") is not None
     assert renewed.is_set()
-    assert clock[0] > started + timedelta(seconds=1)
     assert backend.queries == len(SNAPSHOT_TABLES)
-    assert store.list_snapshots() == [published.rsplit("/", 1)[-1]]
 
 
 def test_simultaneous_gcs_catalog_claim_has_one_winner() -> None:
-    """Give one writer the reservation when both read an absent catalog."""
+    """Compare-and-swap lets only one writer claim the same missing catalog."""
+    archive = MemoryGcsArchive()
+    barrier = Barrier(2)
+    claimants = [Catalog(archive), Catalog(archive)]
 
-    class RacingArchive(MemoryGcsArchive):
-        """Coordinate reads while preserving an atomic provider-side write."""
-
-        def __init__(self) -> None:
-            """Create a shared archive with a two-writer claim barrier."""
-            super().__init__()
-            self.read_barrier = Barrier(2)
-            self.write_lock = Lock()
-
-        @override
-        def read_json(
-            self, relative_name: str
-        ) -> tuple[dict[str, object] | None, int | None]:
-            """Make both claimants observe the same absent catalog version."""
-            result = super().read_json(relative_name)
-            if relative_name == "catalog.json" and result[0] is None:
-                self.read_barrier.wait(timeout=5)
-            return result
-
-        @override
-        def write_json_cas(
-            self,
-            relative_name: str,
-            payload: dict[str, object],
-            *,
-            expected_version: int | str | None,
-        ) -> GcsObject:
-            """Apply one generation check and write at a time."""
-            with self.write_lock:
-                return super().write_json_cas(
-                    relative_name, payload, expected_version=expected_version
-                )
-
-    archive = RacingArchive()
-    store = SnapshotStore("gs://bucket/archive", gcs_bucket=archive)
-    started = datetime(2026, 9, 23, tzinfo=UTC)
-
-    def claim(owner: str) -> int | None:
-        """Try to reserve the shared archive for one writer."""
-        return store._claim_for(archive, started, owner)
+    def claim(catalog: Catalog) -> bool:
+        barrier.wait(timeout=5)
+        try:
+            catalog._update_reservation(claim=True)
+        except ArchiveBusy:
+            return False
+        return True
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        claims = tuple(executor.map(claim, ("first", "second")))
-
-    assert sum(fence is not None for fence in claims) == 1
-    catalog, _ = archive.read_json("catalog.json")
-    assert catalog is not None
-    reservation = catalog["reservation"]
-    assert isinstance(reservation, dict)
-    assert reservation["owner"] in {"first", "second"}
+        winners = list(executor.map(claim, claimants))
+    assert sum(winners) == 1
 
 
 def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
-    """Keep only catalog-published snapshots while conditionally cleaning GCS data."""
+    """Retire objects at exact generations while preserving a lifecycle tombstone."""
     archive = MemoryGcsArchive()
+    store = SnapshotStore(archive.uri, max_snapshots=1, gcs_bucket=archive)
     backend = TableBackend()
-    store = SnapshotStore("gs://bucket/archive", max_snapshots=1, gcs_bucket=archive)
-    assert store.lifecycle_warnings()
     first = store.write(cast(StorageBackend, backend), run_id="one")
     second = store.write(cast(StorageBackend, backend), run_id="two")
     assert first is not None and second is not None
     assert store.list_snapshots() == [second.rsplit("/", 1)[-1]]
-    assert all(first.rsplit("/", 1)[-1] not in name for name in archive.objects)
+    retired = first.rsplit("/", 1)[-1]
+    assert [obj.name for obj in archive.list(retired)] == [f"{retired}/state.json"]
+    state, _ = archive.read_json(f"{retired}/state.json")
+    assert state is not None and state["retired"] is True
 
 
 def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
     tmp_path: Path,
 ) -> None:
-    """Write matching complete archives locally and to GCS from one capture."""
+    """Portable immutable manifests have identical bytes at every destination."""
     archive = MemoryGcsArchive()
     backend = TableBackend()
+    local = tmp_path / "local"
     store = SnapshotStore(
-        file_uri=f"file://{tmp_path}/local",
-        gcs_archive_uri="gs://bucket/archive",
-        gcs_bucket=archive,
+        file_uri=str(local), gcs_archive_uri=archive.uri, gcs_bucket=archive
     )
-
-    local_uri = store.write(cast(StorageBackend, backend), run_id="dual")
-
-    assert local_uri is not None
+    uri = store.write(cast(StorageBackend, backend), run_id="dual")
+    assert uri is not None
+    identifier = uri.rsplit("/", 1)[-1]
     assert backend.queries == len(SNAPSHOT_TABLES)
-    snapshot_id = local_uri.rsplit("/", 1)[-1]
-    local_catalog = json.loads((tmp_path / "local" / "catalog.json").read_text())
-    gcs_catalog, _ = archive.read_json("catalog.json")
-    assert gcs_catalog is not None
-    gcs_entries = cast(list[dict[str, object]], gcs_catalog["entries"])
-    assert [entry["snapshot_id"] for entry in local_catalog["entries"]] == [snapshot_id]
-    assert [entry["snapshot_id"] for entry in gcs_entries] == [snapshot_id]
-    assert local_catalog["entries"][0]["published_at"] == gcs_entries[0]["published_at"]
-
-    local_manifest = json.loads(
-        (tmp_path / "local" / snapshot_id / "manifest.json").read_text()
-    )
-    gcs_manifest_ref = cast(dict[str, object], gcs_entries[0]["manifest"])
-    gcs_manifest_name = cast(str, gcs_manifest_ref["name"])
-    gcs_manifest_generation = cast(int, gcs_manifest_ref["version"])
-    gcs_manifest = json.loads(
-        archive.read_bytes(gcs_manifest_name, version=gcs_manifest_generation)
-    )
-    assert local_manifest["snapshot_id"] == gcs_manifest["snapshot_id"]
-    assert local_manifest["schema_fingerprint"] == gcs_manifest["schema_fingerprint"]
-    for table in SNAPSHOT_TABLES:
-        local_spec = local_manifest["tables"][table]
-        gcs_spec = gcs_manifest["tables"][table]
-        for field in ("status", "completed_at", "rows", "schema", "schema_ipc"):
-            assert local_spec[field] == gcs_spec[field]
-        assert len(local_spec["objects"]) == len(gcs_spec["objects"])
-        for local_object, gcs_object in zip(
-            local_spec["objects"], gcs_spec["objects"], strict=True
-        ):
-            assert local_object["name"] == gcs_object["name"]
-            assert (tmp_path / "local" / local_object["name"]).read_bytes() == (
-                archive.read_bytes(gcs_object["name"], version=gcs_object["version"])
-            )
+    raw = (local / identifier / "manifest.json").read_bytes()
+    manifest, _ = archive.read_json(f"{identifier}/manifest.json")
+    assert json.loads(raw) == manifest
+    for name in ("manifest.json", "COMPLETE", "notes.parquet"):
+        obj = next(
+            o for o in archive.list(identifier) if o.name == f"{identifier}/{name}"
+        )
+        assert (
+            archive.read_bytes(obj.name, version=obj.version)
+            == (local / identifier / name).read_bytes()
+        )
 
 
 def test_pending_destination_renews_during_slow_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Keep a second reservation live while the first destination finishes."""
-    monkeypatch.setattr(snapshot_archiver, "_LEASE_SECONDS", 1)
+    """Retain every destination reservation until all copies finish publication."""
     archive = MemoryGcsArchive()
     store = SnapshotStore(
-        file_uri=f"file://{tmp_path}/local",
-        gcs_archive_uri="gs://bucket/archive",
+        file_uri=str(tmp_path / "local"),
+        gcs_archive_uri=archive.uri,
         gcs_bucket=archive,
     )
-    original = store._publish_for
-    calls = 0
-    first_published = Event()
-    pending_renewed = Event()
-    original_renew = store._renew_for
+    original = Catalog.publish
 
-    def renew(
-        destination: SnapshotBucket, owner: str, fence: int, now: datetime
-    ) -> bool:
-        """Signal renewal of GCS while local publication is held open."""
-        result = original_renew(destination, owner, fence, now)
-        if result and destination is archive and first_published.is_set():
-            pending_renewed.set()
-        return result
+    def publish(self: Catalog, identifier: str, captured_at: str) -> None:
+        original(self, identifier, captured_at)
+        for bucket in store.reader.buckets:
+            document, _ = bucket.read_json("control.json")
+            assert document is not None and isinstance(document["reservation"], dict)
 
-    monkeypatch.setattr(store, "_renew_for", renew)
-
-    def slow_publish(
-        destination: SnapshotBucket,
-        entry: dict[str, object],
-        *,
-        owner: str,
-        fence: int,
-        now: datetime,
-        published_at: datetime | None = None,
-    ) -> bool | None:
-        """Hold the first publication open until the pending archive renews."""
-        nonlocal calls
-        result = original(
-            destination,
-            entry,
-            owner=owner,
-            fence=fence,
-            now=now,
-            published_at=published_at,
-        )
-        calls += 1
-        if calls == 1:
-            first_published.set()
-            assert pending_renewed.wait(timeout=5), (
-                "pending destination was not renewed"
-            )
-        return result
-
-    monkeypatch.setattr(store, "_publish_for", slow_publish)
-    published = store.write(cast(StorageBackend, TableBackend()), run_id="slow")
-
-    assert published is not None
-    assert pending_renewed.is_set()
-    assert len(store.list_snapshots()) == 1
-    gcs_catalog, _ = archive.read_json("catalog.json")
-    assert gcs_catalog is not None
-    assert len(cast(list[dict[str, object]], gcs_catalog["entries"])) == 1
+    monkeypatch.setattr(Catalog, "publish", publish)
+    assert store.write(cast(StorageBackend, TableBackend()), run_id="dual") is not None
 
 
 def test_dual_publication_failure_does_not_prune_previous_snapshots(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Retain the previous catalog entry when the second publication fails."""
+    """Do not rotate either destination after an incomplete dual publication."""
     archive = MemoryGcsArchive()
-    backend = TableBackend()
     store = SnapshotStore(
-        file_uri=f"file://{tmp_path}/local",
-        gcs_archive_uri="gs://bucket/archive",
+        file_uri=str(tmp_path / "local"),
+        gcs_archive_uri=archive.uri,
         gcs_bucket=archive,
         max_snapshots=1,
     )
-
-    first = store.write(cast(StorageBackend, backend), run_id="first")
+    first = store.write(cast(StorageBackend, TableBackend()), run_id="first")
     assert first is not None
-    first_id = first.rsplit("/", 1)[-1]
-    archive.fail_catalog_write_at = archive.catalog_writes + 2
+    original = Catalog.publish
 
+    def fail(self: Catalog, identifier: str, captured_at: str) -> None:
+        if self.bucket is archive:
+            raise RuntimeError("catalog publication failed")
+        original(self, identifier, captured_at)
+
+    monkeypatch.setattr(Catalog, "publish", fail)
     with pytest.raises(RuntimeError, match="catalog publication failed"):
-        store.write(cast(StorageBackend, backend), run_id="second")
-
-    assert store.list_snapshots() == [first_id]
-    gcs_catalog, _ = archive.read_json("catalog.json")
-    assert gcs_catalog is not None
-    gcs_entries = cast(list[dict[str, object]], gcs_catalog["entries"])
-    assert [entry["snapshot_id"] for entry in gcs_entries] == [first_id]
+        store.write(cast(StorageBackend, TableBackend()), run_id="second")
+    candidates, _ = store.reader.candidates()
+    # A retired rollback entry must never be eligible for recovery.
+    with store.reader.prepare() as prepared:
+        assert prepared.candidate.identifier == first.rsplit("/", 1)[-1]
+    assert any(c.identifier == first.rsplit("/", 1)[-1] for c in candidates)

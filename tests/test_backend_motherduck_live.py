@@ -133,6 +133,15 @@ def _reset_test_schema(backend: MotherDuckBackend) -> None:
         if not is_simple_identifier(table):
             pytest.fail(f"invalid packaged table name {table!r}")
         backend.connection.execute(f'DROP TABLE IF EXISTS "{table}"')
+    # This database is exclusively disposable: older prerelease table shapes
+    # must not survive a reset and masquerade as unexpected recovery data.
+    for schema, table in backend.connection.execute(
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        "WHERE table_catalog = current_database() AND table_type = 'BASE TABLE'"
+    ).fetchall():
+        quoted_schema = '"' + str(schema).replace('"', '""') + '"'
+        quoted_table = '"' + str(table).replace('"', '""') + '"'
+        backend.connection.execute(f"DROP TABLE {quoted_schema}.{quoted_table}")
 
 
 @pytest.fixture(scope="module")
@@ -738,7 +747,7 @@ def test_live_configured_clients_and_curation_preserve_source_identity(
             ).to_pylist()
         } == expected_notes
         invoke("doctor")
-        invoke("audit")
+        invoke("audit", "runs")
         invoke("note", "remove", *options)
         assert remote.query(
             "SELECT source_id, note FROM session_notes "
@@ -862,10 +871,6 @@ def test_live_portable_snapshots_and_atomic_restore(
         assert portable.write(local, run_id=str(uuid4())) is not None
 
         command = ["restore", "--config", str(restore_config)]
-        declined = runner.invoke(app, command, input="n\n")
-        assert declined.exit_code != 0
-        assert "Aborted" in plain_cli_output(declined.output)
-        assert rows(remote) == expected
         rejected = runner.invoke(app, command, input="y\n")
         assert rejected.exit_code != 0
         assert "restore requires an empty warehouse" in plain_cli_output(
@@ -880,8 +885,14 @@ def test_live_portable_snapshots_and_atomic_restore(
         )
         assert uninitialized.exit_code != 0
         assert "not initialized" in plain_cli_output(uninitialized.output)
-        initialized = runner.invoke(app, ["init", "--config", str(restore_config)])
+        initialized = runner.invoke(
+            app, ["init", "--restore", "--config", str(restore_config)]
+        )
         assert initialized.exit_code == 0, plain_cli_output(initialized.output)
+        declined = runner.invoke(app, command, input="n\n")
+        assert declined.exit_code != 0
+        assert "Aborted" in plain_cli_output(declined.output)
+        assert all(not records for records in rows(remote).values())
         original_append = remote.append
         written: list[str] = []
 

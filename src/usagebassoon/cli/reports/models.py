@@ -10,6 +10,7 @@ from typing import Annotated
 
 import typer
 
+from usagebassoon.cli._output import render_records
 from usagebassoon.cli.reports._common import (
     CACHE_MULTIPLIER_HEADER,
     SAMPLE_LOCAL_SOURCE_ID,
@@ -29,7 +30,7 @@ from usagebassoon.cli.reports._common import (
     sanitize_records,
     truncate_middle,
 )
-from usagebassoon.cli.reports._render import output_format, render_records, render_table
+from usagebassoon.cli.reports._render import output_format, render_table
 
 _EXPORT_COLUMNS = (
     "model",
