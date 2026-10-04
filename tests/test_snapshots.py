@@ -1015,3 +1015,142 @@ def test_archive_discovery_honors_logging_opt_out(
     assert store.destination_uris == (str(tmp_path / "archive"),)
     assert logging.getLogger(LOGGER_NAME).disabled
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_reservation_release_failure_preserves_operation_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    body_fails: bool,
+) -> None:
+    """Failed release is logged and expires without hiding successful or failed work."""
+    import logging
+
+    from usagebassoon.buckets.base import SnapshotObject, SnapshotVersion
+
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    original = bucket.write_json_cas
+    failure = ValueError("primary snapshot failure")
+
+    def release_fails(
+        name: str,
+        payload: dict[str, object],
+        *,
+        expected_version: SnapshotVersion | None,
+    ) -> SnapshotObject:
+        if name == "control.json" and payload.get("reservation") is None:
+            raise OSError("release unavailable")
+        return original(name, payload, expected_version=expected_version)
+
+    monkeypatch.setattr(bucket, "write_json_cas", release_fails)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    catalog = Catalog(bucket)
+    if body_fails:
+        with pytest.raises(ValueError) as caught, catalog.hold():
+            raise failure
+        assert caught.value is failure
+    else:
+        with catalog.hold():
+            catalog.check()
+    assert catalog.fence is None
+    assert "Snapshot reservation release failed" in caplog.text
+    assert "release unavailable" in caplog.text
+    assert Catalog(bucket).control()[0]["reservation"] is not None
+
+
+def test_read_only_recovery_logs_reservation_failure_without_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Library recovery remains observable even when notice callbacks are absent."""
+    import logging
+
+    source = _backend()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="read-only", manual=True)
+        assert uri is not None
+
+        def denied(_catalog: Catalog, *, enforce_policy: bool = False) -> None:
+            assert not enforce_policy
+            raise PermissionError("archive is read-only")
+
+        monkeypatch.setattr(Catalog, "hold", denied)
+        monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+        monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+        with store.reader.prepare(uri) as prepared:
+            assert prepared.candidate.uri == uri
+        assert "Snapshot read reservation unavailable" in caplog.text
+        assert "archive is read-only" in caplog.text
+    finally:
+        source.close()
+
+
+def test_maintenance_notice_failure_does_not_hide_restore_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Diagnostic transport failures cannot replace the primary recovery error."""
+    import logging
+
+    from usagebassoon.snapshot.restore import report_maintenance
+
+    backend = _backend()
+    failure = RuntimeError("primary restore failure")
+
+    def unavailable() -> tuple[bool, str] | None:
+        raise OSError("maintenance inspection unavailable")
+
+    def broken_notice(_message: str) -> None:
+        raise OSError("notice sink unavailable")
+
+    monkeypatch.setattr(backend, "maintenance_status", unavailable)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                raise failure
+            finally:
+                report_maintenance(backend, broken_notice)
+        assert caught.value is failure
+        assert "maintenance inspection unavailable" in caplog.text
+        assert "notice sink unavailable" in caplog.text
+    finally:
+        backend.close()
+
+
+def test_local_publication_failure_survives_failed_temporary_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Local bucket cleanup retains the primary write failure and logs debris."""
+    import logging
+
+    from usagebassoon.buckets.local import durable_replace
+
+    failure = OSError("primary snapshot sync failure")
+
+    def failed_sync(_descriptor: int) -> None:
+        raise failure
+
+    def failed_unlink(_path: Path, *, missing_ok: bool = False) -> None:
+        assert missing_ok
+        raise PermissionError("secondary snapshot cleanup failure")
+
+    monkeypatch.setattr("usagebassoon.buckets.local.os.fsync", failed_sync)
+    monkeypatch.setattr(Path, "unlink", failed_unlink)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        with pytest.raises(OSError) as caught:
+            durable_replace(tmp_path / "manifest.json", b"{}")
+        assert caught.value is failure
+        assert not (tmp_path / "manifest.json").exists()
+        assert "secondary snapshot cleanup failure" in caplog.text
+    finally:
+        monkeypatch.undo()

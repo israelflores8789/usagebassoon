@@ -184,3 +184,40 @@ def test_registered_migration_chain_rolls_back_and_retries_without_legacy_assets
         ).to_pylist() == [{"version": 2}, {"version": 3}]
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("primary failure"), KeyboardInterrupt()]
+)
+def test_transaction_preserves_failure_when_rollback_fails(
+    failure: BaseException,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rollback failure cannot replace an operation failure or cancellation."""
+    import logging
+
+    backend = DuckDBBackend(":memory:")
+    connection = backend.connection
+    calls: list[str] = []
+
+    class BrokenRollback:
+        """Fail only the rollback performed during exception unwinding."""
+
+        def execute(self, sql: str) -> None:
+            calls.append(sql)
+            if sql == "ROLLBACK":
+                raise RuntimeError("rollback failure")
+
+    monkeypatch.setattr(backend, "connection", BrokenRollback())
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        with pytest.raises(type(failure)) as caught, backend.transaction():
+            raise failure
+        assert caught.value is failure
+        assert calls == ["BEGIN TRANSACTION", "ROLLBACK"]
+        assert "could not roll back" in caplog.text
+        assert "rollback failure" in caplog.text
+    finally:
+        connection.close()

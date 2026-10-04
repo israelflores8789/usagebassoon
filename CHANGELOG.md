@@ -14,9 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Namespaced backend providers, collection schedules, and snapshot destinations; added default 12-hour local snapshots, shared weekly scheduling, explicit destination enablement, and configurable logging disablement.
-
-- Added dialect-specific `audit_sources` views shared with snapshot audits and explicit `GCP_PROJECT_ID` selection for GCS CI tests.
 - Added independent snapshot scheduler jobs, immutable-only emergency recovery, atomic fenced lifecycle transitions, immediate owned-stage retries, bounded source auditing, and separately reported scheduled/weekly backup health.
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
@@ -46,4 +43,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added SQL parity test suite that ensures structural and synthetic replay behavior against all SQL dialects using SQLGlot.
 - Added explicit, idempotent warehouse initialization and schema-compatibility preflight checks.
 - Added local collector exclusion, replay-safe remote publication, and bounded persistence retries for concurrent ephemeral environments.
-- Added configurable yaspin indicators for interactive CLI waits, with Pong by default, 64 randomized messages, and terminal theme colors.
+- Added operational logger to support debugging, with file rotation and configuration settings.
+- Added project configuration through `config.toml` with primary namespaces `tokscale`, `backend`, `snapshots`, `collection`, and `logging`. Loading spinner is configurable (yaspin). Default behavior specified in the README.

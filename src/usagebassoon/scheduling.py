@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import plistlib
 import re
@@ -17,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
@@ -38,6 +38,8 @@ from usagebassoon.diagnostics import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.orchestrator import collect as collect_run
 from usagebassoon.version import __version__
+
+_LOG = logging.getLogger("usagebassoon")
 
 Platform = Literal["linux", "darwin"]
 SYSTEMD_SERVICE_NAME = "usagebassoon.service"
@@ -436,8 +438,13 @@ def _write_atomic(path: Path, content: bytes, mode: int = 0o644) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, stat.S_IMODE(mode))
         os.replace(temporary, path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            _LOG.warning(
+                "could not remove temporary scheduler file %s", temporary, exc_info=True
+            )
         raise
 
 
@@ -620,6 +627,7 @@ def native_schedule_status(config: UsageBassoonConfig) -> ScheduleStatus:
     try:
         command = _collect_command(config)
     except SchedulingError:
+        _LOG.warning("could not resolve scheduled collection command", exc_info=True)
         command = ()
     if availability.platform == "linux":
         return _systemd_status(
@@ -648,6 +656,7 @@ def schedule_doctor_check(config: UsageBassoonConfig | None) -> DoctorCheck:
     try:
         availability = scheduler_availability()
     except SchedulingError as error:
+        _LOG.warning("doctor scheduler availability inspection failed", exc_info=True)
         return DoctorCheck("scheduling", "warning", str(error))
     if config is None:
         return DoctorCheck(
@@ -659,6 +668,7 @@ def schedule_doctor_check(config: UsageBassoonConfig | None) -> DoctorCheck:
     try:
         status = native_schedule_status(config)
     except SchedulingError as error:
+        _LOG.warning("doctor native schedule inspection failed", exc_info=True)
         return DoctorCheck("scheduling", "warning", str(error))
     if not availability.available:
         return DoctorCheck("scheduling", "warning", availability.detail)
@@ -698,9 +708,16 @@ def _read_worker_pid(path: Path) -> int | None:
     """Read a valid PID from a worker state file."""
     try:
         value = int(path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, OSError, ValueError):
+    except FileNotFoundError:
         return None
-    return value if value > 0 else None
+    except (OSError, ValueError) as error:
+        raise SchedulingError(
+            "worker PID state is unreadable or invalid; "
+            "inspect it before controlling workers"
+        ) from error
+    if value <= 0:
+        raise SchedulingError("worker PID state must contain a positive process ID")
+    return value
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -820,8 +837,14 @@ def start_worker(
             mode=0o600,
         )
     except OSError as error:
-        with suppress(OSError):
+        try:
             process.terminate()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            _LOG.warning(
+                "could not terminate worker after PID publication failed", exc_info=True
+            )
         raise SchedulingError(f"could not write worker PID file: {error}") from error
     return worker_status(configuration)
 

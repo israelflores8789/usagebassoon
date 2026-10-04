@@ -340,6 +340,11 @@ class Catalog:
                         self._update_reservation()
                 except Exception as error:
                     self._failure = error
+                    _LOG.warning(
+                        "Snapshot reservation renewal failed at %s",
+                        self.bucket.uri,
+                        exc_info=True,
+                    )
                     return
 
         thread = Thread(target=renew, name="snapshot-reservation", daemon=True)
@@ -364,24 +369,37 @@ class Catalog:
         finally:
             stop.set()
             thread.join()
-            for _ in range(8):
-                document, version = self.control()
-                reservation = document.get("reservation")
-                if (
-                    not isinstance(reservation, dict)
-                    or reservation.get("owner") != self.owner
-                    or reservation.get("fence") != self.fence
-                ):
+            try:
+                for _ in range(8):
+                    document, version = self.control()
+                    reservation = document.get("reservation")
+                    if (
+                        not isinstance(reservation, dict)
+                        or reservation.get("owner") != self.owner
+                        or reservation.get("fence") != self.fence
+                    ):
+                        break
+                    document["reservation"] = None
+                    try:
+                        self.bucket.write_json_cas(
+                            CONTROL_NAME, document, expected_version=version
+                        )
+                    except SnapshotPreconditionError:
+                        continue
                     break
-                document["reservation"] = None
-                try:
-                    self.bucket.write_json_cas(
-                        CONTROL_NAME, document, expected_version=version
+                else:
+                    _LOG.warning(
+                        "Snapshot reservation release exhausted CAS retries at %s",
+                        self.bucket.uri,
                     )
-                except SnapshotPreconditionError:
-                    continue
-                break
-            self.fence = None
+            except Exception:
+                _LOG.warning(
+                    "Snapshot reservation release failed at %s; claim will expire",
+                    self.bucket.uri,
+                    exc_info=True,
+                )
+            finally:
+                self.fence = None
 
     def publish(self, identifier: str, captured_at: str) -> None:
         """Authorize a verified complete snapshot in the fenced control document."""

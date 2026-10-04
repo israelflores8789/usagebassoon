@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -40,6 +41,8 @@ from usagebassoon.storage_model import (
     SNAPSHOT_TABLES,
     newer_observation,
 )
+
+_LOG = logging.getLogger("usagebassoon")
 
 
 def _identifier(value: str) -> str:
@@ -368,7 +371,12 @@ class _DuckDBStorage(AbstractStorageBackend):
                     f"FROM _usagebassoon_upsert_batch AS source WHERE {join}"
                 )
         finally:
-            self.connection.unregister("_usagebassoon_upsert_batch")
+            try:
+                self.connection.unregister("_usagebassoon_upsert_batch")
+            except Exception:
+                _LOG.warning(
+                    "could not unregister temporary upsert batch", exc_info=True
+                )
         return UpsertResult(inserted=int(inserted), updated=int(updated))
 
     @override
@@ -394,7 +402,12 @@ class _DuckDBStorage(AbstractStorageBackend):
                 f"SELECT {quoted_columns} FROM _usagebassoon_append_batch"
             )
         finally:
-            self.connection.unregister("_usagebassoon_append_batch")
+            try:
+                self.connection.unregister("_usagebassoon_append_batch")
+            except Exception:
+                _LOG.warning(
+                    "could not unregister temporary append batch", exc_info=True
+                )
 
     @override
     def has_committed_run(self, run_id: str) -> bool:
@@ -510,8 +523,13 @@ class _DuckDBStorage(AbstractStorageBackend):
         self.connection.execute("BEGIN TRANSACTION")
         try:
             yield
-        except Exception:
-            self.connection.execute("ROLLBACK")
+        except BaseException:
+            try:
+                self.connection.execute("ROLLBACK")
+            except Exception:
+                _LOG.exception(
+                    "could not roll back failed backend transaction; close the backend"
+                )
             raise
         else:
             self.connection.execute("COMMIT")

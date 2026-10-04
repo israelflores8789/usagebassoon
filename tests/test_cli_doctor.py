@@ -222,3 +222,58 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     assert "scheduled recovery capture is overdue" in check.message
     assert "current weekly recovery slot is overdue" not in check.message
     assert any("1/4 recovery slots" in detail for detail in check.details)
+
+
+def test_advisory_maintenance_failure_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Optional maintenance inspection stays non-fatal with traceback evidence."""
+    import logging
+
+    from usagebassoon.diagnostics import maintenance_health
+
+    backend = DuckDBBackend(":memory:")
+
+    def unavailable() -> tuple[bool, str] | None:
+        raise OSError("maintenance RPC unavailable")
+
+    monkeypatch.setattr(backend, "maintenance_status", unavailable)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        assert maintenance_health(backend).status == "warning"
+        assert "doctor maintenance inspection failed" in caplog.text
+        assert "maintenance RPC unavailable" in caplog.text
+    finally:
+        backend.close()
+
+
+def test_compaction_read_failure_is_logged_and_other_checks_continue(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown retention health is an error check without aborting the whole doctor."""
+    import logging
+
+    from usagebassoon.diagnostics import run_doctor
+
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+
+    def unavailable() -> pa.Table | None:
+        raise OSError("compaction progress unavailable")
+
+    monkeypatch.setattr(backend, "compaction_backlog", unavailable)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        report = run_doctor(backend, backend_name="duckdb", database=":memory:")
+        assert any(
+            c.name == "compaction" and c.status == "error" for c in report.checks
+        )
+        assert any(c.name == "reconciliation" for c in report.checks)
+        assert "doctor compaction inspection failed" in caplog.text
+        assert "compaction progress unavailable" in caplog.text
+    finally:
+        backend.close()

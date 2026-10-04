@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -172,6 +173,9 @@ def stop(
     except (OSError, RuntimeError, ValueError) as error:
         if not worker_was_running:
             _schedule_error(error)
+        logging.getLogger("usagebassoon").warning(
+            "worker stopped but native scheduler could not be stopped", exc_info=True
+        )
         typer.echo(f"Warning: native scheduler was not stopped: {error}", err=True)
     typer.echo("Stopped collection schedule.")
 

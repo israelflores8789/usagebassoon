@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid5
 
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.snapshot.reader import PreparedSnapshot
+
+_LOG = logging.getLogger("usagebassoon")
 
 
 def restore_operation_id(prepared: PreparedSnapshot) -> str:
@@ -53,7 +56,7 @@ def restore_prepared(
                 operation_id=operation,
                 snapshot_id=prepared.candidate.identifier,
             )
-        except Exception as error:
+        except Exception:
             try:
                 committed = backend.restore_committed(operation)
             except Exception as inspection_error:
@@ -62,7 +65,10 @@ def restore_prepared(
                     "retry receipt inspection before further writes."
                 ) from inspection_error
             if not committed:
-                raise error
+                raise
+            _LOG.warning(
+                "Restore committed; its acknowledgement was interrupted", exc_info=True
+            )
             if notice:
                 notice("Restore committed; its acknowledgement was interrupted.")
     finally:
@@ -85,13 +91,19 @@ def report_maintenance(
     try:
         status = backend.maintenance_status()
     except Exception as error:
-        notice(
+        _LOG.warning("Restore maintenance state could not be determined", exc_info=True)
+        message = (
             f"Maintenance state could not be determined: {error}. "
             "Inspect before resuming writers."
         )
-        return
-    if status is not None:
-        notice(
+    else:
+        if status is None:
+            return
+        message = (
             f"Maintenance status: {status[1]}. Run bassoon init after "
             "recovery verification to resume maintenance."
         )
+    try:
+        notice(message)
+    except Exception:
+        _LOG.warning("could not deliver restore maintenance notice", exc_info=True)

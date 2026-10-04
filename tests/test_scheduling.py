@@ -597,3 +597,35 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     assert loaded.collection.schedule.interval == "30m"
     assert loaded.snapshots.schedule.interval == "2d"
     assert ConfigurationManager(config.path).load() == loaded
+
+
+@pytest.mark.parametrize("content", ["not-a-pid", "0", "-1"])
+def test_invalid_worker_pid_state_blocks_worker_control(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    """Unknown worker identity must not be treated as proof no worker exists."""
+    from usagebassoon.scheduling import SchedulingError, _read_worker_pid
+
+    path = tmp_path / "worker.pid"
+    assert _read_worker_pid(path) is None
+    path.write_text(content)
+    with pytest.raises(SchedulingError, match="worker PID state"):
+        _read_worker_pid(path)
+
+
+def test_unreadable_worker_pid_state_is_not_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permission failures prevent unsafe duplicate startup or misleading stop."""
+    from usagebassoon.scheduling import SchedulingError, _read_worker_pid
+
+    def denied(_path: Path, *, encoding: str) -> str:
+        assert encoding == "utf-8"
+        raise PermissionError("cannot inspect worker identity")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(SchedulingError) as caught:
+        _read_worker_pid(tmp_path / "worker.pid")
+    assert isinstance(caught.value.__cause__, PermissionError)

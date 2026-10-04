@@ -125,9 +125,10 @@ def configure(config: LoggingConfig) -> logging.Logger:
             "operational logs are being written to stderr instead.",
             file=sys.stderr,
         )
-        logger.error(
+        logger.warning(
             "could not configure the operational log at %s; using stderr",
             log_path,
+            exc_info=True,
         )
         return logger
     handler.setFormatter(

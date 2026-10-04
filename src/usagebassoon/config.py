@@ -28,7 +28,7 @@ from platformdirs import (
 )
 from yaspin.constants import SPINNER_ATTRS
 
-from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.motherduck import MotherDuckBackend
 
@@ -167,7 +167,14 @@ def write_initial_config(path: Path) -> bool:
             os.replace(temporary, path)
             sync_directory(path.parent)
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                _LOG.warning(
+                    "could not remove temporary initial configuration file %s",
+                    temporary,
+                    exc_info=True,
+                )
         return True
 
 
@@ -920,8 +927,15 @@ def _atomic_replace(path: Path, content: str) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            _LOG.warning(
+                "could not remove temporary configuration file %s",
+                temporary,
+                exc_info=True,
+            )
         raise
 
 
@@ -1018,8 +1032,8 @@ def open_backend(
     if not initialize:
         try:
             backend.preflight()
-        except Exception:
-            backend.close()
+        except BaseException:
+            close_backend(backend, context="failed backend preflight")
             raise
     return backend
 

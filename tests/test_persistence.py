@@ -79,6 +79,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reuse one run UUID and Arrow bundle until persistence succeeds."""
     config = UsageBassoonConfig(
@@ -138,6 +139,13 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     assert result.inserted == 1
     assert attempts == [normalized.run_id, normalized.run_id]
     assert schema_attempts == []
+    retry = next(
+        record
+        for record in caplog.records
+        if "retryable backend error" in record.getMessage()
+    )
+    assert retry.exc_info is not None
+    assert "transient warehouse error" in caplog.text
 
 
 def test_bigquery_partial_publication_never_marks_missing_facts_complete(

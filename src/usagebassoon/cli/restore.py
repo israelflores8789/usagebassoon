@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from usagebassoon.audit import source_identity_warning
+from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 from usagebassoon.cli.snapshot import notice
 from usagebassoon.cli.spinner import spinner
@@ -70,6 +71,6 @@ def restore(
             except (RuntimeError, ValueError) as error:
                 raise typer.BadParameter(str(error)) from error
     finally:
-        backend.close()
+        close_backend(backend, context="restoring a snapshot")
     details = ", ".join(f"{table}={count}" for table, count in restored.items())
     typer.echo(f"Restored {details}")

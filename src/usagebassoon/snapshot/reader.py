@@ -201,6 +201,11 @@ class SnapshotReader:
         try:
             SnapshotReader.manifest(candidate)
         except (ValueError, RuntimeError) as error:
+            _LOG.warning(
+                "Snapshot compatibility check failed at %s",
+                candidate.uri,
+                exc_info=True,
+            )
             return {"supported": False, "reason": str(error)}
         return {"supported": True, "reason": None}
 
@@ -228,6 +233,11 @@ class SnapshotReader:
                 try:
                     state = Catalog(candidate.bucket).state(candidate.identifier)
                 except (ValueError, OSError, RuntimeError):
+                    _LOG.warning(
+                        "Snapshot lifecycle inspection failed at %s",
+                        candidate.uri,
+                        exc_info=True,
+                    )
                     state = None
                 result.append(
                     {
@@ -257,6 +267,11 @@ class SnapshotReader:
                     }
                 )
             except Exception as error:
+                _LOG.warning(
+                    "Snapshot listing inspection failed at %s",
+                    candidate.uri,
+                    exc_info=True,
+                )
                 result.append(
                     {
                         "id": candidate.identifier,
@@ -471,6 +486,11 @@ class SnapshotReader:
                         try:
                             stack.enter_context(catalog.hold())
                         except Exception as error:
+                            _LOG.warning(
+                                "Snapshot read reservation unavailable at %s",
+                                candidate.uri,
+                                exc_info=True,
+                            )
                             discovery_warning(
                                 "Reading immutable snapshot without reservation "
                                 f"at {candidate.uri}: {error}"
@@ -489,6 +509,11 @@ class SnapshotReader:
                                     "recovery validates immutable contents."
                                 )
                         except Exception as error:
+                            _LOG.warning(
+                                "Snapshot recovery lifecycle inspection failed at %s",
+                                candidate.uri,
+                                exc_info=True,
+                            )
                             discovery_warning(
                                 "Ignoring damaged lifecycle metadata "
                                 f"at {candidate.uri}: "
@@ -501,6 +526,11 @@ class SnapshotReader:
                         try:
                             stack.close()
                         except Exception as error:
+                            _LOG.warning(
+                                "Snapshot read reservation release failed at %s",
+                                candidate.uri,
+                                exc_info=True,
+                            )
                             discovery_warning(
                                 "Archive reservation release failed after immutable "
                                 f"reading at {candidate.uri}: {error}"

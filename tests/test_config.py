@@ -607,3 +607,74 @@ def test_disabled_logging_applies_to_configuration_errors(tmp_path: Path) -> Non
         ConfigurationManager(path).load()
     assert "logged to" not in str(captured.value)
     assert not directory.exists()
+
+
+def test_failed_preflight_preserves_error_when_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Backend cleanup cannot hide a schema or connection preflight failure."""
+    from usagebassoon.backends.duckdb_local import DuckDBBackend
+    from usagebassoon.config import UsageBassoonConfig, open_backend
+
+    failure = RuntimeError("primary preflight failure")
+    backend = DuckDBBackend(":memory:")
+    connection = backend.connection
+
+    def failed_preflight() -> None:
+        raise failure
+
+    def failed_close() -> None:
+        raise OSError("secondary close failure")
+
+    def opened_backend(_path: Path) -> DuckDBBackend:
+        """Return the backend whose preflight and cleanup are under test."""
+        return backend
+
+    monkeypatch.setattr(config_module, "DuckDBBackend", opened_backend)
+    monkeypatch.setattr(backend, "preflight", failed_preflight)
+    monkeypatch.setattr(backend, "close", failed_close)
+    monkeypatch.setattr(logging.getLogger(LOGGER_NAME), "propagate", True)
+    monkeypatch.setattr(logging.getLogger(LOGGER_NAME), "disabled", False)
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        local_database=Path(":memory:"),
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            open_backend(config)
+        assert caught.value is failure
+        assert "secondary close failure" in caplog.text
+    finally:
+        connection.close()
+
+
+def test_atomic_config_failure_survives_failed_temporary_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failed writes retain the original config and report leftover temporary files."""
+    target = tmp_path / "config.toml"
+    target.write_text("original")
+    failure = OSError("primary replace failure")
+
+    def failed_replace(_source: object, _target: object) -> None:
+        raise failure
+
+    def failed_unlink(_path: Path, *, missing_ok: bool = False) -> None:
+        assert missing_ok
+        raise PermissionError("secondary cleanup failure")
+
+    monkeypatch.setattr(config_module.os, "replace", failed_replace)
+    monkeypatch.setattr(Path, "unlink", failed_unlink)
+    monkeypatch.setattr(logging.getLogger(LOGGER_NAME), "propagate", True)
+    monkeypatch.setattr(logging.getLogger(LOGGER_NAME), "disabled", False)
+    with pytest.raises(OSError) as caught:
+        config_module._atomic_replace(target, "replacement")
+    assert caught.value is failure
+    assert target.read_text() == "original"
+    assert "secondary cleanup failure" in caplog.text

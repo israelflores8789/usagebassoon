@@ -3,6 +3,7 @@
 
 """collection_lock.py — Exclude simultaneous collection by one local user."""
 
+import logging
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -11,6 +12,8 @@ from pathlib import Path
 from tempfile import gettempdir
 
 from usagebassoon.config import UsageBassoonConfig
+
+_LOG = logging.getLogger("usagebassoon")
 
 
 class CollectionBusy(RuntimeError):
@@ -43,8 +46,13 @@ def collection_lock(config: UsageBassoonConfig) -> Generator[None]:
             try:
                 yield
             finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    _LOG.warning(
+                        "could not unlock collection; closing handle", exc_info=True
+                    )
         else:
             import fcntl
 
@@ -57,4 +65,9 @@ def collection_lock(config: UsageBassoonConfig) -> Generator[None]:
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    _LOG.warning(
+                        "could not unlock collection; closing handle", exc_info=True
+                    )

@@ -165,3 +165,50 @@ def test_shared_ansi_selection_and_indexed_palette() -> None:
     palette = adapt_palette(console, ["#8040c0"])
     assert palette[0].startswith("color(")
     assert palette != ["#8040c0"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX terminal attributes")
+def test_terminal_restore_failure_is_logged_without_aborting_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cosmetic probe still reports failure to restore the user's input mode."""
+    import logging
+    import sys
+    import termios
+    from collections.abc import Callable
+
+    from usagebassoon.cli._colorterm import _posix_colors
+
+    master, slave = os.openpty()
+    calls: list[int] = []
+
+    def set_mode(descriptor: int, _when: int, _attributes: object) -> None:
+        """Simulate successful setup followed by failed terminal restoration."""
+        calls.append(descriptor)
+        if len(calls) == 2:
+            raise termios.error("terminal restore unavailable")
+
+    def no_reply(
+        _write: Callable[[str], object],
+        _read: Callable[[float], str],
+        *,
+        ansi_index: int,
+    ) -> None:
+        """Finish the cosmetic probe without waiting for terminal replies."""
+        assert ansi_index == 5
+
+    monkeypatch.setattr(termios, "tcsetattr", set_mode)
+    monkeypatch.setattr("usagebassoon.cli._colorterm._probe_colors", no_reply)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+    try:
+        with os.fdopen(os.dup(slave), "r") as stream:
+            monkeypatch.setattr(sys, "stdin", stream)
+            assert _posix_colors(Console(file=stream)) is None
+        assert len(calls) == 2
+        assert "could not restore terminal input settings" in caplog.text
+        assert "terminal restore unavailable" in caplog.text
+    finally:
+        os.close(master)
+        os.close(slave)

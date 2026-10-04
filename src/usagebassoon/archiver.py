@@ -450,6 +450,12 @@ class SnapshotArchiver:
             try:
                 state = Catalog(prepared.candidate.bucket).state(identifier)
             except (ValueError, OSError, RuntimeError):
+                _LOG.warning(
+                    "Snapshot copy could not read lifecycle state at %s; "
+                    "preserving a pin",
+                    prepared.candidate.uri,
+                    exc_info=True,
+                )
                 state = None
             if state is None:
                 state = {"pinned": True, "roles": list[str](), "retired": False}

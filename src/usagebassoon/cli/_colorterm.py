@@ -10,19 +10,21 @@ contains no report metrics, calendar layout, or activity intensity policy.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import struct
 import sys
 import time
 from collections.abc import Callable, Sequence
-from contextlib import suppress
 from typing import TextIO, cast
 
 from rich.color import Color, ColorSystem
 from rich.console import Console
 
 from usagebassoon.cli._output import output_console
+
+_LOG = logging.getLogger("usagebassoon")
 
 type RGB = tuple[int, int, int]
 type TerminalColors = tuple[RGB, RGB]
@@ -99,6 +101,7 @@ def _windows_colors(ansi_index: int = 5) -> TerminalColors | None:
             (background & 255, (background >> 8) & 255, (background >> 16) & 255),
         )
     except (AttributeError, KeyError, OSError, ValueError):
+        _LOG.debug("Windows terminal palette unavailable", exc_info=True)
         return None
 
 
@@ -171,6 +174,7 @@ def _posix_colors(
     try:
         original = termios.tcgetattr(descriptor)
     except termios.error:
+        _LOG.debug("terminal input settings unavailable for theme probe", exc_info=True)
         if trace is not None:
             trace.append("Could not read terminal input settings.")
         return None
@@ -202,10 +206,13 @@ def _posix_colors(
             return _probe_colors(write, read, trace=trace, ansi_index=ansi_index)
         return _probe_colors(write, read, ansi_index=ansi_index)
     except termios.error:
+        _LOG.debug("terminal theme probe unavailable", exc_info=True)
         return None
     finally:
-        with suppress(termios.error):
+        try:
             termios.tcsetattr(descriptor, termios.TCSANOW, original)
+        except termios.error:
+            _LOG.warning("could not restore terminal input settings", exc_info=True)
 
 
 def _windows_query_colors(
@@ -262,7 +269,8 @@ def _windows_query_colors(
     try:
         return _probe_colors(write, read, ansi_index=ansi_index)
     finally:
-        kernel.SetConsoleMode(handle, original.value)
+        if not kernel.SetConsoleMode(handle, original.value):
+            _LOG.warning("could not restore Windows terminal input settings")
 
 
 def resolve_theme_colors(console: Console, color: str = "magenta") -> TerminalColors:
@@ -278,7 +286,9 @@ def resolve_theme_colors(console: Console, color: str = "magenta") -> TerminalCo
             if colors is not None:
                 return colors
         except (AttributeError, KeyError, OSError, ValueError):
-            pass
+            _LOG.debug(
+                "terminal theme discovery failed; using fallback colors", exc_info=True
+            )
     name = next(name for name, index in _ANSI_COLORS.items() if index == ansi_index)
     return _windows_colors(ansi_index) or (fallback_accent(name), _FALLBACK_BACKGROUND)
 

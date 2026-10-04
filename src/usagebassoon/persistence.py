@@ -236,12 +236,13 @@ def persist_with_retries(
             delay = random.uniform(0, maximum_delay)
             logger.warning(
                 "another UsageBassoon instance may be writing to the database; "
-                "collection run %s had a retryable write conflict on attempt "
+                "collection run %s had a retryable backend error on attempt "
                 "%s of %s; retrying in %.1fs",
                 bundle.run_id,
                 attempt,
                 attempts,
                 delay,
+                exc_info=True,
             )
             time.sleep(delay)
         finally:

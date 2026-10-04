@@ -109,6 +109,7 @@ def maintenance_health(backend: StorageBackend | None) -> DoctorCheck:
     try:
         result = backend.maintenance_status()
     except Exception as error:
+        _LOG.warning("doctor maintenance inspection failed", exc_info=True)
         return DoctorCheck("maintenance", "warning", f"inspection unavailable: {error}")
     if result is None:
         return DoctorCheck("maintenance", "ok", "scheduled compaction is not required")
@@ -223,6 +224,7 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
                     )
         warnings.extend(str(r["error"]) for r in rows if "error" in r)
     except Exception as error:
+        _LOG.warning("doctor archive inspection failed", exc_info=True)
         warnings.append(f"archive inspection unavailable: {error}")
     return DoctorCheck(
         "backup_freshness",
@@ -536,6 +538,10 @@ def run_doctor(
         try:
             backend.query(probe)
         except Exception:
+            active_logger.warning(
+                "doctor combined schema probe failed; checking individual relations",
+                exc_info=True,
+            )
             if workers > 1:
                 with ThreadPoolExecutor(
                     max_workers=min(workers, len(REQUIRED_RELATIONS))
@@ -646,6 +652,7 @@ def run_doctor(
         try:
             backlog_table = _read_value(backlog_result)
         except Exception as error:
+            active_logger.exception("doctor compaction inspection failed")
             checks.append(
                 DoctorCheck(
                     "compaction",

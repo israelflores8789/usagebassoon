@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 from collections.abc import Generator
@@ -21,6 +22,16 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
+
+_LOG = logging.getLogger("usagebassoon")
+
+
+def _remove_temporary(path: Path) -> None:
+    """Remove a disposable file without masking publication or failure."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        _LOG.warning("could not remove temporary snapshot file %s", path, exc_info=True)
 
 
 def sync_directory(path: Path) -> None:
@@ -63,7 +74,7 @@ def durable_replace(path: Path, payload: bytes) -> None:
         temporary.replace(path)
         sync_directory(path.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        _remove_temporary(temporary)
 
 
 @contextmanager
@@ -82,8 +93,14 @@ def _catalog_lock(path: Path) -> Generator[None]:
             try:
                 yield
             finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    _LOG.warning(
+                        "could not unlock snapshot catalog; closing handle",
+                        exc_info=True,
+                    )
         else:
             import fcntl
 
@@ -91,7 +108,13 @@ def _catalog_lock(path: Path) -> Generator[None]:
             try:
                 yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    _LOG.warning(
+                        "could not unlock snapshot catalog; closing handle",
+                        exc_info=True,
+                    )
 
 
 class LocalSnapshotBucket:
@@ -203,7 +226,7 @@ class LocalSnapshotBucket:
             os.link(temporary, target)
             sync_directory(target.parent)
         finally:
-            temporary.unlink(missing_ok=True)
+            _remove_temporary(temporary)
         with target.open("rb") as stream:
             version = hashlib.file_digest(stream, "sha256").hexdigest()
         return SnapshotObject(relative_name, version, target.stat().st_size, version)
