@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO, override
 
-from usagebassoon.config import LoggingConfig
+from .config import LoggingConfig
 
 LOGGER_NAME = "usagebassoon"
 LOG_DIRECTORY_ENV_VAR = "USAGEBASSOON_LOG_DIRECTORY"
@@ -83,17 +83,33 @@ def configure(config: LoggingConfig) -> logging.Logger:
     Returns:
         The package logger configured for exception diagnostics.
     """
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.disabled = config.disable
+    if config.disable:
+        for handler in tuple(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        return logger
     directory = _log_directory(config)
     log_path = directory / "usagebassoon.log"
-    logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    for handler in logger.handlers:
-        if isinstance(handler, RotatingFileHandler) and handler.baseFilename == str(
-            log_path
+    reusable: RotatingFileHandler | None = None
+    for handler in tuple(logger.handlers):
+        if not isinstance(handler, RotatingFileHandler):
+            continue
+        if (
+            handler.baseFilename == str(log_path.resolve())
+            and handler.maxBytes == config.max_bytes
+            and handler.backupCount == config.max_files - 1
         ):
-            _remove_fallback_handlers(logger)
-            return logger
+            reusable = handler
+        else:
+            logger.removeHandler(handler)
+            handler.close()
+    if reusable is not None:
+        _remove_fallback_handlers(logger)
+        return logger
     try:
         directory.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(

@@ -116,14 +116,16 @@ def _normalized_bundle(
     )
 
 
-def _snapshot_config(settings: LiveSettings, directory: Path, source_id: str) -> Path:
+def _local_snapshot_config(
+    settings: LiveSettings, directory: Path, source_id: str
+) -> Path:
     """Use the test's exact source namespace and an explicit private archive."""
     configuration = directory / "config.toml"
     content = settings.config_path.read_text().replace(
         f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
     )
     configuration.write_text(
-        content + f'\n[snapshots]\nfile_uri = "{directory / "snapshots"}"\n'
+        content + f'\n[snapshots.local]\npath = "{directory / "snapshots"}"\n'
     )
     return configuration
 
@@ -307,8 +309,8 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
         log_directory = config_path.parent / "logs"
         config_path.write_text(
             f'source_id = "{source_id}"\n'
-            'backend = "bigquery"\n'
-            "[bigquery]\n"
+            'backend.provider = "bigquery"\n'
+            "[backend.bigquery]\n"
             f'project = "{project}"\n'
             f'dataset = "{_DATASET}"\n'
             f'location = "{location}"\n'
@@ -455,7 +457,7 @@ def test_live_cli_commands_including_models_report(
         persist_run(backend, bundle)
     finally:
         backend.close()
-    config_path = _snapshot_config(live_settings, tmp_path, source_id)
+    config_path = _local_snapshot_config(live_settings, tmp_path, source_id)
     configuration = ConfigurationManager(config_path).load()
 
     def preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
@@ -959,7 +961,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
     remote = _backend(live_settings)
     local = DuckDBBackend(":memory:")
     local.apply_ddl()
-    config_path = _snapshot_config(live_settings, tmp_path, source_id)
+    config_path = _local_snapshot_config(live_settings, tmp_path, source_id)
     configuration = ConfigurationManager(config_path).load()
     archive = SnapshotArchiver.from_config(configuration)
     runner = CliRunner()

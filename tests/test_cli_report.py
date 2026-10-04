@@ -56,8 +56,8 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
         f'source_id = "{LOCAL_SOURCE_ID}"\n'
-        f'backend = "duckdb"\n'
-        f'local_database = "{database}"\n'
+        f'backend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()

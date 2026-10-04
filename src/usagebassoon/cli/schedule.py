@@ -46,12 +46,20 @@ def _schedule_error(error: Exception) -> NoReturn:
 
 @schedule_app.command()
 def install(
-    interval: Annotated[
+    collect_interval: Annotated[
         str | None,
         typer.Option(
-            "--interval",
-            "-i",
+            "--collect-interval",
+            "-c",
             help="Persist the collection interval in config.toml before installation.",
+        ),
+    ] = None,
+    snapshot_interval: Annotated[
+        str | None,
+        typer.Option(
+            "--snapshot-interval",
+            "-s",
+            help="Persist the independent snapshot interval before installation.",
         ),
     ] = None,
     config: Annotated[
@@ -69,12 +77,24 @@ def install(
     """Install and enable the native collection schedule."""
     manager = ConfigurationManager(config)
     try:
-        configuration = manager.load(schedule_interval=interval)
-        if interval is not None:
+        configuration = manager.load(
+            schedule_interval=collect_interval,
+            snapshot_schedule_interval=snapshot_interval,
+        )
+        if collect_interval is not None or snapshot_interval is not None:
             availability = scheduler_availability()
             if not availability.available:
                 raise SchedulingError(availability.detail)
-            update_schedule_interval(manager.path, configuration.schedule.interval)
+            if collect_interval is not None:
+                update_schedule_interval(
+                    manager.path, configuration.collection.schedule.interval
+                )
+            if snapshot_interval is not None:
+                update_schedule_interval(
+                    manager.path,
+                    configuration.snapshots.schedule.interval,
+                    domain="snapshots",
+                )
             configuration = manager.load()
         with spinner(configuration):
             status = install_native_schedule(configuration, no_linger=no_linger)
@@ -185,17 +205,25 @@ def remove() -> None:
     help="Run `bassoon schedule worker --foreground` as the container's main process."
 )
 def worker(
-    interval: Annotated[
+    collect_interval: Annotated[
         str | None,
         typer.Option(
-            "--interval",
-            "-i",
+            "--collect-interval",
+            "-c",
             help="Persist the collection interval in config.toml before starting.",
         ),
     ] = None,
     config: Annotated[
         Path | None,
         typer.Option("--config", help="Use this configuration file."),
+    ] = None,
+    snapshot_interval: Annotated[
+        str | None,
+        typer.Option(
+            "--snapshot-interval",
+            "-s",
+            help="Persist the independent snapshot interval before starting.",
+        ),
     ] = None,
     foreground: Annotated[
         bool,
@@ -208,9 +236,17 @@ def worker(
     """Start the self-contained worker for interactive or container use."""
     try:
         if foreground:
-            run_worker(config, schedule_interval=interval)
+            run_worker(
+                config,
+                schedule_interval=collect_interval,
+                snapshot_schedule_interval=snapshot_interval,
+            )
             return
-        result = start_worker(config, schedule_interval=interval)
+        result = start_worker(
+            config,
+            schedule_interval=collect_interval,
+            snapshot_schedule_interval=snapshot_interval,
+        )
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
         _schedule_error(error)
     if not result.running:

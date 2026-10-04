@@ -21,9 +21,11 @@ from usagebassoon.config import default_snapshot_directory
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.parametrize("location", ["default", "path", "file_uri"])
 def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    location: str,
 ) -> None:
     """Use the documented manual marker before any collection run exists."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -31,9 +33,17 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
+    snapshot_directory = default_snapshot_directory()
+    snapshot_settings = ""
+    if location != "default":
+        value = str(snapshot_directory)
+        if location == "file_uri":
+            value = f"file://{value}"
+        snapshot_settings = f"[snapshots.local]\npath = '{value}'\n"
     config.write_text(
         f'source_id = "{SOURCE_ID}"\n'
-        f'backend = "duckdb"\nlocal_database = "{database}"\n'
+        f'backend.provider = "duckdb"\nbackend.duckdb.database = "{database}"\n'
+        + snapshot_settings
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -49,7 +59,6 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     result = CliRunner().invoke(app, ["snapshot", "--config", str(config)])
     assert result.exit_code == 0, plain_cli_output(result.output)
 
-    snapshot_directory = default_snapshot_directory()
     store = SnapshotStore(str(snapshot_directory))
     stamps = store.list_snapshots()
     with (snapshot_directory / stamps[0] / "manifest.json").open() as handle:

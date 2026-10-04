@@ -42,8 +42,10 @@ def _configuration(
     content = "\n".join(
         (
             f'source_id = "{SOURCE_ID}"',
-            'backend = "duckdb"',
-            'local_database = ":memory:"',
+            'backend.provider = "duckdb"',
+            'backend.duckdb.database = ":memory:"',
+            "[snapshots.local]",
+            "enable = false",
             "",
         )
     )
@@ -188,7 +190,10 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
     with pytest.raises(KeyboardInterrupt):
         run_worker(configuration.path, schedule_interval="30m")
 
-    assert ConfigurationManager(configuration.path).load().schedule.interval == "30m"
+    assert (
+        ConfigurationManager(configuration.path).load().collection.schedule.interval
+        == "30m"
+    )
 
 
 @pytest.mark.parametrize("change", ["edited", "replaced", "invalid", "deleted", "none"])
@@ -203,9 +208,9 @@ def test_worker_keeps_startup_configuration_until_restart(
     configuration = _configuration(tmp_path)
     changed_content = (
         'source_id = "22222222-2222-4222-8222-222222222222"\n'
-        'backend = "duckdb"\n'
-        'local_database = "changed.duckdb"\n'
-        '[schedule]\ninterval = "1h"\n'
+        'backend.provider = "duckdb"\n'
+        'backend.duckdb.database = "changed.duckdb"\n'
+        '[collection.schedule]\ninterval = "1h"\n'
         '[tokscale]\nbin = "changed-tokscale"\n'
         "[logging]\nmax_bytes = 12345\n"
     )
@@ -284,7 +289,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
             "worker",
             "--config",
             str(configuration.path),
-            "--interval",
+            "--collect-interval",
             "1d",
         ],
     )
@@ -293,9 +298,15 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     assert "minutes or hours" in plain_cli_output(result.output)
 
 
+@pytest.mark.parametrize(
+    ("collect_flag", "snapshot_flag"),
+    [("--collect-interval", "--snapshot-interval"), ("-c", "-s")],
+)
 def test_worker_cli_starts_detached_process_and_reports_pid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    collect_flag: str,
+    snapshot_flag: str,
 ) -> None:
     """Return promptly while reporting the detached worker's runtime details."""
     configuration = _configuration(tmp_path)
@@ -312,7 +323,9 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
         _config: Path | None = None,
         *,
         schedule_interval: str | None = None,
+        snapshot_schedule_interval: str | None = None,
     ) -> WorkerStatus:
+        assert snapshot_schedule_interval == "12h"
         calls.append(schedule_interval)
         return started
 
@@ -325,8 +338,10 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
             "worker",
             "--config",
             str(configuration.path),
-            "--interval",
+            collect_flag,
             "30m",
+            snapshot_flag,
+            "12h",
         ],
     )
 
@@ -337,11 +352,13 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
     assert str(started.log_path) in plain_cli_output(result.output)
 
 
+@pytest.mark.parametrize("collect_flag", ["--collect-interval", "-c"])
 def test_schedule_install_persists_explicit_interval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    collect_flag: str,
 ) -> None:
-    """Persist --interval before handing the schedule to its provider."""
+    """Persist --collect-interval before handing the schedule to its provider."""
     configuration = _configuration(tmp_path)
     status = ScheduleStatus(
         platform="linux",
@@ -379,13 +396,16 @@ def test_schedule_install_persists_explicit_interval(
             "install",
             "--config",
             str(configuration.path),
-            "--interval",
+            collect_flag,
             "30m",
         ],
     )
 
     assert result.exit_code == 0, plain_cli_output(result.output)
-    assert ConfigurationManager(configuration.path).load().schedule.interval == "30m"
+    assert (
+        ConfigurationManager(configuration.path).load().collection.schedule.interval
+        == "30m"
+    )
 
 
 def test_snapshot_worker_runs_while_collection_is_blocked(
@@ -395,11 +415,14 @@ def test_snapshot_worker_runs_while_collection_is_blocked(
     from dataclasses import replace
 
     import usagebassoon.scheduling as module
-    from usagebassoon.config import SnapshotConfig
+    from usagebassoon.config import (
+        LocalSnapshotConfig,
+        SnapshotsConfig,
+    )
 
     configuration = replace(
         _configuration(tmp_path),
-        snapshots=SnapshotConfig(file_uri=str(tmp_path / "archive")),
+        snapshots=SnapshotsConfig(local=LocalSnapshotConfig(path=tmp_path / "archive")),
     )
     captured = Event()
     blocked = Event()
@@ -450,12 +473,21 @@ def test_native_snapshot_artifacts_have_independent_cadence(
     from dataclasses import replace
 
     import usagebassoon.scheduling as module
-    from usagebassoon.config import ScheduleConfig, SnapshotConfig
+    from usagebassoon.config import (
+        CollectionConfig,
+        LocalSnapshotConfig,
+        ScheduleConfig,
+        SnapshotScheduleConfig,
+        SnapshotsConfig,
+    )
 
     config = replace(
         _configuration(tmp_path),
-        schedule=ScheduleConfig(interval="2h"),
-        snapshots=SnapshotConfig(file_uri=str(tmp_path / "archive"), interval="10m"),
+        collection=CollectionConfig(schedule=ScheduleConfig(interval="2h")),
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+            schedule=SnapshotScheduleConfig(interval="10m"),
+        ),
     )
     monkeypatch.setattr(module, "_systemd_unit_dir", lambda: tmp_path)
     monkeypatch.setattr(module, "_snapshot_plist", lambda: tmp_path / "snapshot.plist")
@@ -479,3 +511,89 @@ def test_native_snapshot_artifacts_have_independent_cadence(
         payload = plistlib.loads((tmp_path / "snapshot.plist").read_bytes())
         assert payload["StartInterval"] == 600
         assert "--automatic" in payload["ProgramArguments"]
+
+
+@pytest.mark.parametrize("disabled_weekly", [False, True])
+def test_snapshot_schedule_defaults_and_disable_flags(
+    tmp_path: Path, disabled_weekly: bool
+) -> None:
+    """Use hourly weekly checks or twelve-hour cadence, and stop disabled archives."""
+    from dataclasses import replace
+
+    from usagebassoon.config import (
+        LocalSnapshotConfig,
+        SnapshotScheduleConfig,
+        SnapshotsConfig,
+    )
+    from usagebassoon.scheduling import snapshot_schedule_seconds
+
+    config = replace(
+        _configuration(tmp_path),
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+            schedule=SnapshotScheduleConfig(disable_weekly=disabled_weekly),
+        ),
+    )
+    assert snapshot_schedule_seconds(config) == (43200.0 if disabled_weekly else 3600.0)
+    disabled = replace(
+        config, snapshots=SnapshotsConfig(local=LocalSnapshotConfig(enable=False))
+    )
+    assert snapshot_schedule_seconds(disabled) is None
+
+
+@pytest.mark.parametrize("snapshot_flag", ["--snapshot-interval", "-s"])
+def test_schedule_install_persists_independent_snapshot_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_flag: str
+) -> None:
+    """Install uses the validated snapshot override and preserves collection cadence."""
+    config = _configuration(tmp_path)
+    observed: list[UsageBassoonConfig] = []
+
+    def install(
+        configuration: UsageBassoonConfig, *, no_linger: bool
+    ) -> ScheduleStatus:
+        del no_linger
+        observed.append(configuration)
+        return ScheduleStatus(
+            platform="linux",
+            provider="systemd",
+            installed=True,
+            active=True,
+            enabled=True,
+            interval=configuration.collection.schedule.interval,
+            artifact=tmp_path / "timer",
+            log_path="journal",
+            command=(),
+        )
+
+    monkeypatch.setattr(
+        "usagebassoon.cli.schedule.scheduler_availability",
+        lambda: SchedulerAvailability("linux", "systemd", True, "ready"),
+    )
+    monkeypatch.setattr("usagebassoon.cli.schedule.install_native_schedule", install)
+    result = CliRunner().invoke(
+        app,
+        [
+            "schedule",
+            "install",
+            "--config",
+            str(config.path),
+            snapshot_flag,
+            "2d",
+        ],
+    )
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    assert observed[0].snapshots.schedule.interval == "2d"
+    assert observed[0].collection.schedule.interval == "15m"
+    assert ConfigurationManager(config.path).load() == observed[0]
+
+
+def test_worker_persists_both_intervals(tmp_path: Path) -> None:
+    """Validate and persist both independent schedules before worker startup."""
+    from usagebassoon.scheduling import _worker_configuration
+
+    config = _configuration(tmp_path)
+    loaded = _worker_configuration(config.path, "30m", "2d")
+    assert loaded.collection.schedule.interval == "30m"
+    assert loaded.snapshots.schedule.interval == "2d"
+    assert ConfigurationManager(config.path).load() == loaded

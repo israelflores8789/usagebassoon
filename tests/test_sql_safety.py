@@ -30,8 +30,8 @@ def initialized_config(tmp_path: Path) -> Path:
         backend.close()
     config = tmp_path / "config.toml"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
-        f'local_database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
     return config
 

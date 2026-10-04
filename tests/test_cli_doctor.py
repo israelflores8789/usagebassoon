@@ -27,8 +27,8 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
-        f'local_database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -176,7 +176,12 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     """Each automatic role has its own freshness check."""
     from datetime import UTC, datetime, timedelta
 
-    from usagebassoon.config import SnapshotConfig, UsageBassoonConfig
+    from usagebassoon.config import (
+        LocalSnapshotConfig,
+        SnapshotScheduleConfig,
+        SnapshotsConfig,
+        UsageBassoonConfig,
+    )
     from usagebassoon.diagnostics import snapshot_health
     from usagebassoon.snapshot.reader import SnapshotReader
 
@@ -185,7 +190,10 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
         tmp_path / "config.toml",
         "11111111-1111-4111-8111-111111111111",
         "duckdb",
-        snapshots=SnapshotConfig(file_uri=root, interval="1h"),
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=Path(root)),
+            schedule=SnapshotScheduleConfig(interval="1h"),
+        ),
     )
     stamp = datetime.now(UTC)
 

@@ -56,7 +56,7 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 ```bash
 pipx install "usagebassoon"            # minimal install
 
-pipx install "usagebassoon[bigquery]"  # use with BigQuery
+pipx install "usagebassoon[backend.bigquery]"  # use with BigQuery
 pipx install "usagebassoon[gcs]"       # use with Google Cloud Storage
 pipx install "usagebassoon[polars]"    # use polars dataframes
 pipx install "usagebassoon[full]"      # full installation
@@ -281,12 +281,7 @@ Intensity is relative to this selection. Unfilled squares show zero recorded usa
 
 source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically generated with `bassoon init`. Set manually
                                                     # for identical environments (e.g. respawning a crashed container).
-backend = "duckdb"                                  # Required; one of `duckdb`, `motherduck`, or `bigquery`.
-spinner = "pong"                                    # Optional; yaspin animation name, e.g. `pong`, `dots`, or `line`.
-local_database = "path/to/your/database.duckdb"     # Optional; local DuckDB file path.
-                                                    # Default: Linux: ~/.local/share/usagebassoon/usagebassoon.duckdb
-                                                    #          macOS: ~/Library/Application Support/UsageBassoon/usagebassoon.duckdb
-                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\usagebassoon.duckdb
+spinner = "pong"                                    # Optional; yaspin animation name, e.g. pong, dots, or line.
 
 [tokscale]                                          # Optional; `bin` overrides `TOKSCALE_BIN` when set.
 bin = "bunx tokscale@latest"                        # Command prefix with runner arguments.
@@ -298,47 +293,64 @@ timeout = "180s"                                    # Optional; max duration of 
 max_stdout_bytes = 67108864                         # Optional; max stdout captured from tokscale for one command.
 max_stderr_bytes = 8388608                          # Optional; this and the above prevent memory-leaks and abuse.
 
-[bigquery]                                          # Required when backend is `bigquery`.
+[backend]
+provider = "duckdb"                                 # duckdb (default), motherduck, or bigquery.
+
+[backend.duckdb]                                    # Optional; defaults to the platform data directory.
+database = "path/to/your/database.duckdb"           # Optional; local DuckDB file path.
+                                                    # Default: Linux: ~/.local/share/usagebassoon/usagebassoon.duckdb
+                                                    #          macOS: ~/Library/Application Support/UsageBassoon/usagebassoon.duckdb
+                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\usagebassoon.duckdb
+
+[backend.bigquery]                                  # Required when backend.provider is `bigquery`.
 project = "my-gcp-project"                          # Required; Google Cloud project ID.
 dataset = "usagebassoon"                            # Required; BigQuery dataset ID in the project above.
-location = "US"                                     # Optional dataset and job location; defaults to `US`.
+location = "US"                                     # Optional; dataset and job location.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
 timeout = "120s"                                    # Optional; max wait for one BigQuery job or Storage Read request.
 
-[motherduck]                                        # Required when backend is `motherduck`.
+[backend.motherduck]                                # Required when backend.provider is `motherduck`.
 database = "usagebassoon"                           # Required; MotherDuck database name without the `md:` prefix.
                                                     # Don't forget to set your MOTHERDUCK_TOKEN environment variable!
 
-[gcs]                                               # Optional; configure GCS snapshots independently of the data backend.
-uri = "gs://my-private-bucket/usagebassoon"         # Required if `gcs` is present; private Google Cloud Storage URI.
-project = "my-gcp-project"                          # Required; Google Cloud project ID.
-credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
-timeout = "60s"                                     # Optional; max wait for one GCS request, not the whole snapshot.
+[collection]                                        # Optional; persistence retry settings.
+max_retries = 3                                     # Optional; additional attempts after the first persistence failure.
+retry_initial_seconds = 1.0                         # Optional; positive initial delay for exponential backoff.
 
-[schedule]                                          # Optional automated collection scheduling.
-interval = "15m"                                    # Minutes or hours between collection cycles; must exceed tokscale.timeout.
+[collection.schedule]                               # Optional; automated collection scheduling.
+interval = "15m"                                    # Optional; minutes or hours; must exceed tokscale.timeout.
 
-[collection]                                        # Optional persistence retry settings.
-max_retries = 3                                     # Additional attempts after the first persistence failure.
-retry_initial_seconds = 1.0                         # Positive initial delay for exponential backoff.
+[snapshots]
+max_snapshots = 3                                   # Optional; maximum snapshots in rotation
 
-[logging]                                           # Optional rotating operational log settings.
-max_files = 5                                       # Retained files, including the active file.
-max_bytes = 5242880                                 # Max size of the active log file before rotation (5 MiB).
-directory = "path/to/your/logs/"                    # Log files directory.
-                                                    # Default: Linux: ~/.local/state/usagebassoon/logs/
-                                                    #          macOS: ~/Library/Logs/UsageBassoon/
-                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\Logs\
+[snapshots.schedule]                                # Optional; automatic snapshot cadence settings.
+interval = "12h"                                    # Optional; minutes, hours, or days.
+disable_weekly = false                              # Optional; set `true` to disable weekly snapshots.
 
-[snapshots]                                         # Optional retention and automatic snapshot settings.
-max_snapshots = 3                                   # Max number of snapshots to retain.
-interval = "12h"                                    # Optional positive cadence (m, h, d).
-file_uri = "file:///path/to/your/snapshots/"        # Optional local path or `file://` archive.
+[snapshots.local]                                   # Optional; local snapshots are enabled by default.
+enable = true
+path = "path/to/your/snapshots"                     # Optional; local filesystem path or `file://` archive.
                                                     # with `gcs.uri`, snapshots go both locally and to GCS.
                                                     # Default: Linux: ~/.local/share/usagebassoon/snapshots/
                                                     #          macOS: ~/Library/Application Support/UsageBassoon/snapshots/
                                                     #          Windows: %LOCALAPPDATA%\UsageBassoon\snapshots\
+
+[snapshots.gcs]                                     # Optional; remote snapshot bucket.
+enable = false
+uri = "gs://my-private-bucket/usagebassoon"         # Required; private Google Cloud Storage URI.
+project = "my-gcp-project"                          # Required; Google Cloud project ID.
+credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
+timeout = "60s"                                     # Optional; max wait for one GCS request, not the whole snapshot.
+
+[logging]                                           # Optional; operational logging is enabled by default.
+disable = false
+max_files = 5                                       # Optional; maximum log files in rotation.
+max_bytes = 5242880                                 # Optional; max size of the active log file before rotation (5 MiB).
+directory = "path/to/your/logs/"                    # Optional; log files directory.
+                                                    # Default: Linux: ~/.local/state/usagebassoon/logs/
+                                                    #          macOS: ~/Library/Logs/UsageBassoon/
+                                                    #          Windows: %LOCALAPPDATA%\UsageBassoon\Logs\
 ```
 
 > [!TIP]
@@ -346,7 +358,7 @@ file_uri = "file:///path/to/your/snapshots/"        # Optional local path or `fi
 
 BigQuery is *not* required to persist snapshots to Google Cloud Storage, and GCS is *not* required to use BigQuery.
 
-If neither `gcs.uri` nor `snapshots.file_uri` is configured, snapshots use the platform-specific local archive documented above. If only `gcs.uri` is configured, snapshots go to GCS; if both are configured, snapshots go to both destinations. On Linux, the default archive follows `XDG_DATA_HOME` when set; the default is `~/.local/share/usagebassoon/snapshots/`.
+Local and remote snapshot enablement are independent. Local snapshots remain enabled when GCS is enabled; set `[snapshots.local].enable = false` for a GCS-only archive. On Linux, the local archive follows `XDG_DATA_HOME` when set; the default is `~/.local/share/usagebassoon/snapshots/`.
 
 ## Choosing a Backend
 
@@ -381,7 +393,7 @@ bassoon schedule stop
 bassoon schedule remove
 ```
 
-`--interval` persists to `[schedule].interval` in `config.toml`. The value must use minutes or hours.
+`--interval` persists to `[collection.schedule].interval` in `config.toml` and accepts minutes or hours. `--snapshot-interval` persists to `[snapshots.schedule].interval` and accepts minutes, hours, or days. Both options work with `schedule install` and `schedule worker`; their defaults are `15m` and `12h`, respectively. Scheduling must still be installed or a worker started.
 
 #### Interactive Use
 ```bash
@@ -460,35 +472,25 @@ The commands have deliberately different sharing behavior:
 
 ## Snapshots
 
-`bassoon snapshot` creates a private, whole-backend Parquet archive and pins it by default. It preserves all sources, including uncompacted BigQuery observations. A manual request bypasses automatic cadence; use `--no-pin` to make it eligible for rotation. Pins do not change immutable manifests or data hashes.
-
-```bash
-bassoon snapshot
-bassoon snapshot list                     # YAML, newest capture first; --json available
-bassoon snapshot inspect --from-snapshot SNAPSHOT_ID
-bassoon snapshot audit --from-snapshot SNAPSHOT_ID
-bassoon snapshot pin SNAPSHOT_ID
-bassoon snapshot copy /new/archive --from-snapshot SNAPSHOT_ID
-bassoon snapshot delete SNAPSHOT_ID        # displays all selected copies; type DELETE
-```
-
-`bassoon audit snapshot` and `bassoon audit snapshots` are aliases for `bassoon snapshot audit`. Integrity auditing downloads and checks every table without opening a destination backend. `inspect` shows producer version, data-schema version, archive-format version, backend schema version/hash, capture time, and cadence. `inspect` and listing expose verified provenance even when this release cannot restore a newer format or data contract, and separately report compatibility. Listing is discovery, not a full integrity audit. Snapshot commands emit structured YAML or JSON on stdout; notices and warnings go to stderr.
-
-Local manual snapshots use the platform data directory by default. Set `snapshots.file_uri` or `gcs.uri` to choose archive destinations; GCS requires `usagebassoon[gcs]`. Both can be configured for redundant publication. `snapshots.interval` enables automatic user-cadence captures, and `snapshots.max_snapshots` limits unpinned scheduled/manual recovery points (default three). Explicitly configured destinations also capture the current UTC calendar-week slot and retain four successful weekly slots. Set `[snapshots].disable_weekly_snapshots = true` or `[gcs].disable_weekly_snapshots = true` to opt out for that destination. Pins are exempt from both retention classes and consume storage until explicitly deleted. Manual captures do not advance automatic cadence clocks.
-
-Snapshot cadence is independent of collection. `bassoon schedule install` creates separate systemd/launchd snapshot jobs, and the container worker services snapshots separately even while collection is blocked or fails. For cron, invoke `bassoon snapshot --automatic` independently of `bassoon collect`; automatic invocations capture only due obligations and never pin. Weekly obligations are checked at least hourly while these jobs are operational. A stopped host cannot capture missing weeks: the next invocation serves the current slot. A capture can fulfill scheduled and weekly obligations together; failed publication does not evict older recovery points. Four weekly slots provide roughly three to four weeks of coverage. Use pins for longer-lived recovery points, and stop rotation during an incident. Instances sharing an archive obey its recorded retention policy; reconcile intentional changes with `bassoon snapshot policy --max-snapshots N` and update their configuration to match.
+You can archive or perform routine backup of your token usage data with `bassoon snapshot` which creates whole-backend archive in Parquet format. Manually invoking `bassoon snapshot` bypasses scheduled snapshots, if configured, and pins it out of rotation (use `--no-pin` if you just want an ephemeral snapshot). Local snapshots are enabled by default. See [#configtoml] for default path and settings.
 
 > [!TIP]
-> Recovery requires immutable `manifest.json`, its valid `COMPLETE` digest, and every referenced Parquet file. Copy the complete snapshot directory, including portable pin metadata in `state.json`, with its ID unchanged between local and GCS locations to preserve both data and retention settings. Preserve `catalog.json` when copying a whole archive; a missing catalog can be discovered from complete directories and rebuilt with `bassoon snapshot repair`. Incomplete contents are never restorable. Routine management excludes retired or unpublished snapshots, but emergency restore can read surviving valid immutable contents regardless of missing, damaged, or retired mutable metadata. Pin metadata travels in `state.json`; missing or unreadable state never silently authorizes rotation.
+> Use `bassoon snapshot --help` to see what it can do!
+
+Snapshot cadence is independent of collection cadence. `bassoon schedule install` creates separate systemd/launchd snapshot jobs, and `bassoon schedule worker` for containers services also has separate cadences. For cron, invoke `bassoon snapshot --automatic` independently of `bassoon collect` which captures only due obligations and never pins.
+
+There are two snapshot cadences: configured and weekly. The default configured cadence is `12h`. Weekly snapshots are rotated every 4 weeks. The weekly cadence is checked at least hourly while the schedule is operational.
 
 > [!NOTE]
-> Snapshots preserve logical state at capture time, not every revision, original agent session files, or original tokscale payloads. Deleted tags and notes are absent from snapshot state. Archives contain original private values and should remain private.
+> Snapshots preserve the logical state of the data warehouse at capture time. Snapshots do not capture revisions, original agent session files, or original tokscale payloads. Deleted tags and notes are absent from snapshot state. Snapshot data is raw and can contain original private values. Handle with care.
 
 ## Restoring your data
 
-Stop all destination writers before recovery: collectors in every environment, systemd/launchd schedules (`bassoon schedule stop`), container workers, cron jobs, and external writers. Keep them stopped through verification. Restore requires an initialized, empty destination and rejects populated unexpected base tables too. Keep the damaged backend and a separate copy of the recovery archive until recovery is verified.
+It happens. Sometimes you find the need to start over. Here's how you recover your data from a valid snapshot:
 
-Create a separate recovery configuration pointing to a fresh storage destination and the existing archive. Changing destinations does not change a continuing collection environment's identity: preserve its original `source_id` to avoid collecting the same history into a second namespace. Restore preserves every archived source ID; the recovery configuration's ID does not filter or rewrite the archive. If the ID is lost, inspect `bassoon audit sources --from-snapshot /path/to/SNAPSHOT_ID` or a GCS URI. `bassoon audit runs --from-snapshot …` also works without a working backend or source ID. Host metadata is evidence for identifying a source, not proof of identity.
+1. **Stop _all_ UsageBassoon instances before recovery.** This is *crucial*. Recovery *requires* an initialized, **empty** data warehouse and collection quiescence. Make sure you stop your systemd/launchd schedules (`bassoon schedule stop`), container workers, cron jobs, and external writers! We recommend keeping the damaged data warehouse and a separate copy of the recovery archive until recovery is verified.
+
+2. **Create a separate recovery `config.toml`.** This is *strongly* recommended. Point it to a fresh data warehouse and the existing archive. Make sure you *preserve the original* `source_id` in your recovery config! There is no way for UsageBassoon to know if you're recovering from a new environment or an old one. While there are some protections in place, if you have tokscale data on your present environment, you were using UsagaBasson until the time of recovery, and you attempt to recover with a different `source_id`, *you risk duplicating your tokscale data in your environment under a new* `source_id`. If you lost your `source_id`, you can use `bassoon audit sources --from-snapshot /path/to/SNAPSHOT_ID` or a remote URI (e.g. GCS). In a pinch, `bassoon audit runs --from-snapshot …` also works.
 
 ```bash
 bassoon init --restore --config recovery.toml
@@ -510,7 +512,7 @@ New releases retain registered forward recovery paths for publicly released arch
 
 ## MotherDuck setup and permissions
 
-- Set `MOTHERDUCK_TOKEN` to a read/write token for the identity that owns the configured `[motherduck].database`. Initialization, collection, curation, and restore need a writable database.
+- Set `MOTHERDUCK_TOKEN` to a read/write token for the identity that owns the configured `[backend.motherduck].database`. Initialization, collection, curation, and restore need a writable database.
 - **Builder** is required to create and manage service accounts and their tokens through the MotherDuck UI; **Admin** also includes these permissions. MotherDuck's Admin REST API requires an Admin user's read/write token. See [service-account setup](https://motherduck.com/docs/key-tasks/service-accounts-guide/create-and-configure-service-accounts/).
 - Builder is not a blanket requirement for using UsageBassoon with a personal database: MotherDuck's **Explorer** role can create databases and run SQL. Organization roles do not grant write access to another identity's database. See [MotherDuck roles and access control](https://motherduck.com/docs/concepts/roles-and-access-control/).
 
@@ -524,7 +526,7 @@ New releases retain registered forward recovery paths for publicly released arch
 1. Enable the BigQuery, BigQuery Storage, and BigQuery Data Transfer APIs. UsageBassoon does not enable services itself.
 2. Pre-create an empty dataset in the location configured in `config.toml`, or give the setup identity permission to create it. Pre-creating it avoids granting dataset creation to your everyday identity.
 3. Configure a dedicated service account or your own identity through Application Default Credentials, or set `credentials_file` explicitly.
-4. Grant the permissions below, configure `[bigquery]`, and run `bassoon init` with the setup identity.
+4. Grant the permissions below, configure `[backend.bigquery]`, and run `bassoon init` with the setup identity.
 5. Run `bassoon collect` and `bassoon doctor` to check access and compaction backlog. Verify the Scheduled Query is enabled and runs successfully in BigQuery; doctor does not inspect the schedule configuration.
 
 ### Permissions UsageBassoon may use
@@ -575,9 +577,9 @@ Google Cloud Storage (GCS) is an optional snapshot destination, independent of t
 
 1. Install the GCS extra with `pipx install "usagebassoon[gcs]"`, or include `gcs` alongside your other required extras.
 2. Create a private snapshot bucket yourself; UsageBassoon never creates buckets.
-3. Configure `[gcs].uri` and `[gcs].project` in `config.toml`. Use Application Default Credentials or set `[gcs].credentials_file` explicitly.
+3. Enable `[snapshots.gcs].enable` and configure `[snapshots.gcs].uri` and `[snapshots.gcs].project` in `config.toml`. Use Application Default Credentials or set `[snapshots.gcs].credentials_file` explicitly.
 4. Grant the bucket permissions below to the identity used for snapshots. Keep snapshots private: they contain raw restoration data.
-5. Run `bassoon snapshot` to publish an archive and `bassoon doctor` to inspect bucket lifecycle rules. Configure `[snapshots].interval` for due-only automatic snapshots after collection.
+5. Run `bassoon snapshot` to publish an archive and `bassoon doctor` to inspect bucket lifecycle rules. Configure `[snapshots.schedule].interval` for independent due-only automatic snapshots.
 
 ### Permissions UsageBassoon may use
 

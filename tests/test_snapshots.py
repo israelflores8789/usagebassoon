@@ -27,7 +27,11 @@ from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.buckets.base import SnapshotPreconditionError
 from usagebassoon.buckets.local import LocalSnapshotBucket
-from usagebassoon.config import SnapshotConfig, UsageBassoonConfig
+from usagebassoon.config import (
+    LocalSnapshotConfig,
+    SnapshotsConfig,
+    UsageBassoonConfig,
+)
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.reader import SnapshotReader
 
@@ -351,9 +355,13 @@ def test_weekly_retention_is_independent_and_never_fabricates_slots(
         tmp_path / "config.toml",
         "11111111-1111-4111-8111-111111111111",
         "duckdb",
-        snapshots=SnapshotConfig(file_uri=str(tmp_path / "archive"), max_snapshots=1),
+        snapshots=SnapshotsConfig(
+            max_snapshots=1,
+            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+        ),
     )
     store = SnapshotStore.from_config(configuration)
+    store.interval = None  # Exercise weekly retention independently of cadence.
     clock = [datetime(2026, 1, 5, tzinfo=UTC)]
     monkeypatch.setattr(module, "_now", lambda: clock[0])
     try:
@@ -881,3 +889,129 @@ def test_repair_indexes_only_verified_copies_without_destroying_recovery_data(
     finally:
         source.close()
         target.close()
+
+
+@pytest.mark.parametrize("local_enabled", [False, True])
+@pytest.mark.parametrize("gcs_enabled", [False, True])
+def test_archiver_uses_only_enabled_destinations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    local_enabled: bool,
+    gcs_enabled: bool,
+) -> None:
+    """Archive locally and to one remote bucket according to explicit flags."""
+    from tests.test_bucket_gcs import MemoryGcsArchive
+    from usagebassoon.config import GcsConfig
+
+    archive = MemoryGcsArchive()
+    calls: list[str] = []
+
+    def cloud(
+        uri: str, *, project: str, credentials_file: Path | None, timeout_seconds: float
+    ) -> MemoryGcsArchive:
+        del project, credentials_file, timeout_seconds
+        calls.append(uri)
+        return archive
+
+    monkeypatch.setattr("usagebassoon.buckets.gcs.GcsSnapshotBucket", cloud)
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive", enable=local_enabled),
+            gcs=GcsConfig(uri=archive.uri, project="test", enable=gcs_enabled),
+            max_snapshots=5,
+        ),
+    )
+    if not local_enabled and not gcs_enabled:
+        with pytest.raises(ValueError, match="at least one snapshot destination"):
+            SnapshotStore.from_config(config)
+        assert not calls
+        return
+    store = SnapshotStore.from_config(config)
+    expected = ([str(tmp_path / "archive")] if local_enabled else []) + (
+        [archive.uri] if gcs_enabled else []
+    )
+    assert store.destination_uris == tuple(expected)
+    assert calls == ([archive.uri] if gcs_enabled else [])
+    assert store.interval == timedelta(hours=12)
+    assert store._weekly == set(expected)
+    assert (
+        store.write(cast(StorageBackend, TableBackend()), run_id="shared") is not None
+    )
+    for bucket in store.reader.buckets:
+        control, _ = Catalog(bucket).control()
+        assert control["policy"] == {"max_snapshots": 5, "weekly_slots": 4}
+
+
+@pytest.mark.parametrize("disable_weekly", [False, True])
+def test_automatic_snapshots_observe_independent_cadence_and_weekly_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_weekly: bool
+) -> None:
+    """Automatic captures serve due roles and skip a call before twelve hours."""
+    import usagebassoon.archiver as module
+    from usagebassoon.config import SnapshotScheduleConfig
+
+    clock = [datetime.now(UTC)]
+    monkeypatch.setattr(module, "_now", lambda: clock[0])
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+            schedule=SnapshotScheduleConfig(disable_weekly=disable_weekly),
+        ),
+    )
+    store = SnapshotStore.from_config(config)
+    backend = _backend()
+    try:
+        uri = store.write(backend, run_id="scheduled")
+        assert uri is not None
+        manifest = json.loads((Path(uri) / "manifest.json").read_text())
+        assert manifest["cadence"]["roles"] == (
+            ["scheduled"] if disable_weekly else ["scheduled", "weekly"]
+        )
+        assert manifest["cadence"]["interval_seconds"] == 43200.0
+        clock[0] += timedelta(minutes=1)
+        assert store.write(backend, run_id="early") is None
+        clock[0] += timedelta(hours=13)
+        assert store.write(backend, run_id="due") is not None
+    finally:
+        backend.close()
+
+
+def test_archive_read_configuration_does_not_require_a_backend(tmp_path: Path) -> None:
+    """Discover archives without requiring valid backend settings."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'backend.provider = "unavailable"\n'
+        f'[snapshots.local]\npath = "{tmp_path / "archive"}"\n'
+        '[snapshots.schedule]\ninterval = "2d"\ndisable_weekly = true\n'
+        "[snapshots.gcs]\nenable = false\n"
+    )
+    store = SnapshotStore.for_read(path)
+    assert store.destination_uris == (str(tmp_path / "archive"),)
+    assert store.interval == timedelta(days=2)
+
+
+def test_archive_discovery_honors_logging_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read-only archive commands honor disabled logs without backend validation."""
+    import logging
+
+    from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR, LOGGER_NAME
+
+    directory = tmp_path / "disabled-logs"
+    monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(directory))
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'[snapshots.local]\npath = "{tmp_path / "archive"}"\n'
+        "[logging]\ndisable = true\n"
+    )
+    store = SnapshotStore.for_read(path)
+    assert store.destination_uris == (str(tmp_path / "archive"),)
+    assert logging.getLogger(LOGGER_NAME).disabled
+    assert not directory.exists()

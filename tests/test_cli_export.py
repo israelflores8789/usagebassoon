@@ -30,8 +30,8 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\n'
-        f'local_database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -164,7 +164,9 @@ def test_export_reads_canonical_views(
 
     config = tmp_path / "config.toml"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend = "duckdb"\nlocal_database = ":memory:"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        f'backend.provider = "duckdb"\n'
+        f'backend.duckdb.database = ":memory:"\n'
     )
     publication = pa.table({"source_id": [SOURCE_ID], "value": ["accepted raw data"]})
     client = MagicMock()

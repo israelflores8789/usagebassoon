@@ -120,8 +120,8 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     """Report recovery coverage and last creation verification for each archive."""
     if configuration is None:
         return DoctorCheck("backup_freshness", "warning", "configuration unavailable")
-    settings, cloud = configuration.snapshots, configuration.gcs
-    if settings is None and cloud is None:
+    settings = configuration.snapshots
+    if not settings.enabled:
         return DoctorCheck(
             "backup_freshness", "ok", "automatic snapshots are not configured"
         )
@@ -168,16 +168,8 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
                 "last creation verification "
                 f"{max(verified) if verified else 'unavailable'}"
             )
-            weekly = (
-                cloud is not None
-                and bucket.uri == cloud.uri
-                and not cloud.disable_weekly_snapshots
-            ) or (
-                settings is not None
-                and bucket.uri == settings.file_uri
-                and not settings.disable_weekly_snapshots
-            )
-            interval = parse_interval(settings.interval) if settings else None
+            weekly = not settings.schedule.disable_weekly
+            interval = parse_interval(settings.schedule.interval)
             scheduled = [
                 timestamp(r["captured_at"])
                 for r in available

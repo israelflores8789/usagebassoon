@@ -63,3 +63,21 @@ def test_unavailable_log_directory_falls_back_to_stderr(
     )
     assert "operational log" in plain_cli_output(captured.err)
     assert "fallback collection error" in plain_cli_output(captured.err)
+
+
+def test_logging_disable_closes_sinks_and_can_be_reenabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit opt-out blocks logging even with a directory override."""
+    monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(tmp_path / "logs"))
+    enabled = LoggingConfig()
+    logger = configure(enabled)
+    logger.info("first enabled message")
+    path = tmp_path / "logs" / "usagebassoon.log"
+    original = path.read_bytes()
+    configure(LoggingConfig(disable=True)).error("disabled message")
+    assert not logger.handlers
+    assert path.read_bytes() == original
+    configure(enabled).info("reenabled message")
+    assert "reenabled message" in path.read_text()
+    assert "disabled message" not in path.read_text()

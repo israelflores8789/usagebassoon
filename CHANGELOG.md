@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Namespaced backend providers, collection schedules, and snapshot destinations; added default 12-hour local snapshots, shared weekly scheduling, explicit destination enablement, and configurable logging disablement.
+
 - Added dialect-specific `audit_sources` views shared with snapshot audits and explicit `GCP_PROJECT_ID` selection for GCS CI tests.
 - Added independent snapshot scheduler jobs, immutable-only emergency recovery, atomic fenced lifecycle transitions, immediate owned-stage retries, bounded source auditing, and separately reported scheduled/weekly backup health.
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.

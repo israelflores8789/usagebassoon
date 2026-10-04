@@ -14,7 +14,6 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pyarrow.parquet as pq
@@ -24,11 +23,15 @@ from usagebassoon.buckets.base import SnapshotBucket, SnapshotObject
 from usagebassoon.buckets.local import LocalSnapshotBucket
 from usagebassoon.config import (
     GcsConfig,
-    _gcs_config,
-    _snapshot_config,
+    LoggingConfig,
+    SnapshotsConfig,
+    UsageBassoonConfig,
+    _logging_config,
+    _snapshots_config,
     default_snapshot_directory,
     parse_interval,
 )
+from usagebassoon.logger import configure as configure_logging
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.format import FORMAT_VERSION, digest, encode, timestamp
 from usagebassoon.snapshot.reader import Candidate, SnapshotReader
@@ -39,9 +42,6 @@ from usagebassoon.storage_model import (
     SNAPSHOT_TABLES,
 )
 from usagebassoon.version import __version__
-
-if TYPE_CHECKING:
-    from usagebassoon.config import UsageBassoonConfig
 
 _LOG = logging.getLogger("usagebassoon")
 
@@ -108,10 +108,17 @@ class SnapshotArchiver:
     @classmethod
     def from_config(cls, configuration: UsageBassoonConfig) -> SnapshotArchiver:
         """Create an authenticated archiver with explicit weekly destination policy."""
+        result = cls._from_settings(configuration.snapshots)
+        result._configuration = configuration
+        return result
+
+    @classmethod
+    def _from_settings(cls, settings: SnapshotsConfig) -> SnapshotArchiver:
+        """Construct enabled archives from backend-independent snapshot settings."""
         from usagebassoon.buckets.gcs import GcsSnapshotBucket
 
-        settings, gcs = configuration.snapshots, configuration.gcs
-        file_uri = settings.file_uri if settings else None
+        gcs = settings.gcs if settings.gcs and settings.gcs.enable else None
+        file_uri = str(settings.local.path) if settings.local.enable else None
         cloud = (
             GcsSnapshotBucket(
                 gcs.uri,
@@ -123,51 +130,27 @@ class SnapshotArchiver:
             else None
         )
         result = cls(
-            file_uri=file_uri
-            or (str(default_snapshot_directory()) if not gcs else None),
+            file_uri=file_uri,
             gcs_archive_uri=gcs.uri if gcs else None,
             gcs_bucket=cloud,
-            max_snapshots=settings.max_snapshots if settings else 3,
-            interval=settings.interval if settings else None,
+            max_snapshots=settings.max_snapshots,
+            interval=settings.schedule.interval,
         )
-        result._configuration = configuration
         result._cloud_settings = gcs
-        if file_uri and settings and not settings.disable_weekly_snapshots:
-            result._weekly.add(file_uri.rstrip("/"))
-        if gcs and not gcs.disable_weekly_snapshots:
-            result._weekly.add(gcs.uri.rstrip("/"))
+        if not settings.schedule.disable_weekly:
+            result._weekly.update(bucket.uri for bucket in result._archives)
         return result
 
     @classmethod
     def for_read(cls, path: Path) -> SnapshotArchiver:
-        """Read archive settings without requiring a valid destination or source ID."""
+        """Read archive settings without requiring a valid backend or source ID."""
         if not path.exists():
+            configure_logging(LoggingConfig())
             return cls(str(default_snapshot_directory()))
-        from usagebassoon.buckets.gcs import GcsSnapshotBucket
-
         payload = tomllib.loads(path.read_text(encoding="utf-8"))
-        settings = _snapshot_config(payload.get("snapshots"))
-        gcs = _gcs_config(payload.get("gcs"))
-        cloud = (
-            GcsSnapshotBucket(
-                gcs.uri,
-                project=gcs.project,
-                credentials_file=gcs.credentials_file,
-                timeout_seconds=gcs.timeout_seconds,
-            )
-            if gcs
-            else None
-        )
-        result = cls(
-            file_uri=settings.file_uri
-            if settings and settings.file_uri
-            else (None if gcs else str(default_snapshot_directory())),
-            gcs_archive_uri=gcs.uri if gcs else None,
-            gcs_bucket=cloud,
-            max_snapshots=settings.max_snapshots if settings else 3,
-        )
-        result._cloud_settings = gcs
-        return result
+        configure_logging(_logging_config(payload.get("logging")))
+        settings = _snapshots_config(payload.get("snapshots"))
+        return cls._from_settings(settings)
 
     @property
     def reader(self) -> SnapshotReader:

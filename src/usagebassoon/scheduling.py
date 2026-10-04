@@ -263,17 +263,13 @@ def _collect_command(config: UsageBassoonConfig) -> tuple[str, ...]:
 
 def snapshot_schedule_seconds(config: UsageBassoonConfig) -> float | None:
     """Return an independent cadence for checking configured backup obligations."""
-    deadlines: list[float] = []
     settings = config.snapshots
-    if settings is not None:
-        interval = parse_interval(settings.interval)
-        if interval is not None:
-            deadlines.append(interval.total_seconds())
-        if settings.file_uri and not settings.disable_weekly_snapshots:
-            deadlines.append(3600.0)
-    if config.gcs is not None and not config.gcs.disable_weekly_snapshots:
-        deadlines.append(3600.0)
-    return min(deadlines) if deadlines else None
+    if not settings.enabled:
+        return None
+    interval = parse_interval(settings.schedule.interval, units="mhd")
+    assert interval is not None
+    seconds = interval.total_seconds()
+    return seconds if settings.schedule.disable_weekly else min(seconds, 3600.0)
 
 
 def run_snapshot_check(config: UsageBassoonConfig) -> None:
@@ -332,10 +328,11 @@ def _install_snapshot_schedule(config: UsageBassoonConfig, platform: str) -> Non
                 .replace("tokscale collection", "snapshot capture")
                 .encode(),
             )
-            timer = _systemd_timer(config.schedule.interval)
+            timer = _systemd_timer(config.collection.schedule.interval)
             timer = (
                 timer.replace(
-                    _systemd_time_span(config.schedule.interval), f"{seconds:g}s"
+                    _systemd_time_span(config.collection.schedule.interval),
+                    f"{seconds:g}s",
                 )
                 .replace(SYSTEMD_SERVICE_NAME, SNAPSHOT_SERVICE_NAME)
                 .replace("collection schedule", "snapshot schedule")
@@ -368,7 +365,7 @@ def _duration_seconds(interval: str) -> float:
         )
     duration = parse_interval(interval)
     if duration is None:
-        raise SchedulingError("schedule.interval must be positive")
+        raise SchedulingError("collection.schedule.interval must be positive")
     return duration.total_seconds()
 
 
@@ -471,7 +468,7 @@ def _install_systemd(
     )
     _write_atomic(
         unit_dir / SYSTEMD_TIMER_NAME,
-        _systemd_timer(config.schedule.interval).encode(),
+        _systemd_timer(config.collection.schedule.interval).encode(),
     )
     _run(["systemctl", "--user", "daemon-reload"])
     _run(["systemctl", "--user", "enable", "--now", SYSTEMD_TIMER_NAME])
@@ -509,7 +506,7 @@ def _launchd_plist_bytes(
     command: tuple[str, ...],
 ) -> bytes:
     """Render a launchd plist for one collection schedule."""
-    seconds = _duration_seconds(config.schedule.interval)
+    seconds = _duration_seconds(config.collection.schedule.interval)
     if seconds < 1 or seconds > 2**31 - 1:
         raise SchedulingError(
             "launchd schedule interval is outside its supported range"
@@ -523,8 +520,12 @@ def _launchd_plist_bytes(
         "ProcessType": "Background",
         "LowPriorityIO": True,
         "Nice": 10,
-        "StandardOutPath": str(_launchd_log()),
-        "StandardErrorPath": str(_launchd_log()),
+        "StandardOutPath": os.devnull
+        if config.logging.disable
+        else str(_launchd_log()),
+        "StandardErrorPath": os.devnull
+        if config.logging.disable
+        else str(_launchd_log()),
     }
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
 
@@ -720,7 +721,7 @@ def worker_status(config: UsageBassoonConfig) -> WorkerStatus:
     return WorkerStatus(
         pid=pid,
         running=pid is not None and _pid_is_running(pid),
-        interval=config.schedule.interval,
+        interval=config.collection.schedule.interval,
         pid_path=pid_path,
         log_path=_worker_log_path(config),
         snapshot_interval_seconds=snapshot_schedule_seconds(config),
@@ -730,12 +731,23 @@ def worker_status(config: UsageBassoonConfig) -> WorkerStatus:
 def _worker_configuration(
     config_path: Path | None,
     schedule_interval: str | None,
+    snapshot_schedule_interval: str | None = None,
 ) -> UsageBassoonConfig:
     """Load worker configuration and persist an optional interval override."""
     manager = ConfigurationManager(config_path)
-    configuration = manager.load(schedule_interval=schedule_interval)
+    configuration = manager.load(
+        schedule_interval=schedule_interval,
+        snapshot_schedule_interval=snapshot_schedule_interval,
+    )
     if schedule_interval is not None:
-        update_schedule_interval(manager.path, configuration.schedule.interval)
+        update_schedule_interval(
+            manager.path, configuration.collection.schedule.interval
+        )
+    if snapshot_schedule_interval is not None:
+        update_schedule_interval(
+            manager.path, configuration.snapshots.schedule.interval, domain="snapshots"
+        )
+    if schedule_interval is not None or snapshot_schedule_interval is not None:
         configuration = manager.load()
     return configuration
 
@@ -744,12 +756,15 @@ def start_worker(
     config_path: Path | None = None,
     *,
     schedule_interval: str | None = None,
+    snapshot_schedule_interval: str | None = None,
 ) -> WorkerStatus:
     """Start the detached worker and return its PID and log locations.
 
     Args:
         config_path: Optional configuration file to load.
-        schedule_interval: Optional interval to persist before starting.
+        schedule_interval: Optional collection interval to persist before starting.
+        snapshot_schedule_interval: Optional snapshot interval to persist
+            before starting.
 
     Returns:
         The detached worker state after launch.
@@ -757,7 +772,9 @@ def start_worker(
     Raises:
         SchedulingError: If a worker is already running or cannot be started.
     """
-    configuration = _worker_configuration(config_path, schedule_interval)
+    configuration = _worker_configuration(
+        config_path, schedule_interval, snapshot_schedule_interval
+    )
     existing = worker_status(configuration)
     if existing.running:
         raise SchedulingError(
@@ -774,7 +791,11 @@ def start_worker(
         str(configuration.path.expanduser().resolve()),
     ]
     configuration.logging.directory.expanduser().mkdir(parents=True, exist_ok=True)
-    log_handle = _worker_log_path(configuration).open("a", encoding="utf-8")
+    log_handle = (
+        Path(os.devnull)
+        if configuration.logging.disable
+        else _worker_log_path(configuration)
+    ).open("a", encoding="utf-8")
     try:
         try:
             process = subprocess.Popen(
@@ -901,6 +922,7 @@ def run_worker(
     config_path: Path | None = None,
     *,
     schedule_interval: str | None = None,
+    snapshot_schedule_interval: str | None = None,
 ) -> None:
     """Run the foreground self-contained container scheduler.
 
@@ -909,14 +931,18 @@ def run_worker(
 
     Args:
         config_path: Optional configuration file to load.
-        schedule_interval: Optional interval to persist before starting.
+        schedule_interval: Optional collection interval to persist before starting.
+        snapshot_schedule_interval: Optional snapshot interval to persist
+            before starting.
     """
-    configuration = _worker_configuration(config_path, schedule_interval)
+    configuration = _worker_configuration(
+        config_path, schedule_interval, snapshot_schedule_interval
+    )
     configuration_stamp = _worker_configuration_stamp(configuration.path)
     change_reported = False
-    interval = parse_interval(configuration.schedule.interval)
+    interval = parse_interval(configuration.collection.schedule.interval)
     if interval is None:
-        raise SchedulingError("schedule.interval must be positive")
+        raise SchedulingError("collection.schedule.interval must be positive")
     logger = configure_logging(configuration.logging)
     logger.info("worker configuration is fixed at startup; restart after file changes")
     stop_requested = Event()
@@ -1055,7 +1081,7 @@ def _systemd_status(
         installed=installed,
         active=active,
         enabled=enabled,
-        interval=config.schedule.interval,
+        interval=config.collection.schedule.interval,
         artifact=timer,
         log_path=_systemd_log(),
         command=command,
@@ -1105,7 +1131,7 @@ def _launchd_status(
         installed=installed,
         active=active,
         enabled=active,
-        interval=config.schedule.interval,
+        interval=config.collection.schedule.interval,
         artifact=plist,
         log_path=str(_launchd_log()),
         command=command,

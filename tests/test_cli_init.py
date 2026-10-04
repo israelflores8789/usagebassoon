@@ -31,7 +31,11 @@ def test_missing_source_identity_is_repaired_atomically_without_reformatting(
     """Simultaneous initialization preserves comments and one shared new identity."""
     path = tmp_path / "config.toml"
     content = (
-        '# Keep this comment.\nbackend = "duckdb"\n\n[snapshots]\nmax_snapshots = 8\n'
+        "# Keep this comment.\n"
+        'backend.provider = "duckdb"\n'
+        "\n"
+        "[snapshots]\n"
+        "max_snapshots = 8\n"
     )
     path.write_text(content)
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -54,7 +58,9 @@ def test_recovery_init_rejects_data_and_leaves_configuration_identity_intact(
     database = tmp_path / "destination.duckdb"
     source = "11111111-1111-4111-8111-111111111111"
     path.write_text(
-        f'source_id = "{source}"\nbackend = "duckdb"\nlocal_database = "{database}"\n'
+        f'source_id = "{source}"\n'
+        f'backend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -88,7 +94,7 @@ def test_init_creates_source_config_and_local_schema(
     assert configuration.backend == "duckdb"
     assert configuration.spinner == "pong"
     assert configuration.local_database == default_local_database_path()
-    assert configuration.schedule.interval == "15m"
+    assert configuration.collection.schedule.interval == "15m"
     assert configuration.logging.max_files == 5
     repeated = CliRunner().invoke(app, ["init", "--config", str(config_path)])
     assert repeated.exit_code == 0
@@ -111,8 +117,8 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
     source_id = "11111111-1111-4111-8111-111111111111"
     config_path.write_text(
         f'source_id = "{source_id}"\n'
-        'backend = "duckdb"\n'
-        f'local_database = "{database}"\n'
+        'backend.provider = "duckdb"\n'
+        f'backend.duckdb.database = "{database}"\n'
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
@@ -137,14 +143,14 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     log_directory = tmp_path / "logs"
     config_path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        'backend = "unsupported"\n'
-        'local_database = "usagebassoon"\n'
+        'backend.provider = "unsupported"\n'
+        'backend.duckdb.database = "usagebassoon"\n'
         f'\n[logging]\ndirectory = "{log_directory}"\n'
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
 
     assert result.exit_code != 0
-    assert "backend must be one of" in plain_cli_output(result.output)
+    assert "backend.provider must be one of" in plain_cli_output(result.output)
     log_path = log_directory / "usagebassoon.log"
-    assert "backend must be one of" in log_path.read_text()
+    assert "backend.provider must be one of" in log_path.read_text()

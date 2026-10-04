@@ -153,8 +153,8 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
     log_directory = config_path.parent / "logs"
     config_path.write_text(
         f'source_id = "{source_id}"\n'
-        'backend = "motherduck"\n'
-        "[motherduck]\n"
+        'backend.provider = "motherduck"\n'
+        "[backend.motherduck]\n"
         f'database = "{_DATABASE}"\n'
         "[collection]\n"
         "max_retries = 3\n"
@@ -192,7 +192,9 @@ def _normalized_bundle(
     )
 
 
-def _snapshot_config(settings: LiveSettings, directory: Path, source_id: str) -> Path:
+def _local_snapshot_config(
+    settings: LiveSettings, directory: Path, source_id: str
+) -> Path:
     """Configure an explicit source and private local archive for a live scenario."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"config-{source_id}.toml"
@@ -200,7 +202,7 @@ def _snapshot_config(settings: LiveSettings, directory: Path, source_id: str) ->
         settings.config_path.read_text().replace(
             f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
         )
-        + f'\n[snapshots]\nfile_uri = "{directory / "snapshots"}"\n'
+        + f'\n[snapshots.local]\npath = "{directory / "snapshots"}"\n'
     )
     return path
 
@@ -630,8 +632,8 @@ def test_live_configured_clients_and_curation_preserve_source_identity(
 ) -> None:
     """Exercise ambient auth, real CLI/library reads, global tags, and scoped notes."""
     source_a, source_b = live_settings.source_id, str(uuid4())
-    config_a = _snapshot_config(live_settings, tmp_path, source_a)
-    config_b = _snapshot_config(live_settings, tmp_path, source_b)
+    config_a = _local_snapshot_config(live_settings, tmp_path, source_a)
+    config_b = _local_snapshot_config(live_settings, tmp_path, source_b)
     remote = _backend()
     session = collection_bundle.report_rows[0]
     target = {"client": session.client, "session_id": session.session_id}
@@ -795,8 +797,10 @@ def test_live_portable_snapshots_and_atomic_restore(
 ) -> None:
     """Verify both snapshot directions, restore safety, and transaction rollback."""
     source_a, source_b = live_settings.source_id, str(uuid4())
-    capture_config = _snapshot_config(live_settings, tmp_path, source_a)
-    restore_config = _snapshot_config(live_settings, tmp_path / "restore", source_a)
+    capture_config = _local_snapshot_config(live_settings, tmp_path, source_a)
+    restore_config = _local_snapshot_config(
+        live_settings, tmp_path / "restore", source_a
+    )
     captured = SnapshotArchiver.from_config(ConfigurationManager(capture_config).load())
     portable = SnapshotArchiver.from_config(ConfigurationManager(restore_config).load())
     remote = _backend()
