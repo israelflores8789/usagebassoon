@@ -9,22 +9,16 @@ from collections.abc import Iterable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from socket import gethostname
+from tempfile import TemporaryDirectory
+
+import duckdb
+import pyarrow as pa
 
 from usagebassoon.backends.base import StorageBackend
+from usagebassoon.schema_assets import view_sql
 from usagebassoon.snapshot.reader import PreparedSnapshot
-from usagebassoon.storage_model import SNAPSHOT_TABLES
+from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS, SNAPSHOT_TABLES
 from usagebassoon.system_metadata import capture_system_metadata
-
-_HOST_FIELDS = (
-    "host",
-    "os_name",
-    "os_version",
-    "architecture",
-    "cpu_model",
-    "cpu_count",
-    "memory_bytes",
-    "shell",
-)
 
 
 def snapshot_runs(prepared: PreparedSnapshot) -> Iterable[dict[str, object]]:
@@ -73,78 +67,41 @@ def _run_order(row: dict[str, object]) -> tuple[str, str, bool, str]:
 def audit_sources(
     backend: StorageBackend | None = None, *, prepared: PreparedSnapshot | None = None
 ) -> list[dict[str, object]]:
-    """Summarize every observed source, including sources without ledger evidence."""
-    source_ids: set[str] = set()
-    if prepared is not None:
-        for table in SNAPSHOT_TABLES:
-            for batch in prepared.batches(table):
-                source_ids.update(
-                    str(v)
-                    for v in batch.column(
-                        batch.schema.get_field_index("source_id")
-                    ).to_pylist()
-                )
-        runs = (
-            row
-            for batch in prepared.batches("collection_ledger")
-            for row in batch.to_pylist()
-        )
-    elif backend is not None:
-        union = " UNION DISTINCT ".join(
-            f"SELECT source_id FROM current_{table}" for table in SNAPSHOT_TABLES
-        )
-        source_ids.update(
-            str(row["source_id"]) for row in backend.query(union).to_pylist()
-        )
-        runs = iter(
-            backend.query(
-                "SELECT * FROM current_collection_ledger "
-                "ORDER BY finished_at DESC, run_id DESC"
-            ).to_pylist()
-        )
-    else:
-        raise ValueError("a backend or prepared snapshot is required")
-    result: dict[str, dict[str, object]] = {}
-    latest: dict[str, dict[str, object]] = {}
-    seen_runs: set[tuple[str, str]] = set()
-    for row in runs:
-        source = str(row["source_id"])
-        source_ids.add(source)
-        key = (source, str(row["run_id"]))
-        at = row.get("finished_at") or row.get("started_at")
-        item = result.setdefault(
-            source,
-            {
-                "source_id": source,
-                "first_activity": at,
-                "last_activity": at,
-                "run_count": 0,
-            },
-        )
-        if key not in seen_runs:
-            item["run_count"] = int(str(item["run_count"])) + 1
-            seen_runs.add(key)
-        if str(at) < str(item["first_activity"]):
-            item["first_activity"] = at
-        if source not in latest or _run_order(row) > _run_order(latest[source]):
-            latest[source] = row
-            item["last_activity"] = at
-            item["latest_outcome"] = row.get("status")
-            item.update({field: row.get(field) for field in _HOST_FIELDS})
-    for source in source_ids - set(result):
-        result[source] = {
-            "source_id": source,
-            "first_activity": None,
-            "last_activity": None,
-            "run_count": 0,
-            "latest_outcome": None,
-            **dict.fromkeys(_HOST_FIELDS),
-        }
-    return sorted(
-        result.values(),
-        key=_source_order,
-        reverse=True,
+    """Return one row per source without retaining historical runs in Python."""
+    sql = (
+        "SELECT * FROM audit_sources "
+        "ORDER BY last_activity DESC NULLS LAST, source_id DESC"
     )
+    if prepared is not None:
+        with (
+            TemporaryDirectory(prefix="usagebassoon-source-audit-") as temporary,
+            duckdb.connect(
+                config={
+                    "memory_limit": "128MB",
+                    "threads": "1",
+                    "temp_directory": temporary,
+                }
+            ) as connection,
+        ):
+            for table in SNAPSHOT_TABLES:
+                relation = f"current_{table}"
+                if table in prepared.files:
+                    connection.read_parquet(str(prepared.files[table])).create_view(
+                        relation
+                    )
+                else:
+                    connection.register(
+                        relation,
+                        pa.Table.from_batches(
+                            [], schema=CANONICAL_TABLE_SCHEMAS[table]
+                        ),
+                    )
+            connection.execute(view_sql("duckdb", "audit_sources"))
+            return connection.execute(sql).to_arrow_table().to_pylist()
+    if backend is None:
+        raise ValueError("a backend or prepared snapshot is required")
+    with backend.consistent_read() as read:
+        return read.query(sql).to_pylist()
 
 
 def source_identity_warning(source_id: str, prepared: PreparedSnapshot) -> str | None:
@@ -184,8 +141,3 @@ def source_identity_warning(source_id: str, prepared: PreparedSnapshot) -> str |
         f"{prepared.candidate.uri}. Restore preserves every source ID "
         "and will not change your configuration."
     )
-
-
-def _source_order(item: dict[str, object]) -> tuple[str, str]:
-    """Order sources by latest activity with an identifier tie-break."""
-    return str(item["last_activity"] or ""), str(item["source_id"])

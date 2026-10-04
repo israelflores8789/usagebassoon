@@ -924,6 +924,12 @@ def test_live_portable_snapshots_and_atomic_restore(
             {"source_id": value, "note": f"note for {value}"}
             for value in sorted((source_a, source_b))
         ]
+        from usagebassoon.audit import audit_sources
+
+        assert {row["source_id"] for row in audit_sources(remote)} == {
+            source_a,
+            source_b,
+        }
     finally:
         remote.close()
         local.close()

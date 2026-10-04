@@ -11,8 +11,8 @@ import json
 import logging
 import re
 from base64 import b64decode
-from collections.abc import Callable, Generator, Iterable, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +93,7 @@ class SnapshotReader:
         *,
         allow_empty: bool = False,
         warning: Callable[[str], None] | None = None,
+        recovery: bool = False,
     ) -> tuple[list[Candidate], bool]:
         """Resolve a latest/root request or an exact ID/path request."""
         buckets = self.buckets
@@ -131,7 +132,7 @@ class SnapshotReader:
                         for obj in bucket.list(f"{exact}/manifest.json")
                     ):
                         continue
-                    manifest = self.manifest(Candidate(bucket, exact, ""))
+                    manifest = self.raw_manifest(Candidate(bucket, exact, ""))[0]
                     entries.append(
                         {
                             "snapshot_id": exact,
@@ -139,7 +140,11 @@ class SnapshotReader:
                         }
                     )
                 else:
-                    entries = Catalog(bucket).entries()
+                    entries = (
+                        Catalog(bucket).discover(recovery=True, warning=warning)
+                        if recovery
+                        else Catalog(bucket).entries()
+                    )
                 candidates.extend(
                     Candidate(bucket, str(e["snapshot_id"]), str(e["captured_at"]))
                     for e in entries
@@ -169,16 +174,9 @@ class SnapshotReader:
         return SnapshotReader.manifest_document(candidate)[0]
 
     @staticmethod
-    def manifest_document(
-        candidate: Candidate, *, allow_staging: bool = False
-    ) -> tuple[dict[str, object], bytes]:
-        """Verify immutable completion evidence and portable manifest metadata."""
+    def raw_manifest(candidate: Candidate) -> tuple[dict[str, object], bytes]:
+        """Verify immutable provenance without requiring a compatible reader."""
         prefix = candidate.identifier
-        state, _ = candidate.bucket.read_json(f"{prefix}/state.json")
-        if state is not None and state.get("retired") is True:
-            raise ValueError("snapshot is retired")
-        if not allow_staging and state is not None and state.get("published") is False:
-            raise ValueError("snapshot publication has not completed")
         complete, _ = candidate.bucket.read_json(f"{prefix}/COMPLETE")
         if complete is None or complete.get("snapshot_id") != prefix:
             raise ValueError("snapshot has no valid completion record")
@@ -190,14 +188,31 @@ class SnapshotReader:
         if hashlib.sha256(raw).hexdigest() != complete.get("manifest_sha256"):
             raise ValueError("snapshot manifest SHA-256 does not match completion")
         value: object = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError("snapshot manifest must be an object")
-        value = decode_manifest(value)
-        validate_manifest(value, prefix)
-        if candidate.captured_at and timestamp(value.get("captured_at")) != timestamp(
-            candidate.captured_at
-        ):
+        if not isinstance(value, dict) or value.get("snapshot_id") != prefix:
+            raise ValueError("snapshot manifest identity does not match")
+        captured = timestamp(value.get("captured_at"))
+        if candidate.captured_at and captured != timestamp(candidate.captured_at):
             raise ValueError("snapshot capture point does not match its catalog")
+        return value, raw
+
+    @staticmethod
+    def compatibility(candidate: Candidate) -> dict[str, object]:
+        """Describe restore support separately from verified raw provenance."""
+        try:
+            SnapshotReader.manifest(candidate)
+        except (ValueError, RuntimeError) as error:
+            return {"supported": False, "reason": str(error)}
+        return {"supported": True, "reason": None}
+
+    @staticmethod
+    def manifest_document(
+        candidate: Candidate, *, allow_staging: bool = False
+    ) -> tuple[dict[str, object], bytes]:
+        """Verify immutable completion evidence and portable manifest metadata."""
+        del allow_staging
+        value, raw = SnapshotReader.raw_manifest(candidate)
+        value = decode_manifest(value)
+        validate_manifest(value, candidate.identifier)
         return value, raw
 
     def listing(self, selection: str = "latest") -> list[dict[str, object]]:
@@ -209,10 +224,11 @@ class SnapshotReader:
         result: list[dict[str, object]] = []
         for candidate in candidates:
             try:
-                manifest = self.manifest(candidate)
-                state, _ = candidate.bucket.read_json(
-                    f"{candidate.identifier}/state.json"
-                )
+                manifest = self.raw_manifest(candidate)[0]
+                try:
+                    state = Catalog(candidate.bucket).state(candidate.identifier)
+                except (ValueError, OSError, RuntimeError):
+                    state = None
                 result.append(
                     {
                         "id": candidate.identifier,
@@ -226,6 +242,7 @@ class SnapshotReader:
                         "roles": state.get("roles") if state else None,
                         "weekly_slot": state.get("weekly_slot") if state else None,
                         "verified_at": state.get("verified_at") if state else None,
+                        "compatibility": self.compatibility(candidate),
                         **{
                             k: manifest.get(k)
                             for k in (
@@ -372,36 +389,46 @@ class SnapshotReader:
                 files[table] = path
         steps = transformation_path(version) if transform else ()
         for step in steps:
+            before = {path: digest(path) for path in files.values()}
             output = directory / f"contract-{step.to_version}"
             output.mkdir()
             transformed = step.transform(files, output)
             if any(
-                path.resolve() in {p.resolve() for p in files.values()}
+                not path.resolve().is_relative_to(output.resolve())
                 for path in transformed.values()
-            ):
+            ) or any(digest(path) != sha for path, sha in before.items()):
                 raise ValueError(
                     "snapshot transformations must preserve original files"
                 )
+            self.validate_files(transformed, DATA_CONTRACTS[step.to_version])
             step.validate(files, transformed)
             files = dict(transformed)
         if steps:
-            counts = {}
-            if set(files) != set(SNAPSHOT_TABLES):
-                raise ValueError(
-                    "snapshot transformation did not produce every current table"
-                )
-            for table, path in files.items():
-                parquet = pq.ParquetFile(path)
-                if not parquet.schema_arrow.equals(
-                    CANONICAL_TABLE_SCHEMAS[table], check_metadata=False
-                ):
-                    raise ValueError(
-                        "snapshot transformation produced an invalid current schema"
-                    )
-                for batch in parquet.iter_batches(batch_size=65536):
-                    batch.validate(full=True)
-                counts[table] = parquet.metadata.num_rows
+            counts = self.validate_files(files, CANONICAL_TABLE_SCHEMAS)
         return PreparedSnapshot(candidate, manifest, files, counts, manifest_bytes)
+
+    @staticmethod
+    def validate_files(
+        files: Mapping[str, Path], contract: Mapping[str, pa.Schema]
+    ) -> dict[str, int]:
+        """Validate every intermediate output independently of semantic callbacks."""
+        if set(files) != set(contract):
+            raise ValueError(
+                "snapshot transformation must produce every contract table"
+            )
+        counts: dict[str, int] = {}
+        for table, path in files.items():
+            parquet = pq.ParquetFile(path)
+            schema = contract[table]
+            if not parquet.schema_arrow.equals(schema, check_metadata=False):
+                raise ValueError(f"invalid transformation schema: {table}")
+            for batch in parquet.iter_batches(batch_size=65536):
+                batch.validate(full=True)
+                for index, field in enumerate(schema):
+                    if not field.nullable and batch.column(index).null_count:
+                        raise ValueError(f"null required field: {table}.{field.name}")
+            counts[table] = parquet.metadata.num_rows
+        return counts
 
     @contextmanager
     def prepare(
@@ -425,33 +452,59 @@ class SnapshotReader:
             if warning:
                 warning(message)
 
-        candidates, automatic = self.candidates(selection, warning=discovery_warning)
+        candidates, automatic = self.candidates(
+            selection, warning=discovery_warning, recovery=True
+        )
         with TemporaryDirectory(prefix="usagebassoon-restore-") as temporary:
             directory = Path(temporary)
             prepared: PreparedSnapshot | None = None
-            for candidate in candidates:
+            for index, candidate in enumerate(candidates):
+                candidate_directory = directory / str(index)
+                candidate_directory.mkdir()
                 downloaded: PreparedSnapshot | None = None
                 try:
                     # A download reservation prevents concurrent rotation. Read-only
                     # archives can still recover through stable provider revisions.
                     catalog = Catalog(candidate.bucket)
+                    stack = ExitStack()
                     try:
-                        with catalog.hold():
-                            downloaded = self.download(
-                                candidate, directory, tables, transform=transform
+                        try:
+                            stack.enter_context(catalog.hold())
+                        except Exception as error:
+                            discovery_warning(
+                                "Reading immutable snapshot without reservation "
+                                f"at {candidate.uri}: {error}"
                             )
-                    except Exception as error:
-                        if (
-                            not isinstance(
-                                error, (PermissionError, json.JSONDecodeError)
+                        try:
+                            state = catalog.state(candidate.identifier)
+                            if (
+                                state is None
+                                or state.get("retired") is True
+                                or state.get("published") is False
+                                or state.get("indexed") is False
+                            ):
+                                discovery_warning(
+                                    "Ignoring missing or inactive lifecycle metadata "
+                                    f"at {candidate.uri}; "
+                                    "recovery validates immutable contents."
+                                )
+                        except Exception as error:
+                            discovery_warning(
+                                "Ignoring damaged lifecycle metadata "
+                                f"at {candidate.uri}: "
+                                f"{error}"
                             )
-                            and error.__class__.__name__ != "Forbidden"
-                            and "invalid archive catalog" not in str(error)
-                        ):
-                            raise
                         downloaded = self.download(
-                            candidate, directory, tables, transform=transform
+                            candidate, candidate_directory, tables, transform=transform
                         )
+                    finally:
+                        try:
+                            stack.close()
+                        except Exception as error:
+                            discovery_warning(
+                                "Archive reservation release failed after immutable "
+                                f"reading at {candidate.uri}: {error}"
+                            )
                 except Exception as error:
                     if isinstance(error, OSError) and error.errno in {
                         errno.ENOSPC,
@@ -478,7 +531,7 @@ class SnapshotReader:
                 message = (
                     f"Recovery selected {prepared.candidate.uri}, "
                     f"captured {prepared.candidate.captured_at}; "
-                    "newer candidates were unavailable."
+                    "see recovery warnings above."
                 )
                 _LOG.warning(message)
                 if warning:

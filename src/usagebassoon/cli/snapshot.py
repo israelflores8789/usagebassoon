@@ -16,7 +16,7 @@ from usagebassoon.cli._output import render_records
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import ConfigurationManager
-from usagebassoon.snapshot.catalog import CONTROL_NAME, Catalog
+from usagebassoon.snapshot.catalog import Catalog
 
 snapshot_app = typer.Typer(
     invoke_without_command=True, help="Create and manage portable private snapshots."
@@ -42,6 +42,13 @@ def snapshot(
     no_pin: Annotated[
         bool, typer.Option("--no-pin", help="Create an unpinned manual snapshot.")
     ] = False,
+    automatic: Annotated[
+        bool,
+        typer.Option(
+            "--automatic",
+            help="Capture only due scheduled/weekly obligations without pinning.",
+        ),
+    ] = False,
 ) -> None:
     """Capture and pin when no management subcommand is selected."""
     if ctx.invoked_subcommand is not None:
@@ -51,16 +58,22 @@ def snapshot(
     try:
         with spinner(configuration):
             archiver = snapshot_archiver(configuration)
-            uri = archiver.write(backend, run_id="manual", manual=True, pin=not no_pin)
+            uri = archiver.write(
+                backend,
+                run_id="scheduled" if automatic else "manual",
+                manual=not automatic,
+                pin=not automatic and not no_pin,
+            )
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
     finally:
         close_backend(backend, context="writing a snapshot")
     if uri is None:
-        notice("Snapshot skipped: an archive is reserved by another operation.")
+        notice("Snapshot skipped: no obligation is due or an archive is reserved.")
     else:
         typer.echo(
-            f"Created private raw snapshot at {uri}{' (pinned)' if not no_pin else ''}."
+            f"Created private raw snapshot at {uri}"
+            f"{' (pinned)' if not no_pin and not automatic else ''}."
         )
 
 
@@ -123,13 +136,17 @@ def inspect_snapshot(
     try:
         reader = read_archiver(_config(ctx, config)).reader
         candidates, _ = reader.candidates(selection)
-        manifest = reader.manifest(candidates[0])
+        manifest = reader.raw_manifest(candidates[0])[0]
         render_records(
             [],
             columns=(),
             format="json" if json_output else "yaml",
             save=None,
-            json_payload={"uri": candidates[0].uri, "manifest": manifest},
+            json_payload={
+                "uri": candidates[0].uri,
+                "manifest": manifest,
+                "compatibility": reader.compatibility(candidates[0]),
+            },
         )
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
@@ -264,13 +281,9 @@ def repair_catalog(
     try:
         for bucket in archiver.reader.buckets:
             catalog = Catalog(bucket, archiver.max_snapshots)
-            for entry in catalog.discover():
-                with archiver.reader.prepare(
-                    f"{bucket.uri}/{entry['snapshot_id']}", warning=notice
-                ):
-                    pass
             with catalog.hold():
                 catalog.repair()
+                catalog.cleanup_abandoned()
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo("Reconstructed archive catalogs.")
@@ -288,9 +301,12 @@ def archive_policy(
     archiver = read_archiver(_config(ctx, config))
     for bucket in archiver.reader.buckets:
         with Catalog(bucket, max_snapshots).hold() as catalog:
-            document, version = catalog.control()
-            document["policy"] = {"max_snapshots": max_snapshots, "weekly_slots": 4}
-            bucket.write_json_cas(CONTROL_NAME, document, expected_version=version)
+
+            def change(document: dict[str, object]) -> None:
+                """Reconcile policy under the same CAS as reservation authority."""
+                document["policy"] = {"max_snapshots": max_snapshots, "weekly_slots": 4}
+
+            catalog.mutate(change)
     typer.echo(
         f"Archive policy now retains {max_snapshots} unpinned scheduled snapshots "
         "and four weekly slots."

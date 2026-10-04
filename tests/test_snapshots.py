@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import json
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -499,6 +500,384 @@ def test_temporary_disk_exhaustion_stops_selection_without_destination_writes(
         assert len(calls) == 1 and calls[0].startswith(Path(latest).name + "/")
         assert target.query("SELECT * FROM notes").num_rows == 0
         assert target.query("SELECT * FROM restore_receipts").num_rows == 0
+    finally:
+        source.close()
+        target.close()
+
+
+@pytest.mark.parametrize("mutable", ["catalog.json", "control.json", "state.json"])
+def test_emergency_restore_ignores_corrupt_mutable_metadata(
+    tmp_path: Path, mutable: str
+) -> None:
+    """Intact immutable recovery units survive damaged coordination documents."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="recover", manual=True, pin=True)
+        assert uri is not None
+        path = (
+            Path(uri) / mutable
+            if mutable == "state.json"
+            else Path(uri).parent / mutable
+        )
+        path.write_text('{"version": 999}' if mutable == "control.json" else "broken")
+        notices: list[str] = []
+        assert store.restore(target, notice=notices.append)["notes"] == 1
+        assert target.query("SELECT note FROM notes").to_pylist() == [
+            {"note": "private note"}
+        ]
+    finally:
+        source.close()
+        target.close()
+
+
+def test_retired_immutable_copy_remains_readable_before_cleanup(tmp_path: Path) -> None:
+    """Retirement affects management eligibility, not immutable recovery validity."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="retired", manual=True)
+        assert uri is not None
+        bucket = LocalSnapshotBucket(str(Path(uri).parent))
+        with Catalog(bucket).hold() as catalog:
+            state = catalog.state(Path(uri).name)
+            assert state is not None
+            catalog.transition(Path(uri).name, {**state, "retired": True})
+        assert store.list_snapshots() == []
+        assert store.restore(target, uri)["notes"] == 1
+    finally:
+        source.close()
+        target.close()
+
+
+@pytest.mark.parametrize("operation", ["publish", "retire", "pin"])
+def test_takeover_between_authority_read_and_mutation_blocks_stale_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """A changed control generation rejects the transition itself, not a later check."""
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    first, second = Catalog(bucket), Catalog(bucket)
+    first._update_reservation(claim=True)
+    first.stage("owned", {"pinned": False, "retired": False, "published": False})
+    original = bucket.write_json_cas
+    intercepted = False
+
+    def takeover(
+        name: str, payload: dict[str, object], *, expected_version: str | int | None
+    ) -> object:
+        nonlocal intercepted
+        if name == "control.json" and not intercepted:
+            intercepted = True
+            document, version = first.control()
+            reservation = document["reservation"]
+            assert isinstance(reservation, dict)
+            reservation["expires_at"] = (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat()
+            original(name, document, expected_version=version)
+            second._update_reservation(claim=True)
+        return original(name, payload, expected_version=expected_version)
+
+    monkeypatch.setattr(bucket, "write_json_cas", takeover)
+    with pytest.raises(ArchiveBusy, match="lost"):
+        if operation == "publish":
+            first.publish("owned", datetime.now(UTC).isoformat())
+        elif operation == "retire":
+            first.retire("owned")
+        else:
+            first.pin("owned")
+    state = second.state("owned")
+    assert state is not None and state["retired"] is False
+    assert state["published"] is False and state["pinned"] is False
+
+
+def test_repair_corrupt_index_with_abandoned_stage(tmp_path: Path) -> None:
+    """Index reconstruction does not retire through the corrupt index first."""
+    backend = _backend()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(backend, run_id="complete", manual=True, pin=True)
+        assert uri is not None
+        bucket = LocalSnapshotBucket(str(Path(uri).parent))
+        with Catalog(bucket).hold() as catalog:
+            catalog.stage(
+                "abandoned", {"pinned": False, "retired": False, "published": False}
+            )
+        (Path(uri).parent / "catalog.json").write_text("broken")
+        with Catalog(bucket).hold() as catalog:
+            catalog.repair()
+            catalog.cleanup_abandoned()
+        assert store.list_snapshots() == [Path(uri).name]
+        state = Catalog(bucket).state("abandoned")
+        assert state is not None and state["retired"] is True
+    finally:
+        backend.close()
+
+
+def test_transformation_rejects_bad_intermediate_contract_before_next_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Synthetic future registrations test infrastructure without legacy fixtures."""
+    import usagebassoon.snapshot.format as format_module
+    import usagebassoon.snapshot.reader as reader_module
+
+    backend = _backend()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(backend, run_id="contract", manual=True)
+        assert uri is not None
+        monkeypatch.setattr(format_module, "DATA_SCHEMA_VERSION", 3)
+        monkeypatch.setattr(reader_module, "DATA_SCHEMA_VERSION", 3)
+        contracts = format_module.DATA_CONTRACTS
+        monkeypatch.setitem(contracts, 2, contracts[1])
+        monkeypatch.setitem(contracts, 3, contracts[1])
+        called: list[str] = []
+
+        def invalid_step(_files: object, _output: Path) -> dict[str, Path]:
+            called.append("invalid")
+            return {}
+
+        def forbidden_step(_files: object, _output: Path) -> dict[str, Path]:
+            called.append("next")
+            raise AssertionError("next step must not consume invalid intermediate data")
+
+        def validate(_before: object, _after: object) -> None:
+            called.append("semantic")
+
+        monkeypatch.setattr(
+            format_module,
+            "TRANSFORMATIONS",
+            (
+                format_module.SnapshotTransformation(1, 2, invalid_step, validate),
+                format_module.SnapshotTransformation(2, 3, forbidden_step, validate),
+            ),
+        )
+        with (
+            pytest.raises(ValueError, match="every contract table"),
+            store.reader.prepare(uri),
+        ):
+            pass
+        assert called == ["invalid"]
+    finally:
+        backend.close()
+
+
+def test_transformation_fallback_isolates_candidates_and_preserves_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed upgrade cannot contaminate the next candidate's temporary files."""
+    import shutil
+
+    import pyarrow.parquet as pq
+
+    import usagebassoon.snapshot.format as format_module
+    import usagebassoon.snapshot.reader as reader_module
+
+    source = _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        older = store.write(source, run_id="older", manual=True)
+        newer = store.write(source, run_id="newer", manual=True)
+        assert older is not None and newer is not None
+        original_manifest = (Path(older) / "manifest.json").read_bytes()
+        original_notes = (Path(older) / "notes.parquet").read_bytes()
+        contracts = format_module.DATA_CONTRACTS
+        monkeypatch.setattr(format_module, "DATA_SCHEMA_VERSION", 3)
+        monkeypatch.setattr(reader_module, "DATA_SCHEMA_VERSION", 3)
+        monkeypatch.setitem(contracts, 2, contracts[1])
+        monkeypatch.setitem(contracts, 3, contracts[1])
+        failed = [False]
+        validations: list[int] = []
+
+        def transform(files: Mapping[str, Path], output: Path) -> Mapping[str, Path]:
+            if not failed[0]:
+                failed[0] = True
+                (output / "partial").write_text("interrupted")
+                raise ValueError("interrupted transformation")
+            result: dict[str, Path] = {}
+            for table, schema in contracts[1].items():
+                path = output / f"{table}.parquet"
+                if table in files:
+                    shutil.copyfile(files[table], path)
+                else:
+                    pq.write_table(pa.Table.from_batches([], schema=schema), path)
+                result[table] = path
+            return result
+
+        def semantic(before: Mapping[str, Path], after: Mapping[str, Path]) -> None:
+            assert pq.read_table(before["notes"]).equals(pq.read_table(after["notes"]))
+            validations.append(1)
+
+        monkeypatch.setattr(
+            format_module,
+            "TRANSFORMATIONS",
+            (
+                format_module.SnapshotTransformation(1, 2, transform, semantic),
+                format_module.SnapshotTransformation(2, 3, transform, semantic),
+            ),
+        )
+        notices: list[str] = []
+        with store.reader.prepare(warning=notices.append) as prepared:
+            assert prepared.candidate.identifier == Path(older).name
+            assert prepared.rows["notes"] == 1
+            assert len(validations) == 2
+            assert next(iter(prepared.batches("notes"))).num_rows == 1
+        assert any("interrupted transformation" in notice for notice in notices)
+        assert (Path(older) / "manifest.json").read_bytes() == original_manifest
+        assert (Path(older) / "notes.parquet").read_bytes() == original_notes
+    finally:
+        source.close()
+
+
+def test_lost_restore_acknowledgement_resolves_receipt_without_replaying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-commit exception is distinguished from a failed transaction."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    original = target.restore_snapshot
+    attempts: list[str] = []
+
+    def lost_reply(
+        files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        attempts.append(operation_id)
+        original(files, operation_id=operation_id, snapshot_id=snapshot_id)
+        raise RuntimeError("commit reply lost")
+
+    try:
+        uri = store.write(source, run_id="receipt", manual=True)
+        assert uri is not None
+        monkeypatch.setattr(target, "restore_snapshot", lost_reply)
+        notices: list[str] = []
+        assert store.restore(target, uri, notice=notices.append)["notes"] == 1
+        assert any("acknowledgement was interrupted" in notice for notice in notices)
+        assert store.restore(target, uri)["notes"] == 1
+        assert len(attempts) == 1
+        assert target.query("SELECT * FROM notes").num_rows == 1
+        assert target.query("SELECT * FROM restore_receipts").num_rows == 1
+    finally:
+        source.close()
+        target.close()
+
+
+def test_download_reservation_blocks_rotation_until_files_are_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal reader protects its recovery point throughout bounded download."""
+    from threading import Event
+
+    source = _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    started, release = Event(), Event()
+    original = LocalSnapshotBucket.download_file
+
+    def download(bucket: LocalSnapshotBucket, relative_name: str, path: Path) -> object:
+        started.set()
+        assert release.wait(5)
+        return original(bucket, relative_name, path)
+
+    def read(uri: str) -> int:
+        with store.reader.prepare(uri) as prepared:
+            return prepared.rows["notes"]
+
+    try:
+        uri = store.write(source, run_id="reader", manual=True)
+        assert uri is not None
+        monkeypatch.setattr(LocalSnapshotBucket, "download_file", download)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(read, uri)
+            try:
+                assert started.wait(5)
+                bucket = LocalSnapshotBucket(str(Path(uri).parent))
+                with pytest.raises(ArchiveBusy), Catalog(bucket).hold():
+                    pytest.fail("rotation acquired an active download reservation")
+            finally:
+                release.set()
+            assert future.result(timeout=5) == 1
+        assert (Path(uri) / "COMPLETE").exists()
+    finally:
+        source.close()
+
+
+def test_rescue_copy_preserves_immutables_when_source_lifecycle_is_damaged(
+    tmp_path: Path,
+) -> None:
+    """A verified rescue copy conservatively pins unknown lifecycle state."""
+    backend = _backend()
+    _append_note(backend)
+    store = SnapshotStore(str(tmp_path / "source"))
+    try:
+        uri = store.write(backend, run_id="rescue", manual=True)
+        assert uri is not None
+        manifest = (Path(uri) / "manifest.json").read_bytes()
+        (Path(uri).parent / "control.json").write_text("damaged")
+        (Path(uri) / "state.json").write_text("damaged")
+        copied = store.copy(uri, str(tmp_path / "rescue"))
+        assert (Path(copied) / "manifest.json").read_bytes() == manifest
+        assert (
+            SnapshotStore(str(tmp_path / "rescue")).reader.listing()[0]["pinned"]
+            is True
+        )
+    finally:
+        backend.close()
+
+
+def test_verified_download_survives_corrupted_reservation_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutables changing during download cannot invalidate already verified data."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    original = LocalSnapshotBucket.download_file
+
+    def corrupt_after_read(
+        bucket: LocalSnapshotBucket, relative_name: str, path: Path
+    ) -> object:
+        result = original(bucket, relative_name, path)
+        (tmp_path / "archive" / "control.json").write_text("corrupted during reading")
+        return result
+
+    try:
+        uri = store.write(source, run_id="read-release", manual=True)
+        assert uri is not None
+        monkeypatch.setattr(LocalSnapshotBucket, "download_file", corrupt_after_read)
+        notices: list[str] = []
+        assert store.restore(target, uri, notice=notices.append)["notes"] == 1
+        assert any("reservation release failed" in notice for notice in notices)
+        assert target.query("SELECT * FROM notes").num_rows == 1
+    finally:
+        source.close()
+        target.close()
+
+
+def test_repair_indexes_only_verified_copies_without_destroying_recovery_data(
+    tmp_path: Path,
+) -> None:
+    """Failed repair verification excludes management without preventing rescue."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        older = store.write(source, run_id="older", manual=True)
+        newer = store.write(source, run_id="newer", manual=True)
+        assert older is not None and newer is not None
+        path = Path(newer) / "notes.parquet"
+        original = path.read_bytes()
+        path.write_bytes(b"damaged")
+        bucket = LocalSnapshotBucket(str(Path(newer).parent))
+        with Catalog(bucket).hold() as catalog:
+            catalog.repair()
+        assert store.list_snapshots() == [Path(older).name]
+        assert (Path(newer) / "COMPLETE").exists()
+        path.write_bytes(original)
+        assert store.restore(target, newer)["notes"] == 1
     finally:
         source.close()
         target.close()

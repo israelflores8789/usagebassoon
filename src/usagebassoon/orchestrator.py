@@ -10,8 +10,6 @@ from datetime import UTC, date, datetime
 from socket import gethostname
 from uuid import uuid4
 
-from usagebassoon.archiver import SnapshotArchiver
-from usagebassoon.backends.base import StorageBackend, close_backend
 from usagebassoon.collection_lock import CollectionBusy, collection_lock
 from usagebassoon.collector import (
     RawCollection,
@@ -22,7 +20,7 @@ from usagebassoon.collector import (
     _object,
     _prefix,
 )
-from usagebassoon.config import UsageBassoonConfig, open_backend
+from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.ingest import (
     build_collection_bundle,
     build_ingest_evidence,
@@ -42,32 +40,6 @@ _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
 _GRAPH_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 _LOG = logging.getLogger(LOGGER_NAME)
-
-
-def _snapshot_after_collect(
-    config: UsageBassoonConfig,
-    run_id: str,
-    logger: logging.Logger,
-) -> None:
-    """Attempt a due optional archive without invalidating persisted usage data."""
-    settings = config.snapshots
-    if (
-        settings is None or (settings.interval is None and settings.file_uri is None)
-    ) and config.gcs is None:
-        return
-    backend: StorageBackend | None = None
-    try:
-        backend = open_backend(config)
-        SnapshotArchiver.from_config(config).write(backend, run_id=run_id)
-    except Exception:
-        logger.exception("snapshot after collection run %s failed", run_id)
-    finally:
-        if backend is not None:
-            close_backend(
-                backend,
-                context=f"snapshot after collection run {run_id}",
-                logger=logger,
-            )
 
 
 def _collect_locked(
@@ -197,6 +169,4 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     except Exception:
         logger.exception("collection cycle failed before completion")
         raise
-    finally:
-        _snapshot_after_collect(config, run_id, logger)
     return run_id, summary

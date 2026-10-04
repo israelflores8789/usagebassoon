@@ -119,3 +119,68 @@ def test_transactional_read_session_preserves_snapshot_after_external_commit(
     finally:
         writer.close()
         backend.close()
+
+
+def test_registered_migration_chain_rolls_back_and_retries_without_legacy_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise future migration rollback, chaining and ledger idempotency."""
+    import usagebassoon.backends.duckdb_local as module
+    import usagebassoon.schema_assets as assets
+
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    final_hash = assets.schema_hash("duckdb")
+    steps = (
+        assets.SchemaMigration(
+            2,
+            {"duckdb": "original", "bigquery": "original"},
+            {"duckdb": "middle", "bigquery": "middle"},
+            {"duckdb": "step2.sql", "bigquery": "step2.sql"},
+        ),
+        assets.SchemaMigration(
+            3,
+            {"duckdb": "middle", "bigquery": "middle"},
+            {"duckdb": final_hash, "bigquery": assets.schema_hash("bigquery")},
+            {"duckdb": "step3.sql", "bigquery": "step3.sql"},
+        ),
+    )
+    monkeypatch.setattr(assets, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(module, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(assets, "SCHEMA_MIGRATIONS", steps)
+    backend.connection.execute(
+        "UPDATE schema_marker SET version = 1, schema_hash = 'original'"
+    )
+    fail = [True]
+
+    def sql(step: assets.SchemaMigration, _dialect: str) -> str:
+        if step.version == 3 and fail[0]:
+            raise RuntimeError("interrupted migration")
+        return f"CREATE TABLE migration_{step.version} (source_id VARCHAR NOT NULL)"
+
+    monkeypatch.setattr(assets.SchemaMigration, "sql", sql)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted migration"):
+            backend.preflight()
+        assert backend.query("SELECT version FROM schema_marker").to_pylist() == [
+            {"version": 1}
+        ]
+        assert backend.query("SELECT * FROM schema_migrations").num_rows == 0
+        assert (
+            backend.query(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name = 'migration_2'"
+            ).num_rows
+            == 0
+        )
+        fail[0] = False
+        backend.preflight()
+        backend.preflight()
+        assert backend.query("SELECT version FROM schema_marker").to_pylist() == [
+            {"version": 3}
+        ]
+        assert backend.query(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).to_pylist() == [{"version": 2}, {"version": 3}]
+    finally:
+        backend.close()

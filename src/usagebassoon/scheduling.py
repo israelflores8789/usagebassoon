@@ -20,14 +20,17 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Literal
 
+from usagebassoon.archiver import SnapshotArchiver
+from usagebassoon.backends.base import close_backend
 from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationManager,
     UsageBassoonConfig,
+    open_backend,
     parse_interval,
     update_schedule_interval,
 )
@@ -40,6 +43,9 @@ Platform = Literal["linux", "darwin"]
 SYSTEMD_SERVICE_NAME = "usagebassoon.service"
 SYSTEMD_TIMER_NAME = "usagebassoon.timer"
 LAUNCH_LABEL = "io.github.israelflores8789.usagebassoon.collect"
+SNAPSHOT_SERVICE_NAME = "usagebassoon-snapshot.service"
+SNAPSHOT_TIMER_NAME = "usagebassoon-snapshot.timer"
+SNAPSHOT_LAUNCH_LABEL = "io.github.israelflores8789.usagebassoon.snapshot"
 _SYSTEMD_RUNNING_STATES = frozenset({"running", "degraded", "starting", "initializing"})
 _PATH_SUFFIX = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -98,6 +104,7 @@ class WorkerStatus:
     interval: str
     pid_path: Path
     log_path: Path
+    snapshot_interval_seconds: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return JSON-compatible worker status data."""
@@ -107,6 +114,7 @@ class WorkerStatus:
             "interval": self.interval,
             "pid_path": str(self.pid_path),
             "log_path": str(self.log_path),
+            "snapshot_interval_seconds": self.snapshot_interval_seconds,
         }
 
 
@@ -253,6 +261,105 @@ def _collect_command(config: UsageBassoonConfig) -> tuple[str, ...]:
     )
 
 
+def snapshot_schedule_seconds(config: UsageBassoonConfig) -> float | None:
+    """Return an independent cadence for checking configured backup obligations."""
+    deadlines: list[float] = []
+    settings = config.snapshots
+    if settings is not None:
+        interval = parse_interval(settings.interval)
+        if interval is not None:
+            deadlines.append(interval.total_seconds())
+        if settings.file_uri and not settings.disable_weekly_snapshots:
+            deadlines.append(3600.0)
+    if config.gcs is not None and not config.gcs.disable_weekly_snapshots:
+        deadlines.append(3600.0)
+    return min(deadlines) if deadlines else None
+
+
+def run_snapshot_check(config: UsageBassoonConfig) -> None:
+    """Capture due archives without acquiring tokscale data or a collection lock."""
+    backend = open_backend(config)
+    try:
+        SnapshotArchiver.from_config(config).write(backend, run_id="scheduled")
+    finally:
+        close_backend(backend, context="scheduled snapshot")
+
+
+def _snapshot_worker(config: UsageBassoonConfig, stop: Event, seconds: float) -> None:
+    """Service backup deadlines independently of the collection worker."""
+    logger = configure_logging(config.logging)
+    while not stop.is_set():
+        try:
+            run_snapshot_check(config)
+        except Exception:
+            logger.exception("independent snapshot cycle failed")
+        if stop.wait(seconds):
+            break
+
+
+def _snapshot_command(config: UsageBassoonConfig) -> tuple[str, ...]:
+    """Build the due-only automatic archive invocation."""
+    return (
+        _resolve_bassoon(),
+        "snapshot",
+        "--automatic",
+        "--config",
+        str(config.path.expanduser().resolve()),
+    )
+
+
+def _snapshot_plist() -> Path:
+    """Return the independently managed backup LaunchAgent path."""
+    return _launchd_plist().with_name(f"{SNAPSHOT_LAUNCH_LABEL}.plist")
+
+
+def _install_snapshot_schedule(config: UsageBassoonConfig, platform: str) -> None:
+    """Install or remove backup artifacts independently of collection cadence."""
+    seconds = snapshot_schedule_seconds(config)
+    if platform == "linux":
+        directory = _systemd_unit_dir()
+        if seconds is None:
+            _run(
+                ["systemctl", "--user", "disable", "--now", SNAPSHOT_TIMER_NAME],
+                check=False,
+            )
+            for name in (SNAPSHOT_SERVICE_NAME, SNAPSHOT_TIMER_NAME):
+                (directory / name).unlink(missing_ok=True)
+        else:
+            _write_atomic(
+                directory / SNAPSHOT_SERVICE_NAME,
+                _systemd_service(_snapshot_command(config))
+                .replace("tokscale collection", "snapshot capture")
+                .encode(),
+            )
+            timer = _systemd_timer(config.schedule.interval)
+            timer = (
+                timer.replace(
+                    _systemd_time_span(config.schedule.interval), f"{seconds:g}s"
+                )
+                .replace(SYSTEMD_SERVICE_NAME, SNAPSHOT_SERVICE_NAME)
+                .replace("collection schedule", "snapshot schedule")
+            )
+            _write_atomic(directory / SNAPSHOT_TIMER_NAME, timer.encode())
+            _run(["systemctl", "--user", "daemon-reload"])
+            _run(["systemctl", "--user", "enable", "--now", SNAPSHOT_TIMER_NAME])
+    else:
+        path = _snapshot_plist()
+        _launchctl("bootout", _launch_domain(), str(path), check=False)
+        if seconds is None:
+            path.unlink(missing_ok=True)
+        else:
+            payload: object = plistlib.loads(
+                _launchd_plist_bytes(config, _snapshot_command(config))
+            )
+            if not isinstance(payload, dict):
+                raise SchedulingError("invalid snapshot scheduler template")
+            payload["Label"] = SNAPSHOT_LAUNCH_LABEL
+            payload["StartInterval"] = max(1, int(seconds))
+            _write_atomic(path, plistlib.dumps(payload))
+            _launchctl("bootstrap", _launch_domain(), str(path))
+
+
 def _duration_seconds(interval: str) -> float:
     """Parse one validated schedule interval into seconds."""
     if re.fullmatch(r"\d+(?:\.\d+)?[mh]", interval, re.IGNORECASE) is None:
@@ -345,7 +452,6 @@ def install_native_schedule(
     """Preflight and install the native schedule for the current platform."""
     availability = _require_scheduler()
     command = _collect_command(config)
-    preflight_tokscale(config)
     if availability.platform == "linux":
         return _install_systemd(config, command, no_linger=no_linger)
     return _install_launchd(config, command)
@@ -383,6 +489,7 @@ def _install_systemd(
                     "could not enable systemd lingering; the schedule may stop "
                     f"after logout ({detail})"
                 )
+    _install_snapshot_schedule(config, "linux")
     return _systemd_status(config, command, tuple(warnings))
 
 
@@ -442,6 +549,7 @@ def _install_launchd(
     _write_atomic(plist, _launchd_plist_bytes(config, command))
     _launchctl("bootout", _launch_domain(), str(plist), check=False)
     _launchctl("bootstrap", _launch_domain(), str(plist))
+    _install_snapshot_schedule(config, "darwin")
     return _launchd_status(config, command)
 
 
@@ -449,17 +557,18 @@ def start_native_schedule(config: UsageBassoonConfig) -> ScheduleStatus:
     """Start an installed native schedule after preflight."""
     availability = _require_scheduler()
     command = _collect_command(config)
-    preflight_tokscale(config)
     if availability.platform == "linux":
         if not (_systemd_unit_dir() / SYSTEMD_TIMER_NAME).is_file():
             raise SchedulingError("schedule is not installed")
         _run(["systemctl", "--user", "enable", "--now", SYSTEMD_TIMER_NAME])
+        _install_snapshot_schedule(config, "linux")
         return _systemd_status(config, command)
     plist = _launchd_plist()
     if not plist.is_file():
         raise SchedulingError("schedule is not installed")
     _launchctl("bootout", _launch_domain(), str(plist), check=False)
     _launchctl("bootstrap", _launch_domain(), str(plist))
+    _install_snapshot_schedule(config, "darwin")
     return _launchd_status(config, command)
 
 
@@ -469,8 +578,11 @@ def stop_native_schedule() -> None:
     if availability.platform == "linux":
         _run(["systemctl", "--user", "stop", SYSTEMD_TIMER_NAME], check=False)
         _run(["systemctl", "--user", "stop", SYSTEMD_SERVICE_NAME], check=False)
+        _run(["systemctl", "--user", "stop", SNAPSHOT_TIMER_NAME], check=False)
+        _run(["systemctl", "--user", "stop", SNAPSHOT_SERVICE_NAME], check=False)
         return
     _launchctl("bootout", _launch_domain(), str(_launchd_plist()), check=False)
+    _launchctl("bootout", _launch_domain(), str(_snapshot_plist()), check=False)
 
 
 def remove_native_schedule() -> None:
@@ -484,11 +596,20 @@ def remove_native_schedule() -> None:
         unit_dir = _systemd_unit_dir()
         (unit_dir / SYSTEMD_SERVICE_NAME).unlink(missing_ok=True)
         (unit_dir / SYSTEMD_TIMER_NAME).unlink(missing_ok=True)
+        _run(
+            ["systemctl", "--user", "disable", "--now", SNAPSHOT_TIMER_NAME],
+            check=False,
+        )
+        _run(["systemctl", "--user", "stop", SNAPSHOT_SERVICE_NAME], check=False)
+        (unit_dir / SNAPSHOT_SERVICE_NAME).unlink(missing_ok=True)
+        (unit_dir / SNAPSHOT_TIMER_NAME).unlink(missing_ok=True)
         _run(["systemctl", "--user", "daemon-reload"])
         return
     plist = _launchd_plist()
     _launchctl("bootout", _launch_domain(), str(plist), check=False)
     plist.unlink(missing_ok=True)
+    _launchctl("bootout", _launch_domain(), str(_snapshot_plist()), check=False)
+    _snapshot_plist().unlink(missing_ok=True)
 
 
 def native_schedule_status(config: UsageBassoonConfig) -> ScheduleStatus:
@@ -602,6 +723,7 @@ def worker_status(config: UsageBassoonConfig) -> WorkerStatus:
         interval=config.schedule.interval,
         pid_path=pid_path,
         log_path=_worker_log_path(config),
+        snapshot_interval_seconds=snapshot_schedule_seconds(config),
     )
 
 
@@ -643,7 +765,6 @@ def start_worker(
             "use `bassoon schedule stop` first"
         )
     existing.pid_path.unlink(missing_ok=True)
-    preflight_tokscale(configuration)
     command = [
         _resolve_bassoon(),
         "schedule",
@@ -797,13 +918,6 @@ def run_worker(
     if interval is None:
         raise SchedulingError("schedule.interval must be positive")
     logger = configure_logging(configuration.logging)
-    try:
-        preflight_tokscale(configuration)
-    except RuntimeError:
-        logger.exception(
-            "tokscale preflight failed; worker will retry collection "
-            "and continue independent snapshot checks"
-        )
     logger.info("worker configuration is fixed at startup; restart after file changes")
     stop_requested = Event()
 
@@ -811,6 +925,23 @@ def run_worker(
         """Stop future cycles without interrupting an active collection."""
         stop_requested.set()
 
+    snapshot_thread: Thread | None = None
+    seconds = snapshot_schedule_seconds(configuration)
+    if seconds is not None:
+        snapshot_thread = Thread(
+            target=_snapshot_worker,
+            args=(configuration, stop_requested, seconds),
+            name="usagebassoon-snapshots",
+            daemon=True,
+        )
+        snapshot_thread.start()
+    try:
+        preflight_tokscale(configuration)
+    except RuntimeError:
+        logger.exception(
+            "tokscale preflight failed; worker will retry collection "
+            "and continue independent snapshot checks"
+        )
     previous_term = signal.signal(signal.SIGTERM, request_stop)
     previous_int = signal.signal(signal.SIGINT, request_stop)
     try:
@@ -854,6 +985,9 @@ def run_worker(
                 break
             stop_requested.wait(interval.total_seconds())
     finally:
+        stop_requested.set()
+        if snapshot_thread is not None:
+            snapshot_thread.join()
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
         print("schedule worker stopped", flush=True)
@@ -898,6 +1032,23 @@ def _systemd_status(
             line for line in timer_result.stdout.splitlines() if line.strip()
         )
     details.append(f"service artifact: {service}")
+    seconds = snapshot_schedule_seconds(config)
+    if seconds is not None:
+        installed_snapshot = (unit_dir / SNAPSHOT_TIMER_NAME).is_file()
+        snapshot_active = None
+        if shutil.which("systemctl"):
+            snapshot_active = (
+                _run(
+                    ["systemctl", "--user", "is-active", SNAPSHOT_TIMER_NAME],
+                    check=False,
+                ).returncode
+                == 0
+            )
+        details.append(
+            f"snapshot cadence: {seconds:g}s; "
+            f"installed={installed_snapshot}, active={snapshot_active}; "
+            f"artifact: {unit_dir / SNAPSHOT_TIMER_NAME}"
+        )
     return ScheduleStatus(
         platform="linux",
         provider="systemd",
@@ -933,6 +1084,21 @@ def _launchd_status(
             details.extend(result.stdout.splitlines())
         elif result.stderr.strip():
             details.append(result.stderr.strip())
+    seconds = snapshot_schedule_seconds(config)
+    if seconds is not None:
+        snapshot_active = None
+        if shutil.which("launchctl"):
+            snapshot_active = (
+                _launchctl(
+                    "print", f"{_launch_domain()}/{SNAPSHOT_LAUNCH_LABEL}", check=False
+                ).returncode
+                == 0
+            )
+        details.append(
+            f"snapshot cadence: {seconds:g}s; "
+            f"installed={_snapshot_plist().is_file()}, active={snapshot_active}; "
+            f"artifact: {_snapshot_plist()}"
+        )
     return ScheduleStatus(
         platform="darwin",
         provider="launchd",

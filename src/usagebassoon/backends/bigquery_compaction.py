@@ -3,11 +3,16 @@
 
 """bigquery_compaction.py — Install the versioned nightly BigQuery Scheduled Query."""
 
+from __future__ import annotations
+
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from importlib import resources
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from google.cloud import bigquery_datatransfer
 
 from google.auth.credentials import Credentials
 
@@ -89,6 +94,34 @@ def install_compaction(
         return config.name
 
 
+def _matching_schedules(
+    client: bigquery_datatransfer.DataTransferServiceClient,
+    parent: str,
+    display_name: str,
+    remaining: Callable[[], float],
+) -> list[bigquery_datatransfer.TransferConfig]:
+    """Fetch each page with a fresh remaining operation budget."""
+    matches: list[bigquery_datatransfer.TransferConfig] = []
+    token = ""
+    while True:
+        pager = client.list_transfer_configs(
+            request={"parent": parent, "page_token": token},
+            retry=None,
+            timeout=remaining(),
+        )
+        page = next(iter(pager.pages))
+        remaining()
+        matches.extend(
+            config
+            for config in page.transfer_configs
+            if config.display_name == display_name
+            and config.data_source_id == "scheduled_query"
+        )
+        token = page.next_page_token
+        if not token:
+            return matches
+
+
 def pause_compaction(
     backend: BigQueryBackendCompaction, *, timeout: float = 60.0
 ) -> None:
@@ -96,17 +129,25 @@ def pause_compaction(
     from google.cloud import bigquery_datatransfer
     from google.protobuf.field_mask_pb2 import FieldMask
 
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        """Apply one operation budget to discovery, updates and polling."""
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError(
+                "scheduled compaction shutdown deadline exceeded; "
+                "inspect maintenance state and retry restore"
+            )
+        return budget
+
     parent = f"projects/{backend.project}/locations/{backend.location.lower()}"
     display_name = f"UsageBassoon nightly compaction: {backend.dataset}"
     logging.getLogger("usagebassoon").info("Disabling scheduled compaction...")
     with bigquery_datatransfer.DataTransferServiceClient(
         credentials=backend._credentials
     ) as client:
-        matches = [
-            c
-            for c in client.list_transfer_configs(parent=parent)
-            if c.display_name == display_name and c.data_source_id == "scheduled_query"
-        ]
+        matches = _matching_schedules(client, parent, display_name, remaining)
         if len(matches) > 1:
             raise RuntimeError(
                 "multiple UsageBassoon compaction schedules exist; "
@@ -121,20 +162,31 @@ def pause_compaction(
                     name=config.name, disabled=True
                 ),
                 update_mask=FieldMask(paths=["disabled"]),
+                retry=None,
+                timeout=remaining(),
             )
-        deadline = time.monotonic() + timeout
         while True:
-            active = list(
-                client.list_transfer_runs(
+            token = ""
+            active = False
+            while True:
+                pager = client.list_transfer_runs(
                     request={
                         "parent": config.name,
                         "states": [
                             bigquery_datatransfer.TransferState.PENDING,
                             bigquery_datatransfer.TransferState.RUNNING,
                         ],
-                    }
+                        "page_token": token,
+                    },
+                    retry=None,
+                    timeout=remaining(),
                 )
-            )
+                page = next(iter(pager.pages))
+                remaining()
+                active = bool(page.transfer_runs)
+                token = page.next_page_token
+                if active or not token:
+                    break
             if not active:
                 return
             if time.monotonic() >= deadline:
@@ -145,20 +197,27 @@ def pause_compaction(
             time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
 
 
-def compaction_status(backend: BigQueryBackendCompaction) -> tuple[bool, str]:
+def compaction_status(
+    backend: BigQueryBackendCompaction, *, timeout: float = 30.0
+) -> tuple[bool, str]:
     """Inspect the destination's schedule without changing its enabled state."""
     from google.cloud import bigquery_datatransfer
+
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        """Bound optional maintenance-state reporting as well as shutdown."""
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError("maintenance status deadline exceeded")
+        return budget
 
     parent = f"projects/{backend.project}/locations/{backend.location.lower()}"
     display_name = f"UsageBassoon nightly compaction: {backend.dataset}"
     with bigquery_datatransfer.DataTransferServiceClient(
         credentials=backend._credentials
     ) as client:
-        matches = [
-            c
-            for c in client.list_transfer_configs(parent=parent)
-            if c.display_name == display_name and c.data_source_id == "scheduled_query"
-        ]
+        matches = _matching_schedules(client, parent, display_name, remaining)
         if len(matches) != 1:
             return (
                 False,

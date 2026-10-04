@@ -108,3 +108,34 @@ def pending_migrations(
             "no safe migration path exists; initialize a fresh warehouse"
         )
     return steps
+
+
+def view_sql(dialect: str, name: str) -> str:
+    """Return one packaged native view definition for private query connections.
+
+    Args:
+        dialect: SQL installation whose view definition is needed.
+        name: Exact name of the packaged view.
+
+    Returns:
+        The native CREATE VIEW statement.
+
+    Raises:
+        ValueError: If the requested dialect or view is not supported.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    if dialect not in {"duckdb", "bigquery"}:
+        raise ValueError(f"unsupported SQL dialect: {dialect}")
+    sql = (
+        resources.files(f"usagebassoon.sql.{dialect}").joinpath("views.sql").read_text()
+    )
+    for statement in sqlglot.parse(sql, read=dialect):
+        if (
+            isinstance(statement, exp.Create)
+            and statement.kind == "VIEW"
+            and statement.this.name == name
+        ):
+            return statement.sql(dialect=dialect)
+    raise ValueError(f"packaged view is not defined: {name}")

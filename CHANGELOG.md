@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added dialect-specific `audit_sources` views shared with snapshot audits and explicit `GCP_PROJECT_ID` selection for GCS CI tests.
+- Added independent snapshot scheduler jobs, immutable-only emergency recovery, atomic fenced lifecycle transitions, immediate owned-stage retries, bounded source auditing, and separately reported scheduled/weekly backup health.
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
 - Added support for `tokscale` v4.15.1.
@@ -31,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added persisted daily model timing components, derived milliseconds-per-thousand-token rates, and reconciliation against tokscale's reported rate.
 - Added global workspace, client, and session tags with mutation provenance and source-scoped session notes for user-curated reports.
 - Added permanent collection audits, models payload reconciliation, and diagnostics using append-only outcomes and issue events.
-- Added portable Parquet snapshots and restore for local and remote object store archives, with consistent warehouse capture, catalog-based publication, integrity checks, retention, optional collection-triggered cadence, and restoration into initialized empty destinations across supported backends.
+- Added portable Parquet snapshots and restore for local and remote object store archives, with consistent warehouse capture, catalog-based publication, integrity checks, retention, independent scheduled cadence, and restoration into initialized empty destinations across supported backends.
 - Added support for Google Cloud Storage for snapshot archives.
 - Added self-contained disk-backed snapshots, catalog reconstruction, cross-location copying, pinned manual recovery points, independent four-week retention, global latest selection, and explicit archive paths/URIs with warned automatic fallback.
 - Added snapshot listing, inspection, integrity audits and aliases, protected pin/delete operations, source/run audits directly from archives, recovery initialization, scheduled maintenance shutdown, and atomic restore completion receipts.

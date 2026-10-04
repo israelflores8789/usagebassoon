@@ -179,3 +179,47 @@ def test_snapshot_delete_does_not_include_copies_created_during_confirmation(
     assert result.exit_code == 0, plain_cli_output(result.output)
     assert not (local / identifier / "COMPLETE").exists()
     assert f"archive/{identifier}/COMPLETE" in cloud.objects
+
+
+def test_inspect_exposes_verified_producer_metadata_for_unsupported_contract(
+    tmp_path: Path,
+) -> None:
+    """An unsupported reader does not hide the producer needed for manual recovery."""
+    from hashlib import sha256
+
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    try:
+        uri = SnapshotStore(str(tmp_path / "archive")).write(
+            backend, run_id="future", manual=True
+        )
+        assert uri is not None
+    finally:
+        backend.close()
+    path = Path(uri) / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["data_schema_version"] = 999
+    raw = json.dumps(manifest).encode()
+    path.write_bytes(raw)
+    (Path(uri) / "COMPLETE").write_text(
+        json.dumps(
+            {"snapshot_id": Path(uri).name, "manifest_sha256": sha256(raw).hexdigest()}
+        )
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "snapshot",
+            "inspect",
+            "--from-snapshot",
+            uri,
+            "--json",
+            "--config",
+            str(tmp_path / "lost.toml"),
+        ],
+    )
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    payload = json.loads(plain_cli_output(result.stdout))
+    assert payload["manifest"]["data_schema_version"] == 999
+    assert payload["manifest"]["usagebassoon_version"]
+    assert payload["compatibility"]["supported"] is False

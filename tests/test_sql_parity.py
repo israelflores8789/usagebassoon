@@ -253,3 +253,74 @@ def test_session_report_sorting_matches_both_sql_dialects(by_model: bool) -> Non
     finally:
         local.close()
         remote.close()
+
+
+def test_source_audit_view_deduplicates_runs_and_preserves_coherent_host_evidence(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Both native view definitions preserve ties, run counts and ledgerless sources."""
+    from dataclasses import replace
+
+    from tests._observations import observations
+    from usagebassoon.audit import audit_sources
+
+    local = DuckDBBackend(":memory:")
+    remote = BigQueryReplayBackend()
+    source = collection_bundle.source_id
+    other = "22222222-2222-4222-8222-222222222222"
+    stamp = datetime.now(UTC)
+    ledger_schema = CANONICAL_TABLE_SCHEMAS["collection_ledger"]
+    bundle = normalize(
+        replace(collection_bundle, run_id="11111111-1111-4111-8111-111111111111")
+    )
+    try:
+        local.apply_ddl()
+        for backend in (local, remote):
+            for table, data in bundle.tables.items():
+                if data.num_rows:
+                    backend.append(table, data)
+            rows = backend.query("SELECT * FROM current_collection_ledger").to_pylist()
+            for row in rows:
+                row.update(started_at=stamp, finished_at=stamp, collected_at=stamp)
+                row["host"] = "one-host"
+                row["cpu_count"] = 2
+                if row["domain"] != "collection":
+                    row["host"] = "another-host"
+                    row["cpu_count"] = 64
+            backend.append(
+                "collection_ledger", pa.Table.from_pylist(rows, schema=ledger_schema)
+            )
+            # Duplicate ledger publication and multiple domains still describe one run.
+            backend.append(
+                "collection_ledger", pa.Table.from_pylist(rows, schema=ledger_schema)
+            )
+            backend.append(
+                "notes",
+                observations(
+                    pa.table(
+                        {
+                            "source_id": [other],
+                            "client": ["codex"],
+                            "session_id": ["curation-only"],
+                            "note": ["no ledger"],
+                            "created_at": [stamp],
+                            "collected_at": [stamp],
+                        }
+                    )
+                ),
+            )
+        left = local.query("SELECT * FROM audit_sources")
+        right = remote.query("SELECT * FROM audit_sources")
+        assert normalized_records(left) == normalized_records(right)
+        summaries = {row["source_id"]: row for row in left.to_pylist()}
+        assert summaries[source]["run_count"] == 1
+        assert summaries[source]["host"] == "one-host"
+        assert summaries[source]["cpu_count"] == 2
+        assert summaries[other]["run_count"] == 0
+        assert summaries[other]["host"] is None
+        assert normalized_records(
+            pa.Table.from_pylist(audit_sources(local))
+        ) == normalized_records(left)
+    finally:
+        local.close()
+        remote.close()

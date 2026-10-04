@@ -815,12 +815,21 @@ def test_recovery_schedule_pause_waits_and_fails_closed(
     )
     client = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
     client.__enter__.return_value = client
-    client.list_transfer_configs.return_value = [config]
+    config_page = MagicMock()
+    config_page.pages = [
+        bigquery_datatransfer.ListTransferConfigsResponse(transfer_configs=[config])
+    ]
+    client.list_transfer_configs.return_value = config_page
     run = bigquery_datatransfer.TransferRun(
         state=bigquery_datatransfer.TransferState.RUNNING
     )
-    no_runs: list[bigquery_datatransfer.TransferRun] = []
-    client.list_transfer_runs.side_effect = [[run], no_runs]
+    running_page = MagicMock()
+    running_page.pages = [
+        bigquery_datatransfer.ListTransferRunsResponse(transfer_runs=[run])
+    ]
+    finished_page = MagicMock()
+    finished_page.pages = [bigquery_datatransfer.ListTransferRunsResponse()]
+    client.list_transfer_runs.side_effect = [running_page, finished_page]
     monkeypatch.setattr(
         bigquery_datatransfer,
         "DataTransferServiceClient",
@@ -837,10 +846,15 @@ def test_recovery_schedule_pause_waits_and_fails_closed(
     assert list(update["update_mask"].paths) == ["disabled"]
     assert client.list_transfer_runs.call_count == 2
     client.list_transfer_runs.side_effect = None
-    client.list_transfer_runs.return_value = [run]
-    times = iter((0.0, 2.0))
-    monkeypatch.setattr(module.time, "monotonic", lambda: next(times))
-    with pytest.raises(RuntimeError, match="run remains active"):
+    client.list_transfer_runs.return_value = running_page
+    clock = [0.0]
+
+    def tick() -> float:
+        clock[0] += 0.3
+        return clock[0]
+
+    monkeypatch.setattr(module.time, "monotonic", tick)
+    with pytest.raises(RuntimeError, match=r"deadline exceeded|run remains active"):
         module.pause_compaction(backend, timeout=1.0)
 
 
@@ -1068,3 +1082,91 @@ def test_doctor_snapshot_failure_never_falls_back_to_live_reads() -> None:
     assert report.status == "error"
     assert "snapshot unavailable" in report.errors[0].message
     backend.query.assert_not_called()
+
+
+def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry preparation waits for terminal jobs instead of waiting for stage expiry."""
+    backend = _backend()
+    table = bigquery.Table(f"{backend.dataset_ref}._stage_notes_attempt")
+    operation = "11111111-1111-4111-8111-111111111111"
+    table.labels = {
+        "usagebassoon_kind": "restore_stage",
+        "usagebassoon_restore": operation,
+    }
+    table.expires = datetime.now(UTC) + timedelta(days=1)
+    stage = {
+        "table": str(table.reference),
+        "operation_id": operation,
+        "expires_at": table.expires,
+    }
+    monkeypatch.setattr(backend, "restore_stages", lambda: [stage])
+
+    def uncommitted(_operation: str) -> bool:
+        """No application transaction has committed in this interrupted attempt."""
+        return False
+
+    monkeypatch.setattr(backend, "restore_committed", uncommitted)
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    job = MagicMock(spec=bigquery.QueryJob)
+    from hashlib import sha256
+
+    job.labels = {
+        "usagebassoon_kind": "restore_job",
+        "usagebassoon_restore": operation,
+        "usagebassoon_destination": sha256(backend.dataset_ref.encode()).hexdigest()[
+            :63
+        ],
+    }
+    job.state = "RUNNING"
+
+    def finish(**_kwargs: object) -> None:
+        job.state = "DONE"
+
+    job.reload.side_effect = finish
+    client.list_jobs.side_effect = [[job], list[bigquery.QueryJob]()]
+    client.get_table.return_value = table
+    backend.cleanup_restore_stages()
+    job.cancel.assert_called_once()
+    job.reload.assert_called_once()
+    client.delete_table.assert_called_once()
+    assert client.delete_table.call_args.args[0] == table.reference
+
+
+def test_recovery_schedule_pagination_reapplies_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pagination cannot reset discovery's operation deadline on each request."""
+    import usagebassoon.backends.bigquery_compaction as module
+
+    backend = _backend()
+    client = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
+    client.__enter__.return_value = client
+    clock = [0.0]
+    calls: list[tuple[str, float]] = []
+
+    def list_configs(
+        *, request: dict[str, str], retry: object, timeout: float
+    ) -> MagicMock:
+        assert retry is None
+        calls.append((request["page_token"], timeout))
+        clock[0] += 20.0
+        response = bigquery_datatransfer.ListTransferConfigsResponse(
+            next_page_token="next" if len(calls) == 1 else ""
+        )
+        pager = MagicMock()
+        pager.pages = [response]
+        return pager
+
+    client.list_transfer_configs.side_effect = list_configs
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        bigquery_datatransfer,
+        "DataTransferServiceClient",
+        MagicMock(return_value=client),
+    )
+    module.pause_compaction(backend, timeout=60)
+    assert calls == [("", 60.0), ("next", 40.0)]
+    client.update_transfer_config.assert_not_called()

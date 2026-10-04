@@ -355,9 +355,6 @@ def test_schedule_install_persists_explicit_interval(
         command=("bassoon", "collect"),
     )
 
-    def fake_preflight(_config: UsageBassoonConfig) -> tuple[str, ...]:
-        return ("tokscale",)
-
     def fake_install(
         _config: UsageBassoonConfig,
         *,
@@ -369,10 +366,6 @@ def test_schedule_install_persists_explicit_interval(
     monkeypatch.setattr(
         "usagebassoon.cli.schedule.scheduler_availability",
         lambda: SchedulerAvailability("linux", "systemd", True, "ready"),
-    )
-    monkeypatch.setattr(
-        "usagebassoon.cli.schedule.preflight_tokscale",
-        fake_preflight,
     )
     monkeypatch.setattr(
         "usagebassoon.cli.schedule.install_native_schedule",
@@ -393,3 +386,96 @@ def test_schedule_install_persists_explicit_interval(
 
     assert result.exit_code == 0, plain_cli_output(result.output)
     assert ConfigurationManager(configuration.path).load().schedule.interval == "30m"
+
+
+def test_snapshot_worker_runs_while_collection_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backup deadlines advance independently of a blocked collection call."""
+    from dataclasses import replace
+
+    import usagebassoon.scheduling as module
+    from usagebassoon.config import SnapshotConfig
+
+    configuration = replace(
+        _configuration(tmp_path),
+        snapshots=SnapshotConfig(file_uri=str(tmp_path / "archive")),
+    )
+    captured = Event()
+    blocked = Event()
+    signals: dict[int, object] = {}
+
+    def configuration_for_worker(*_args: object) -> UsageBassoonConfig:
+        return configuration
+
+    def snapshot_interval(_config: UsageBassoonConfig) -> float:
+        return 0.01
+
+    monkeypatch.setattr(module, "_worker_configuration", configuration_for_worker)
+    monkeypatch.setattr(module, "snapshot_schedule_seconds", snapshot_interval)
+
+    def install_signal(number: int, handler: object) -> None:
+        signals[number] = handler
+
+    def snapshot(_config: UsageBassoonConfig) -> None:
+        if blocked.wait(2):
+            captured.set()
+
+    def collect(_config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        blocked.set()
+        assert captured.wait(2), "blocked collection prevented independent backup"
+        handler = signals[module.signal.SIGTERM]
+        assert callable(handler)
+        handler(0, None)
+        return "run", PersistSummary(0, 0, {})
+
+    def broken_preflight(_config: UsageBassoonConfig) -> None:
+        raise RuntimeError("tokscale unavailable")
+
+    monkeypatch.setattr(module.signal, "signal", install_signal)
+    monkeypatch.setattr(module, "preflight_tokscale", broken_preflight)
+    monkeypatch.setattr(module, "run_snapshot_check", snapshot)
+    monkeypatch.setattr(module, "collect_run", collect)
+    run_worker(configuration.path)
+    assert captured.is_set()
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_native_snapshot_artifacts_have_independent_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """Separate scheduler artifacts never reuse the collection interval."""
+    import plistlib
+    import subprocess
+    from dataclasses import replace
+
+    import usagebassoon.scheduling as module
+    from usagebassoon.config import ScheduleConfig, SnapshotConfig
+
+    config = replace(
+        _configuration(tmp_path),
+        schedule=ScheduleConfig(interval="2h"),
+        snapshots=SnapshotConfig(file_uri=str(tmp_path / "archive"), interval="10m"),
+    )
+    monkeypatch.setattr(module, "_systemd_unit_dir", lambda: tmp_path)
+    monkeypatch.setattr(module, "_snapshot_plist", lambda: tmp_path / "snapshot.plist")
+    monkeypatch.setattr(module, "_resolve_bassoon", lambda: "/usr/bin/bassoon")
+    calls: list[list[str]] = []
+
+    def run(
+        command: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        del check
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module, "_run", run)
+    module._install_snapshot_schedule(config, platform)
+    if platform == "linux":
+        timer = (tmp_path / module.SNAPSHOT_TIMER_NAME).read_text()
+        assert "OnUnitActiveSec=600s" in timer and module.SNAPSHOT_SERVICE_NAME in timer
+        assert "--automatic" in (tmp_path / module.SNAPSHOT_SERVICE_NAME).read_text()
+    else:
+        payload = plistlib.loads((tmp_path / "snapshot.plist").read_bytes())
+        assert payload["StartInterval"] == 600
+        assert "--automatic" in payload["ProgramArguments"]

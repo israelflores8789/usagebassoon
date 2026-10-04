@@ -9,7 +9,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from typing import cast, override
 
 import pyarrow as pa
@@ -290,13 +290,40 @@ def test_snapshot_renews_reservation_during_long_capture(
 
 
 def test_simultaneous_gcs_catalog_claim_has_one_winner() -> None:
-    """Compare-and-swap lets only one writer claim the same missing catalog."""
-    archive = MemoryGcsArchive()
+    """Force both claimants to observe one generation before atomic provider CAS."""
     barrier = Barrier(2)
+
+    class RacingArchive(MemoryGcsArchive):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = Lock()
+
+        @override
+        def read_json(
+            self, relative_name: str
+        ) -> tuple[dict[str, object] | None, int | None]:
+            result = super().read_json(relative_name)
+            if relative_name == "control.json" and result[0] is None:
+                barrier.wait(timeout=5)
+            return result
+
+        @override
+        def write_json_cas(
+            self,
+            relative_name: str,
+            payload: dict[str, object],
+            *,
+            expected_version: str | int | None,
+        ) -> GcsObject:
+            with self.lock:
+                return super().write_json_cas(
+                    relative_name, payload, expected_version=expected_version
+                )
+
+    archive = RacingArchive()
     claimants = [Catalog(archive), Catalog(archive)]
 
     def claim(catalog: Catalog) -> bool:
-        barrier.wait(timeout=5)
         try:
             catalog._update_reservation(claim=True)
         except ArchiveBusy:
@@ -360,16 +387,32 @@ def test_pending_destination_renews_during_slow_publication(
         gcs_archive_uri=archive.uri,
         gcs_bucket=archive,
     )
+    import usagebassoon.snapshot.catalog as module
+
+    monkeypatch.setattr(module, "LEASE_SECONDS", 1)
     original = Catalog.publish
+    original_renew = Catalog._update_reservation
+    published = Event()
+    renewed = Event()
+
+    def renew(self: Catalog, *, claim: bool = False) -> None:
+        original_renew(self, claim=claim)
+        if self.bucket is archive and published.is_set() and not claim:
+            renewed.set()
 
     def publish(self: Catalog, identifier: str, captured_at: str) -> None:
         original(self, identifier, captured_at)
+        if self.bucket is not archive:
+            published.set()
+            assert renewed.wait(5), "pending remote destination did not renew"
         for bucket in store.reader.buckets:
             document, _ = bucket.read_json("control.json")
             assert document is not None and isinstance(document["reservation"], dict)
 
+    monkeypatch.setattr(Catalog, "_update_reservation", renew)
     monkeypatch.setattr(Catalog, "publish", publish)
     assert store.write(cast(StorageBackend, TableBackend()), run_id="dual") is not None
+    assert renewed.is_set()
 
 
 def test_dual_publication_failure_does_not_prune_previous_snapshots(
@@ -399,4 +442,41 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
     # A retired rollback entry must never be eligible for recovery.
     with store.reader.prepare() as prepared:
         assert prepared.candidate.identifier == first.rsplit("/", 1)[-1]
-    assert any(c.identifier == first.rsplit("/", 1)[-1] for c in candidates)
+    assert len(candidates) == 2
+    assert all(c.identifier == first.rsplit("/", 1)[-1] for c in candidates)
+    for bucket in store.reader.buckets:
+        assert Catalog(bucket).entries() == [
+            {
+                "snapshot_id": first.rsplit("/", 1)[-1],
+                "captured_at": candidates[0].captured_at,
+            }
+        ]
+        assert any(
+            obj.name == first.rsplit("/", 1)[-1] + "/COMPLETE"
+            for obj in bucket.list("")
+        )
+
+
+@pytest.mark.parametrize("project", ["ci-test-project", None])
+def test_gcs_live_project_uses_ci_variable_without_adc_project_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    project: str | None,
+) -> None:
+    """WIF CI selects its bucket project explicitly, without a local ADC project."""
+    import google.auth
+
+    from tests.test_bucket_gcs_live import _test_project
+
+    def no_adc_project(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("CI must not discover a project from local ADC")
+
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("USAGEBASSOON_GCS_PROJECT", "obsolete-project")
+    monkeypatch.setattr(google.auth, "default", no_adc_project)
+    if project is None:
+        monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+        with pytest.raises(pytest.fail.Exception, match="GCP_PROJECT_ID is required"):
+            _test_project()
+    else:
+        monkeypatch.setenv("GCP_PROJECT_ID", project)
+        assert _test_project() == project

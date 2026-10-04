@@ -13,7 +13,11 @@ Raw developer invocation::
 The ``gcs_live`` marker selects these tests, and ``USAGEBASSOON_GCS_LIVE=1``
 enables access to a preconfigured GCS test bucket.
 
-The test bucket is fixed by ``_TEST_BUCKET`` and has no environment override.
+The bucket is always ``usagebassoon-test-snapshots-<gcp-project-id>``.
+``USAGEBASSOON_GCS_PROJECT`` selects the project explicitly in CI. Local runs without
+that variable may use the project resolved by application default authentication.
+Arbitrary bucket names are never accepted.
+
 Each test creates and removes its own prefix, without a bucket reset control.
 
 Credentials use application default authentication, including
@@ -30,6 +34,7 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+import google.auth
 import pyarrow as pa
 import pytest
 
@@ -49,7 +54,19 @@ from usagebassoon.storage_model import (
 
 pytestmark = pytest.mark.gcs_live
 
-_TEST_BUCKET = "usagebassoon-test-snapshots-usagebassoon-510501"
+_TEST_BUCKET_PREFIX = "usagebassoon-test-snapshots-"
+
+
+def _test_project() -> str:
+    """Select the CI project explicitly, with discovery for local runs only."""
+    project = os.environ.get("USAGEBASSOON_GCS_PROJECT")
+    if not project and os.environ.get("CI") == "true":
+        pytest.fail("USAGEBASSOON_GCS_PROJECT is required for CI GCS tests")
+    if not project:
+        _, project = google.auth.default()
+    if not project:
+        pytest.fail("GCS project is unavailable; set USAGEBASSOON_GCS_PROJECT")
+    return project
 
 
 @pytest.fixture
@@ -57,7 +74,11 @@ def live_archive() -> Generator[GcsArchive]:
     """Create and remove an isolated prefix in the dedicated GCS test bucket."""
     if os.environ.get("USAGEBASSOON_GCS_LIVE") != "1":
         pytest.skip("set USAGEBASSOON_GCS_LIVE=1 to run GCS integration tests")
-    archive = GcsArchive(f"gs://{_TEST_BUCKET}/usagebassoon-tests/{uuid4().hex}")
+    project = _test_project()
+    archive = GcsArchive(
+        f"gs://{_TEST_BUCKET_PREFIX}{project}/usagebassoon-tests/{uuid4().hex}",
+        project=project,
+    )
     try:
         yield archive
     finally:
@@ -138,6 +159,11 @@ def test_live_gcs_snapshot_round_trip_verifies_downloaded_references(
         relocated.delete("catalog.json", version=generation)
         recovery = SnapshotStore(relocated_root, gcs_bucket=relocated)
         assert recovery.reader.listing()[0]["pinned"] is True
+        # Immutable emergency recovery does not need working lifecycle controls.
+        relocated.write_bytes("control.json", b'{"version": 999}')
+        relocated.write_bytes(
+            f"{relocated_uri.rsplit('/', 1)[-1]}/state.json", b"damaged"
+        )
         restored = recovery.restore(destination, relocated_uri)
         assert restored == {table: len(rows) for table, rows in expected.items()}
         for table, records in expected.items():

@@ -974,6 +974,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
         relocated_root = tmp_path / "relocated"
         copied = archive.copy(captured, str(relocated_root))
         (relocated_root / "catalog.json").unlink()
+        (Path(copied) / "state.json").write_text("damaged lifecycle metadata")
         command.extend(["--from-snapshot", copied])
         before = normalized_records(
             remote.query(
@@ -1012,7 +1013,28 @@ def test_live_restore_requires_an_explicit_disposable_reset(
         declined = runner.invoke(app, command, input="n\n")
         assert declined.exit_code != 0
         assert "Aborted" in plain_cli_output(declined.output)
-        with _phase("BigQuery CLI restore"):
+        # Simulate a crashed attempt with a populated, nonexpired owned stage.
+        from usagebassoon.backends.bigquery import _schema_from_arrow
+        from usagebassoon.snapshot.restore import restore_operation_id
+
+        with archive.reader.prepare(copied) as prepared:
+            operation = restore_operation_id(prepared)
+        stage = bigquery.Table(
+            f"{remote.dataset_ref}._stage_notes_{uuid4().hex}",
+            schema=_schema_from_arrow(local.query("SELECT * FROM notes")),
+        )
+        stage.labels = {
+            "usagebassoon_kind": "restore_stage",
+            "usagebassoon_restore": operation,
+        }
+        stage.expires = datetime.now(UTC) + timedelta(days=1)
+        remote.client.create_table(stage)
+        remote._load(
+            local.query("SELECT * FROM notes"),
+            str(stage.reference),
+            disposition="WRITE_APPEND",
+        )
+        with _phase("BigQuery CLI restore after interrupted attempt"):
             restored = runner.invoke(app, command, input="y\n")
         assert restored.exit_code == 0, (
             f"{plain_cli_output(restored.output)}\n{restored.exception!r}"
@@ -1034,6 +1056,34 @@ def test_live_restore_requires_an_explicit_disposable_reset(
         assert initialized.exit_code == 0, plain_cli_output(initialized.output)
         state = remote.maintenance_status()
         assert state is not None and state[0]
+        assert remote.restore_stages() == []
+        totals = remote.query(
+            "SELECT SUM(total_tokens) AS total FROM current_daily_stats"
+        ).to_pylist()
+        persist_run(
+            remote,
+            normalize(
+                replace(collection_bundle, source_id=source_id, run_id=str(uuid4()))
+            ),
+        )
+        assert remote.query(
+            "SELECT COUNT(*) AS count FROM current_daily_stats"
+        ).to_pylist() == [{"count": len(expected["daily_stats"])}]
+        assert set(
+            remote.query("SELECT DISTINCT source_id FROM current_daily_stats")
+            .column("source_id")
+            .to_pylist()
+        ) == set(sources)
+        _compact(remote)
+        assert (
+            remote.query(
+                "SELECT SUM(total_tokens) AS total FROM current_daily_stats"
+            ).to_pylist()
+            == totals
+        )
+        assert remote.query(
+            "SELECT COUNT(*) AS count FROM daily_stats"
+        ).to_pylist() == [{"count": len(expected["daily_stats"])}]
     finally:
         remote.close()
         local.close()
@@ -1098,5 +1148,29 @@ def test_live_consistent_read_preserves_state_across_compaction_and_late_append(
             assert read.query(ledger_sql).equals(ledger_before)
             assert remote.query(usage_sql).num_rows == 2
             assert remote.query(ledger_sql).num_rows == 2
+    finally:
+        remote.close()
+
+
+def test_live_source_audit_aggregates_history_with_one_summary_per_source(
+    live_settings: LiveSettings, collection_bundle: CollectionBundle
+) -> None:
+    """Validate portable aggregation SQL against native BigQuery audit views."""
+    from usagebassoon.audit import audit_sources
+
+    remote = _backend(live_settings)
+    sources = (str(uuid4()), str(uuid4()))
+    try:
+        for source_id in sources:
+            persist_run(
+                remote,
+                normalize(
+                    replace(collection_bundle, source_id=source_id, run_id=str(uuid4()))
+                ),
+            )
+        rows = {str(row["source_id"]): row for row in audit_sources(remote)}
+        assert set(sources) <= set(rows)
+        assert all(rows[source]["run_count"] == 1 for source in sources)
+        assert all(rows[source]["last_activity"] is not None for source in sources)
     finally:
         remote.close()

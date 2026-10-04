@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from copy import copy
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
@@ -30,6 +32,7 @@ from google.api_core.exceptions import (
     ServiceUnavailable,
     TooManyRequests,
 )
+from google.api_core.retry import Retry
 from google.auth import default as default_credentials
 from google.auth.credentials import Credentials
 from google.auth.exceptions import GoogleAuthError
@@ -872,7 +875,7 @@ class BigQueryBackend(AbstractStorageBackend):
         """Inspect native schedule state through the authorized lazy SDK path."""
         from usagebassoon.backends.bigquery_compaction import compaction_status
 
-        return compaction_status(self)
+        return compaction_status(self, timeout=min(30.0, self.timeout_seconds))
 
     @override
     def check_restore_empty(self) -> None:
@@ -884,6 +887,13 @@ class BigQueryBackend(AbstractStorageBackend):
                 "restore_receipts",
             }:
                 continue
+            if item.table_id.startswith("_stage_"):
+                table = self.client.get_table(item.reference)
+                labels = table.labels or {}
+                if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
+                    "usagebassoon_restore"
+                ):
+                    continue
             predicate = (
                 " WHERE domain <> '__lock__'"
                 if item.table_id == "compaction_ledger"
@@ -940,17 +950,75 @@ class BigQueryBackend(AbstractStorageBackend):
 
     @override
     def cleanup_restore_stages(self) -> None:
-        """Remove only expired label-owned stages after checking operation status."""
-        for stage in self.restore_stages():
-            expires = stage["expires_at"]
-            operation = stage["operation_id"]
-            if (
-                isinstance(expires, datetime)
-                and isinstance(operation, str)
-                and expires <= datetime.now(UTC)
+        """Drain owned restore jobs and immediately discard disposable stages."""
+        stages = self.restore_stages()
+        if not stages:
+            return
+        operations = {str(stage["operation_id"]) for stage in stages}
+        deadline = time.monotonic() + min(60.0, self.timeout_seconds)
+
+        def remaining() -> float:
+            """Share one deadline across discovery, cancellation and polling."""
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise RuntimeError(
+                    "owned restore jobs remain active; staging was preserved, "
+                    "retry cleanup"
+                )
+            return budget
+
+        for state in ("pending", "running"):
+            for job in self.client.list_jobs(
+                all_users=True,
+                state_filter=state,
+                retry=Retry(predicate=lambda _error: False),
+                timeout=remaining(),
             ):
-                self.restore_committed(operation)
-                self.client.delete_table(str(stage["table"]), not_found_ok=True)
+                if not isinstance(job, (bigquery.QueryJob, bigquery.LoadJob)):
+                    continue
+                labels: dict[str, str] = job.labels or {}
+                if (
+                    labels.get("usagebassoon_kind") != "restore_job"
+                    or labels.get("usagebassoon_destination")
+                    != sha256(self.dataset_ref.encode()).hexdigest()[:63]
+                    or labels.get("usagebassoon_restore") not in operations
+                ):
+                    continue
+                job.cancel(
+                    retry=Retry(predicate=lambda _error: False), timeout=remaining()
+                )
+                while job.state != "DONE":
+                    job.reload(
+                        retry=Retry(predicate=lambda _error: False), timeout=remaining()
+                    )
+                    if job.state != "DONE":
+                        time.sleep(min(0.5, remaining()))
+        for stage in stages:
+            operation = str(stage["operation_id"])
+            committed = self.restore_committed(operation)
+            _LOG.info(
+                "Discarding owned restore stage %s; committed=%s",
+                stage["table"],
+                committed,
+            )
+            # Recheck ownership immediately before deleting an observed table.
+            table = self.client.get_table(
+                str(stage["table"]),
+                retry=Retry(predicate=lambda _error: False),
+                timeout=remaining(),
+            )
+            labels = table.labels or {}
+            if (
+                labels.get("usagebassoon_kind") != "restore_stage"
+                or labels.get("usagebassoon_restore") != operation
+            ):
+                raise RuntimeError("restore stage ownership changed; refusing cleanup")
+            self.client.delete_table(
+                table.reference,
+                not_found_ok=True,
+                retry=Retry(predicate=lambda _error: False),
+                timeout=remaining(),
+            )
 
     @override
     def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
@@ -976,10 +1044,12 @@ class BigQueryBackend(AbstractStorageBackend):
             raise ValueError("unsupported restore tables")
         if self.restore_committed(operation_id):
             return
+        self.cleanup_restore_stages()
+        attempt_id = uuid4().hex
         stages: dict[str, str] = {}
         try:
             for table, path in files.items():
-                stage = self._stage_id(table, operation_id)
+                stage = self._stage_id(table, attempt_id)
                 schema = CANONICAL_TABLE_SCHEMAS[table]
                 owned = bigquery.Table(
                     stage,
@@ -988,6 +1058,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 owned.labels = {
                     "usagebassoon_kind": "restore_stage",
                     "usagebassoon_restore": operation_id,
+                    "usagebassoon_attempt": attempt_id,
                 }
                 owned.expires = datetime.now(UTC) + timedelta(days=1)
                 self.client.create_table(owned)
@@ -1000,6 +1071,13 @@ class BigQueryBackend(AbstractStorageBackend):
                             payload,
                             stage,
                             job_config=bigquery.LoadJobConfig(
+                                labels={
+                                    "usagebassoon_kind": "restore_job",
+                                    "usagebassoon_restore": operation_id,
+                                    "usagebassoon_destination": sha256(
+                                        self.dataset_ref.encode()
+                                    ).hexdigest()[:63],
+                                },
                                 source_format=bigquery.SourceFormat.PARQUET,
                                 parquet_options=options,
                                 schema=owned.schema,
@@ -1066,19 +1144,23 @@ class BigQueryBackend(AbstractStorageBackend):
             "@operation_id, @snapshot_id, CURRENT_TIMESTAMP());"
         )
         statements.append("COMMIT TRANSACTION;")
+        options = self._query_config(
+            parameters=[
+                bigquery.ScalarQueryParameter("operation_id", "STRING", operation_id),
+                bigquery.ScalarQueryParameter("snapshot_id", "STRING", snapshot_id),
+            ]
+        )
+        options.labels = {
+            "usagebassoon_kind": "restore_job",
+            "usagebassoon_restore": operation_id,
+            "usagebassoon_destination": sha256(self.dataset_ref.encode()).hexdigest()[
+                :63
+            ],
+        }
         self._wait_for_job(
             self.client.query(
                 "\n".join(statements),
-                job_config=self._query_config(
-                    parameters=[
-                        bigquery.ScalarQueryParameter(
-                            "operation_id", "STRING", operation_id
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "snapshot_id", "STRING", snapshot_id
-                        ),
-                    ]
-                ),
+                job_config=options,
                 location=self.location,
             )
         )

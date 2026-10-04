@@ -106,6 +106,45 @@ WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), IN
 CREATE OR REPLACE VIEW collection_runs AS
 SELECT * FROM current_collection_ledger WHERE domain = 'collection';
 
+-- One source summary combines all canonical domains and one latest metadata row.
+CREATE OR REPLACE VIEW audit_sources AS
+WITH sources AS (
+    SELECT source_id FROM current_sessions
+    UNION DISTINCT SELECT source_id FROM current_daily_stats
+    UNION DISTINCT SELECT source_id FROM current_price_versions
+    UNION DISTINCT SELECT source_id FROM current_tags
+    UNION DISTINCT SELECT source_id FROM current_notes
+    UNION DISTINCT SELECT source_id FROM current_collection_ledger
+    UNION DISTINCT SELECT source_id FROM current_schema_drift_events
+    UNION DISTINCT SELECT source_id FROM current_reconciliation_issues
+), totals AS (
+    SELECT source_id,
+        MIN(COALESCE(finished_at, started_at)) AS first_activity,
+        MAX(COALESCE(finished_at, started_at)) AS last_activity,
+        COUNT(DISTINCT run_id) AS run_count
+    FROM current_collection_ledger
+    GROUP BY source_id
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY source_id
+        ORDER BY COALESCE(finished_at, started_at) DESC NULLS LAST,
+            collected_at DESC NULLS LAST,
+            CASE WHEN domain = 'collection' THEN 1 ELSE 0 END DESC,
+            event_id DESC
+    ) AS evidence_rank
+    FROM current_collection_ledger
+), latest AS (
+    SELECT * FROM ranked WHERE evidence_rank = 1
+)
+SELECT sources.source_id, totals.first_activity, totals.last_activity,
+    COALESCE(totals.run_count, 0) AS run_count,
+    latest.status AS latest_outcome,
+    latest.host, latest.os_name, latest.os_version, latest.architecture,
+    latest.cpu_model, latest.cpu_count, latest.memory_bytes, latest.shell
+FROM sources
+LEFT JOIN totals ON sources.source_id = totals.source_id
+LEFT JOIN latest ON sources.source_id = latest.source_id;
+
 CREATE OR REPLACE VIEW collection_status AS
 SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status FROM (
 SELECT current_collection_ledger.*, ROW_NUMBER() OVER (

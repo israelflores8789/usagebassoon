@@ -197,7 +197,7 @@ class SnapshotArchiver:
         week = now.strftime("%G-W%V")
         has_week = False
         for entry in catalog.entries():
-            state, _ = catalog.bucket.read_json(f"{entry['snapshot_id']}/state.json")
+            state = catalog.state(str(entry["snapshot_id"]))
             if state is None or state.get("retired") is not False:
                 continue
             memberships = state.get("roles", [])
@@ -265,13 +265,8 @@ class SnapshotArchiver:
                             if "weekly" in memberships
                             else None,
                         }
-                        written[catalog.bucket] = [
-                            catalog.bucket.write_json_cas(
-                                f"{identifier}/state.json",
-                                initial_state,
-                                expected_version=None,
-                            )
-                        ]
+                        catalog.stage(identifier, initial_state)
+                        written[catalog.bucket] = []
                     directory = Path(temporary)
                     specifications: dict[str, object] = {}
                     files: dict[str, Path] = {}
@@ -349,15 +344,6 @@ class SnapshotArchiver:
                             owned.append(
                                 archive.upload_file(f"{identifier}/{path.name}", path)
                             )
-                        state, version = archive.read_json(f"{identifier}/state.json")
-                        assert state is not None
-                        archive.write_json_cas(
-                            f"{identifier}/state.json",
-                            {**state, "captured_at": captured_at},
-                            expected_version=version,
-                        )
-                        catalog.check()
-                        catalog.publish(identifier, captured_at)
                         owned.append(
                             archive.upload_file(
                                 f"{identifier}/COMPLETE", completion_path
@@ -371,18 +357,7 @@ class SnapshotArchiver:
                             SNAPSHOT_TABLES,
                             allow_staging=True,
                         )
-                        state, version = archive.read_json(f"{identifier}/state.json")
-                        assert state is not None
-                        catalog.check()
-                        archive.write_json_cas(
-                            f"{identifier}/state.json",
-                            {
-                                **state,
-                                "published": True,
-                                "verified_at": _now().isoformat(),
-                            },
-                            expected_version=version,
-                        )
+                        catalog.publish(identifier, captured_at)
                     for catalog, _ in due:
                         catalog.record_outcome(identifier)
                         try:
@@ -399,7 +374,11 @@ class SnapshotArchiver:
                     raise
 
         except ArchiveBusy:
-            if not written:
+            _LOG.warning(
+                "Snapshot attempt stopped after contention or ownership loss; "
+                "next cadence will retry"
+            )
+            if not manual:
                 return None
             raise
 
@@ -485,20 +464,20 @@ class SnapshotArchiver:
                 e["snapshot_id"] == identifier for e in catalog.entries()
             ):
                 raise ValueError("destination already contains this snapshot")
-            state, _ = prepared.candidate.bucket.read_json(f"{identifier}/state.json")
-            if state is None or state.get("retired") is not False:
-                raise ValueError("snapshot lifecycle state is missing or retired")
-            catalog.check()
-            bucket.write_json_cas(
-                f"{identifier}/state.json",
+            try:
+                state = Catalog(prepared.candidate.bucket).state(identifier)
+            except (ValueError, OSError, RuntimeError):
+                state = None
+            if state is None:
+                state = {"pinned": True, "roles": list[str](), "retired": False}
+            catalog.stage(
+                identifier,
                 {
                     **state,
                     "kind": "snapshot_stage",
-                    "owner": catalog.owner,
-                    "fence": catalog.fence,
                     "published": False,
+                    "retired": False,
                 },
-                expected_version=None,
             )
             try:
                 for table, path in prepared.files.items():
@@ -509,7 +488,6 @@ class SnapshotArchiver:
                     manifest_path = directory / "manifest.json"
                     manifest_path.write_bytes(prepared.manifest_bytes)
                     bucket.upload_file(f"{identifier}/manifest.json", manifest_path)
-                    catalog.publish(identifier, prepared.candidate.captured_at)
                     catalog.check()
                     bucket.write_json_cas(
                         f"{identifier}/COMPLETE",
@@ -528,14 +506,7 @@ class SnapshotArchiver:
                         allow_staging=True,
                         transform=False,
                     )
-                current, version = bucket.read_json(f"{identifier}/state.json")
-                assert current is not None
-                catalog.check()
-                bucket.write_json_cas(
-                    f"{identifier}/state.json",
-                    {**current, "published": True, "verified_at": _now().isoformat()},
-                    expected_version=version,
-                )
+                catalog.publish(identifier, prepared.candidate.captured_at)
             except Exception:
                 try:
                     catalog.check()

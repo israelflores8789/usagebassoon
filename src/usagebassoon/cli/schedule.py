@@ -11,7 +11,6 @@ from typing import Annotated, NoReturn
 import typer
 
 from usagebassoon.cli.spinner import spinner
-from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
@@ -75,7 +74,6 @@ def install(
             availability = scheduler_availability()
             if not availability.available:
                 raise SchedulingError(availability.detail)
-            preflight_tokscale(configuration)
             update_schedule_interval(manager.path, configuration.schedule.interval)
             configuration = manager.load()
         with spinner(configuration):

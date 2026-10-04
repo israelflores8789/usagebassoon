@@ -168,3 +168,49 @@ def test_doctor_reports_failed_tokscale_probe(
     assert "ERROR tokscale:" in plain_cli_output(result.output)
     assert "command: missing-tokscale" in plain_cli_output(result.output)
     assert "OK configuration:" in plain_cli_output(result.output)
+
+
+def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each automatic role has its own freshness check."""
+    from datetime import UTC, datetime, timedelta
+
+    from usagebassoon.config import SnapshotConfig, UsageBassoonConfig
+    from usagebassoon.diagnostics import snapshot_health
+    from usagebassoon.snapshot.reader import SnapshotReader
+
+    root = str(tmp_path / "archive")
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        snapshots=SnapshotConfig(file_uri=root, interval="1h"),
+    )
+    stamp = datetime.now(UTC)
+
+    def listing(
+        _reader: SnapshotReader, _selection: str = "latest"
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "uri": root + "/scheduled",
+                "captured_at": (stamp - timedelta(hours=2)).isoformat(),
+                "roles": ["scheduled"],
+                "verified_at": stamp.isoformat(),
+            },
+            {
+                "uri": root + "/weekly",
+                "captured_at": stamp.isoformat(),
+                "roles": ["weekly"],
+                "weekly_slot": stamp.strftime("%G-W%V"),
+                "verified_at": stamp.isoformat(),
+            },
+        ]
+
+    monkeypatch.setattr(SnapshotReader, "listing", listing)
+    check = snapshot_health(config)
+    assert check.status == "warning"
+    assert "scheduled recovery capture is overdue" in check.message
+    assert "current weekly recovery slot is overdue" not in check.message
+    assert any("1/4 recovery slots" in detail for detail in check.details)

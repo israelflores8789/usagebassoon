@@ -122,6 +122,13 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
     )
     try:
         rows = audit_sources(backend)
+        assert (
+            backend.query(
+                "SELECT * FROM audit_sources "
+                "ORDER BY last_activity DESC NULLS LAST, source_id DESC"
+            ).to_pylist()
+            == rows
+        )
         assert rows[0]["source_id"] == SOURCE_ID
         assert rows[0]["run_count"] == 2
         assert rows[0]["host"] == "new-host" and rows[0]["cpu_count"] == 2
@@ -146,6 +153,8 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
     )
     assert result.exit_code == 0, plain_cli_output(result.output)
     sources = json.loads(plain_cli_output(result.stdout))
+    expected = json.loads(json.dumps(rows, default=lambda value: value.isoformat()))
+    assert sources == expected
     assert sources[0]["source_id"] == SOURCE_ID and sources[0]["host"] == "new-host"
     assert sources[1]["source_id"] == other and sources[1]["run_count"] == 0
     runs = runner.invoke(

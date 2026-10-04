@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from threading import Event, RLock, Thread
@@ -71,19 +71,108 @@ class Catalog:
             raise ValueError(
                 "archive control metadata is invalid; cannot safely mutate it"
             )
+        if "records" in document and not isinstance(document["records"], dict):
+            raise ValueError("invalid archive lifecycle records")
         return document, version
 
-    def discover(self) -> list[dict[str, object]]:
+    def state(self, identifier: str) -> dict[str, object] | None:
+        """Read authoritative state, falling back to a relocated portable sidecar."""
+        document, _ = self.control()
+        records = document.get("records", {})
+        if not isinstance(records, dict):
+            raise ValueError("invalid archive lifecycle records")
+        state = records.get(identifier)
+        if state is not None:
+            if not isinstance(state, dict):
+                raise ValueError("invalid snapshot lifecycle state")
+            return dict(state)
+        return self.bucket.read_json(f"{identifier}/state.json")[0]
+
+    def mutate(self, change: Callable[[dict[str, object]], None]) -> None:
+        """Atomically authorize a transition against the reservation's own version."""
+        with self._control_lock:
+            if self._failure is not None:
+                raise ArchiveBusy(
+                    "archive reservation renewal failed"
+                ) from self._failure
+            for _ in range(8):
+                document, version = self.control()
+                reservation = document.get("reservation")
+                if (
+                    not isinstance(reservation, dict)
+                    or reservation.get("owner") != self.owner
+                    or reservation.get("fence") != self.fence
+                    or timestamp(reservation.get("expires_at")) <= datetime.now(UTC)
+                ):
+                    raise ArchiveBusy(
+                        f"snapshot reservation was lost: {self.bucket.uri}"
+                    )
+                change(document)
+                try:
+                    self.bucket.write_json_cas(
+                        CONTROL_NAME, document, expected_version=version
+                    )
+                except SnapshotPreconditionError:
+                    continue
+                return
+            raise ArchiveBusy("archive control metadata changed repeatedly")
+
+    def transition(self, identifier: str, state: dict[str, object]) -> None:
+        """Commit portable lifecycle state under the current fence."""
+        snapshot_id(identifier)
+
+        def change(document: dict[str, object]) -> None:
+            """Store the state in the same CAS document as mutation authority."""
+            records = document.setdefault("records", {})
+            if not isinstance(records, dict):
+                raise ValueError("invalid archive lifecycle records")
+            previous = records.get(identifier)
+            if (
+                isinstance(previous, dict)
+                and previous.get("retired") is True
+                and state.get("retired") is not True
+            ):
+                raise ValueError("retired snapshot identity cannot be republished")
+            records[identifier] = dict(state)
+
+        self.mutate(change)
+        # Projections are portable conveniences, never mutation authority.
+        try:
+            _, version = self.bucket.read_json(f"{identifier}/state.json")
+            self.bucket.write_json_cas(
+                f"{identifier}/state.json", state, expected_version=version
+            )
+        except Exception:
+            _LOG.exception(
+                "Lifecycle committed; sidecar projection failed at %s", self.bucket.uri
+            )
+
+    def stage(self, identifier: str, state: dict[str, object]) -> None:
+        """Reserve a new identity before creating any immutable objects."""
+        if self.state(identifier) is not None:
+            raise ValueError("snapshot identity already exists in this archive")
+        self.transition(identifier, {**state, "owner": self.owner, "fence": self.fence})
+
+    def discover(
+        self, *, recovery: bool = False, warning: Callable[[str], None] | None = None
+    ) -> list[dict[str, object]]:
         """Discover complete non-retired directories without trusting an index."""
         entries: list[dict[str, object]] = []
         for obj in self.bucket.list(""):
             if not obj.name.endswith("/COMPLETE") or obj.name.count("/") != 1:
                 continue
-            identifier = snapshot_id(obj.name.split("/")[0])
+            identifier = obj.name.split("/")[0]
             try:
-                state, _ = self.bucket.read_json(f"{identifier}/state.json")
-                if state is not None and (
-                    state.get("retired") is True or state.get("published") is False
+                snapshot_id(identifier)
+                state = None if recovery else self.state(identifier)
+                if (
+                    not recovery
+                    and state is not None
+                    and (
+                        state.get("retired") is True
+                        or state.get("published") is False
+                        or state.get("indexed") is False
+                    )
                 ):
                     continue
                 complete, _ = self.bucket.read_json(obj.name)
@@ -105,6 +194,7 @@ class Catalog:
                     or manifest.get("snapshot_id") != identifier
                 ):
                     raise ValueError("completion identity does not match")
+                timestamp(manifest.get("captured_at"))
                 entries.append(
                     {
                         "snapshot_id": identifier,
@@ -112,6 +202,11 @@ class Catalog:
                     }
                 )
             except (ValueError, OSError, RuntimeError) as error:
+                if warning:
+                    warning(
+                        f"Ignoring incomplete snapshot {identifier} "
+                        f"at {self.bucket.uri}: {error}"
+                    )
                 _LOG.warning(
                     "Ignoring incomplete snapshot %s at %s: %s",
                     identifier,
@@ -125,6 +220,24 @@ class Catalog:
 
     def entries(self) -> list[dict[str, object]]:
         """Return validated discovery entries from the catalog."""
+        control, _ = self.control()
+        records = control.get("records")
+        if isinstance(records, dict):
+            published: list[dict[str, object]] = []
+            for key, state in records.items():
+                snapshot_id(key)
+                if not isinstance(state, dict):
+                    raise ValueError("invalid snapshot lifecycle state")
+                if state.get("published") is True and state.get("retired") is False:
+                    if state.get("indexed") is False:
+                        continue
+                    captured = state.get("captured_at")
+                    timestamp(captured)
+                    published.append({"snapshot_id": key, "captured_at": captured})
+            return sorted(
+                published,
+                key=_entry_order,
+            )
         document, _ = self.read()
         values = document["entries"]
         if not isinstance(values, list):
@@ -135,7 +248,7 @@ class Catalog:
                 raise ValueError("invalid catalog entry")
             snapshot_id(entry.get("snapshot_id"))
             timestamp(entry.get("captured_at"))
-            state, _ = self.bucket.read_json(f"{entry['snapshot_id']}/state.json")
+            state = self.state(str(entry["snapshot_id"]))
             if state is not None and (
                 state.get("retired") is True or state.get("published") is False
             ):
@@ -159,7 +272,7 @@ class Catalog:
                             f"snapshot archive is reserved: {self.bucket.uri}"
                         )
                     previous = document.get("fence", 0)
-                    if not isinstance(previous, int):
+                    if not isinstance(previous, int) or isinstance(previous, bool):
                         raise ValueError("invalid catalog fence")
                     self.fence = previous + 1
                 elif (
@@ -193,10 +306,10 @@ class Catalog:
         self._update_reservation()
 
     def record_outcome(self, identifier: str, *, error: str | None = None) -> None:
-        """Keep inspectable last-attempt evidence under the destination reservation."""
-        with self._control_lock:
-            self.check()
-            document, version = self.control()
+        """Commit last-attempt evidence with the current mutation authority."""
+
+        def change(document: dict[str, object]) -> None:
+            """Record the result without a separate check/write race."""
             evidence: dict[str, object] = {
                 "snapshot_id": identifier,
                 "at": datetime.now(UTC).isoformat(),
@@ -206,7 +319,8 @@ class Catalog:
                 document["last_failure"] = None
             else:
                 document["last_failure"] = {**evidence, "error": error}
-            self.bucket.write_json_cas(CONTROL_NAME, document, expected_version=version)
+
+        self.mutate(change)
 
     @contextmanager
     def hold(self, *, enforce_policy: bool = False) -> Generator[Catalog]:
@@ -232,19 +346,19 @@ class Catalog:
         thread.start()
         try:
             if enforce_policy:
-                document, version = self.control()
-                policy = {"max_snapshots": self.max_snapshots, "weekly_slots": 4}
-                existing = document.get("policy")
-                if existing is not None and existing != policy:
-                    raise ValueError(
-                        "archive retention policy conflicts; use snapshot policy "
-                        "to explicitly reconcile it"
-                    )
-                if existing is None:
+
+                def policy_change(document: dict[str, object]) -> None:
+                    """Preserve an existing authoritative retention policy."""
+                    policy = {"max_snapshots": self.max_snapshots, "weekly_slots": 4}
+                    existing = document.get("policy")
+                    if existing is not None and existing != policy:
+                        raise ValueError(
+                            "archive retention policy conflicts; use snapshot policy "
+                            "to explicitly reconcile it"
+                        )
                     document["policy"] = policy
-                    self.bucket.write_json_cas(
-                        CONTROL_NAME, document, expected_version=version
-                    )
+
+                self.mutate(policy_change)
             yield self
             self.check()
         finally:
@@ -270,62 +384,85 @@ class Catalog:
             self.fence = None
 
     def publish(self, identifier: str, captured_at: str) -> None:
-        """Index an independently complete snapshot under the held reservation."""
-        with self._control_lock:
-            self.check()
-            document, version = self.read()
-            entries = self.entries()
-            if any(e["snapshot_id"] == identifier for e in entries):
-                raise ValueError("snapshot identity already exists in this archive")
-            new_entry: dict[str, object] = {
-                "snapshot_id": identifier,
+        """Authorize a verified complete snapshot in the fenced control document."""
+        self.check()
+        state = self.state(identifier)
+        if (
+            state is None
+            or state.get("owner") != self.owner
+            or state.get("fence") != self.fence
+        ):
+            raise ArchiveBusy("cannot publish a snapshot staged by another owner")
+        self.transition(
+            identifier,
+            {
+                **state,
                 "captured_at": captured_at,
-            }
-            document["entries"] = sorted(
-                [*entries, new_entry],
-                key=_entry_order,
+                "published": True,
+                "indexed": True,
+                "verified_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        self.project_index()
+
+    def project_index(self) -> None:
+        """Refresh the derived index without making it an authorization boundary."""
+        try:
+            _, version = self.read()
+            self.bucket.write_json_cas(
+                CATALOG_NAME,
+                {"version": FORMAT_VERSION, "entries": self.entries()},
+                expected_version=version,
             )
-            self.bucket.write_json_cas(CATALOG_NAME, document, expected_version=version)
+        except Exception:
+            _LOG.exception(
+                "Lifecycle committed; catalog projection requires repair at %s",
+                self.bucket.uri,
+            )
 
     def pin(self, identifier: str) -> None:
-        """Pin immutable contents by updating only portable lifecycle metadata."""
-        with self._control_lock:
-            self.check()
-            state, version = self.bucket.read_json(f"{identifier}/state.json")
-            if state is None or state.get("retired") is not False:
-                raise ValueError("snapshot lifecycle state is missing or retired")
-            self.bucket.write_json_cas(
-                f"{identifier}/state.json",
-                {**state, "pinned": True},
-                expected_version=version,
-            )
+        """Pin under the same fenced authority as publication and retirement."""
+        state = self.state(identifier)
+        if state is None or state.get("retired") is not False:
+            raise ValueError("snapshot lifecycle state is missing or retired")
+        self.transition(identifier, {**state, "pinned": True})
 
     def retire(self, identifier: str) -> None:
-        """Persist retirement before removing exact versions, keeping its tombstone."""
-        with self._control_lock:
-            self.check()
-            state, version = self.bucket.read_json(f"{identifier}/state.json")
-            if state is None or not isinstance(state.get("pinned"), bool):
-                raise ValueError(
-                    "snapshot state is missing or unreadable; refusing deletion"
-                )
-            self.bucket.write_json_cas(
-                f"{identifier}/state.json",
-                {**state, "retired": True},
-                expected_version=version,
+        """Authorize monotonic retirement and cleanup of exactly observed revisions."""
+        state = self.state(identifier)
+        if state is None or not isinstance(state.get("pinned"), bool):
+            raise ValueError(
+                "snapshot state is missing or unreadable; refusing deletion"
             )
-            document, version = self.read()
-            document["entries"] = [
-                e for e in self.entries() if e["snapshot_id"] != identifier
+        cleanup = state.get("cleanup")
+        if cleanup is None:
+            cleanup = [
+                {"name": obj.name, "version": obj.version}
+                for obj in self.bucket.list(identifier)
+                if obj.name.startswith(identifier + "/")
+                and obj.name != f"{identifier}/state.json"
             ]
-            self.bucket.write_json_cas(CATALOG_NAME, document, expected_version=version)
-            for obj in self.bucket.list(identifier):
-                if (
-                    obj.name.startswith(identifier + "/")
-                    and obj.name != f"{identifier}/state.json"
-                ):
-                    self.check()
-                    self.bucket.delete(obj.name, version=obj.version)
+        self.transition(identifier, {**state, "retired": True, "cleanup": cleanup})
+        self.project_index()
+        if not isinstance(cleanup, list):
+            raise ValueError("invalid retirement cleanup evidence")
+        for ref in cleanup:
+            if not isinstance(ref, dict) or not isinstance(ref.get("name"), str):
+                raise ValueError("invalid retirement object reference")
+            name, version = ref["name"], ref.get("version")
+            if not isinstance(version, (str, int)) or isinstance(version, bool):
+                raise ValueError("invalid retirement object version")
+            if (
+                not name.startswith(identifier + "/")
+                or name == f"{identifier}/state.json"
+            ):
+                raise ValueError("invalid retirement object scope")
+            self.check()
+            existing = next(
+                (obj for obj in self.bucket.list(name) if obj.name == name), None
+            )
+            if existing is not None:
+                self.bucket.delete(name, version=version)
 
     def rotate(self) -> None:
         """Retain pins, scheduled count, and four distinct successful UTC weeks."""
@@ -340,7 +477,7 @@ class Catalog:
             weeks: set[str] = set()
             for entry in entries:
                 identifier = str(entry["snapshot_id"])
-                state, _ = self.bucket.read_json(f"{identifier}/state.json")
+                state = self.state(identifier)
                 if (
                     state is None
                     or state.get("retired") is not False
@@ -375,46 +512,114 @@ class Catalog:
                 self.retire(identifier)
 
     def repair(self) -> None:
-        """Rebuild a missing index while preserving reservations and policy."""
-        with self._control_lock:
+        """Verify immutable candidates and rebuild the index before optional cleanup."""
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from usagebassoon.snapshot.reader import Candidate, SnapshotReader
+        from usagebassoon.storage_model import SNAPSHOT_TABLES
+
+        self.check()
+        references = self.bucket.list(CATALOG_NAME)
+        current = next((obj for obj in references if obj.name == CATALOG_NAME), None)
+        if current is not None:
+            raw = self.bucket.read_bytes(current.name, version=current.version)
+            try:
+                self.read()
+            except ValueError:
+                self.bucket.write_bytes(
+                    f"catalog.corrupt-{uuid4().hex}.json",
+                    raw,
+                    content_type="application/json",
+                )
+        verified: list[dict[str, object]] = []
+        repair_warnings: list[str] = []
+        for entry in self.discover(recovery=True, warning=repair_warnings.append):
             self.check()
-            for obj in self.bucket.list(""):
-                if obj.name.count("/") != 1 or not obj.name.endswith("/state.json"):
-                    continue
-                state, _ = self.bucket.read_json(obj.name)
-                if state is None:
-                    continue
-                fence = state.get("fence")
-                if (
-                    state.get("kind") == "snapshot_stage"
-                    and state.get("published") is False
-                    and isinstance(fence, int)
-                    and not isinstance(fence, bool)
-                    and self.fence is not None
-                    and fence < self.fence
-                    and isinstance(state.get("owner"), str)
-                ):
-                    self.retire(snapshot_id(obj.name.split("/")[0]))
-            references = self.bucket.list(CATALOG_NAME)
-            current = next(
-                (obj for obj in references if obj.name == CATALOG_NAME), None
-            )
-            version = current.version if current is not None else None
-            if current is not None:
-                raw = self.bucket.read_bytes(current.name, version=current.version)
-                try:
-                    self.read()
-                except ValueError:
-                    self.bucket.write_bytes(
-                        f"catalog.corrupt-{uuid4().hex}.json",
-                        raw,
-                        content_type="application/json",
+            identifier = str(entry["snapshot_id"])
+            try:
+                state = self.state(identifier)
+            except (ValueError, OSError, RuntimeError):
+                state = None
+                _LOG.warning(
+                    "Preserving uncertain pin state during repair: %s", identifier
+                )
+            if state is not None and (
+                state.get("retired") is True or state.get("published") is False
+            ):
+                continue
+            candidate = Candidate(self.bucket, identifier, str(entry["captured_at"]))
+            try:
+                with TemporaryDirectory(prefix="usagebassoon-repair-") as directory:
+                    SnapshotReader((self.bucket,), lambda _uri: self.bucket).download(
+                        candidate,
+                        Path(directory),
+                        SNAPSHOT_TABLES,
                     )
-            document: dict[str, object] = {
-                "version": FORMAT_VERSION,
-                "entries": self.discover(),
-            }
-            self.bucket.write_json_cas(CATALOG_NAME, document, expected_version=version)
+            except (ValueError, OSError, RuntimeError) as error:
+                _LOG.exception(
+                    "Excluding damaged snapshot from repaired index: %s", candidate.uri
+                )
+                repair_warnings.append(f"{candidate.uri}: {error}")
+                continue
+            verified.append(entry)
+            if state is None:
+                state = {
+                    "pinned": True,
+                    "retired": False,
+                    "published": True,
+                    "roles": list[str](),
+                }
+            self.transition(
+                identifier,
+                {**state, "captured_at": entry["captured_at"], "indexed": True},
+            )
+        verified_ids = {str(entry["snapshot_id"]) for entry in verified}
+
+        def mark_indexed(document: dict[str, object]) -> None:
+            """Keep invalid recovery points out of routine management after repair."""
+            records = document.get("records", {})
+            if not isinstance(records, dict):
+                raise ValueError("invalid archive lifecycle records")
+            for identifier, state in records.items():
+                if isinstance(state, dict) and state.get("published") is True:
+                    state["indexed"] = identifier in verified_ids
+            document["repair_warnings"] = repair_warnings
+
+        self.mutate(mark_indexed)
+        self.check()
+        _, version = (
+            self.bucket.read_json(CATALOG_NAME)
+            if current is None
+            else (None, current.version)
+        )
+        self.bucket.write_json_cas(
+            CATALOG_NAME,
+            {"version": FORMAT_VERSION, "entries": verified},
+            expected_version=version,
+        )
+
+    def cleanup_abandoned(self) -> None:
+        """Retire older owned stages only when no complete recovery unit survives."""
+        document, _ = self.control()
+        records = document.get("records", {})
+        if not isinstance(records, dict):
+            raise ValueError("invalid archive lifecycle records")
+        for identifier, state in records.items():
+            if not isinstance(state, dict):
+                continue
+            fence = state.get("fence")
+            if (
+                state.get("published") is False
+                and isinstance(fence, int)
+                and self.fence is not None
+                and fence < self.fence
+                and not any(
+                    obj.name == f"{identifier}/COMPLETE"
+                    for obj in self.bucket.list(f"{identifier}/COMPLETE")
+                )
+            ):
+                self.retire(str(identifier))
 
 
 def _entry_order(entry: dict[str, object]) -> tuple[datetime, str]:

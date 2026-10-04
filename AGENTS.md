@@ -71,7 +71,7 @@ Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<pa
   - Optional extras for Polars, BigQuery, and GCS.
 - **Dev Environment**: `uv`, `hatchling`, `twine`, `pyrefly`, `ruff`, `pytest`, `just`, `pre-commit`.
 
-**Terminology:** Use **storage backend** (or **backend**) for a `StorageBackend` implementation and its configured database destination. Use database, dataset, or warehouse only when referring to a platform-specific resource. A **snapshot bucket** is a `SnapshotBucket` storage adapter; a **snapshot destination** is its configured archive root. Snapshot buckets are independent of storage backends. **Direct transactional upsert** and **Append-and-compact** name persistence architectures, not individual platforms.
+**Terminology:** Use **storage backend** (or **backend**) for a `StorageBackend` implementation and its configured database destination. Use database, dataset, or warehouse only when referring to a platform-specific resource. A **snapshot bucket** (or **bucket**) is a `SnapshotBucket` storage adapter; a **snapshot destination** is its configured archive root. Snapshot buckets are independent of storage backends. **Direct transactional upsert** and **Append-and-compact** name persistence architectures, not individual platforms.
 
 UsageBassoon separates collection, ingest, normalization, backend persistence, and snapshot archival. Follow this path when changing collection behavior:
 
@@ -88,7 +88,6 @@ scheduling.py / CLI
         → backends/base.py      StorageBackend → DuckDB / MotherDuck / BigQuery
         → sql/                  installed dialect-specific views; no collection DDL
         → collection_lock.py    release the local collection lock
-        → archiver.py           optional consistent backend capture
         → CLI / Python API
 ```
 
@@ -98,10 +97,10 @@ scheduling.py / CLI
 
 `normalizer.py` owns `NormalizedBundle` and converts `CollectionBundle` into canonical Arrow tables, including derived columns. It does not execute backend transactions. `persistence.py` reads collection planning state through one preflight view, assembles batches, and handles bounded retries. `collection_lock.py` excludes simultaneous local DuckDB collectors; remote collectors publish independently. `backends/base.py` defines `StorageBackend` and `AbstractStorageBackend`; implementations execute native publication and restore operations. SQL DDL and views remain dialect-specific under `sql/`.
 
-Snapshot archival is a separate path after persistence:
+Snapshot archival is scheduled independently of collection:
 
 ```text
-CLI / scheduling / orchestrator.py → archiver.py       SnapshotArchiver
+CLI / independent scheduling       → archiver.py       SnapshotArchiver
                                    → snapshot/format.py / catalog.py / reader.py / restore.py
                                    → backends/base.py  StorageBackend → DuckDB / MotherDuck / BigQuery
                                    → buckets/base.py   SnapshotBucket → local / GCS
@@ -110,7 +109,7 @@ audit.py → canonical backend views or snapshot/reader.py
 normalizer.py / backends / snapshot → storage_model.py
 ```
 
-`SnapshotArchiver` is the public orchestrator; the `snapshot/` subpackage owns format contracts, catalog lifecycle, reading, and recovery coordination. It never imports `archiver.py`. `storage_model.py` remains core because collection, curation, compaction, and snapshots share its Arrow schemas, identities, and ordering. Backends stream canonical Arrow batches at one consistent read point: a DuckDB/MotherDuck transaction or BigQuery time travel at a captured timestamp. The archiver owns incremental Parquet serialization to private temporary files; buckets own bounded file transfer. `SnapshotBucket` implementations own version-aware object storage and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`. Current implementations are local files and GCS; future object-store providers must satisfy the same `SnapshotBucket` contract.
+`SnapshotArchiver` is the public orchestrator; the `snapshot/` subpackage owns format contracts, catalog lifecycle, reading, and recovery coordination. It never imports `archiver.py`. `storage_model.py` remains core because collection, curation, compaction, and snapshots share its Arrow schemas, identities, and ordering. Backends stream canonical Arrow batches at one consistent read point: a DuckDB/MotherDuck transaction or BigQuery time travel at a captured timestamp. The archiver owns incremental Parquet serialization to private temporary files. `SnapshotBucket` implementations own bounded file transfer, version-aware object storage, and compare-and-swap operations; they do not define snapshot policy. Snapshot storage providers belong in `buckets/`, not `backends/`. Current implementations are local files and GCS; future object-store providers must satisfy the same `SnapshotBucket` contract.
 
 Diagnostic inspection is a separate read-only path:
 
@@ -297,7 +296,7 @@ The following are out-of-scope and/or antithetical to the design goals:
   3. Validate against the schema contract with pydantic strict mode. Invalid required graph/models fields *abort* usage publication; report/pricing validation failures follow the per-day/per-model tolerance above. Unknown fields, type changes, and changed cardinalities produce **drift events** — appended to ephemeral `schema_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them.
   4. Normalize to Arrow tables, compute derived columns, and assign the stable collection and observation IDs described above.
   5. Publish through the selected persistence architecture, following its publication and retry rules above.
-  6. Independently check configured scheduled/weekly archive obligations through `SnapshotArchiver`, including after failed collection.
+  6. Collection does not trigger archival. Independent snapshot jobs check scheduled/weekly obligations through `SnapshotArchiver` without waiting for collection or requiring tokscale.
 
 - **Backend SQL management:** Each backend installs native DDL and views under `sql/<dialect>/`; MotherDuck shares the DuckDB assets. CI checks structural parity with SQLGlot and behavior with synthetic replay and native backend tests.
 
@@ -311,24 +310,26 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Ingest semantics:** Daily models define session/model usage state; reports add session metadata. `session_model_stats` calculates all-time totals over `daily_stats`. Curation deletion follows the persistence architecture: retained gold tombstones for Append-and-compact, physical deletion for current Direct transactional upsert implementations.
 
-- **Snapshot semantics:** Whole-backend snapshots are portable normalized-state archives, not raw-payload replay points. They preserve every source and observation ID. Backend-native dumps must not bypass canonical Arrow and archiver-owned Parquet serialization.
+- **Snapshot semantics:** Snapshots are portable, normalized-state, whole-backend archives, not raw-payload replay points. They preserve every source and observation ID. Backend-native dumps must not bypass canonical Arrow and archiver-owned Parquet serialization.
   - Backend reads, incremental Parquet writing, uploads, verified downloads, and transactional restore use bounded batches/files. Keep the DuckDB/MotherDuck transaction open through streaming; BigQuery physical reads use one captured timestamp. Temporary disk failure must leave destination application data unchanged.
   - `manifest.json` and `COMPLETE` are immutable. Manifest objects use snapshot-directory-relative names, row counts, schemas, sizes, and content hashes; provider generations never define portable identity. Completion evidence binds the immutable manifest digest. `state.json` travels with the snapshot and stores mutable pins/lifecycle metadata under compare-and-swap.
-  - Complete, authorized snapshot directories are independently recoverable. `catalog.json` is a derived index. `control.json` independently owns reservations, fences, and authoritative destination retention policy, so index repair cannot erase a live claim. Missing indexes can be discovered read-only; explicit repair validates complete snapshots, preserves corrupt index evidence, and writes under the current reservation. Exclude incomplete and retired directories; retain retirement tombstones through interrupted deletion.
-  - Claim every participating destination in deterministic order before capture. Renew through all capture/upload/publication phases. Pinning, deletion, retention, repair, and downloading obey the same fenced lifecycle. A stale owner cannot publish or retire another owner's snapshot. Cleanup uses owned identities and exact observed provider versions. Never classify active capture as abandoned from directory age alone.
+  - Valid immutable snapshot directories are independently recoverable regardless of missing, damaged, unpublished, or retired mutable state. Mutable metadata governs archive management, never emergency reading. `catalog.json` is a derived index. `control.json` independently owns reservations, fences, and authoritative destination retention policy, so index repair cannot erase a live claim. Missing indexes can be discovered read-only; explicit repair validates complete snapshots, preserves corrupt index evidence, and writes under the current reservation. Routine management excludes unpublished/retired directories; emergency recovery excludes only invalid immutable contents. Retain retirement tombstones through interrupted deletion. Repair preserves corrupt index evidence and verifies candidates before separate abandoned-stage cleanup.
+  - Claim every participating destination in deterministic order before capture. Renew through all capture/upload/publication phases. Publication, pinning, and retirement authorize transitions through the same control-document CAS as owner/fence checks. Catalogs and sidecars are projections. Downloads attempt reservations but must support verified read-only recovery when mutation authority is unavailable. A stale owner cannot publish or retire another owner's snapshot and stops that attempt until the next cadence opportunity. Cleanup uses owned identities and exact observed provider versions. Never classify active capture as abandoned from directory age alone.
   - `latest` sorts globally by capture time, grouping copies of an identity before older recovery points. Automatic selection warns on unavailable/corrupt copies and reports the actual selected URI/time. Exact ID/directory/manifest selections fail explicitly. Explicit archive roots allow fallback within that root and override configured locations. Fallback finishes before destination writes and never follows a destination transaction failure.
   - Manual `bassoon snapshot` bypasses cadence and pins by default; `--no-pin` opts out. Pins do not rewrite content hashes, are exempt from rotation, and survive copying/index reconstruction. No unpin command: `snapshot delete` displays selected copies/pin/weekly roles and requires typing `DELETE`. Retired copy cleanup is retryable; explicit URIs restrict the scope.
-  - Scheduled captures use the configured interval and unpinned retention count (default three). Explicit archive locations enable an independent current UTC-week capture unless destination `disable_weekly_snapshots` is true. Retain four successful weekly slots; never fabricate missing weeks or rotate an old point after failed publication. A capture can fulfill both obligations and survives while either class retains it. Manual captures do not reset automatic clocks. Checks run on operational scheduler ticks even when collection fails; stopped hosts cannot execute captures.
+  - Scheduled captures use the configured interval and unpinned retention count (default three). Explicit archive locations enable an independent current UTC-week capture unless destination `disable_weekly_snapshots` is true. Retain four successful weekly slots; never fabricate missing weeks or rotate an old point after failed publication. A capture can fulfill both obligations and survives while either class retains it. Manual captures do not reset automatic clocks. Separate native snapshot jobs and a dedicated worker loop service snapshot deadlines even while collection is blocked or fails; `snapshot --automatic` is due-only and unpinned; stopped hosts cannot execute captures.
   - Shared destination policy is authoritative. Ordinary publication must reject conflicting destructive settings; only an explicit `snapshot policy` operation reconciles the ceiling. Different instances may request different cadence intervals or destination subsets without redefining shared deletion policy.
   - Capture canonical gold plus retained raw state, including uncompacted observations, deduplicated ledger outcomes, and diagnostic event streams. Exclude physical schema/compaction metadata and restore receipts. Deleted curation assignments and original agent files/tokscale payloads are not archived.
   - Restore requires a fresh, initialized, empty, quiescent destination. Check all base tables, including populated unexpected tables, before disabling maintenance; repeat emptiness checks inside the native atomic restore transaction. Schema/bootstrap/control metadata and restore receipts are explicit exceptions. Stop collectors, native schedules, workers, cron, and external writers. The CLI validates first, checks emptiness, warns about matching source evidence, then confirms with default No before changing maintenance or data.
   - `init --restore` provisions recovery without collecting or starting backup jobs, checks emptiness, and disables applicable maintenance. Restore independently disables maintenance and waits with a bound for existing runs. Maintenance remains disabled on success/failure; plain `init` enables it after user verification. Keep source IDs of continuing collection environments; never infer identity from hardware or remap archived IDs.
-  - A snapshot must restore across every supported backend and relocate across local/GCS roots without rewriting contents or identity. Restore validates original bytes, applies registered forward transformations on separate files, validates current schemas/semantics, then publishes atomically. BigQuery loads owned, expiring stages and commits durable gold, diagnostic raw, audit outcomes, and a completion receipt together. DuckDB/MotherDuck insert verified Arrow batches and the receipt in one transaction. Receipt lookup resolves lost acknowledgements. Stage inspection/cleanup must verify ownership, expiry, and operation status; names alone never authorize deletion.
+  - A snapshot must restore across every supported backend and relocate across local/GCS roots without rewriting contents or identity. Restore validates original bytes, applies registered forward transformations on separate files, validates current schemas/semantics, then publishes atomically. BigQuery loads owned, expiring stages and commits durable gold, diagnostic raw, audit outcomes, and a completion receipt together. DuckDB/MotherDuck insert verified Arrow batches and the receipt in one transaction. Receipt lookup resolves lost acknowledgements. Stage cleanup must verify ownership and terminal job status, and immediately discard disposable stages without waiting for expiry. Use stable digest-bound logical restore IDs and unique attempt IDs; names alone never authorize deletion. All maintenance RPCs and polling share an operation deadline; report known maintenance state on success, failure, and committed retries without hiding the original error.
+
+- **Source audit aggregation:** Query the installed dialect-specific `audit_sources` view; snapshot audits reuse its packaged DuckDB definition; snapshot audits query verified Parquet with memory-limited, disk-backed DuckDB. Retain one Python summary per source, not one identity per historical run.
 
 - **Snapshot buckets:** Every provider implements bounded file upload/download, version-aware metadata reads, compare-and-swap, exact-version deletion, listing, and lifecycle warnings. Local publication flushes/syncs temporary files, atomically publishes them, and syncs containing directories where supported. GCS resolves revisions at the current location; copied generations need not match the producing location. Portable hashes remain the integrity gate.
 
 - **Public compatibility contracts:** Application SemVer identifies the producer; `storage_model.DATA_SCHEMA_VERSION` identifies portable data meanings/schemas; `snapshot.format.FORMAT_VERSION` identifies packaging; `schema_assets.SCHEMA_VERSION` plus hash identifies the physical SQL installation. Record all four responsibilities in manifests. An incompatible public persistence or archive interface requires a major application release; compatible additions/fixes do not automatically require one. A major release does not justify abandoning backup recovery.
-  - Every publicly released format/data contract retains a tested recovery path. Register immutable format readers, historical Arrow contracts, contiguous forward file transformations, and semantic validators in `snapshot/format.py`. Preserve source/event identity and original archives. Removed direct readers need a documented tested conversion path; historical released packages are an emergency fallback.
+  - Every publicly released format/data contract retains a tested recovery path. Register immutable format readers, historical Arrow contracts, contiguous forward file transformations, and semantic validators in `snapshot/format.py`. Independently validate every intermediate schema and required field in isolated candidate directories. Expose verified raw provenance even when compatibility is unsupported. Preserve source/event identity and original archives. Removed direct readers need a documented tested conversion path; historical released packages are an emergency fallback.
   - Physical backend SQL migrations remain separate in `schema_assets.py`: registered native assets and previous/target hashes for every dialect, contiguous steps, ledger recording, and no baseline-DDL fallback. Automatic upgrades preserve deliberate maintenance pauses. Prerelease refactors replace the baseline and reset disposable test resources; do not invent legacy conversions before public contracts exist.
 
 - **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift_events` rows and a user-facing warning and asks for a bug report:
@@ -461,6 +462,7 @@ max_stderr_bytes = 8388608
 # project = "my-project" # required when GCS is configured
 # credentials_file = "/path/to/service-account.json" # optional; default unset
 # timeout = "60s"
+# disable_weekly_snapshots = false
 
 [schedule]
 interval = "15m" # default interval; scheduling is not installed by default
@@ -475,10 +477,10 @@ max_files = 5
 max_bytes = 5242880
 
 # [snapshots] # optional; absent = automatic snapshots off; manual snapshot still available
-# file_uri = "/path/to/local/snapshots" # defaults to platform snapshot directory when no destination is configured
+# file_uri = "/path/to/local/snapshots" # defaults to platform snapshot directory
 # max_snapshots = 3 # unpinned scheduled/manual retention; weekly slots and pins are independent
 # interval = "12h" # independent automatic cadence; unset by default
-# disable_weekly_snapshots = false # local destination opt-out; also supported under [gcs]
+# disable_weekly_snapshots = false
 ```
 
 Default directories leverage XDG, macOS XDG equivalents, and Windows support through `platformdirs` by the following:

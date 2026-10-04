@@ -139,6 +139,11 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
         for bucket in archiver.reader.buckets:
             control, _ = Catalog(bucket).control()
             last_failure = control.get("last_failure")
+            repair_warnings = control.get("repair_warnings")
+            if isinstance(repair_warnings, list):
+                warnings.extend(
+                    f"archive repair warning: {value}" for value in repair_warnings
+                )
             if isinstance(last_failure, dict):
                 warnings.append(
                     f"last snapshot attempt failed at {bucket.uri} "
@@ -173,22 +178,57 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
                 and not settings.disable_weekly_snapshots
             )
             interval = parse_interval(settings.interval) if settings else None
-            deadlines = [
-                delta
-                for delta in (interval, timedelta(days=7) if weekly else None)
-                if delta is not None
-            ]
-            automatic = [
+            scheduled = [
                 timestamp(r["captured_at"])
                 for r in available
-                if isinstance(r.get("roles"), list)
-                and any(role in r["roles"] for role in ("scheduled", "weekly"))
+                if isinstance(r.get("roles"), list) and "scheduled" in r["roles"]
             ]
-            if deadlines and (not automatic or now > max(automatic) + min(deadlines)):
-                warnings.append(
-                    f"automatic recovery capture is overdue at {bucket.uri}; "
-                    "check scheduler and operational logs"
+            if interval is not None:
+                details.append(
+                    f"{bucket.uri}: scheduled last capture "
+                    f"{max(scheduled).isoformat() if scheduled else 'unavailable'}, "
+                    f"interval {interval}"
                 )
+                if not scheduled or now > max(scheduled) + interval:
+                    warnings.append(
+                        f"scheduled recovery capture is overdue at {bucket.uri}; "
+                        "check snapshot scheduler"
+                    )
+            if weekly:
+                slots = {
+                    str(r["weekly_slot"])
+                    for r in available
+                    if isinstance(r.get("roles"), list)
+                    and "weekly" in r["roles"]
+                    and r.get("weekly_slot")
+                }
+                current_slot = now.strftime("%G-W%V")
+                weekly_points = [
+                    timestamp(r["captured_at"])
+                    for r in available
+                    if isinstance(r.get("roles"), list) and "weekly" in r["roles"]
+                ]
+                details.append(
+                    f"{bucket.uri}: weekly slots "
+                    f"{', '.join(sorted(slots)) or 'none'}; "
+                    f"{min(4, len(slots))}/4 recovery slots accumulated"
+                )
+                week_start = now.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ) - timedelta(days=now.weekday())
+                if current_slot not in slots and now >= week_start + timedelta(hours=1):
+                    warnings.append(
+                        f"current weekly recovery slot is overdue at {bucket.uri}"
+                    )
+                if (
+                    len(slots) < 4
+                    and weekly_points
+                    and min(weekly_points) <= now - timedelta(weeks=4)
+                ):
+                    warnings.append(
+                        f"weekly recovery coverage is incomplete at {bucket.uri}: "
+                        f"{len(slots)}/4 slots"
+                    )
         warnings.extend(str(r["error"]) for r in rows if "error" in r)
     except Exception as error:
         warnings.append(f"archive inspection unavailable: {error}")
