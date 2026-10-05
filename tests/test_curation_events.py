@@ -19,13 +19,148 @@ from usagebassoon.curation import (
     NoteAssignment,
     TagAssignment,
     add_tag,
+    edit_note_by_id,
+    get_note,
+    get_note_by_id,
+    get_notes_by_id,
+    list_notes,
     remove_note,
+    remove_note_by_id,
     remove_tag,
     rename_tag,
     set_note,
 )
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
-from usagebassoon.storage_model import STATE_KEYS
+from usagebassoon.storage_model import STATE_KEYS, normalize_note_id
+
+
+def test_note_uuid_contract_is_compact_deterministic_and_unambiguous() -> None:
+    """Keep the UUID namespace/encoding stable and distinguish every key field."""
+    note = NoteAssignment("source", "codex", "session", "first")
+    assert note.note_id == "n_4GVLe2lAWyCJxr0Zd0qTMQ"
+    assert len(note.note_id) == 24
+    assert normalize_note_id("e0654b7b-6940-5b20-89c6-bd19774a9331") == note.note_id
+    assert normalize_note_id(note.note_id) == note.note_id
+    assert (
+        NoteAssignment("source", "codex", "session", "edited").note_id == note.note_id
+    )
+    assert (
+        len(
+            {
+                note.note_id,
+                NoteAssignment("other", "codex", "session", "x").note_id,
+                NoteAssignment("source", "other", "session", "x").note_id,
+                NoteAssignment("source", "codex", "other", "x").note_id,
+                NoteAssignment("a/b", "c", "d", "x").note_id,
+                NoteAssignment("a", "b/c", "d", "x").note_id,
+                NoteAssignment("source", "codex", "会話", "x").note_id,
+            }
+        )
+        == 7
+    )
+    for invalid in ("not-a-uuid", "n_4GVLe2lAWyCJxr0Zd0qTMR", str(UUID(int=0))):
+        with pytest.raises(ValueError):
+            normalize_note_id(invalid)
+
+
+def test_note_id_access_preserves_lifetimes_and_natural_key_dedup(
+    warehouse: StorageBackend,
+) -> None:
+    """Same-ID delete/recreate beats old and duplicate raw events through compaction."""
+    created = datetime.now(UTC) - timedelta(days=2)
+    edited = created + timedelta(days=1)
+    note = NoteAssignment("source", "codex", "session", "first")
+    assert STATE_KEYS["notes"] == ("source_id", "client", "session_id")
+    set_note(warehouse, note, at=created)
+    assert (
+        get_note(warehouse, source_id="source", client="codex", session_id="session")
+        == note
+    )
+    initial = get_note_by_id(warehouse, note.note_id)
+    assert initial.assignment == note
+    assert initial.created_at == initial.updated_at == created
+    original_rows = warehouse.query("SELECT * FROM current_notes").to_pylist()
+    original = pa.Table.from_pylist(
+        original_rows, schema=CANONICAL_TABLE_SCHEMAS["notes"]
+    )
+    edit_note_by_id(warehouse, note.note_id, "edited", at=edited)
+    revised = get_note_by_id(warehouse, note.note_id)
+    assert revised.note_id == initial.note_id
+    assert revised.created_at == created and revised.updated_at == edited
+    assert revised.assignment.note == "edited"
+    assert get_notes_by_id(warehouse, [note.note_id, note.note_id]) == [revised]
+    if isinstance(warehouse, BigQueryReplayBackend):
+        warehouse.compact()
+    assert remove_note_by_id(warehouse, note.note_id) == 1
+    with pytest.raises(LookupError):
+        get_note_by_id(warehouse, note.note_id)
+    assert list_notes(warehouse) == []
+    if isinstance(warehouse, BigQueryReplayBackend):
+        warehouse.append("notes", original)
+        warehouse.append("notes", original)
+        warehouse.compact()
+        assert warehouse.query("SELECT * FROM current_notes").num_rows == 0
+        tombstones = warehouse.query("SELECT * FROM notes").to_pylist()
+        assert len(tombstones) == 1
+        assert tombstones[0]["op"] == "delete"
+        assert tombstones[0]["note_id"] == note.note_id
+        warehouse.engine.connection.execute("DELETE FROM raw_notes")
+        assert warehouse.query("SELECT * FROM current_notes").num_rows == 0
+    recreated = datetime.now(UTC) + timedelta(seconds=1)
+    set_note(warehouse, note, at=recreated)
+    current = get_note_by_id(warehouse, note.note_id)
+    assert current.note_id == initial.note_id
+    assert current.created_at == current.updated_at == recreated
+    if isinstance(warehouse, BigQueryReplayBackend):
+        replay = warehouse.query("SELECT * FROM current_notes")
+        warehouse.append("notes", replay)
+        warehouse.append("notes", original)
+        warehouse.compact()
+        assert get_note_by_id(warehouse, note.note_id) == current
+        warehouse.engine.connection.execute("DELETE FROM raw_notes")
+        assert get_note_by_id(warehouse, note.note_id) == current
+
+
+def test_note_pages_are_bounded_ordered_and_source_aware(
+    warehouse: StorageBackend,
+) -> None:
+    """Page ties without duplicates and preserve cursors when new notes arrive."""
+    created = datetime(2026, 9, 1, tzinfo=UTC)
+    for index in range(35):
+        set_note(
+            warehouse,
+            NoteAssignment(
+                "source" if index % 2 else "other", "codex", str(index), "text"
+            ),
+            at=created + timedelta(seconds=index // 5),
+        )
+    ordered = (
+        warehouse.query(
+            "SELECT note_id FROM session_notes ORDER BY updated_at DESC, note_id ASC"
+        )
+        .column("note_id")
+        .to_pylist()
+    )
+    first = list_notes(warehouse)
+    assert len(first) == 17
+    assert [record.note_id for record in first[:16]] == ordered[:16]
+    set_note(warehouse, NoteAssignment("source", "codex", "new", "new"))
+    second = list_notes(warehouse, after=first[15])
+    third = list_notes(warehouse, after=second[15])
+    assert [record.note_id for record in second[:16]] == ordered[16:32]
+    assert [record.note_id for record in third] == ordered[32:]
+    # Explicit pages remain useful in noninteractive output.
+    assert [record.note_id for record in list_notes(warehouse, page=3)] == ordered[31:]
+    assert all(
+        record.assignment.source_id == "source"
+        for record in list_notes(warehouse, source_id="source")
+    )
+    assert list_notes(warehouse, source_id="absent") == []
+    for page in (0, -1):
+        with pytest.raises(ValueError):
+            list_notes(warehouse, page=page)
+    with pytest.raises(ValueError):
+        list_notes(warehouse, page=2, after=first[15])
 
 
 @pytest.fixture(params=["duckdb", "bigquery"])
@@ -136,6 +271,10 @@ def test_snapshot_restore_preserves_winning_curation_fields(
                     destination.query(f"SELECT * FROM current_{table}").to_pylist()
                     == original
                 )
+                if table == "notes":
+                    assert get_note_by_id(
+                        destination, original[0]["note_id"]
+                    ) == get_note_by_id(warehouse, original[0]["note_id"])
                 destination.connection.execute(f"DELETE FROM {table}")
     finally:
         destination.close()

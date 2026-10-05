@@ -39,6 +39,7 @@ from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
 from usagebassoon.persistence import persist_run
 from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
+from usagebassoon.storage_model import note_id_for_session
 
 
 class _OfflineClient:
@@ -1111,6 +1112,7 @@ def test_bigquery_snapshot_stream_handles_empty_pages() -> None:
         [
             {
                 "event_id": "event",
+                "note_id": note_id_for_session("source", "codex", "session"),
                 "source_id": "source",
                 "client": "codex",
                 "session_id": "session",

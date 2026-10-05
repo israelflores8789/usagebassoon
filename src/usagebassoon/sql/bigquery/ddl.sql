@@ -90,6 +90,7 @@ CLUSTER BY source_id;
 
 CREATE TABLE notes (
     event_id STRING NOT NULL,
+    note_id STRING NOT NULL,
     source_id STRING NOT NULL,
     client STRING NOT NULL,
     session_id STRING NOT NULL,
@@ -194,6 +195,7 @@ OPTIONS (partition_expiration_days = 90);
 -- Arrival partitions retain historical backfills for a full 90 days.
 CREATE TABLE raw_notes (
     event_id STRING NOT NULL,
+    note_id STRING NOT NULL,
     source_id STRING NOT NULL,
     client STRING NOT NULL,
     session_id STRING NOT NULL,

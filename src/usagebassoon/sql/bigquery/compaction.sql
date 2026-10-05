@@ -170,7 +170,7 @@ FROM raw_notes FOR SYSTEM_TIME AS OF cutoff
 WHERE source_id IN (SELECT DISTINCT source_id FROM candidates_notes);
 
 CREATE TEMP TABLE winners_notes AS
-SELECT event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
+SELECT event_id, note_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
 FROM (
 SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
 FROM (SELECT * FROM notes FOR SYSTEM_TIME AS OF cutoff UNION ALL SELECT * FROM raw_notes FOR SYSTEM_TIME AS OF cutoff) AS observations
@@ -180,7 +180,7 @@ WHERE observation_rank = 1;
 
 -- Existing gold rows participate, including keys no longer present in raw.
 DELETE FROM notes AS target WHERE EXISTS (SELECT 1 FROM keys_notes AS keys WHERE keys.source_id = target.source_id AND keys.client = target.client AND keys.session_id = target.session_id);
-INSERT INTO notes (event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id) SELECT * FROM winners_notes;
+INSERT INTO notes (event_id, note_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id) SELECT * FROM winners_notes;
 INSERT INTO compaction_ledger
 SELECT source_id, GENERATE_UUID(), compaction_run, 'notes', day, arrival_day,
        cutoff, cutoff, raw_rows_processed

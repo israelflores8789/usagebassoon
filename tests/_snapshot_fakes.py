@@ -23,6 +23,7 @@ from usagebassoon.storage_model import (
     CANONICAL_TABLE_SCHEMAS,
     DEBUG_TABLES,
     SNAPSHOT_TABLES,
+    note_id_for_session,
 )
 
 
@@ -76,6 +77,9 @@ class TableBackend:
                     [
                         {
                             "event_id": "event",
+                            "note_id": note_id_for_session(
+                                "source", "codex", "session"
+                            ),
                             "source_id": "source",
                             "client": "codex",
                             "session_id": "session",

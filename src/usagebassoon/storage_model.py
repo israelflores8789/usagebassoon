@@ -3,6 +3,11 @@
 
 """storage_model.py — Shared identities and observation ordering contracts."""
 
+import base64
+import json
+import re
+from uuid import NAMESPACE_URL, UUID, uuid5
+
 import pyarrow as pa
 
 DATA_SCHEMA_VERSION = 1
@@ -21,6 +26,43 @@ EVENT_KEYS: dict[str, tuple[str, ...]] = {
 }
 DEBUG_TABLES = frozenset({"schema_drift_events", "reconciliation_issues"})
 SNAPSHOT_TABLES = tuple(STATE_KEYS) + tuple(EVENT_KEYS)
+
+
+def note_id_for_session(source_id: str, client: str, session_id: str) -> str:
+    """Derive a lossless 24-character UUIDv5 handle from the exact note key.
+
+    JSON array encoding distinguishes keys containing delimiters or Unicode.
+    The fixed namespace and name prefix separate notes from other UUID users.
+    This handle never replaces the natural key for observation deduplication.
+    """
+    name = json.dumps(
+        ["usagebassoon", "notes", source_id, client, session_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "n_" + base64.urlsafe_b64encode(
+        uuid5(NAMESPACE_URL, name).bytes
+    ).decode().rstrip("=")
+
+
+def normalize_note_id(value: str) -> str:
+    """Validate a compact or standard UUIDv5 note ID and return its compact form."""
+    if value.startswith("n_"):
+        value = value[2:]
+    if re.fullmatch(r"[A-Za-z0-9_-]{22}", value):
+        identifier = UUID(bytes=base64.urlsafe_b64decode(value + "=="))
+        compact = base64.urlsafe_b64encode(identifier.bytes).decode().rstrip("=")
+        if compact != value:
+            raise ValueError("note ID has a noncanonical compact encoding")
+    else:
+        try:
+            identifier = UUID(value)
+        except ValueError as error:
+            raise ValueError("note ID must be a compact or standard UUIDv5") from error
+        compact = base64.urlsafe_b64encode(identifier.bytes).decode().rstrip("=")
+    if identifier.version != 5:
+        raise ValueError("note ID must be a UUIDv5")
+    return "n_" + compact
 
 
 def observation_order(table: str, prefix: str = "") -> str:
@@ -214,6 +256,7 @@ CANONICAL_TABLE_SCHEMAS.update(
         "notes": pa.schema(
             [
                 pa.field("event_id", pa.string(), nullable=False),
+                pa.field("note_id", pa.string(), nullable=False),
                 pa.field("source_id", pa.string(), nullable=False),
                 pa.field("client", pa.string(), nullable=False),
                 pa.field("session_id", pa.string(), nullable=False),

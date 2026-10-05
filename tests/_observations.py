@@ -8,6 +8,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pyarrow as pa
 
+from usagebassoon.storage_model import note_id_for_session
+
 
 def observations(data: pa.Table) -> pa.Table:
     """Fill observation metadata on hand-written synthetic test rows."""
@@ -15,6 +17,10 @@ def observations(data: pa.Table) -> pa.Table:
     if not rows:
         return data
     for row in rows:
+        if "note" in row and not row.get("note_id"):
+            row["note_id"] = note_id_for_session(
+                row["source_id"], row["client"], row["session_id"]
+            )
         if "started_at" in row:
             row.setdefault("day", row["started_at"].date())
             row.setdefault("domain", "collection")

@@ -39,7 +39,7 @@ WHERE observation_rank = 1 AND op = 'upsert';
 
 -- Current state includes every retained observation; progress never hides raw data.
 CREATE OR REPLACE VIEW current_notes AS
-SELECT event_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
+SELECT event_id, note_id, source_id, client, session_id, note, created_at, updated_at, collected_at, op, op_id
 FROM (
 SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, client, session_id ORDER BY collected_at DESC, (op = 'upsert') DESC, event_id DESC) AS observation_rank
 FROM (SELECT * FROM notes UNION ALL SELECT * FROM raw_notes) AS observations
@@ -369,7 +369,7 @@ JOIN session_tags AS session_tags
     AND session_tags.session_id = sessions.session_id;
 
 CREATE OR REPLACE VIEW noted_sessions AS
-SELECT sessions.*, notes.note, notes.created_at AS note_created_at,
+SELECT sessions.*, notes.note_id, notes.note, notes.created_at AS note_created_at,
        notes.updated_at AS note_updated_at,
        notes.collected_at AS note_collected_at
 FROM current_sessions AS sessions
@@ -380,7 +380,7 @@ JOIN current_notes AS notes
 
 -- Curation commands read notes through this stable, dialect-paired view.
 CREATE OR REPLACE VIEW session_notes AS
-SELECT source_id, client, session_id, note, created_at, updated_at, collected_at
+SELECT note_id, source_id, client, session_id, note, created_at, updated_at, collected_at
 FROM current_notes AS notes;
 
 -- Planning and resolution share one snapshot and one query job.

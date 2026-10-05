@@ -167,6 +167,7 @@ CREATE TABLE tags (
 -- Table of user-curated notes across usage data.
 CREATE TABLE notes (
     event_id TEXT NOT NULL,
+    note_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     client TEXT NOT NULL,
     session_id TEXT NOT NULL,
