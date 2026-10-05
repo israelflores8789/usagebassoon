@@ -601,6 +601,83 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     assert ConfigurationManager(config.path).load() == loaded
 
 
+@pytest.mark.parametrize(
+    ("role", "failure_kind"),
+    [("collection", "error"), ("collection", "busy"), ("snapshot", "error")],
+)
+def test_worker_continues_after_an_operational_cycle_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    role: str,
+    failure_kind: str,
+) -> None:
+    """Failed cycles remain observable and do not prevent the next scheduled run."""
+    import usagebassoon.scheduling as module
+    from usagebassoon.collection_lock import CollectionBusy
+
+    config = _configuration(tmp_path)
+    attempts: list[UsageBassoonConfig] = []
+    waits: list[float | None] = []
+    logger = logging.getLogger("test_worker_failures")
+    failure = (
+        CollectionBusy("another collector is active")
+        if failure_kind == "busy"
+        else OSError("cycle unavailable")
+    )
+
+    class StopAfterTwoCycles(Event):
+        """Advance two cycles without sleeping or leaving a worker running."""
+
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            waits.append(timeout)
+            if len(waits) == 2:
+                self.set()
+            return self.is_set()
+
+    def cycle(configuration: UsageBassoonConfig) -> None:
+        attempts.append(configuration)
+        if len(attempts) == 1:
+            raise failure
+
+    def collect(configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        cycle(configuration)
+        return "successful-run", PersistSummary(1, 0, {})
+
+    def configure(_config: LoggingConfig) -> logging.Logger:
+        return logger
+
+    def preflight(_config: UsageBassoonConfig) -> tuple[str, str]:
+        return "tokscale", "test"
+
+    monkeypatch.setattr(module, "configure_logging", configure)
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        if role == "snapshot":
+            monkeypatch.setattr(module, "run_snapshot_check", cycle)
+            module._snapshot_worker(config, StopAfterTwoCycles(), 60)
+        else:
+            monkeypatch.setattr(module, "Event", StopAfterTwoCycles)
+            monkeypatch.setattr(module, "preflight_tokscale", preflight)
+            monkeypatch.setattr(module, "collect_run", collect)
+            run_worker(config.path)
+    assert attempts == [config, config]
+    assert waits == ([60, 60] if role == "snapshot" else [900, 900])
+    output = capsys.readouterr()
+    if role == "collection":
+        assert plain_cli_output(output.out).count("scheduled run successful-run") == 1
+        assert str(failure) in plain_cli_output(output.err)
+    records = [record for record in caplog.records if record.exc_info]
+    if failure_kind == "busy":
+        assert not records
+        assert "scheduled collection skipped" in caplog.text
+    else:
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is failure
+
+
 @pytest.mark.parametrize("content", ["not-a-pid", "0", "-1"])
 def test_invalid_worker_pid_state_blocks_worker_control(
     tmp_path: Path,

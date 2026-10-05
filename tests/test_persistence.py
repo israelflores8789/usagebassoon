@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from threading import Lock
 
+import duckdb
 import pyarrow as pa
 import pytest
 from google.api_core.exceptions import ServiceUnavailable
@@ -16,7 +17,7 @@ from google.api_core.exceptions import ServiceUnavailable
 from tests._bigquery_replay import BigQueryReplayBackend
 from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.config import UsageBassoonConfig
+from usagebassoon.config import CollectionConfig, UsageBassoonConfig
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
@@ -67,7 +68,7 @@ def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
         collection_ledger=bundle.tables["collection_ledger"],
     )
     try:
-        with pytest.raises(Exception, match="missing_history"):
+        with pytest.raises(duckdb.CatalogException, match="missing_history"):
             backend.persist_batch(batch)
         assert backend.query("SELECT * FROM daily_stats").num_rows == 0
         assert backend.query("SELECT * FROM collection_ledger").num_rows == 0
@@ -90,6 +91,8 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     attempts: list[str] = []
     schema_attempts: list[None] = []
+    published: list[NormalizedBundle] = []
+    closed: list[None] = []
 
     class _Backend:
         """Minimal retry target that never reaches a real database."""
@@ -100,6 +103,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
 
         def close(self) -> None:
             """Satisfy collection teardown."""
+            closed.append(None)
 
         def is_retryable_error(self, _: Exception) -> bool:
             """Classify the controlled first failure as a transaction conflict."""
@@ -115,6 +119,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
         """Fail once, then record the same normalized bundle run identity."""
         run_id = bundle.run_id
         attempts.append(run_id)
+        published.append(bundle)
         if len(attempts) == 1:
             raise RuntimeError("transient warehouse error")
         return PersistSummary(inserted=1, updated=0, per_table={})
@@ -138,6 +143,8 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     assert result.inserted == 1
     assert attempts == [normalized.run_id, normalized.run_id]
+    assert all(bundle is normalized for bundle in published)
+    assert len(closed) == 2
     assert schema_attempts == []
     retry = next(
         record
@@ -146,6 +153,81 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     )
     assert retry.exc_info is not None
     assert "transient warehouse error" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "max_retries", "expected_attempts"),
+    [
+        ("retryable", 3, 4),
+        ("retryable", 0, 1),
+        ("permanent", 3, 1),
+        ("classification", 3, 1),
+        ("open", 3, 1),
+    ],
+)
+def test_persistence_retry_limits_preserve_failure_and_close_each_backend(
+    collection_bundle: CollectionBundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_mode: str,
+    max_retries: int,
+    expected_attempts: int,
+) -> None:
+    """Bound retries, stop permanent failures, and retain the original exception."""
+    failure = RuntimeError("primary publication failure")
+    bundle = normalize(collection_bundle)
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        collection_bundle.source_id,
+        "duckdb",
+        collection=CollectionConfig(max_retries=max_retries, retry_initial_seconds=1),
+    )
+    opened: list[None] = []
+    closed: list[None] = []
+    published: list[NormalizedBundle] = []
+    delays: list[float] = []
+
+    class Backend:
+        """Classify controlled failures and expose resource cleanup."""
+
+        def is_retryable_error(self, error: Exception) -> bool:
+            assert error is failure
+            if failure_mode == "classification":
+                raise ValueError("classification unavailable")
+            return failure_mode == "retryable"
+
+        def close(self) -> None:
+            closed.append(None)
+
+    def open_backend(_config: UsageBassoonConfig) -> Backend:
+        opened.append(None)
+        if failure_mode == "open":
+            raise failure
+        return Backend()
+
+    def persist(_backend: object, current: NormalizedBundle) -> PersistSummary:
+        published.append(current)
+        raise failure
+
+    def uniform(_low: float, high: float) -> float:
+        return high
+
+    monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
+    monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
+    monkeypatch.setattr("usagebassoon.persistence.time.sleep", delays.append)
+    monkeypatch.setattr("usagebassoon.persistence.random.uniform", uniform)
+    with pytest.raises(RuntimeError) as caught:
+        persist_with_retries(config, bundle, logging.getLogger("usagebassoon-test"))
+    assert caught.value is failure
+    assert len(opened) == expected_attempts
+    assert len(closed) == (0 if failure_mode == "open" else expected_attempts)
+    assert len(published) == len(closed)
+    assert all(current is bundle for current in published)
+    assert delays == ([1.0, 2.0, 4.0] if expected_attempts == 4 else [])
+    assert any(record.exc_info is not None for record in caplog.records)
+    if failure_mode == "classification":
+        assert "classification unavailable" in caplog.text
 
 
 def test_bigquery_partial_publication_never_marks_missing_facts_complete(

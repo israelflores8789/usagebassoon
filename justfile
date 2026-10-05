@@ -107,7 +107,7 @@ test-md-live test-name="tests/test_backend_motherduck_live.py":
 
 # Run tests with coverage reporting
 coverage *args:
-    {{ pytest }} --cov=src --cov-report=term-missing {{ args }}
+    just test --cov=src --cov-report=term-missing {{ args }}
 
 lint:
     #!/usr/bin/env bash

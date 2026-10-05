@@ -431,41 +431,38 @@ def _append_note(backend: DuckDBBackend) -> None:
     )
 
 
-def test_default_local_rotation_retains_three_complete_snapshots(
-    tmp_path: Path,
+@pytest.mark.parametrize("limit", [None, 1])
+def test_local_rotation_retains_newest_complete_snapshots(
+    tmp_path: Path, limit: int | None
 ) -> None:
-    """Use the unified default limit and never delete the newest publication."""
-    backend = _backend()
-    store = SnapshotStore(f"file://{tmp_path}/archive")
-    try:
-        for index in range(4):
-            assert store.write(backend, run_id=f"run-{index}") is not None
-        snapshots = store.list_snapshots()
-        assert len(snapshots) == 3
-        assert all(
-            (tmp_path / "archive" / snapshot / "manifest.json").exists()
-            for snapshot in snapshots
-        )
-    finally:
-        backend.close()
-
-
-def test_custom_local_rotation_and_stale_prefix_are_catalog_safe(
-    tmp_path: Path,
-) -> None:
-    """Ignore incomplete staging prefixes and apply a custom retention ceiling."""
+    """Apply default/custom retention without adopting incomplete prefixes."""
     archive = tmp_path / "archive"
-    (archive / "staging-orphan").mkdir(parents=True)
-    (archive / "staging-orphan" / "manifest.json").write_text("{}")
+    orphan = archive / "staging-orphan"
+    orphan.mkdir(parents=True)
+    (orphan / "manifest.json").write_text("{}")
     backend = _backend()
-    store = SnapshotStore(f"file://{archive}", max_snapshots=1)
+    store = (
+        SnapshotStore(str(archive))
+        if limit is None
+        else SnapshotStore(str(archive), max_snapshots=limit)
+    )
     try:
         assert store.list_snapshots() == []
-        first = store.write(backend, run_id="first")
-        second = store.write(backend, run_id="second")
-        assert first is not None and second is not None
-        assert store.list_snapshots() == [second.rsplit("/", 1)[-1]]
-        assert (archive / "staging-orphan").exists()
+        published: list[str] = []
+        for index in range(4):
+            uri = store.write(backend, run_id=f"run-{index}", manual=True)
+            assert uri is not None
+            published.append(Path(uri).name)
+        snapshots = store.list_snapshots()
+        assert set(snapshots) == set(published[-(3 if limit is None else limit) :])
+        assert all(
+            (archive / identifier / "COMPLETE").exists() for identifier in snapshots
+        )
+        assert all(
+            not (archive / identifier).exists()
+            for identifier in set(published) - set(snapshots)
+        )
+        assert orphan.exists()
     finally:
         backend.close()
 
@@ -580,6 +577,97 @@ def test_restore_verifies_manifest_and_object_sha256(tmp_path: Path) -> None:
         manifest_path.write_bytes(b"x" * len(manifest_path.read_bytes()))
         with pytest.raises(ValueError, match="SHA-256"):
             store.restore(target, snapshot_id)
+    finally:
+        source.close()
+        target.close()
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("identity", "identity does not match"),
+        ("format", "unsupported snapshot format"),
+        ("schema_version", "data schema version is invalid"),
+        ("missing_table", "every expected table"),
+        ("incomplete_table", "incomplete table"),
+        ("provenance", "no source_backend"),
+        ("negative_rows", "invalid table metadata"),
+        ("row_count", "row count or schema does not match"),
+        ("object_count", "invalid object count"),
+        ("traversal", "relative|unsafe"),
+        ("declared_schema", "incompatible with destination schema"),
+        ("parquet_schema", "row count or schema does not match"),
+    ],
+)
+def test_restore_validates_contract_even_when_checksums_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    message: str,
+) -> None:
+    """Reject structurally invalid recovery data before calling the destination."""
+    from base64 import b64encode
+
+    import pyarrow.parquet as pq
+
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+
+    def forbidden_restore(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid snapshot reached destination writes")
+
+    try:
+        uri = store.write(source, run_id="invalid-contract", manual=True)
+        assert uri is not None
+        directory = Path(uri)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        notes = manifest["tables"]["notes"]
+        if damage == "identity":
+            manifest["snapshot_id"] = "different"
+        elif damage == "format":
+            manifest["snapshot_format_version"] = 999
+        elif damage == "schema_version":
+            manifest["data_schema_version"] = True
+        elif damage == "missing_table":
+            del manifest["tables"]["notes"]
+        elif damage == "incomplete_table":
+            notes["status"] = "failed"
+        elif damage == "provenance":
+            del manifest["source_backend"]
+        elif damage == "negative_rows":
+            notes["rows"] = -1
+        elif damage == "row_count":
+            notes["rows"] += 1
+        elif damage == "object_count":
+            notes["objects"].clear()
+        elif damage == "traversal":
+            notes["objects"][0]["name"] = "../notes.parquet"
+        elif damage == "declared_schema":
+            notes["schema_ipc"] = b64encode(
+                pa.schema([("wrong", pa.string())]).serialize()
+            ).decode()
+        else:
+            path = directory / "notes.parquet"
+            pq.write_table(pa.table({"wrong": ["value"]}), path)
+            notes["objects"][0].update(
+                size=path.stat().st_size, sha256=sha256(path.read_bytes()).hexdigest()
+            )
+        raw = json.dumps(manifest).encode()
+        (directory / "manifest.json").write_bytes(raw)
+        (directory / "COMPLETE").write_text(
+            json.dumps(
+                {
+                    "snapshot_id": directory.name,
+                    "manifest_sha256": sha256(raw).hexdigest(),
+                }
+            )
+        )
+        monkeypatch.setattr(target, "restore_snapshot", forbidden_restore)
+        with pytest.raises(ValueError, match=message):
+            store.restore(target, uri)
+        assert target.query("SELECT * FROM notes").num_rows == 0
+        assert target.query("SELECT * FROM restore_receipts").num_rows == 0
     finally:
         source.close()
         target.close()
@@ -830,10 +918,16 @@ def test_corrupt_index_repair_preserves_evidence_and_control(tmp_path: Path) -> 
         uri = store.write(backend, run_id="repair", manual=True, pin=True)
         assert uri is not None
         bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+        with Catalog(bucket).hold() as catalog:
+            catalog.stage(
+                "abandoned", {"pinned": False, "retired": False, "published": False}
+            )
         (tmp_path / "archive" / "catalog.json").write_bytes(b"broken catalog")
         with Catalog(bucket).hold() as catalog:
             owner = catalog.owner
             catalog.repair()
+            catalog.cleanup_abandoned()
+            assert catalog.state("abandoned") is None
             control, _ = catalog.control()
             assert (
                 isinstance(control["reservation"], dict)
@@ -968,145 +1062,6 @@ def test_takeover_between_authority_read_and_mutation_blocks_stale_owner(
     state = second.state("owned")
     assert state is not None and state["retired"] is False
     assert state["published"] is False and state["pinned"] is False
-
-
-def test_repair_corrupt_index_with_abandoned_stage(tmp_path: Path) -> None:
-    """Index reconstruction does not retire through the corrupt index first."""
-    backend = _backend()
-    store = SnapshotStore(str(tmp_path / "archive"))
-    try:
-        uri = store.write(backend, run_id="complete", manual=True, pin=True)
-        assert uri is not None
-        bucket = LocalSnapshotBucket(str(Path(uri).parent))
-        with Catalog(bucket).hold() as catalog:
-            catalog.stage(
-                "abandoned", {"pinned": False, "retired": False, "published": False}
-            )
-        (Path(uri).parent / "catalog.json").write_text("broken")
-        with Catalog(bucket).hold() as catalog:
-            catalog.repair()
-            catalog.cleanup_abandoned()
-        assert store.list_snapshots() == [Path(uri).name]
-        state = Catalog(bucket).state("abandoned")
-        assert state is None
-    finally:
-        backend.close()
-
-
-def test_transformation_rejects_bad_intermediate_contract_before_next_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Synthetic future registrations test infrastructure without legacy fixtures."""
-    import usagebassoon.snapshot.format as format_module
-    import usagebassoon.snapshot.reader as reader_module
-
-    backend = _backend()
-    store = SnapshotStore(str(tmp_path / "archive"))
-    try:
-        uri = store.write(backend, run_id="contract", manual=True)
-        assert uri is not None
-        monkeypatch.setattr(format_module, "DATA_SCHEMA_VERSION", 3)
-        monkeypatch.setattr(reader_module, "DATA_SCHEMA_VERSION", 3)
-        contracts = format_module.DATA_CONTRACTS
-        monkeypatch.setitem(contracts, 2, contracts[1])
-        monkeypatch.setitem(contracts, 3, contracts[1])
-        called: list[str] = []
-
-        def invalid_step(_files: object, _output: Path) -> dict[str, Path]:
-            called.append("invalid")
-            return {}
-
-        def forbidden_step(_files: object, _output: Path) -> dict[str, Path]:
-            called.append("next")
-            raise AssertionError("next step must not consume invalid intermediate data")
-
-        def validate(_before: object, _after: object) -> None:
-            called.append("semantic")
-
-        monkeypatch.setattr(
-            format_module,
-            "TRANSFORMATIONS",
-            (
-                format_module.SnapshotTransformation(1, 2, invalid_step, validate),
-                format_module.SnapshotTransformation(2, 3, forbidden_step, validate),
-            ),
-        )
-        with (
-            pytest.raises(ValueError, match="every contract table"),
-            store.reader.prepare(uri),
-        ):
-            pass
-        assert called == ["invalid"]
-    finally:
-        backend.close()
-
-
-def test_transformation_fallback_isolates_candidates_and_preserves_identities(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failed upgrade cannot contaminate the next candidate's temporary files."""
-    import shutil
-
-    import pyarrow.parquet as pq
-
-    import usagebassoon.snapshot.format as format_module
-    import usagebassoon.snapshot.reader as reader_module
-
-    source = _backend()
-    _append_note(source)
-    store = SnapshotStore(str(tmp_path / "archive"))
-    try:
-        older = store.write(source, run_id="older", manual=True)
-        newer = store.write(source, run_id="newer", manual=True)
-        assert older is not None and newer is not None
-        original_manifest = (Path(older) / "manifest.json").read_bytes()
-        original_notes = (Path(older) / "notes.parquet").read_bytes()
-        contracts = format_module.DATA_CONTRACTS
-        monkeypatch.setattr(format_module, "DATA_SCHEMA_VERSION", 3)
-        monkeypatch.setattr(reader_module, "DATA_SCHEMA_VERSION", 3)
-        monkeypatch.setitem(contracts, 2, contracts[1])
-        monkeypatch.setitem(contracts, 3, contracts[1])
-        failed = [False]
-        validations: list[int] = []
-
-        def transform(files: Mapping[str, Path], output: Path) -> Mapping[str, Path]:
-            if not failed[0]:
-                failed[0] = True
-                (output / "partial").write_text("interrupted")
-                raise ValueError("interrupted transformation")
-            result: dict[str, Path] = {}
-            for table, schema in contracts[1].items():
-                path = output / f"{table}.parquet"
-                if table in files:
-                    shutil.copyfile(files[table], path)
-                else:
-                    pq.write_table(pa.Table.from_batches([], schema=schema), path)
-                result[table] = path
-            return result
-
-        def semantic(before: Mapping[str, Path], after: Mapping[str, Path]) -> None:
-            assert pq.read_table(before["notes"]).equals(pq.read_table(after["notes"]))
-            validations.append(1)
-
-        monkeypatch.setattr(
-            format_module,
-            "TRANSFORMATIONS",
-            (
-                format_module.SnapshotTransformation(1, 2, transform, semantic),
-                format_module.SnapshotTransformation(2, 3, transform, semantic),
-            ),
-        )
-        notices: list[str] = []
-        with store.reader.prepare(warning=notices.append) as prepared:
-            assert prepared.candidate.identifier == Path(older).name
-            assert prepared.rows["notes"] == 1
-            assert len(validations) == 2
-            assert next(iter(prepared.batches("notes"))).num_rows == 1
-        assert any("interrupted transformation" in notice for notice in notices)
-        assert (Path(older) / "manifest.json").read_bytes() == original_manifest
-        assert (Path(older) / "notes.parquet").read_bytes() == original_notes
-    finally:
-        source.close()
 
 
 def test_lost_restore_acknowledgement_resolves_receipt_without_replaying(

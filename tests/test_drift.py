@@ -292,9 +292,8 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
     workers: int,
 ) -> None:
     """Honor concurrency and compaction health for an unfamiliar backend name."""
-    import time
     from collections.abc import Mapping
-    from threading import Lock
+    from threading import Event, Lock
 
     import pyarrow as pa
 
@@ -304,6 +303,7 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
         def __init__(self) -> None:
             super().__init__(":memory:")
             self.lock = Lock()
+            self.overlap = Event()
             self.inflight = 0
             self.peak = 0
 
@@ -317,11 +317,15 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
             self, sql: str, parameters: Mapping[str, str] | None = None
         ) -> pa.Table:
             del parameters
+            if sql == "SELECT 1 AS doctor_ok" or "LIMIT 0" in sql:
+                return pa.table({})
             with self.lock:
                 self.inflight += 1
                 self.peak = max(self.peak, self.inflight)
+                if self.inflight == workers:
+                    self.overlap.set()
             try:
-                time.sleep(0.02)
+                assert self.overlap.wait(5), "diagnostic queries did not overlap"
                 if "open_schema_drift_events" in sql:
                     raise RuntimeError("drift read failed")
                 return pa.table({})

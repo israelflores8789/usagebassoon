@@ -551,52 +551,50 @@ def test_live_append_publication_is_visible_and_replay_safe(
     collection_bundle: CollectionBundle,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Check immediate raw visibility, replay deduplication, and publication time."""
+    """Require fast collection publication, immediate visibility, and safe replay."""
     source_id, bundle = _normalized_bundle(collection_bundle)
     remote = _backend(live_settings)
     try:
         remote.preflight()
-        started = time.monotonic()
-        persist_run(remote, bundle)
-        elapsed = time.monotonic() - started
-        with capsys.disabled():
-            print(f"BigQuery publication: {elapsed:.3f}s", flush=True)
         parameters = {"source_id": source_id}
-        assert (
-            remote.query(
-                "SELECT * FROM daily_stats WHERE source_id = :source_id", parameters
-            ).num_rows
-            == 0
-        )
-        for table in ("sessions", "daily_stats", "price_versions"):
-            assert (
-                remote.query(
-                    f"SELECT * FROM current_{table} WHERE source_id = :source_id",
-                    parameters,
-                ).num_rows
-                == bundle.tables[table].num_rows
+        for attempt in ("initial", "replay"):
+            started = time.monotonic()
+            persist_run(remote, bundle)
+            elapsed = time.monotonic() - started
+            with capsys.disabled():
+                print(f"BigQuery {attempt} publication: {elapsed:.3f}s", flush=True)
+            # REQUIRED collection performance contract: publication must finish in 15s.
+            # Do not remove, relax, skip, or replace this assertion with timing logs
+            # without explicit maintainer approval. Slow collect-time queries/appends
+            # make collection unusable; both initial publication and replay must pass.
+            # Time persistence only; provisioning and diagnostic reads are excluded.
+            assert elapsed < 15.0, (
+                f"BigQuery {attempt} collection publication took {elapsed:.3f}s; "
+                "required threshold is 15 seconds"
             )
-        persist_run(remote, bundle)
-        assert (
-            remote.query(
-                "SELECT * FROM collection_runs WHERE run_id = :run_id",
-                {"run_id": bundle.run_id},
-            ).num_rows
-            == 1
-        )
-        for table in ("sessions", "daily_stats", "price_versions"):
             assert (
                 remote.query(
-                    f"SELECT * FROM current_{table} WHERE source_id = :source_id",
-                    parameters,
+                    "SELECT * FROM daily_stats WHERE source_id = :source_id", parameters
                 ).num_rows
-                == bundle.tables[table].num_rows
+                == 0
+            )
+            for table in ("sessions", "daily_stats", "price_versions"):
+                assert (
+                    remote.query(
+                        f"SELECT * FROM current_{table} WHERE source_id = :source_id",
+                        parameters,
+                    ).num_rows
+                    == bundle.tables[table].num_rows
+                )
+            assert (
+                remote.query(
+                    "SELECT * FROM collection_runs WHERE run_id = :run_id",
+                    {"run_id": bundle.run_id},
+                ).num_rows
+                == 1
             )
     finally:
         remote.close()
-    # Performance guard: the persistence refactor cut publication from >72s to <8s.
-    # Keep the 15s ceiling to detect regressions with service-latency headroom.
-    assert elapsed < 15.0, f"BigQuery publication took {elapsed:.3f}s"
 
 
 def test_live_snapshot_portability_includes_raw_and_compacted_facts(
@@ -651,7 +649,7 @@ def test_live_snapshot_portability_includes_raw_and_compacted_facts(
         ).to_pylist()
         with (
             _phase("populated BigQuery restore rejection"),
-            pytest.raises(Exception, match="empty warehouse"),
+            pytest.raises(ValueError, match="empty warehouse"),
         ):
             archive.restore(remote)
         assert (
@@ -1153,6 +1151,77 @@ def test_live_consistent_read_preserves_state_across_compaction_and_late_append(
             assert remote.query(ledger_sql).num_rows == 2
     finally:
         remote.close()
+
+
+def test_live_snapshot_reads_gold_only_and_uncompacted_keys(
+    live_settings: LiveSettings, tmp_path: Path
+) -> None:
+    """Capture native durable-only facts together with accepted raw arrivals."""
+    remote = _backend(live_settings)
+    target = DuckDBBackend(":memory:")
+    source_id = str(uuid4())
+    try:
+        target.apply_ddl()
+        # Seed durable state directly; collection itself must never write gold.
+        remote._wait_for_job(
+            remote.client.query(
+                f"INSERT INTO {remote._table_ref('daily_stats')} "
+                "(event_id, source_id, day, client, session_id, model, input_tokens, "
+                "output_tokens, cache_read, cache_write, reasoning, total_tokens, "
+                "collected_at) VALUES (GENERATE_UUID(), @source_id, DATE '2021-01-02', "
+                "'codex', 'gold-only', 'test-model', 100, 0, 0, 0, 0, 100, "
+                "CURRENT_TIMESTAMP())",
+                job_config=remote._query_config(
+                    parameters=[
+                        bigquery.ScalarQueryParameter("source_id", "STRING", source_id)
+                    ]
+                ),
+                location=remote.location,
+            )
+        )
+        remote.append(
+            "daily_stats",
+            pa.Table.from_pylist(
+                [
+                    {
+                        "event_id": str(uuid4()),
+                        "source_id": source_id,
+                        "day": date(2021, 1, 2),
+                        "client": "codex",
+                        "session_id": "raw-only",
+                        "model": "test-model",
+                        "input_tokens": 200,
+                        "output_tokens": 0,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "reasoning": 0,
+                        "total_tokens": 200,
+                        "collected_at": datetime.now(UTC),
+                    }
+                ],
+                schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
+            ),
+        )
+        assert remote.query("SELECT session_id FROM daily_stats").to_pylist() == [
+            {"session_id": "gold-only"}
+        ]
+        assert remote.query("SELECT session_id FROM raw_daily_stats").to_pylist() == [
+            {"session_id": "raw-only"}
+        ]
+        store = SnapshotArchiver(str(tmp_path / "gold-and-raw"))
+        uri = store.write(remote, run_id="gold-and-raw", manual=True)
+        assert uri is not None
+        assert store.restore(target, uri)["daily_stats"] == 2
+        assert target.query(
+            "SELECT source_id, session_id, total_tokens FROM current_daily_stats "
+            "ORDER BY session_id"
+        ).to_pylist() == [
+            {"source_id": source_id, "session_id": "gold-only", "total_tokens": 100},
+            {"source_id": source_id, "session_id": "raw-only", "total_tokens": 200},
+        ]
+    finally:
+        remote.close()
+        target.close()
 
 
 def test_live_source_audit_aggregates_history_with_one_summary_per_source(

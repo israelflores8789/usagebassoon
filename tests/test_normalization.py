@@ -268,8 +268,8 @@ def test_collection_status_is_unchanged_when_no_domains_are_refreshed(
         backend.apply_ddl()
         persist_run(backend, normalize(collection_bundle))
         before = backend.query(
-            "SELECT min(collected_at) AS stamp FROM collection_status"
-        ).to_pylist()[0]["stamp"]
+            "SELECT * FROM collection_status ORDER BY source_id, day, domain"
+        ).to_pylist()
         later = replace(
             collection_bundle,
             run_id=str(uuid4()),
@@ -280,8 +280,8 @@ def test_collection_status_is_unchanged_when_no_domains_are_refreshed(
         )
         summary = persist_run(backend, normalize(later))
         after = backend.query(
-            "SELECT min(collected_at) AS stamp FROM collection_status"
-        ).to_pylist()[0]["stamp"]
+            "SELECT * FROM collection_status ORDER BY source_id, day, domain"
+        ).to_pylist()
         assert summary.inserted == 0
         assert after == before
     finally:

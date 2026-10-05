@@ -11,9 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from typing import cast, override
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pytest
+from google.api_core.exceptions import NotFound, PreconditionFailed, ServiceUnavailable
 
 from tests._snapshot_fakes import TableBackend
 from usagebassoon.archiver import SNAPSHOT_TABLES
@@ -21,7 +23,7 @@ from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.buckets.base import SnapshotObject as GcsObject
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
-from usagebassoon.buckets.gcs import GcsClient
+from usagebassoon.buckets.gcs import GcsBlob, GcsBucket, GcsClient
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
@@ -223,6 +225,112 @@ def test_gcs_archive_uses_configured_request_timeout() -> None:
 
     assert archive.list("") == ()
     assert client.list_timeout == 25.0
+
+
+@pytest.mark.parametrize(
+    "operation", ["read", "json", "create", "replace", "upload", "download", "delete"]
+)
+def test_gcs_adapter_passes_generation_guards_and_timeouts(
+    tmp_path: Path, operation: str
+) -> None:
+    """Exercise the actual adapter's SDK boundary rather than an archive double."""
+    client = MagicMock(spec=GcsClient)
+    bucket = MagicMock(spec=GcsBucket)
+    blob = MagicMock(spec=GcsBlob)
+    client.bucket.return_value = bucket
+    bucket.blob.return_value = blob
+    blob.name = "archive/copy/data.parquet"
+    blob.generation, blob.size, blob.crc32c = 7, 3, "checksum"
+    archive = GcsArchive(
+        "gs://bucket/archive", timeout_seconds=17, client=cast(GcsClient, client)
+    )
+    path = tmp_path / "data.parquet"
+    path.write_bytes(b"abc")
+    if operation in {"read", "json"}:
+        if operation == "json":
+            blob.download_as_bytes.return_value = b'{"value": 42}'
+            assert archive.read_json("copy/data.parquet") == ({"value": 42}, 7)
+            bucket.blob.assert_any_call("archive/copy/data.parquet", generation=7)
+            blob.reload.assert_called_once_with(timeout=17)
+        else:
+            blob.download_as_bytes.return_value = b"abc"
+            assert archive.read_bytes("copy/data.parquet", version=7) == b"abc"
+            bucket.blob.assert_called_once_with(
+                "archive/copy/data.parquet", generation=7
+            )
+        blob.download_as_bytes.assert_called_once_with(
+            if_generation_match=7, timeout=17
+        )
+    elif operation in {"create", "replace"}:
+        reference = archive.write_json_cas(
+            "copy/data.parquet",
+            {"value": 42},
+            expected_version=None if operation == "create" else 6,
+        )
+        args, kwargs = blob.upload_from_string.call_args
+        assert json.loads(args[0]) == {"value": 42}
+        assert kwargs == {
+            "content_type": "application/json",
+            "if_generation_match": 0 if operation == "create" else 6,
+            "timeout": 17,
+        }
+        assert reference.version == 7
+    elif operation == "upload":
+        reference = archive.upload_file("copy/data.parquet", path)
+        blob.upload_from_filename.assert_called_once_with(
+            str(path), if_generation_match=0, timeout=17
+        )
+        assert reference == GcsObject("copy/data.parquet", 7, 3, "checksum")
+    elif operation == "download":
+
+        def reload(*, timeout: float) -> None:
+            assert timeout == 17
+            blob.generation = 8
+
+        blob.reload.side_effect = reload
+        reference = archive.download_file("copy/data.parquet", path)
+        blob.download_to_filename.assert_called_once_with(
+            str(path), if_generation_match=8, timeout=17
+        )
+        assert reference.version == 8
+    else:
+        archive.delete("copy/data.parquet", version=7)
+        blob.delete.assert_called_once_with(if_generation_match=7, timeout=17)
+
+
+@pytest.mark.parametrize("operation", ["read", "delete", "replace"])
+@pytest.mark.parametrize(
+    "error_type", [NotFound, PreconditionFailed, ServiceUnavailable]
+)
+def test_gcs_adapter_distinguishes_generation_conflicts_from_service_failures(
+    operation: str, error_type: type[Exception]
+) -> None:
+    """Translate stale generations while preserving unrelated provider failures."""
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    failure = error_type("controlled provider failure")
+    method = {
+        "read": "download_as_bytes",
+        "delete": "delete",
+        "replace": "upload_from_string",
+    }[operation]
+    getattr(blob, method).side_effect = failure
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    conflict = error_type is PreconditionFailed or (
+        error_type is NotFound and operation != "replace"
+    )
+    expected = GcsPreconditionError if conflict else error_type
+    with pytest.raises(expected) as caught:
+        if operation == "read":
+            archive.read_bytes("copy/data.parquet", version=7)
+        elif operation == "delete":
+            archive.delete("copy/data.parquet", version=7)
+        else:
+            archive.write_json_cas("control.json", {}, expected_version=7)
+    if conflict:
+        assert caught.value.__cause__ is failure
+    else:
+        assert caught.value is failure
 
 
 def test_gcs_reservation_expires_during_slow_snapshot() -> None:

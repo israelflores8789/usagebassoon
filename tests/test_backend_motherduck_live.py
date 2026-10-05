@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+import duckdb
 import pyarrow as pa
 import pytest
 from sqlglot import exp
@@ -473,7 +474,7 @@ def test_live_batch_rolls_back_after_late_failure(
             {"missing_history": bundle.tables["collection_ledger"]},
             bundle.tables["collection_ledger"],
         )
-        with pytest.raises(Exception, match="missing_history"):
+        with pytest.raises(duckdb.Error, match="missing_history"):
             backend.persist_batch(batch)
         assert not backend.has_committed_run(bundle.run_id)
         assert (
@@ -487,26 +488,15 @@ def test_live_batch_rolls_back_after_late_failure(
         backend.close()
 
 
-def test_live_snapshot_reads_one_transaction_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exclude a note committed between two remote snapshot table reads."""
+def test_live_snapshot_stream_reads_one_transaction_state() -> None:
+    """Exclude a remote commit between lazy table reads and release the read scope."""
     reader = _backend()
     writer = _backend()
     source_id = str(uuid4())
-    original_query = reader.query
-    reads = 0
-
-    def read_then_write(
-        sql: str, parameters: Mapping[str, str] | None = None
-    ) -> pa.Table:
-        """Commit a note after the first table read has materialized."""
-        nonlocal reads
-        result = original_query(sql, parameters)
-        if "CURRENT_TIMESTAMP" in sql:
-            return result
-        reads += 1
-        if reads == 1:
+    try:
+        with reader.stream_snapshot(("sessions", "notes")) as snapshot:
+            assert snapshot.captured_at.tzinfo is not None
+            list(snapshot.tables["sessions"])
             stamp = datetime.now(UTC)
             writer.append(
                 "notes",
@@ -515,7 +505,7 @@ def test_live_snapshot_reads_one_transaction_state(
                         {
                             "source_id": [source_id],
                             "client": ["codex"],
-                            "session_id": ["between-reads"],
+                            "session_id": ["between-streams"],
                             "note": ["committed after capture"],
                             "created_at": [stamp],
                             "collected_at": [stamp],
@@ -523,18 +513,16 @@ def test_live_snapshot_reads_one_transaction_state(
                     )
                 ),
             )
-        return result
-
-    monkeypatch.setattr(reader, "query", read_then_write)
-    try:
-        snapshot = reader.read_snapshot_tables(("sessions", "notes"))
-        assert snapshot.captured_at.tzinfo is not None
-        assert reads == 2
-        assert all(
-            row["source_id"] != source_id
-            for row in snapshot.tables["notes"].to_pylist()
-        )
-        assert writer.query(
+            assert writer.query(
+                "SELECT count(*) AS n FROM notes WHERE source_id = :source_id",
+                {"source_id": source_id},
+            ).to_pylist() == [{"n": 1}]
+            assert all(
+                row["source_id"] != source_id
+                for batch in snapshot.tables["notes"]
+                for row in batch.to_pylist()
+            )
+        assert reader.query(
             "SELECT count(*) AS n FROM notes WHERE source_id = :source_id",
             {"source_id": source_id},
         ).to_pylist() == [{"n": 1}]
@@ -787,6 +775,56 @@ def test_live_configured_clients_and_curation_preserve_source_identity(
         )
     finally:
         remote.close()
+
+
+def test_live_restore_receipt_survives_lost_reply_and_reconnection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve a real committed restore and refuse replay through a new connection."""
+    source = DuckDBBackend(":memory:")
+    remote = _backend()
+    attempts: list[str] = []
+    original = remote.restore_snapshot
+
+    def lost_reply(
+        files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        original(files, operation_id=operation_id, snapshot_id=snapshot_id)
+        attempts.append(operation_id)
+        raise OSError("MotherDuck restore acknowledgement lost")
+
+    def forbidden_replay(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("a committed restore was replayed after reconnecting")
+
+    try:
+        source.apply_ddl()
+        note = NoteAssignment(str(uuid4()), "codex", "receipt-session", "durable note")
+        set_note(source, note)
+        expected = source.query("SELECT * FROM current_notes").to_pylist()
+        store = SnapshotArchiver(str(tmp_path / "archive"))
+        uri = store.write(source, run_id="receipt", manual=True)
+        assert uri is not None
+        notices: list[str] = []
+        monkeypatch.setattr(remote, "restore_snapshot", lost_reply)
+        assert store.restore(remote, uri, notice=notices.append)["notes"] == 1
+        assert any("acknowledgement was interrupted" in notice for notice in notices)
+        assert len(attempts) == 1
+        remote.close()
+        remote = _backend()
+        monkeypatch.setattr(remote, "restore_snapshot", forbidden_replay)
+        assert remote.restore_committed(attempts[0])
+        notices.clear()
+        assert store.restore(remote, uri, notice=notices.append)["notes"] == 1
+        assert any("already committed" in notice for notice in notices)
+        assert remote.query("SELECT * FROM current_notes").to_pylist() == expected
+        assert remote.query(
+            "SELECT count(*) AS n FROM restore_receipts "
+            "WHERE operation_id = :operation",
+            {"operation": attempts[0]},
+        ).to_pylist() == [{"n": 1}]
+    finally:
+        remote.close()
+        source.close()
 
 
 def test_live_portable_snapshots_and_atomic_restore(

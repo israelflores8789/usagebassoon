@@ -27,10 +27,12 @@ Credentials use application default authentication, including
 from __future__ import annotations
 
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from typing import cast
 from uuid import uuid4
 
@@ -48,7 +50,7 @@ from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import normalize
 from usagebassoon.persistence import persist_run
-from usagebassoon.snapshot.catalog import Catalog
+from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.storage_model import (
     DEBUG_TABLES,
 )
@@ -125,6 +127,20 @@ def test_live_gcs_generation_operations(live_archive: GcsArchive) -> None:
     assert live_archive.read_bytes("probe", version=first.version) == b"one"
     with pytest.raises(GcsPreconditionError):
         live_archive.write_bytes("probe", b"two", if_generation_match=0)
+    replacement = live_archive.write_bytes(
+        "probe", b"two", if_generation_match=cast(int, first.version)
+    )
+    assert replacement.version != first.version
+    try:
+        historical = live_archive.read_bytes("probe", version=first.version)
+    except GcsPreconditionError:
+        pass
+    else:
+        # Versioned buckets may retain the old generation; never return new bytes.
+        assert historical == b"one"
+    with pytest.raises(GcsPreconditionError):
+        live_archive.delete("probe", version=first.version)
+    assert live_archive.read_bytes("probe", version=replacement.version) == b"two"
     catalog = live_archive.write_json_cas(
         "catalog.json", {"entries": []}, expected_version=None
     )
@@ -132,7 +148,84 @@ def test_live_gcs_generation_operations(live_archive: GcsArchive) -> None:
         {"entries": []},
         catalog.version,
     )
+    updated = live_archive.write_json_cas(
+        "catalog.json", {"entries": ["updated"]}, expected_version=catalog.version
+    )
+    with pytest.raises(GcsPreconditionError):
+        live_archive.write_json_cas(
+            "catalog.json", {"entries": []}, expected_version=catalog.version
+        )
+    assert live_archive.read_json("catalog.json") == (
+        {"entries": ["updated"]},
+        updated.version,
+    )
     live_archive.lifecycle_warnings()
+
+
+def test_live_gcs_catalog_claim_race_and_takeover_reject_stale_owner(
+    live_archive: GcsArchive,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native CAS admits one claimant and fences an expired owner's mutations."""
+    claimants = [
+        Catalog(GcsArchive(live_archive.uri, project=live_archive.project))
+        for _ in range(2)
+    ]
+    barrier = Barrier(2)
+
+    def synchronize_read(
+        bucket: GcsArchive,
+    ) -> Callable[[str], tuple[dict[str, object] | None, str | int | None]]:
+        original = bucket.read_json
+
+        def read(name: str) -> tuple[dict[str, object] | None, str | int | None]:
+            result = original(name)
+            if name == "control.json" and result[0] is None:
+                # Both native reads must observe absence before either native CAS.
+                barrier.wait(timeout=30)
+            return result
+
+        return read
+
+    def claim(catalog: Catalog) -> bool:
+        try:
+            catalog._update_reservation(claim=True)
+        except ArchiveBusy:
+            return False
+        return True
+
+    with monkeypatch.context() as synchronized:
+        for catalog in claimants:
+            assert isinstance(catalog.bucket, GcsArchive)
+            synchronized.setattr(
+                catalog.bucket, "read_json", synchronize_read(catalog.bucket)
+            )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(claim, claimants))
+    assert sum(outcomes) == 1
+    winner, successor = (
+        claimants[outcomes.index(True)],
+        claimants[outcomes.index(False)],
+    )
+    winner.stage("owned", {"pinned": False, "retired": False, "published": False})
+    old_fence = winner.fence
+    document, version = winner.control()
+    reservation = document["reservation"]
+    assert isinstance(reservation, dict)
+    reservation["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    live_archive.write_json_cas("control.json", document, expected_version=version)
+    successor._update_reservation(claim=True)
+    assert old_fence is not None and successor.fence is not None
+    assert successor.fence > old_fence
+    successor.pin("owned")
+    with pytest.raises(ArchiveBusy):
+        winner.publish("owned", datetime.now(UTC).isoformat())
+    state = successor.state("owned")
+    assert state is not None and state["pinned"] is True
+    assert state["published"] is False and state["retired"] is False
+    control, _ = successor.control()
+    reservation = control["reservation"]
+    assert isinstance(reservation, dict) and reservation["owner"] == successor.owner
 
 
 def test_live_gcs_retirement_forgets_only_completed_cleanup(

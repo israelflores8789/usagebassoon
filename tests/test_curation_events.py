@@ -126,35 +126,33 @@ def test_note_pages_are_bounded_ordered_and_source_aware(
 ) -> None:
     """Page ties without duplicates and preserve cursors when new notes arrive."""
     created = datetime(2026, 9, 1, tzinfo=UTC)
+    seeded: list[tuple[int, NoteAssignment]] = []
     for index in range(35):
-        set_note(
-            warehouse,
-            NoteAssignment(
-                "source" if index % 2 else "other", "codex", str(index), "text"
-            ),
-            at=created + timedelta(seconds=index // 5),
+        note = NoteAssignment(
+            "source" if index % 2 else "other", "codex", str(index), "text"
         )
-    ordered = (
-        warehouse.query(
-            "SELECT note_id FROM session_notes ORDER BY updated_at DESC, note_id ASC"
-        )
-        .column("note_id")
-        .to_pylist()
-    )
+        seeded.append((index // 5, note))
+        set_note(warehouse, note, at=created + timedelta(seconds=index // 5))
+
+    def order(item: tuple[int, NoteAssignment]) -> tuple[int, str]:
+        return -item[0], item[1].note_id
+
+    expected = [note for _, note in sorted(seeded, key=order)]
+    ordered = [note.note_id for note in expected]
     first = list_notes(warehouse)
-    assert len(first) == 17
-    assert [record.note_id for record in first[:16]] == ordered[:16]
-    set_note(warehouse, NoteAssignment("source", "codex", "new", "new"))
+    assert [record.note_id for record in first] == ordered[:17]
+    arriving = NoteAssignment("source", "codex", "new", "new")
+    set_note(warehouse, arriving, at=created + timedelta(minutes=1))
     second = list_notes(warehouse, after=first[15])
     third = list_notes(warehouse, after=second[15])
     assert [record.note_id for record in second[:16]] == ordered[16:32]
     assert [record.note_id for record in third] == ordered[32:]
     # Explicit pages remain useful in noninteractive output.
     assert [record.note_id for record in list_notes(warehouse, page=3)] == ordered[31:]
-    assert all(
-        record.assignment.source_id == "source"
-        for record in list_notes(warehouse, source_id="source")
-    )
+    assert [record.note_id for record in list_notes(warehouse, source_id="source")] == [
+        arriving.note_id,
+        *(note.note_id for note in expected if note.source_id == "source"),
+    ][:17]
     assert list_notes(warehouse, source_id="absent") == []
     for page in (0, -1):
         with pytest.raises(ValueError):
@@ -257,12 +255,15 @@ def test_snapshot_restore_preserves_winning_curation_fields(
         warehouse, NoteAssignment("source", "codex", "session", "edited"), at=edited
     )
     store = SnapshotArchiver(str(tmp_path / "archive"))
-    destination = DuckDBBackend(":memory:")
-    destination.apply_ddl()
-    try:
-        for phase in range(2):
-            if phase and isinstance(warehouse, BigQueryReplayBackend):
-                warehouse.compact()
+    phases = range(2) if isinstance(warehouse, BigQueryReplayBackend) else range(1)
+    for phase in phases:
+        if phase and isinstance(warehouse, BigQueryReplayBackend):
+            warehouse.compact()
+            for table in ("tags", "notes"):
+                warehouse.engine.connection.execute(f"DELETE FROM raw_{table}")
+        destination = DuckDBBackend(":memory:")
+        try:
+            destination.apply_ddl()
             assert store.write(warehouse, run_id=f"snapshot-{phase}") is not None
             store.restore(destination)
             for table in ("tags", "notes"):
@@ -275,9 +276,8 @@ def test_snapshot_restore_preserves_winning_curation_fields(
                     assert get_note_by_id(
                         destination, original[0]["note_id"]
                     ) == get_note_by_id(warehouse, original[0]["note_id"])
-                destination.connection.execute(f"DELETE FROM {table}")
-    finally:
-        destination.close()
+        finally:
+            destination.close()
 
 
 def test_global_tags_and_source_scoped_notes_survive_compaction(

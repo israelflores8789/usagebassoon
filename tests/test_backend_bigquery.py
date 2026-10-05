@@ -284,33 +284,28 @@ class _StorageReadClient:
         ]
 
 
-def test_bigquery_job_timeout_cancels_and_fails_loudly() -> None:
-    """Cancel a stuck remote job and expose its identity in the exception."""
-    job = _TimeoutJob()
-    backend = _backend()
-
-    with pytest.raises(RuntimeError, match="stuck-job exceeded 120 seconds") as failure:
+@pytest.mark.parametrize("timeout", [None, 45.0])
+def test_bigquery_job_timeout_cancels_and_is_retryable(timeout: float | None) -> None:
+    """Honor default/custom waits, cancel stuck jobs, and report retryable failure."""
+    expected = 120.0 if timeout is None else timeout
+    job = _TimeoutJob(expected_timeout=expected)
+    backend = (
+        _backend()
+        if timeout is None
+        else BigQueryBackend(
+            "usagebassoon-test",
+            "usagebassoon_emulated",
+            timeout_seconds=timeout,
+            client=cast(bigquery.Client, _OfflineClient()),
+        )
+    )
+    with pytest.raises(
+        RuntimeError, match=f"stuck-job exceeded {expected:g} seconds"
+    ) as failure:
         backend._wait_for_job(cast(bigquery.job.QueryJob, job))
-
     assert job.cancelled
     assert backend.is_retryable_error(failure.value)
     assert not backend.is_retryable_error(ValueError("invalid observation"))
-
-
-def test_bigquery_uses_configured_job_timeout() -> None:
-    """Pass a custom job wait to BigQuery and report it on timeout."""
-    job = _TimeoutJob(expected_timeout=45.0)
-    backend = BigQueryBackend(
-        "usagebassoon-test",
-        "usagebassoon_emulated",
-        timeout_seconds=45.0,
-        client=cast(bigquery.Client, _OfflineClient()),
-    )
-
-    with pytest.raises(RuntimeError, match="stuck-job exceeded 45 seconds"):
-        backend._wait_for_job(cast(bigquery.job.QueryJob, job))
-
-    assert job.cancelled
 
 
 def test_bigquery_query_configuration_sets_the_billing_ceiling() -> None:

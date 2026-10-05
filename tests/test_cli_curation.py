@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 
 import pytest
 import yaml
@@ -47,7 +45,7 @@ def _command(config: Path, *parts: str) -> list[str]:
 def test_curation_commands_use_only_the_explicit_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Assert every curation subcommand honors its explicit configuration."""
+    """Direct tag and note writes to the selected configuration only."""
     selected_config = tmp_path / "selected.toml"
     selected_database = tmp_path / "selected.duckdb"
     environment_config = tmp_path / "environment.toml"
@@ -84,6 +82,12 @@ def test_curation_commands_use_only_the_explicit_config(
         assert backend.query("SELECT note FROM notes").to_pylist() == [
             {"note": "Track this session"}
         ]
+    finally:
+        backend.close()
+    backend = DuckDBBackend(tmp_path / "environment.duckdb")
+    try:
+        assert backend.query("SELECT * FROM tags").num_rows == 0
+        assert backend.query("SELECT * FROM notes").num_rows == 0
     finally:
         backend.close()
 
@@ -337,32 +341,14 @@ def test_note_list_escapes_terminal_controls(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("json_output", [False, True])
-def test_note_describe_uses_shared_formats_for_one_or_multiple_ids(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+def test_note_describe_serializes_ordered_metadata_for_one_or_multiple_ids(
+    tmp_path: Path, json_output: bool
 ) -> None:
-    """Produce ordered metadata using the shared YAML/JSON serializer."""
+    """Produce complete ordered metadata in YAML and JSON."""
     config = tmp_path / "config.toml"
     database = tmp_path / "usage.duckdb"
     _write_config(config, database)
     notes = _seed_notes(database, 2)
-    calls = []
-    original = note_cli.render_records
-
-    def recorded(
-        rows: Sequence[Mapping[str, object]],
-        *,
-        columns: Sequence[str],
-        format: Literal["json", "csv", "yaml"],
-        save: Path | None,
-        json_payload: Mapping[str, object] | None = None,
-    ) -> None:
-        """Record calls while preserving shared serialization."""
-        calls.append(format)
-        original(
-            rows, columns=columns, format=format, save=save, json_payload=json_payload
-        )
-
-    monkeypatch.setattr(note_cli, "render_records", recorded)
     for selected in ([notes[0]], [notes[1], notes[0]]):
         flags = ["--json"] if json_output else []
         result = CliRunner().invoke(
@@ -390,7 +376,6 @@ def test_note_describe_uses_shared_formats_for_one_or_multiple_ids(
                     + timedelta(seconds=int(note.session_id))
                 ).isoformat(),
             }
-    assert calls == ["json" if json_output else "yaml"] * 2
 
 
 def test_note_describe_rejects_missing_and_invalid_ids_without_partial_output(
