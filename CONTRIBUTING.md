@@ -237,6 +237,8 @@ A new backend contribution must:
 
 ## Snapshot and recovery contracts
 
+UsageBassoon captures a consistent, point-in-time view of a storage backend as a portable archive of Parquet data and snapshot metadata. A snapshot bucket stores that archive independently of the backend, so copies can move between local and object-storage providers. Immutable manifests, completion evidence, and object hashes define recoverable contents; catalog and control documents support discovery, retention, and concurrency. Restore validates archive integrity and compatibility before changing destination maintenance, then commits data and a completion receipt into an empty, quiescent backend. Scheduled snapshots and weekly backups run independently of collection, and every released archive format and data contract must retain a tested recovery path.
+
 ### Snapshot contents and lifecycle
 
 - Complete snapshots contain:
@@ -245,29 +247,32 @@ A new backend contribution must:
   - all immutable referenced Parquet objects, and
   - mutable portable `state.json`.
 - Relative object names and hashes *define* portable contents. Provider generations are only concurrency metadata. Copies retain the ID and immutable contents.
-- `catalog.json` is rebuildable.
-- `control.json` owns retention, lifecycle, and reservation owner/expiry/fence. Publish, pin, and retire operates through its reservation CAS; catalogs and sidecars are projections.
+- `catalog.json` is a rebuildable index of published snapshots for routine discovery and selection.
+- `control.json` owns retention, lifecycle, and reservation owner/expiry/fence. Publish, pin, and retire transitions use the reservation CAS on `control.json`; catalogs and sidecars are projections.
 - Lost ownership ends an attempt until rescheduled. Repair preserves corrupt evidence and active claims. Retirement tombstones block routine resurrection after interrupted deletion; valid immutable contents remain recoverable.
 
 ### Capture and publication
 
-- Fenced reservations cover capture, pinning, deletion, retention, copying, and repair. Downloads try a reservation, but control-write failures cannot block verified recovery.
+- Snapshots employ Lease Fencing for concurrency control. Fenced reservations cover capture, pinning, deletion, retention, copying, and repair. Downloads try a reservation, but control-write failures cannot block verified recovery.
 - Claim destinations in deterministic order before reading; renew through streaming and publication. Never retire unverified lifecycle state or remove active staging by age alone.
 - Flush and sync local files and directories around atomic publication. Roll back partial cross-destination publication while claims are held; no transaction spans destinations. Retain only after every copy verifies.
 
 ### Scheduling and retention
 
-- Manual snapshots bypass cadence and pin by default. Scheduled retention counts unpinned snapshots; keep four successful UTC weekly slots separately. Pins are exempt from both rules.
-- Scheduled snapshots and weekly backups use independent native artifacts and a worker loop separate from collection. They run without collection completion or tokscale preflight. Backup health reports each role and accumulated weekly coverage; another instance cannot silently weaken archive policy.
+- Manual snapshots bypass cadence and pins the snapshot by default. Pinning a snapshot removes it from rotation. Scheduled retention counts unpinned snapshots; keep four successful UTC weekly slots separately.
+- Scheduled snapshots and weekly backups use independent native artifacts and a worker loop separate from collection. They run without collection completion or tokscale preflight. Backup health reports each role and accumulated weekly coverage.
 - Deletion requires selected locations and the CLI's `DELETE` confirmation. Partial cleanup remains retired and retryable.
 
 ### Restore and recovery
 
-- Recovery requires valid immutable manifest/completion evidence and all referenced objects, regardless of mutable lifecycle or retirement state. Management eligibility is separate; verified provenance remains inspectable when compatibility is unsupported.
-- Validate every registered intermediate output contract, required fields, and semantic validator in an isolated candidate directory before changing maintenance or data.
-- Stop all destination writers; checks and receipts are not a collection mutex. `init --restore` provisions with maintenance disabled. Restore pauses applicable maintenance and drains jobs within a bound; the native transaction rechecks emptiness, including unexpected populated tables, then commits data with a completion receipt.
-- BigQuery restore stages use digest-bound logical operation IDs, unique attempt IDs, ownership labels, and expiry as a backstop. Retries drain labeled jobs and discard owned stages immediately; never infer ownership from a name prefix.
-- One operation deadline covers every maintenance RPC and wait. Every exit reports known maintenance state without hiding the original failure. Plain `init` resumes maintenance explicitly.
+Restore should let users recover valid archived data even when the files used for routine snapshot management are damaged. Contributors should preserve these guarantees:
+
+- **Immutable archive contents are enough.** Restore requires a valid immutable `manifest.json`, the immutable `COMPLETE` marker, and every referenced immutable Parquet object.
+- **Mutable management files are optional.** `state.json`, `catalog.json`, `control.json`, retirement markers, and other files used to list or manage snapshots may be missing or corrupt. They must never be prerequisites for restoring verified immutable contents.
+- **Validate before writing.** Check archive integrity and format compatibility before changing destination maintenance or data. If a supported conversion is needed, validate each intermediate result separately and preserve the original archive. A failed conversion leaves the destination untouched.
+- **Require a stopped, empty destination.** Stopping every UsageBassoon instance that can publish data is a hard requirement. Concurrent writes can unsafely mix data into the restore. A CLI confirmation or receipt does not stop writers. Recheck emptiness, including unexpected populated tables, in the same transaction that writes the restored data and completion receipt.
+- **Prevent maintenance from racing with restore.** Initialize with compaction disabled and bound maintenance changes and waits with one operation deadline. Report the known maintenance state after success or failure without hiding the original error. Plain `bassoon init` is the explicit command for resuming maintenance.
+- **Keep unsupported archives useful.** If the installed release cannot restore an archive, users should still be able to inspect its verified producer and schema details and identify a compatible release.
 
 ### Versioning and compatibility
 
@@ -278,13 +283,19 @@ A new backend contribution must:
 | Snapshot-format version | `snapshot/format.py` | Manifest and file packaging/interpretation |
 | Physical backend schema version/hash | `schema_assets.py` | Installed native SQL, including scheduled compaction |
 
-Persisted data and archives are public contracts: incompatible changes require a major application release; compatible additions and fixes do not automatically require one. Backend SQL upgrades and snapshot transformations use separate registries. Physical upgrades need native assets, complete previous/target hashes for each dialect, contiguous steps, and migration-ledger entries. Baseline DDL is never a fallback migration; automatic upgrades preserve maintenance pauses.
+Persisted data and archives are public contracts: changes follow [Semantic Version](https://semver.org/) requirements for major and minor version releases. Backend SQL upgrades and snapshot transformations use separate registries. Each backend schema change needs a dialect-specific SQL migration asset and the expected schema hash before and after that step for every dialect. Registered steps must form a gap-free path between supported schemas, and completed steps are recorded in `schema_migrations`. Baseline DDL is **never** a substitute for a migration.
 
-Every released format and data contract needs tested recovery: historical readers, immutable Arrow contracts, forward transformations in separate files, and semantic validators in `snapshot/format.py`. Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented, tested conversion; released packages remain an emergency fallback.
+Every released format and data contract needs tested recovery:
+- historical readers,
+- immutable Arrow contracts,
+- forward transformations in separate files, and
+- semantic validators in `snapshot/format.py`.
+
+Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented, tested conversion.
 
 ### Recovery drill
 
-- Extend existing test modules. Seed multiple sources and every logical table; relocate local/GCS copies, remove the copied index, restore to another supported backend, compare with independently derived expected data, and resume collection with source IDs preserved.
+- Extend existing test modules. Seed multiple sources and every logical table; relocate local/remote copies, remove the copied index, restore to another supported backend, compare with independently derived expected data, and resume collection with source IDs preserved.
 - Use only the `usagebassoon_it` BigQuery dataset, MotherDuck database, and mandated GCS test bucket. Run destructive shared-destination phases serially.
 
 ## Golden fixture policy
