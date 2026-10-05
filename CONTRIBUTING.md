@@ -253,15 +253,22 @@ UsageBassoon captures a consistent, point-in-time view of a storage backend as a
 
 ### Capture and publication
 
-- Snapshots employ Lease Fencing for concurrency control. Fenced reservations cover capture, pinning, deletion, retention, copying, and repair. Downloads try a reservation, but control-write failures cannot block verified recovery.
-- Claim destinations in deterministic order before reading; renew through streaming and publication. Never retire unverified lifecycle state or remove active staging by age alone.
-- Flush and sync local files and directories around atomic publication. Roll back partial cross-destination publication while claims are held; no transaction spans destinations. Retain only after every copy verifies.
+Capture and lifecycle operations can run for a while and involve several archive destinations. Coordinate concurrent work without risking an existing recovery point.
+
+- Use fenced destination reservations for capture, pinning, deletion, retention, copying, and repair. They coordinate concurrent operations and prevent work that lost ownership from changing archive state.
+- Claim every participating destination in deterministic order before reading, then renew claims through streaming and publication. Downloads should try a reservation, but inability to update control metadata must not block recovery of verified immutable contents.
+- Make local publication durable by flushing and syncing files and directories around the atomic write. Never retire unverified lifecycle state or remove active staging just because it looks old.
+- No transaction spans destinations. If publication reaches only some locations, roll it back while the claims are still owned; begin retention only after every copy verifies.
 
 ### Scheduling and retention
 
-- Manual snapshots bypass cadence and pins the snapshot by default. Pinning a snapshot removes it from rotation. Scheduled retention counts unpinned snapshots; keep four successful UTC weekly slots separately.
-- Scheduled snapshots and weekly backups use independent native artifacts and a worker loop separate from collection. They run without collection completion or tokscale preflight. Backup health reports each role and accumulated weekly coverage.
-- Deletion requires selected locations and the CLI's `DELETE` confirmation. Partial cleanup remains retired and retryable.
+Manual, scheduled, and weekly snapshots serve different recovery needs. Keep their retention and health rules distinct.
+
+- A manual snapshot bypasses cadence and is pinned by default. Pinning removes it from rotation.
+- Scheduled retention counts unpinned snapshots. Keep four successful UTC weekly slots separately; pins are exempt from both retention rules.
+- Give scheduled and weekly backups independent native artifacts and a worker loop separate from collection. They must run without waiting for collection or tokscale preflight, so a collection problem cannot stop backup coverage.
+- Report scheduled and weekly health separately, including accumulated weekly coverage, so one obligation cannot hide a gap in the other.
+- Deletion requires explicitly selected locations and the CLI's `DELETE` confirmation. If cleanup is partial, keep the snapshot retired and retryable.
 
 ### Restore and recovery
 
