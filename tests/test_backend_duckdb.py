@@ -5,15 +5,146 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pytest
 
 from tests._sql_parity import normalized_records
+from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.backends.factory import StorageBackendRegistry, open_backend
 from usagebassoon.backends.motherduck import MotherDuckBackend
+from usagebassoon.config import (
+    BackendName,
+    BigQueryConfig,
+    MotherDuckConfig,
+    UsageBassoonConfig,
+)
 from usagebassoon.ingest import CollectionBundle
+
+
+@pytest.mark.parametrize("provider", ["duckdb", "motherduck", "bigquery"])
+@pytest.mark.parametrize("initialize", [False, True])
+def test_backend_factory_applies_settings_and_enforces_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: BackendName,
+    initialize: bool,
+) -> None:
+    """Every provider receives its settings without implicit schema provisioning."""
+    configuration = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        provider,
+        local_database=tmp_path / "configured.duckdb",
+        motherduck=MotherDuckConfig("usagebassoon_it"),
+        bigquery=BigQueryConfig(
+            "test-project",
+            "usagebassoon_it",
+            location="EU",
+            credentials_file=tmp_path / "credentials.json",
+            maximum_bytes_billed=123456,
+            timeout_seconds=17.0,
+        ),
+    )
+    backend = DuckDBBackend(":memory:")
+    constructors: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    readiness: list[str] = []
+
+    def construct(*args: object, **kwargs: object) -> StorageBackend:
+        """Record provider construction without contacting a remote service."""
+        constructors.append((args, kwargs))
+        return backend
+
+    def preflight() -> None:
+        readiness.append("preflight")
+
+    def forbidden_ddl() -> None:
+        raise AssertionError("backend construction must not issue DDL")
+
+    constructor = {
+        "duckdb": "usagebassoon.backends.duckdb_local.DuckDBBackend",
+        "motherduck": "usagebassoon.backends.motherduck.MotherDuckBackend",
+        "bigquery": "usagebassoon.backends.bigquery.BigQueryBackend",
+    }[provider]
+    monkeypatch.setattr(constructor, construct)
+    monkeypatch.setattr(backend, "preflight", preflight)
+    monkeypatch.setattr(backend, "apply_ddl", forbidden_ddl)
+    try:
+        assert open_backend(configuration, initialize=initialize) is backend
+        assert readiness == ([] if initialize else ["preflight"])
+        expected: tuple[tuple[object, ...], dict[str, object]]
+        if provider == "duckdb":
+            expected = ((configuration.local_database,), {})
+        elif provider == "motherduck":
+            expected = (("usagebassoon_it",), {})
+        else:
+            expected = (
+                ("test-project", "usagebassoon_it"),
+                {
+                    "location": "EU",
+                    "credentials_file": tmp_path / "credentials.json",
+                    "maximum_bytes_billed": 123456,
+                    "timeout_seconds": 17.0,
+                },
+            )
+        assert constructors == [expected]
+    finally:
+        backend.close()
+
+
+def test_registered_backend_uses_shared_open_and_snapshot_contract(
+    tmp_path: Path,
+) -> None:
+    """An additional provider participates through the complete backend protocol."""
+    from usagebassoon.archiver import SnapshotArchiver
+
+    backend = DuckDBBackend(":memory:")
+    configuration = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        cast(BackendName, "additional-provider"),
+    )
+    opened: list[UsageBassoonConfig] = []
+
+    def construct(config: UsageBassoonConfig) -> StorageBackend:
+        opened.append(config)
+        return backend
+
+    registry = StorageBackendRegistry(factories={"additional-provider": construct})
+    try:
+        assert opened == []
+        provision = open_backend(configuration, initialize=True, registry=registry)
+        assert provision is backend
+        provision.apply_ddl()
+        assert open_backend(configuration, registry=registry) is backend
+        archive = SnapshotArchiver(str(tmp_path / "archive"))
+        snapshot = archive.write(backend, run_id="registered", manual=True, pin=True)
+        assert snapshot is not None
+        with archive.reader.prepare(snapshot) as prepared:
+            assert prepared.manifest["source_backend"] == "duckdb"
+        assert opened == [configuration, configuration]
+    finally:
+        backend.close()
+    with pytest.raises(ValueError, match="unsupported storage backend provider"):
+        open_backend(configuration)
+
+
+@pytest.mark.parametrize("provider", ["duckdb", "motherduck", "bigquery"])
+def test_backend_factory_rejects_missing_selected_settings(
+    tmp_path: Path, provider: BackendName
+) -> None:
+    """Missing provider settings fail before attempting connection or authentication."""
+    configuration = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        provider,
+    )
+    with pytest.raises(ValueError, match="missing"):
+        open_backend(configuration)
 
 
 def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
@@ -44,7 +175,6 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
 def test_local_backend_merges_current_state_in_place(
     collection_bundle: CollectionBundle,
 ) -> None:
-    from dataclasses import replace
     from datetime import timedelta
     from uuid import uuid4
 

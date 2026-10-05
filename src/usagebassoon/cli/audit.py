@@ -41,9 +41,13 @@ def _audit(
     try:
         if selection is not None:
             tables = SNAPSHOT_TABLES if sources else ("collection_ledger",)
-            with read_archiver(config).reader.prepare(
+            archiver = read_archiver(config)
+            with archiver.reader.prepare(
                 selection, tables=tables, warning=notice
             ) as prepared:
+                from usagebassoon.cli.snapshot import confirm_location
+
+                confirm_location(archiver, prepared.candidate.uri)
                 rows = (
                     audit_sources(prepared=prepared)
                     if sources
@@ -76,6 +80,8 @@ def _audit(
             format="json" if json_output else "csv" if csv_output else "yaml",
             save=None,
         )
+    except typer.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
 

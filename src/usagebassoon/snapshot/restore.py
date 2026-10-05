@@ -39,17 +39,16 @@ def restore_prepared(
     """Prepare maintenance then commit validated files, resolving lost replies."""
     operation = restore_operation_id(prepared)
     if backend.restore_committed(operation):
-        if notice:
-            notice(
-                "This snapshot restore already committed: "
-                f"{prepared.candidate.identifier}"
-            )
+        deliver_notice(
+            notice,
+            f"This snapshot restore already committed: {prepared.candidate.identifier}",
+        )
         report_maintenance(backend, notice)
         return prepared.rows
     if not preflight_checked:
         backend.check_restore_empty()
     try:
-        backend.prepare_recovery(notice=notice)
+        backend.prepare_recovery(notice=lambda message: deliver_notice(notice, message))
         try:
             backend.restore_snapshot(
                 prepared.files,
@@ -69,17 +68,28 @@ def restore_prepared(
             _LOG.warning(
                 "Restore committed; its acknowledgement was interrupted", exc_info=True
             )
-            if notice:
-                notice("Restore committed; its acknowledgement was interrupted.")
+            deliver_notice(
+                notice, "Restore committed; its acknowledgement was interrupted."
+            )
     finally:
         report_maintenance(backend, notice)
-    if notice:
-        notice(
-            f"Recovered {prepared.candidate.uri}, "
-            f"captured {prepared.candidate.captured_at}. Run bassoon init after "
-            "verification to resume applicable maintenance."
-        )
+    deliver_notice(
+        notice,
+        f"Recovered {prepared.candidate.uri}, "
+        f"captured {prepared.candidate.captured_at}. Run bassoon init after "
+        "verification to resume applicable maintenance.",
+    )
     return prepared.rows
+
+
+def deliver_notice(notice: Callable[[str], None] | None, message: str) -> None:
+    """Deliver optional recovery information without changing its outcome."""
+    if notice is None:
+        return
+    try:
+        notice(message)
+    except Exception:
+        _LOG.warning("could not deliver restore notice", exc_info=True)
 
 
 def report_maintenance(

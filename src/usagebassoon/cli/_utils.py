@@ -11,12 +11,12 @@ import typer
 
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.backends.factory import open_backend
 from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
     UsageBassoonConfig,
-    open_backend,
 )
 
 

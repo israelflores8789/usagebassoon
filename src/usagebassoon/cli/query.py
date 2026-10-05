@@ -17,9 +17,10 @@ import typer
 from rich.table import Table
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.backends.factory import open_backend
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli.spinner import spinner
-from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
+from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.display import sanitize_display
 from usagebassoon.sql_safety import (
     MAX_PUBLIC_QUERY_LIMIT,

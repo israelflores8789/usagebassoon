@@ -422,7 +422,9 @@ def test_snapshot_worker_runs_while_collection_is_blocked(
 
     configuration = replace(
         _configuration(tmp_path),
-        snapshots=SnapshotsConfig(local=LocalSnapshotConfig(path=tmp_path / "archive")),
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive", enable=True)
+        ),
     )
     captured = Event()
     blocked = Event()
@@ -485,7 +487,7 @@ def test_native_snapshot_artifacts_have_independent_cadence(
         _configuration(tmp_path),
         collection=CollectionConfig(schedule=ScheduleConfig(interval="2h")),
         snapshots=SnapshotsConfig(
-            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+            local=LocalSnapshotConfig(path=tmp_path / "archive", enable=True),
             schedule=SnapshotScheduleConfig(interval="10m"),
         ),
     )
@@ -522,7 +524,6 @@ def test_snapshot_schedule_defaults_and_disable_flags(
 
     from usagebassoon.config import (
         LocalSnapshotConfig,
-        SnapshotScheduleConfig,
         SnapshotsConfig,
     )
     from usagebassoon.scheduling import snapshot_schedule_seconds
@@ -530,8 +531,9 @@ def test_snapshot_schedule_defaults_and_disable_flags(
     config = replace(
         _configuration(tmp_path),
         snapshots=SnapshotsConfig(
-            local=LocalSnapshotConfig(path=tmp_path / "archive"),
-            schedule=SnapshotScheduleConfig(disable_weekly=disabled_weekly),
+            local=LocalSnapshotConfig(
+                path=tmp_path / "archive", enable=True, disable_weekly=disabled_weekly
+            ),
         ),
     )
     assert snapshot_schedule_seconds(config) == (43200.0 if disabled_weekly else 3600.0)
@@ -629,3 +631,45 @@ def test_unreadable_worker_pid_state_is_not_absence(
     with pytest.raises(SchedulingError) as caught:
         _read_worker_pid(tmp_path / "worker.pid")
     assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_healthy_collection_does_not_mask_an_inactive_snapshot_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backup scheduler state is independently actionable in doctor output."""
+    from dataclasses import replace
+
+    import usagebassoon.scheduling as module
+    from usagebassoon.config import LocalSnapshotConfig, SnapshotsConfig
+
+    config = replace(
+        _configuration(tmp_path),
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=tmp_path / "archive", enable=True)
+        ),
+    )
+    status = module.ScheduleStatus(
+        "linux",
+        "systemd",
+        True,
+        True,
+        True,
+        "15m",
+        tmp_path / "timer",
+        "log",
+        (),
+        snapshot_installed=True,
+        snapshot_active=False,
+    )
+
+    def available() -> module.SchedulerAvailability:
+        return module.SchedulerAvailability("linux", "systemd", True, "available")
+
+    def state(_config: UsageBassoonConfig) -> module.ScheduleStatus:
+        return status
+
+    monkeypatch.setattr(module, "scheduler_availability", available)
+    monkeypatch.setattr(module, "native_schedule_status", state)
+    check = module.schedule_doctor_check(config)
+    assert check.status == "warning" and "snapshot schedule" in check.message

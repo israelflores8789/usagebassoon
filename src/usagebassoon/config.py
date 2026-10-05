@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""config.py — Configuration loading and backend construction for UsageBassoon."""
+"""config.py — Configuration parsing, validation, and persistence for UsageBassoon."""
 
 from __future__ import annotations
 
@@ -27,10 +27,6 @@ from platformdirs import (
     user_state_path,
 )
 from yaspin.constants import SPINNER_ATTRS
-
-from usagebassoon.backends.base import StorageBackend, close_backend
-from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.backends.motherduck import MotherDuckBackend
 
 _LOG = logging.getLogger("usagebassoon")
 
@@ -76,9 +72,9 @@ _COLLECTION_CONFIG_KEYS = frozenset(
 _SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes", "disable"})
 _GCS_CONFIG_KEYS = frozenset(
-    {"uri", "project", "credentials_file", "timeout", "enable"}
+    {"uri", "project", "credentials_file", "timeout", "enable", "disable_weekly"}
 )
-_SNAPSHOT_CONFIG_KEYS = frozenset({"path", "enable"})
+_SNAPSHOT_CONFIG_KEYS = frozenset({"path", "enable", "disable_weekly"})
 _SNAPSHOTS_CONFIG_KEYS = frozenset({"local", "gcs", "schedule", "max_snapshots"})
 DEFAULT_SCHEDULE_INTERVAL = "15m"
 DEFAULT_SNAPSHOT_INTERVAL = "12h"
@@ -205,6 +201,7 @@ class GcsConfig:
 
     Attributes:
         enable: Whether to archive to Google Cloud Storage.
+        disable_weekly: Disable weekly recovery captures at this destination.
         uri: GCS archive root used for snapshots.
         project: GCP project identifier used by the Storage client.
         credentials_file: Optional service-account credential file path.
@@ -216,6 +213,7 @@ class GcsConfig:
     credentials_file: Path | None = None
     timeout_seconds: float = 60.0
     enable: bool = False
+    disable_weekly: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,23 +277,23 @@ class LocalSnapshotConfig:
     Attributes:
         path: Local archive path, normalized from a filesystem path or file:// URI.
         enable: Whether to archive to the local filesystem.
+        disable_weekly: Disable weekly recovery captures at this destination.
     """
 
     path: Path = field(default_factory=default_snapshot_directory)
-    enable: bool = True
+    enable: bool = False
+    disable_weekly: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class SnapshotScheduleConfig:
-    """Independent snapshot cadence and weekly recovery policy.
+    """Independent snapshot cadence.
 
     Attributes:
         interval: Positive snapshot duration in minutes, hours, or days.
-        disable_weekly: Disable the four weekly recovery slots.
     """
 
     interval: str = DEFAULT_SNAPSHOT_INTERVAL
-    disable_weekly: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +405,10 @@ def _local_snapshot_config(value: object | None) -> LocalSnapshotConfig:
             )
     return LocalSnapshotConfig(
         path=Path(path).expanduser() if path else default_snapshot_directory(),
-        enable=_boolean(table.get("enable", True), "snapshots.local.enable"),
+        enable=_boolean(table.get("enable", False), "snapshots.local.enable"),
+        disable_weekly=_boolean(
+            table.get("disable_weekly", False), "snapshots.local.disable_weekly"
+        ),
     )
 
 
@@ -437,7 +438,7 @@ def _snapshots_config(value: object | None) -> SnapshotsConfig:
     schedule = _table(
         table.get("schedule"),
         "snapshots.schedule",
-        frozenset({"interval", "disable_weekly"}),
+        frozenset({"interval"}),
     )
     interval, _ = _duration(
         schedule.get("interval", DEFAULT_SNAPSHOT_INTERVAL),
@@ -451,13 +452,7 @@ def _snapshots_config(value: object | None) -> SnapshotsConfig:
         ),
         local=local,
         gcs=gcs,
-        schedule=SnapshotScheduleConfig(
-            interval=interval,
-            disable_weekly=_boolean(
-                schedule.get("disable_weekly", False),
-                "snapshots.schedule.disable_weekly",
-            ),
-        ),
+        schedule=SnapshotScheduleConfig(interval=interval),
     )
 
 
@@ -750,17 +745,17 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
             parse_gcs_uri(uri)
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
-    if not enable:
-        return None
-    assert uri is not None and project is not None
     return GcsConfig(
-        uri=uri,
-        project=project,
+        uri=uri or "",
+        project=project or "",
         credentials_file=Path(credentials_file).expanduser()
         if credentials_file
         else None,
         timeout_seconds=timeout.total_seconds(),
         enable=enable,
+        disable_weekly=_boolean(
+            table.get("disable_weekly", False), "snapshots.gcs.disable_weekly"
+        ),
     )
 
 
@@ -831,7 +826,7 @@ def _parse_config(
         snapshot_schedule = _table(
             snapshots_table.get("schedule"),
             "snapshots.schedule",
-            frozenset({"interval", "disable_weekly"}),
+            frozenset({"interval"}),
         )
         snapshots_table = {
             **snapshots_table,
@@ -991,51 +986,6 @@ def _configuration_error_with_log(
         f"{error} (could not write the configuration error log at "
         f"{attempted_path}: {last_error})"
     )
-
-
-def open_backend(
-    config: UsageBassoonConfig, *, initialize: bool = False
-) -> StorageBackend:
-    """Open the backend selected by a validated configuration.
-
-    Args:
-        config: Validated UsageBassoon settings.
-        initialize: Skip preflight only for explicit schema provisioning.
-
-    Returns:
-        An open storage backend owned by the caller.
-
-    Raises:
-        ValueError: If required backend-specific settings are absent.
-    """
-    if config.backend == "duckdb":
-        if config.local_database is None:
-            raise ValueError("Local DuckDB path is missing")
-        backend: StorageBackend = DuckDBBackend(config.local_database)
-    elif config.backend == "motherduck":
-        if config.motherduck is None:
-            raise ValueError("MotherDuck settings are missing")
-        backend = MotherDuckBackend(config.motherduck.database)
-    else:
-        if config.bigquery is None:
-            raise ValueError("BigQuery settings are missing")
-        from usagebassoon.backends.bigquery import BigQueryBackend
-
-        backend = BigQueryBackend(
-            config.bigquery.project,
-            config.bigquery.dataset,
-            location=config.bigquery.location,
-            credentials_file=config.bigquery.credentials_file,
-            maximum_bytes_billed=config.bigquery.maximum_bytes_billed,
-            timeout_seconds=config.bigquery.timeout_seconds,
-        )
-    if not initialize:
-        try:
-            backend.preflight()
-        except BaseException:
-            close_backend(backend, context="failed backend preflight")
-            raise
-    return backend
 
 
 class ConfigurationManager:

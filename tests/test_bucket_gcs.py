@@ -283,7 +283,7 @@ def test_snapshot_renews_reservation_during_long_capture(
     monkeypatch.setattr(Catalog, "_update_reservation", renew)
     archive = MemoryGcsArchive()
     backend = WaitingBackend()
-    store = SnapshotStore(archive.uri, gcs_bucket=archive)
+    store = SnapshotStore(archive.uri, buckets=(archive,))
     assert store.write(cast(StorageBackend, backend), run_id="waiting") is not None
     assert renewed.is_set()
     assert backend.queries == len(SNAPSHOT_TABLES)
@@ -336,18 +336,17 @@ def test_simultaneous_gcs_catalog_claim_has_one_winner() -> None:
 
 
 def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
-    """Retire objects at exact generations while preserving a lifecycle tombstone."""
+    """Retire exact generations and forget completed cleanup."""
     archive = MemoryGcsArchive()
-    store = SnapshotStore(archive.uri, max_snapshots=1, gcs_bucket=archive)
+    store = SnapshotStore(archive.uri, max_snapshots=1, buckets=(archive,))
     backend = TableBackend()
     first = store.write(cast(StorageBackend, backend), run_id="one")
     second = store.write(cast(StorageBackend, backend), run_id="two")
     assert first is not None and second is not None
     assert store.list_snapshots() == [second.rsplit("/", 1)[-1]]
     retired = first.rsplit("/", 1)[-1]
-    assert [obj.name for obj in archive.list(retired)] == [f"{retired}/state.json"]
-    state, _ = archive.read_json(f"{retired}/state.json")
-    assert state is not None and state["retired"] is True
+    assert archive.list(retired) == ()
+    assert Catalog(archive).state(retired) is None
 
 
 def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
@@ -358,7 +357,7 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
     backend = TableBackend()
     local = tmp_path / "local"
     store = SnapshotStore(
-        file_uri=str(local), gcs_archive_uri=archive.uri, gcs_bucket=archive
+        destination_uris=(str(local), archive.uri), buckets=(archive,)
     )
     uri = store.write(cast(StorageBackend, backend), run_id="dual")
     assert uri is not None
@@ -383,9 +382,8 @@ def test_pending_destination_renews_during_slow_publication(
     """Retain every destination reservation until all copies finish publication."""
     archive = MemoryGcsArchive()
     store = SnapshotStore(
-        file_uri=str(tmp_path / "local"),
-        gcs_archive_uri=archive.uri,
-        gcs_bucket=archive,
+        destination_uris=(str(tmp_path / "local"), archive.uri),
+        buckets=(archive,),
     )
     import usagebassoon.snapshot.catalog as module
 
@@ -421,9 +419,8 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
     """Do not rotate either destination after an incomplete dual publication."""
     archive = MemoryGcsArchive()
     store = SnapshotStore(
-        file_uri=str(tmp_path / "local"),
-        gcs_archive_uri=archive.uri,
-        gcs_bucket=archive,
+        destination_uris=(str(tmp_path / "local"), archive.uri),
+        buckets=(archive,),
         max_snapshots=1,
     )
     first = store.write(cast(StorageBackend, TableBackend()), run_id="first")
@@ -439,7 +436,7 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
     with pytest.raises(RuntimeError, match="catalog publication failed"):
         store.write(cast(StorageBackend, TableBackend()), run_id="second")
     candidates, _ = store.reader.candidates()
-    # A retired rollback entry must never be eligible for recovery.
+    # Both destinations preserve their prior recovery point after rollback.
     with store.reader.prepare() as prepared:
         assert prepared.candidate.identifier == first.rsplit("/", 1)[-1]
     assert len(candidates) == 2
@@ -471,12 +468,13 @@ def test_gcs_live_project_uses_ci_variable_without_adc_project_discovery(
         raise AssertionError("CI must not discover a project from local ADC")
 
     monkeypatch.setenv("CI", "true")
-    monkeypatch.setenv("USAGEBASSOON_GCS_PROJECT", "obsolete-project")
     monkeypatch.setattr(google.auth, "default", no_adc_project)
     if project is None:
-        monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
-        with pytest.raises(pytest.fail.Exception, match="GCP_PROJECT_ID is required"):
+        monkeypatch.delenv("USAGEBASSOON_GCS_PROJECT", raising=False)
+        with pytest.raises(
+            pytest.fail.Exception, match="USAGEBASSOON_GCS_PROJECT is required"
+        ):
             _test_project()
     else:
-        monkeypatch.setenv("GCP_PROJECT_ID", project)
+        monkeypatch.setenv("USAGEBASSOON_GCS_PROJECT", project)
         assert _test_project() == project

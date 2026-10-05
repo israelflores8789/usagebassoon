@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 from base64 import b64decode
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
@@ -21,7 +22,8 @@ from tempfile import TemporaryDirectory
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from usagebassoon.buckets.base import SnapshotBucket, validate_relative_name
+from usagebassoon.buckets.base import SnapshotBucket, bucket_uri, validate_relative_name
+from usagebassoon.buckets.factory import bucket_label
 from usagebassoon.snapshot.catalog import Catalog
 from usagebassoon.snapshot.format import (
     DATA_CONTRACTS,
@@ -39,6 +41,21 @@ from usagebassoon.storage_model import (
 )
 
 _LOG = logging.getLogger("usagebassoon")
+
+
+def snapshot_location(selection: str) -> str:
+    """Normalize archive roots and snapshot paths without opening any provider."""
+    return bucket_uri(selection).removesuffix("/manifest.json")
+
+
+def _warning(callback: Callable[[str], None] | None, message: str) -> None:
+    """Keep optional warning delivery from invalidating immutable recovery."""
+    if callback is None:
+        return
+    try:
+        callback(message)
+    except Exception:
+        _LOG.warning("Could not deliver snapshot recovery warning", exc_info=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,12 +97,20 @@ class SnapshotReader:
 
     def __init__(
         self,
-        buckets: Sequence[SnapshotBucket],
+        buckets: Sequence[SnapshotBucket] | Callable[[], Sequence[SnapshotBucket]],
         resolver: Callable[[str], SnapshotBucket],
+        *,
+        locations: Sequence[str] | None = None,
     ) -> None:
         """Bind configured locations and an authenticated URI resolver."""
-        self.buckets = tuple(buckets)
+        self._buckets = buckets
         self.resolver = resolver
+        self._locations = tuple(locations) if locations is not None else None
+
+    @property
+    def buckets(self) -> tuple[SnapshotBucket, ...]:
+        """Resolve configured archives lazily, independently of explicit selections."""
+        return tuple(self._buckets() if callable(self._buckets) else self._buckets)
 
     def candidates(
         self,
@@ -96,7 +121,7 @@ class SnapshotReader:
         recovery: bool = False,
     ) -> tuple[list[Candidate], bool]:
         """Resolve a latest/root request or an exact ID/path request."""
-        buckets = self.buckets
+        buckets: tuple[SnapshotBucket, ...] | None = None
         exact: str | None = None
         automatic = selection == "latest"
         if selection != "latest":
@@ -105,7 +130,7 @@ class SnapshotReader:
                 or selection.startswith((".", "~"))
                 or Path(selection).exists()
             ):
-                location = selection.rstrip("/").removesuffix("/manifest.json")
+                location = snapshot_location(selection)
                 bucket = self.resolver(location)
                 direct = any(
                     obj.name == "manifest.json" for obj in bucket.list("manifest.json")
@@ -123,6 +148,22 @@ class SnapshotReader:
                 exact = snapshot_id(selection)
         candidates: list[Candidate] = []
         failures: list[str] = []
+        if buckets is None:
+            if self._locations is None:
+                buckets = self.buckets
+            else:
+                resolved: list[SnapshotBucket] = []
+                for uri in self._locations:
+                    try:
+                        resolved.append(self.resolver(uri))
+                    except Exception as error:
+                        message = f"Cannot open snapshot archive at {uri}: {error}"
+                        if not automatic:
+                            raise ValueError(message) from error
+                        _LOG.warning(message, exc_info=True)
+                        failures.append(message)
+                        _warning(warning, message)
+                buckets = tuple(resolved)
         for bucket in buckets:
             try:
                 entries: list[dict[str, object]] = []
@@ -154,9 +195,8 @@ class SnapshotReader:
                 if not automatic:
                     raise ValueError(message) from error
                 failures.append(message)
-                _LOG.warning(message)
-                if warning:
-                    warning(message)
+                _LOG.warning(message, exc_info=True)
+                _warning(warning, message)
         candidates.sort(
             key=_candidate_order,
             reverse=True,
@@ -244,9 +284,7 @@ class SnapshotReader:
                         "id": candidate.identifier,
                         "captured_at": candidate.captured_at,
                         "latest": candidate.identifier == latest,
-                        "location": "GCS"
-                        if candidate.bucket.uri.startswith("gs://")
-                        else "Local",
+                        "location": bucket_label(candidate.bucket.uri),
                         "uri": candidate.uri,
                         "pinned": state.get("pinned") if state else None,
                         "roles": state.get("roles") if state else None,
@@ -286,13 +324,13 @@ class SnapshotReader:
         """Resolve exact lifecycle targets, including cleanup of retired copies."""
         if selection == "latest":
             raise ValueError("lifecycle changes require an exact snapshot ID or URI")
-        buckets = self.buckets
+        buckets: tuple[SnapshotBucket, ...] | None = None
         if (
             "/" in selection
             or selection.startswith((".", "~"))
             or Path(selection).exists()
         ):
-            location = selection.rstrip("/").removesuffix("/manifest.json")
+            location = snapshot_location(selection)
             parent, leaf = (
                 location.rsplit("/", 1) if "/" in location else (".", location)
             )
@@ -301,7 +339,7 @@ class SnapshotReader:
         else:
             identifier = snapshot_id(selection)
         targets: list[Candidate] = []
-        for bucket in buckets:
+        for bucket in self.buckets if buckets is None else buckets:
             state, _ = bucket.read_json(f"{identifier}/state.json")
             if state is not None:
                 targets.append(
@@ -464,8 +502,7 @@ class SnapshotReader:
         def discovery_warning(message: str) -> None:
             """Keep discovery failures in recovery metadata and stderr notices."""
             notices.append(message)
-            if warning:
-                warning(message)
+            _warning(warning, message)
 
         candidates, automatic = self.candidates(
             selection, warning=discovery_warning, recovery=True
@@ -549,9 +586,15 @@ class SnapshotReader:
                     if not automatic:
                         raise ValueError(message) from error
                     notices.append(message)
-                    _LOG.warning(message)
-                    if warning:
-                        warning(message)
+                    _LOG.warning(message, exc_info=True)
+                    _warning(warning, message)
+                    try:
+                        shutil.rmtree(candidate_directory)
+                    except OSError:
+                        _LOG.warning(
+                            "Could not remove rejected snapshot files", exc_info=True
+                        )
+                        raise
                     continue
                 prepared = downloaded
                 break
@@ -564,8 +607,7 @@ class SnapshotReader:
                     "see recovery warnings above."
                 )
                 _LOG.warning(message)
-                if warning:
-                    warning(message)
+                _warning(warning, message)
             # Destination exceptions occur outside the fallback loop.
             yield PreparedSnapshot(
                 prepared.candidate,

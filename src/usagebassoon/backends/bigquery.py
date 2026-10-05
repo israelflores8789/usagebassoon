@@ -159,6 +159,10 @@ class _JobTimeout(RuntimeError):
     """A job wait expired; replaying a publication keeps its event identifiers."""
 
 
+class _RestoreUncertain(RuntimeError):
+    """A submitted restore job has not been observed in a terminal state."""
+
+
 class _StorageReadClient(Protocol):
     """Expose the high-level Storage client's stream-name read method."""
 
@@ -913,95 +917,159 @@ class BigQueryBackend(AbstractStorageBackend):
     @override
     def restore_committed(self, operation_id: str) -> bool:
         """Resolve restore completion from the receipt committed with its rows."""
-        rows = self._wait_for_job(
-            self.client.query(
-                f"SELECT 1 FROM {self._table_ref('restore_receipts')} "
-                "WHERE operation_id = @operation_id LIMIT 1",
-                job_config=self._query_config(
-                    parameters=[
-                        bigquery.ScalarQueryParameter(
-                            "operation_id", "STRING", operation_id
-                        )
-                    ]
-                ),
-                location=self.location,
+        deadline = time.monotonic() + min(60.0, self.timeout_seconds)
+        remaining = self._recovery_budget(deadline)
+        committed = self._restore_receipt(operation_id, remaining)
+        if not committed and any(
+            (job.labels or {}).get("usagebassoon_restore") == operation_id
+            for job in self._restore_jobs(remaining)
+        ):
+            raise RuntimeError(
+                "Restore completion could not be determined: "
+                "an owned job is still active. "
+                "Keep writers stopped and retry with --cleanup-stages."
             )
+        return committed
+
+    def _restore_receipt(
+        self, operation_id: str, remaining: Callable[[], float]
+    ) -> bool:
+        """Inspect a receipt within the caller's recovery deadline."""
+        job = self.client.query(
+            f"SELECT 1 FROM {self._table_ref('restore_receipts')} "
+            "WHERE operation_id = @operation_id LIMIT 1",
+            job_config=self._query_config(
+                parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "operation_id", "STRING", operation_id
+                    )
+                ]
+            ),
+            location=self.location,
+            retry=Retry(predicate=lambda _error: False),
+            timeout=remaining(),
+        )
+        rows = job.result(
+            timeout=remaining(),
+            retry=Retry(predicate=lambda _error: False),
+            job_retry=None,
         )
         return next(iter(rows), None) is not None
+
+    @staticmethod
+    def _recovery_budget(deadline: float) -> Callable[[], float]:
+        """Share one deadline across all recovery RPCs and waits."""
+
+        def remaining() -> float:
+            """Fail closed when recovery completion cannot be established in time."""
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise RuntimeError(
+                    "Restore completion could not be determined before the "
+                    "recovery deadline; staging was preserved"
+                )
+            return budget
+
+        return remaining
+
+    def _restore_jobs(
+        self, remaining: Callable[[], float]
+    ) -> list[bigquery.QueryJob | bigquery.LoadJob]:
+        """Find every active owned job, even when no staging table survives."""
+        from google.api_core.exceptions import Forbidden
+
+        result: list[bigquery.QueryJob | bigquery.LoadJob] = []
+        destination = sha256(self.dataset_ref.encode()).hexdigest()[:63]
+        for state in ("pending", "running"):
+            token: str | None = None
+            while True:
+                try:
+                    pager = self.client.list_jobs(
+                        project=self.project,
+                        all_users=True,
+                        state_filter=state,
+                        page_token=token,
+                        retry=Retry(predicate=lambda _error: False),
+                        timeout=remaining(),
+                    )
+                    page = next(iter(pager.pages))
+                except Forbidden as error:
+                    raise RuntimeError(
+                        "Restore job visibility requires bigquery.jobs.listAll "
+                        "on the project; completion cannot be determined"
+                    ) from error
+                for job in page:
+                    if isinstance(job, (bigquery.QueryJob, bigquery.LoadJob)):
+                        labels: dict[str, str] = job.labels or {}
+                        if (
+                            labels.get("usagebassoon_kind") == "restore_job"
+                            and labels.get("usagebassoon_destination") == destination
+                        ):
+                            result.append(job)
+                remaining()
+                token = pager.next_page_token
+                if not token:
+                    break
+        return result
 
     @override
     def restore_stages(self) -> list[dict[str, object]]:
         """Inspect only label-owned restore stages, including their expiry."""
+        return self._restore_stage_records(
+            self._recovery_budget(time.monotonic() + min(60.0, self.timeout_seconds))
+        )
+
+    def _restore_stage_records(
+        self, remaining: Callable[[], float]
+    ) -> list[dict[str, object]]:
+        """Discover disposable stages with bounded metadata reads."""
         result: list[dict[str, object]] = []
-        for item in self.client.list_tables(self.dataset_ref):
-            table = self.client.get_table(item.reference)
-            labels = table.labels or {}
-            if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
-                "usagebassoon_restore"
-            ):
-                result.append(
-                    {
-                        "table": str(table.reference),
-                        "operation_id": labels["usagebassoon_restore"],
-                        "expires_at": table.expires,
-                    }
+        token: str | None = None
+        while True:
+            pager = self.client.list_tables(
+                self.dataset_ref,
+                page_token=token,
+                retry=Retry(predicate=lambda _error: False),
+                timeout=remaining(),
+            )
+            page = next(iter(pager.pages))
+            for item in page:
+                table = self.client.get_table(
+                    item.reference,
+                    retry=Retry(predicate=lambda _error: False),
+                    timeout=remaining(),
                 )
-        return result
+                labels = table.labels or {}
+                if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
+                    "usagebassoon_restore"
+                ):
+                    result.append(
+                        {
+                            "table": str(table.reference),
+                            "operation_id": labels["usagebassoon_restore"],
+                            "expires_at": table.expires,
+                        }
+                    )
+            remaining()
+            token = pager.next_page_token
+            if not token:
+                return result
 
     @override
     def cleanup_restore_stages(self) -> None:
         """Drain owned restore jobs and immediately discard disposable stages."""
-        stages = self.restore_stages()
-        if not stages:
-            return
-        operations = {str(stage["operation_id"]) for stage in stages}
         deadline = time.monotonic() + min(60.0, self.timeout_seconds)
-
-        def remaining() -> float:
-            """Share one deadline across discovery, cancellation and polling."""
-            budget = deadline - time.monotonic()
-            if budget <= 0:
-                raise RuntimeError(
-                    "owned restore jobs remain active; staging was preserved, "
-                    "retry cleanup"
-                )
-            return budget
-
-        for state in ("pending", "running"):
-            for job in self.client.list_jobs(
-                all_users=True,
-                state_filter=state,
-                retry=Retry(predicate=lambda _error: False),
-                timeout=remaining(),
-            ):
-                if not isinstance(job, (bigquery.QueryJob, bigquery.LoadJob)):
-                    continue
-                labels: dict[str, str] = job.labels or {}
-                if (
-                    labels.get("usagebassoon_kind") != "restore_job"
-                    or labels.get("usagebassoon_destination")
-                    != sha256(self.dataset_ref.encode()).hexdigest()[:63]
-                    or labels.get("usagebassoon_restore") not in operations
-                ):
-                    continue
-                job.cancel(
-                    retry=Retry(predicate=lambda _error: False), timeout=remaining()
-                )
-                while job.state != "DONE":
-                    job.reload(
-                        retry=Retry(predicate=lambda _error: False), timeout=remaining()
-                    )
-                    if job.state != "DONE":
-                        time.sleep(min(0.5, remaining()))
+        remaining = self._recovery_budget(deadline)
+        self._drain_restore_jobs(remaining)
+        stages = self._restore_stage_records(remaining)
         for stage in stages:
             operation = str(stage["operation_id"])
-            committed = self.restore_committed(operation)
+            committed = self._restore_receipt(operation, remaining)
             _LOG.info(
                 "Discarding owned restore stage %s; committed=%s",
                 stage["table"],
                 committed,
             )
-            # Recheck ownership immediately before deleting an observed table.
             table = self.client.get_table(
                 str(stage["table"]),
                 retry=Retry(predicate=lambda _error: False),
@@ -1019,6 +1087,59 @@ class BigQueryBackend(AbstractStorageBackend):
                 retry=Retry(predicate=lambda _error: False),
                 timeout=remaining(),
             )
+
+    def _drain_restore_jobs(self, remaining: Callable[[], float]) -> None:
+        """Cancel owned jobs and establish terminal status before deleting stages."""
+        for job in self._restore_jobs(remaining):
+            self._drain_restore_job(job, remaining)
+
+    @staticmethod
+    def _drain_restore_job(
+        job: bigquery.QueryJob | bigquery.LoadJob, remaining: Callable[[], float]
+    ) -> None:
+        """Observe the exact submitted job until cancellation or completion settles."""
+        if job.state != "DONE":
+            job.cancel(retry=Retry(predicate=lambda _error: False), timeout=remaining())
+        while job.state != "DONE":
+            job.reload(retry=Retry(predicate=lambda _error: False), timeout=remaining())
+            if job.state != "DONE":
+                time.sleep(min(0.5, remaining()))
+
+    def _wait_restore_job(
+        self, job: bigquery.QueryJob | bigquery.LoadJob
+    ) -> Iterable[Mapping[str, object]]:
+        """Resolve a failed wait using the exact submitted job reference."""
+        try:
+            options = Retry(predicate=lambda _error: False)
+            rows = (
+                job.result(timeout=self.timeout_seconds, retry=options, job_retry=None)
+                if isinstance(job, bigquery.QueryJob)
+                else job.result(timeout=self.timeout_seconds, retry=options)
+            )
+            return cast(Iterable[Mapping[str, object]], rows)
+        except Exception as wait_error:
+            try:
+                self._drain_restore_job(
+                    job,
+                    self._recovery_budget(
+                        time.monotonic() + min(60.0, self.timeout_seconds)
+                    ),
+                )
+            except Exception as error:
+                _LOG.warning(
+                    "Restore job completion remains unknown; preserving staging",
+                    exc_info=True,
+                )
+                raise _RestoreUncertain(
+                    "Restore completion could not be determined; keep writers "
+                    "stopped and retry receipt inspection or --cleanup-stages"
+                ) from error
+            if isinstance(wait_error, FutureTimeoutError):
+                raise _JobTimeout(
+                    f"BigQuery restore job exceeded {self.timeout_seconds:.0f} "
+                    "seconds; its terminal state was subsequently observed"
+                ) from wait_error
+            raise
 
     @override
     def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
@@ -1047,6 +1168,7 @@ class BigQueryBackend(AbstractStorageBackend):
         self.cleanup_restore_stages()
         attempt_id = uuid4().hex
         stages: dict[str, str] = {}
+        cleanup_allowed = True
         try:
             for table, path in files.items():
                 stage = self._stage_id(table, attempt_id)
@@ -1066,7 +1188,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 options = bigquery.ParquetOptions()
                 options.enable_list_inference = True
                 with path.open("rb") as payload:
-                    self._wait_for_job(
+                    self._wait_restore_job(
                         self.client.load_table_from_file(
                             payload,
                             stage,
@@ -1088,12 +1210,30 @@ class BigQueryBackend(AbstractStorageBackend):
                         )
                     )
             self._commit_restore(stages, operation_id, snapshot_id)
+        except _RestoreUncertain:
+            cleanup_allowed = False
+            raise
         except BadRequest as error:
             if "restore requires an empty warehouse" in str(error):
                 raise ValueError("restore requires an empty warehouse") from error
             raise
+        except BaseException:
+            cleanup_allowed = False
+            raise
         finally:
-            self._delete_stages(tuple(stages.values()))
+            if cleanup_allowed:
+                try:
+                    remaining = self._recovery_budget(
+                        time.monotonic() + min(60.0, self.timeout_seconds)
+                    )
+                    self._drain_restore_jobs(remaining)
+                    self._delete_stages(tuple(stages.values()), remaining=remaining)
+                except Exception:
+                    _LOG.warning(
+                        "Restore jobs could not be drained; "
+                        "owned staging remains for retry",
+                        exc_info=True,
+                    )
 
     def _commit_restore(
         self, stages: Mapping[str, str], operation_id: str, snapshot_id: str
@@ -1157,7 +1297,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 :63
             ],
         }
-        self._wait_for_job(
+        self._wait_restore_job(
             self.client.query(
                 "\n".join(statements),
                 job_config=options,
@@ -1211,11 +1351,18 @@ class BigQueryBackend(AbstractStorageBackend):
         """Return one collision-resistant staging table reference for SQL."""
         return f"`{self._stage_id(table, run_id)}`"
 
-    def _delete_stages(self, stages: Sequence[str]) -> None:
+    def _delete_stages(
+        self, stages: Sequence[str], *, remaining: Callable[[], float] | None = None
+    ) -> None:
         """Best-effort remove staging tables after a batch reaches a terminal state."""
         for stage in stages:
             try:
-                self.client.delete_table(stage, not_found_ok=True)
+                self.client.delete_table(
+                    stage,
+                    not_found_ok=True,
+                    retry=Retry(predicate=lambda _error: False),
+                    timeout=remaining() if remaining else self.timeout_seconds,
+                )
                 _LOG.info("removed BigQuery staging table %s", stage)
             except Exception:
                 _LOG.exception("could not remove BigQuery staging table %s", stage)

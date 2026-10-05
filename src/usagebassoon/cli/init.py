@@ -11,12 +11,12 @@ from typing import Annotated
 import typer
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.backends.factory import open_backend
 from usagebassoon.cli.snapshot import notice
 from usagebassoon.cli.spinner import spinner
 from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
-    open_backend,
     write_initial_config,
 )
 

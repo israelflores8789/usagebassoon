@@ -202,7 +202,7 @@ def _local_snapshot_config(
         settings.config_path.read_text().replace(
             f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
         )
-        + f'\n[snapshots.local]\npath = "{directory / "snapshots"}"\n'
+        + f'\n[snapshots.local]\nenable = true\npath = "{directory / "snapshots"}"\n'
     )
     return path
 

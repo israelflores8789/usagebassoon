@@ -25,7 +25,14 @@ from usagebassoon.archiver import SNAPSHOT_TABLES
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.buckets.base import SnapshotPreconditionError
+from usagebassoon.buckets.base import (
+    ScopedSnapshotBucket,
+    SnapshotBucket,
+    SnapshotObject,
+    SnapshotPreconditionError,
+    SnapshotVersion,
+)
+from usagebassoon.buckets.factory import SnapshotBucketRegistry
 from usagebassoon.buckets.local import LocalSnapshotBucket
 from usagebassoon.config import (
     LocalSnapshotConfig,
@@ -36,11 +43,372 @@ from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.reader import SnapshotReader
 
 
+@pytest.mark.parametrize("provider", ["local", "gcs"])
+@pytest.mark.parametrize("boundary", ["data", "sidecar", "forget"])
+def test_retirement_retries_every_cleanup_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    boundary: str,
+) -> None:
+    """Retain pending authority across deletion and final CAS failures."""
+    from tests.test_bucket_gcs import MemoryGcsArchive
+
+    bucket = cast(
+        SnapshotBucket,
+        LocalSnapshotBucket(str(tmp_path / "archive"))
+        if provider == "local"
+        else MemoryGcsArchive(),
+    )
+    catalog = Catalog(bucket)
+    with catalog.hold():
+        catalog.stage(
+            "pending", {"pinned": False, "retired": False, "published": False}
+        )
+        bucket.write_bytes("pending/data.parquet", b"snapshot data")
+        original_delete = bucket.delete
+        original_write = bucket.write_json_cas
+
+        def fail_delete(name: str, *, version: SnapshotVersion) -> None:
+            """Interrupt either immutable deletion or final sidecar deletion."""
+            target = (
+                "pending/data.parquet" if boundary == "data" else "pending/state.json"
+            )
+            if boundary != "forget" and name == target:
+                raise OSError("interrupted deletion")
+            original_delete(name, version=version)
+
+        def fail_forget(
+            name: str,
+            payload: dict[str, object],
+            *,
+            expected_version: SnapshotVersion | None,
+        ) -> SnapshotObject:
+            """Interrupt the CAS that removes completed cleanup evidence."""
+            if boundary == "forget" and name == "control.json":
+                records = payload.get("records")
+                if isinstance(records, dict) and "pending" not in records:
+                    raise OSError("interrupted deletion")
+            return original_write(name, payload, expected_version=expected_version)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bucket, "delete", fail_delete)
+            patch.setattr(bucket, "write_json_cas", fail_forget)
+            with pytest.raises(OSError, match="interrupted deletion"):
+                catalog.retire("pending")
+            state = catalog.state("pending")
+            assert state is not None and state["retired"] is True
+        fence = catalog.fence
+    with Catalog(bucket).hold(enforce_policy=True) as resumed:
+        assert resumed.fence is not None and fence is not None
+        assert resumed.fence > fence
+        assert resumed.control()[0]["records"] == {}
+        assert bucket.list("pending") == ()
+
+
+def test_local_object_versions_reject_identical_recreations(tmp_path: Path) -> None:
+    """Stale reads, deletes, and JSON CAS cannot target identical new files."""
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    old = bucket.write_bytes("copy/data", b"same bytes")
+    bucket.delete(old.name, version=old.version)
+    new = bucket.write_bytes(old.name, b"same bytes")
+    assert new.checksum == old.checksum
+    assert new.version != old.version
+    with pytest.raises(SnapshotPreconditionError):
+        bucket.delete(old.name, version=old.version)
+    with pytest.raises(SnapshotPreconditionError):
+        bucket.read_bytes(old.name, version=old.version)
+    assert bucket.read_bytes(new.name, version=new.version) == b"same bytes"
+    old_json = bucket.write_json_cas(
+        "control.json", {"value": 1}, expected_version=None
+    )
+    bucket.delete(old_json.name, version=old_json.version)
+    bucket.write_json_cas("control.json", {"value": 1}, expected_version=None)
+    with pytest.raises(SnapshotPreconditionError):
+        bucket.write_json_cas(
+            "control.json", {"value": 2}, expected_version=old_json.version
+        )
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"portable bytes")
+    uploaded = bucket.upload_file("copy/upload.parquet", source)
+    assert (
+        bucket.read_bytes(uploaded.name, version=uploaded.version)
+        == source.read_bytes()
+    )
+    downloaded = bucket.download_file(uploaded.name, tmp_path / "download.parquet")
+    assert downloaded.version == uploaded.version
+    assert downloaded.checksum == uploaded.checksum
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_publication_cleans_abandoned_stages_but_preserves_completed_units(
+    tmp_path: Path, complete: bool
+) -> None:
+    """Only an older fence and absent completion permit abandoned-stage cleanup."""
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    with Catalog(bucket).hold() as previous:
+        previous.stage(
+            "interrupted", {"pinned": False, "retired": False, "published": False}
+        )
+        bucket.write_bytes("interrupted/data.parquet", b"data")
+        if complete:
+            bucket.write_bytes(
+                "interrupted/COMPLETE", b"unverified completion evidence"
+            )
+    with Catalog(bucket).hold(enforce_policy=True) as current:
+        records = current.control()[0]["records"]
+        assert isinstance(records, dict)
+        assert ("interrupted" in records) is complete
+        assert bool(bucket.list("interrupted")) is complete
+
+
+@pytest.mark.parametrize("provider", ["local", "gcs"])
+def test_rotation_bounds_control_records_and_preserves_pins(
+    tmp_path: Path, provider: str
+) -> None:
+    """Control metadata tracks surviving recovery points rather than past captures."""
+    from tests.test_bucket_gcs import MemoryGcsArchive
+
+    if provider == "local":
+        store = SnapshotStore(str(tmp_path / "archive"), max_snapshots=1)
+        bucket: SnapshotBucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    else:
+        archive = MemoryGcsArchive()
+        store = SnapshotStore(archive.uri, max_snapshots=1, buckets=(archive,))
+        bucket = cast(SnapshotBucket, archive)
+    backend = cast(StorageBackend, TableBackend())
+    pinned = store.write(backend, run_id="pinned", manual=True, pin=True)
+    assert pinned is not None
+    retired: list[str] = []
+    latest = ""
+    for index in range(8):
+        uri = store.write(backend, run_id=str(index), manual=True)
+        assert uri is not None
+        if latest:
+            retired.append(latest)
+        latest = uri.rsplit("/", 1)[-1]
+        records = Catalog(bucket).control()[0]["records"]
+        assert isinstance(records, dict)
+        assert set(records) == {pinned.rsplit("/", 1)[-1], latest}
+    for identifier in retired:
+        assert bucket.list(identifier) == ()
+        if provider == "local":
+            assert not (tmp_path / "archive" / identifier).exists()
+
+
+def test_deleted_orphans_stay_recovery_only_during_discovery_and_repair(
+    tmp_path: Path,
+) -> None:
+    """Delayed immutable and sidecar publications cannot recreate lost authority."""
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    store = SnapshotStore(bucket.uri)
+    uri = store.write(
+        cast(StorageBackend, TableBackend()), run_id="orphan", manual=True
+    )
+    assert uri is not None
+    identifier = Path(uri).name
+    objects = {
+        obj.name: bucket.read_bytes(obj.name, version=obj.version)
+        for obj in bucket.list(identifier)
+    }
+    store.delete(uri)
+    for name, payload in objects.items():
+        bucket.write_bytes(name, payload)
+    catalog = Catalog(bucket)
+    assert catalog.entries() == []
+    assert catalog.discover(recovery=True)[0]["snapshot_id"] == identifier
+    with catalog.hold():
+        catalog.repair()
+        with pytest.raises(ValueError, match="already exists"):
+            catalog.stage(
+                identifier,
+                {"pinned": False, "retired": False, "published": False},
+            )
+    assert catalog.entries() == []
+    with store.reader.prepare(uri) as prepared:
+        assert prepared.manifest["snapshot_id"] == identifier
+    assert catalog.control()[0]["records"] == {}
+
+
+@pytest.mark.parametrize("provider", ["local", "gcs"])
+def test_changed_cleanup_revision_remains_pending_without_blocking_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Never delete a changed object or erase its unfinished cleanup evidence."""
+    from tests.test_bucket_gcs import MemoryGcsArchive
+
+    if provider == "local":
+        bucket: SnapshotBucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+        store = SnapshotStore(bucket.uri)
+    else:
+        archive = MemoryGcsArchive()
+        bucket = cast(SnapshotBucket, archive)
+        store = SnapshotStore(archive.uri, buckets=(archive,))
+    catalog = Catalog(bucket)
+    with catalog.hold():
+        catalog.stage(
+            "pending", {"pinned": False, "retired": False, "published": False}
+        )
+        old = bucket.write_bytes("pending/data.parquet", b"same bytes")
+        original = bucket.delete
+
+        def replace_before_delete(name: str, *, version: SnapshotVersion) -> None:
+            """Recreate the same content after cleanup captured its version."""
+            if name == old.name:
+                original(name, version=version)
+                bucket.write_bytes(name, b"same bytes")
+            original(name, version=version)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bucket, "delete", replace_before_delete)
+            with pytest.raises(SnapshotPreconditionError):
+                catalog.retire("pending")
+    published = store.write(
+        cast(StorageBackend, TableBackend()), run_id="independent", manual=True
+    )
+    assert published is not None
+    state = Catalog(bucket).state("pending")
+    assert state is not None and state["retired"] is True
+    current = next(obj for obj in bucket.list("pending") if obj.name == old.name)
+    assert current.version != old.version
+    assert bucket.read_bytes(current.name, version=current.version) == b"same bytes"
+    assert store.list_snapshots() == [published.rsplit("/", 1)[-1]]
+
+
+def test_completed_deletion_allows_explicit_reimport_of_the_same_identity(
+    tmp_path: Path,
+) -> None:
+    """An intentional reimport needs no permanent identity tombstone."""
+    store = SnapshotStore(str(tmp_path / "archive"))
+    original = store.write(
+        cast(StorageBackend, TableBackend()), run_id="reimport", manual=True
+    )
+    assert original is not None
+    clone = store.copy(original, str(tmp_path / "clone"))
+    manifest = (Path(original) / "manifest.json").read_bytes()
+    bucket = LocalSnapshotBucket(store.destination_uris[0])
+    stale = next(
+        obj
+        for obj in bucket.list(Path(original).name)
+        if obj.name.endswith("/manifest.json")
+    )
+    store.delete(original)
+    restored = SnapshotStore(str(tmp_path / "clone")).copy(clone, bucket.uri)
+    assert restored == original
+    assert (Path(restored) / "manifest.json").read_bytes() == manifest
+    assert Catalog(bucket).state(Path(original).name) is not None
+    with pytest.raises(SnapshotPreconditionError):
+        bucket.delete(stale.name, version=stale.version)
+
+
 def _backend() -> DuckDBBackend:
     """Create an initialized temporary DuckDB archive source."""
     backend = DuckDBBackend(":memory:")
     backend.apply_ddl()
     return backend
+
+
+def test_registered_remote_providers_share_capture_and_complete_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """Additional schemes support capture, URI recovery, relocation, and deletion."""
+    opened: list[str] = []
+
+    def simulated_remote(uri: str) -> SnapshotBucket:
+        """Provide protocol storage without depending on any remote SDK."""
+        opened.append(uri)
+        scheme, relative = uri.split("://", 1)
+        bucket = LocalSnapshotBucket(str(tmp_path / "providers" / scheme / relative))
+        bucket.uri = uri
+        return bucket
+
+    registry = SnapshotBucketRegistry()
+    for scheme in ("s3", "az", "r2"):
+        registry.register(scheme, simulated_remote)
+    roots = (
+        str(tmp_path / "local"),
+        "s3://test-bucket/archive",
+        "az://test-container/archive",
+        "r2://test-bucket/archive",
+    )
+    store = SnapshotStore(
+        destination_uris=roots,
+        bucket_factory=registry.resolve,
+        max_snapshots=1,
+    )
+    assert opened == []
+    backend = TableBackend()
+    snapshot = store.write(cast(StorageBackend, backend), run_id="many-providers")
+    assert snapshot is not None
+    assert backend.queries == len(SNAPSHOT_TABLES)
+    identifier = snapshot.rsplit("/", 1)[-1]
+    entries = store.reader.listing()
+    assert len(entries) == 4
+    assert {entry["location"] for entry in entries} == {"Local", "S3", "AZ", "R2"}
+    digests = {
+        sha256(store.reader.raw_manifest(candidate)[1]).hexdigest()
+        for candidate in store.reader.candidates()[0]
+    }
+    assert len(digests) == 1
+    exact = f"{roots[1]}/{identifier}"
+    assert store.selection_enabled(exact)
+    assert not store.selection_enabled("s3://different-bucket/archive")
+    store.pin(exact)
+    assert store.reader.listing(exact)[0]["pinned"] is True
+    copied = store.copy(exact + "/manifest.json", roots[2] + "/relocated")
+    assert copied == f"{roots[2]}/relocated/{identifier}"
+    target = _backend()
+    try:
+        assert store.restore(target, copied)["notes"] == 1
+    finally:
+        target.close()
+    store.delete(exact)
+    assert all(entry["uri"] != exact for entry in store.reader.listing())
+    assert store.reader.listing(copied)[0]["pinned"] is True
+
+
+def test_protocol_bucket_injection_supports_unregistered_provider_subroots(
+    tmp_path: Path,
+) -> None:
+    """An injected provider can serve exact URIs and nested relocation roots."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class RemoteBucket(LocalSnapshotBucket):
+        """A protocol adapter need not be hashable to participate in publication."""
+
+        uri: str
+
+        def __post_init__(self) -> None:
+            location = self.uri
+            super().__init__(str(tmp_path / "simulated-provider"))
+            self.uri = location
+
+    bucket = RemoteBucket("custom://test-bucket/archive")
+    store = SnapshotStore(buckets=(bucket,))
+    snapshot = store.write(
+        cast(StorageBackend, TableBackend()), run_id="injected", manual=True, pin=True
+    )
+    assert snapshot is not None
+    with store.reader.prepare(snapshot + "/manifest.json") as prepared:
+        assert prepared.rows["notes"] == 1
+    copied = store.copy(snapshot, bucket.uri + "/nested")
+    with store.reader.prepare(copied) as prepared:
+        assert prepared.rows["notes"] == 1
+    store.delete(copied)
+    assert store.reader.listing(snapshot)[0]["pinned"] is True
+
+
+def test_unknown_remote_scheme_fails_without_creating_local_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported provider must never silently become a filesystem path."""
+    monkeypatch.chdir(tmp_path)
+    store = SnapshotStore("unknown://test-bucket/archive")
+    with pytest.raises(ValueError, match="unsupported snapshot bucket URI scheme"):
+        store.write(cast(StorageBackend, TableBackend()), run_id="unsupported")
+    assert not (tmp_path / "unknown:").exists()
 
 
 def _append_note(backend: DuckDBBackend) -> None:
@@ -249,6 +617,7 @@ def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:
                 "fence": 999,
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             }
+            document["fence"] = 999
             bucket.write_json_cas("control.json", document, expected_version=version)
             catalog.check()
     finally:
@@ -337,9 +706,9 @@ def test_pins_preserve_manifest_digest_and_survive_rotation(tmp_path: Path) -> N
         assert Path(uri).name in store.list_snapshots()
         store.delete(uri)
         assert len(store.list_snapshots()) == 1
-        # Repeating an interrupted deletion addresses its surviving tombstone.
-        store.delete(uri)
-        assert json.loads((Path(uri) / "state.json").read_text())["retired"] is True
+        bucket = LocalSnapshotBucket(str(Path(uri).parent))
+        assert bucket.list(Path(uri).name) == ()
+        assert Catalog(bucket).state(Path(uri).name) is None
     finally:
         backend.close()
 
@@ -357,7 +726,7 @@ def test_weekly_retention_is_independent_and_never_fabricates_slots(
         "duckdb",
         snapshots=SnapshotsConfig(
             max_snapshots=1,
-            local=LocalSnapshotConfig(path=tmp_path / "archive"),
+            local=LocalSnapshotConfig(path=tmp_path / "archive", enable=True),
         ),
     )
     store = SnapshotStore.from_config(configuration)
@@ -619,7 +988,7 @@ def test_repair_corrupt_index_with_abandoned_stage(tmp_path: Path) -> None:
             catalog.cleanup_abandoned()
         assert store.list_snapshots() == [Path(uri).name]
         state = Catalog(bucket).state("abandoned")
-        assert state is not None and state["retired"] is True
+        assert state is None
     finally:
         backend.close()
 
@@ -925,8 +1294,11 @@ def test_archiver_uses_only_enabled_destinations(
         ),
     )
     if not local_enabled and not gcs_enabled:
-        with pytest.raises(ValueError, match="at least one snapshot destination"):
-            SnapshotStore.from_config(config)
+        store = SnapshotStore.from_config(config)
+        assert store.destination_uris == ()
+        assert (
+            store.write(cast(StorageBackend, TableBackend()), run_id="disabled") is None
+        )
         assert not calls
         return
     store = SnapshotStore.from_config(config)
@@ -940,32 +1312,53 @@ def test_archiver_uses_only_enabled_destinations(
     assert (
         store.write(cast(StorageBackend, TableBackend()), run_id="shared") is not None
     )
-    for bucket in store.reader.buckets:
+    for bucket in store._archives:
         control, _ = Catalog(bucket).control()
         assert control["policy"] == {"max_snapshots": 5, "weekly_slots": 4}
 
 
 @pytest.mark.parametrize("disable_weekly", [False, True])
+@pytest.mark.parametrize("cross_week", [False, True])
 def test_automatic_snapshots_observe_independent_cadence_and_weekly_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_weekly: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disable_weekly: bool,
+    cross_week: bool,
 ) -> None:
     """Automatic captures serve due roles and skip a call before twelve hours."""
-    import usagebassoon.archiver as module
-    from usagebassoon.config import SnapshotScheduleConfig
+    from collections.abc import Generator, Sequence
+    from contextlib import contextmanager
 
-    clock = [datetime.now(UTC)]
+    import usagebassoon.archiver as module
+    from usagebassoon.backends.base import SnapshotStream
+
+    clock = [
+        datetime(2026, 10, 4, 23, 59, tzinfo=UTC)
+        if cross_week
+        else datetime(2026, 10, 6, 12, tzinfo=UTC)
+    ]
     monkeypatch.setattr(module, "_now", lambda: clock[0])
     config = UsageBassoonConfig(
         tmp_path / "config.toml",
         "11111111-1111-4111-8111-111111111111",
         "duckdb",
         snapshots=SnapshotsConfig(
-            local=LocalSnapshotConfig(path=tmp_path / "archive"),
-            schedule=SnapshotScheduleConfig(disable_weekly=disable_weekly),
+            local=LocalSnapshotConfig(
+                path=tmp_path / "archive", enable=True, disable_weekly=disable_weekly
+            ),
         ),
     )
     store = SnapshotStore.from_config(config)
     backend = _backend()
+    original = backend.stream_snapshot
+
+    @contextmanager
+    def stream(tables: Sequence[str]) -> Generator[SnapshotStream]:
+        """Keep capture timestamps and cadence checks on one deterministic clock."""
+        with original(tables) as captured:
+            yield SnapshotStream(clock[0], captured.tables)
+
+    monkeypatch.setattr(backend, "stream_snapshot", stream)
     try:
         uri = store.write(backend, run_id="scheduled")
         assert uri is not None
@@ -975,7 +1368,13 @@ def test_automatic_snapshots_observe_independent_cadence_and_weekly_policy(
         )
         assert manifest["cadence"]["interval_seconds"] == 43200.0
         clock[0] += timedelta(minutes=1)
-        assert store.write(backend, run_id="early") is None
+        early = store.write(backend, run_id="early")
+        if cross_week and not disable_weekly:
+            assert early is not None
+            metadata = json.loads((Path(early) / "manifest.json").read_text())
+            assert metadata["cadence"]["roles"] == ["weekly"]
+        else:
+            assert early is None
         clock[0] += timedelta(hours=13)
         assert store.write(backend, run_id="due") is not None
     finally:
@@ -987,8 +1386,8 @@ def test_archive_read_configuration_does_not_require_a_backend(tmp_path: Path) -
     path = tmp_path / "config.toml"
     path.write_text(
         'backend.provider = "unavailable"\n'
-        f'[snapshots.local]\npath = "{tmp_path / "archive"}"\n'
-        '[snapshots.schedule]\ninterval = "2d"\ndisable_weekly = true\n'
+        f'[snapshots.local]\nenable = true\npath = "{tmp_path / "archive"}"\n'
+        '[snapshots.schedule]\ninterval = "2d"\n'
         "[snapshots.gcs]\nenable = false\n"
     )
     store = SnapshotStore.for_read(path)
@@ -1008,7 +1407,7 @@ def test_archive_discovery_honors_logging_opt_out(
     monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(directory))
     path = tmp_path / "config.toml"
     path.write_text(
-        f'[snapshots.local]\npath = "{tmp_path / "archive"}"\n'
+        f'[snapshots.local]\nenable = true\npath = "{tmp_path / "archive"}"\n'
         "[logging]\ndisable = true\n"
     )
     store = SnapshotStore.for_read(path)
@@ -1026,8 +1425,6 @@ def test_reservation_release_failure_preserves_operation_outcome(
 ) -> None:
     """Failed release is logged and expires without hiding successful or failed work."""
     import logging
-
-    from usagebassoon.buckets.base import SnapshotObject, SnapshotVersion
 
     bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
     original = bucket.write_json_cas
@@ -1154,3 +1551,330 @@ def test_local_publication_failure_survives_failed_temporary_cleanup(
         assert "secondary snapshot cleanup failure" in caplog.text
     finally:
         monkeypatch.undo()
+
+
+def test_relocated_directories_remain_visible_after_partial_authority(
+    tmp_path: Path,
+) -> None:
+    """Pinning one relocated recovery point does not hide other complete copies."""
+    import shutil
+
+    source = _backend()
+    _append_note(source)
+    origin = SnapshotStore(str(tmp_path / "origin"))
+    relocated = tmp_path / "relocated"
+    try:
+        copies = [origin.write(source, run_id="copy", manual=True) for _ in range(2)]
+        for uri in copies:
+            assert uri is not None
+            shutil.copytree(uri, relocated / Path(uri).name)
+        store = SnapshotStore(str(relocated))
+        identifiers = set(store.list_snapshots())
+        assert len(identifiers) == 2
+        store.pin(sorted(identifiers)[0])
+        assert set(store.list_snapshots()) == identifiers
+        published = store.write(source, run_id="new", manual=True, pin=True)
+        assert published is not None
+        assert set(store.list_snapshots()) == identifiers | {Path(published).name}
+    finally:
+        source.close()
+
+
+def test_stale_portable_projection_cannot_overwrite_a_new_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Takeover before sidecar projection preserves the new owner's portable pin."""
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    first, second = Catalog(bucket), Catalog(bucket)
+    first._update_reservation(claim=True)
+    first.stage("owned", {"pinned": False, "retired": False, "published": True})
+    old = first.state("owned")
+    assert old is not None
+    original = bucket.read_json
+    intercepted = False
+
+    def takeover(name: str) -> tuple[dict[str, object] | None, str | int | None]:
+        nonlocal intercepted
+        result = original(name)
+        if name == "owned/state.json" and not intercepted:
+            intercepted = True
+            document, version = original("control.json")
+            assert document is not None
+            reservation = document["reservation"]
+            assert isinstance(reservation, dict)
+            reservation["expires_at"] = (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat()
+            bucket.write_json_cas("control.json", document, expected_version=version)
+            second._update_reservation(claim=True)
+            second.pin("owned")
+        return result
+
+    monkeypatch.setattr(bucket, "read_json", takeover)
+    with pytest.raises(RuntimeError, match="portable state"):
+        first.transition("owned", old)
+    portable, _ = original("owned/state.json")
+    assert portable is not None and portable["pinned"] is True
+    assert second.state("owned") == portable
+
+
+def test_pin_projection_failure_is_reported_and_retry_preserves_relocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin is not reported portable until its sidecar has actually been saved."""
+    source = _backend()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="pin", manual=True)
+        assert uri is not None
+        bucket = LocalSnapshotBucket(str(Path(uri).parent))
+        catalog = Catalog(bucket)
+        original = bucket.write_json_cas
+
+        def fail_sidecar(
+            name: str, payload: dict[str, object], *, expected_version: str | int | None
+        ) -> object:
+            if name.endswith("/state.json"):
+                raise OSError("portable pin write failed")
+            return original(name, payload, expected_version=expected_version)
+
+        with catalog.hold():
+            monkeypatch.setattr(bucket, "write_json_cas", fail_sidecar)
+            with pytest.raises(RuntimeError, match="portable state"):
+                catalog.pin(Path(uri).name)
+            authoritative = catalog.state(Path(uri).name)
+            assert authoritative is not None and authoritative["pinned"] is True
+            monkeypatch.setattr(bucket, "write_json_cas", original)
+            catalog.pin(Path(uri).name)
+        portable, _ = bucket.read_json(f"{Path(uri).name}/state.json")
+        assert portable == Catalog(bucket).state(Path(uri).name)
+        assert portable is not None and portable["pinned"] is True
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize("damage", ["reservation", "fence", "policy", "records"])
+def test_corrupt_coordination_blocks_mutation_but_not_recovery(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    """Malformed authority cannot be silently claimed over intact recovery bytes."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="authority", manual=True)
+        assert uri is not None
+        path = Path(uri).parent / "control.json"
+        document = json.loads(path.read_text())
+        document[damage] = "malformed"
+        path.write_text(json.dumps(document))
+        with (
+            pytest.raises(ValueError),
+            Catalog(LocalSnapshotBucket(str(path.parent))).hold(),
+        ):
+            pytest.fail("malformed control was granted mutation authority")
+        assert store.restore(target, uri)["notes"] == 1
+    finally:
+        source.close()
+        target.close()
+
+
+def test_fallback_removes_rejected_downloads_before_the_next_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Late validation failure does not consume disk needed by the next copy."""
+    source = _backend()
+    _append_note(source)
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        older = store.write(source, run_id="older", manual=True)
+        newer = store.write(source, run_id="newer", manual=True)
+        assert older is not None and newer is not None
+        original = SnapshotReader.download
+
+        def download(
+            self: SnapshotReader,
+            candidate: object,
+            directory: Path,
+            tables: object,
+            **kwargs: object,
+        ) -> object:
+            from usagebassoon.snapshot.reader import Candidate
+
+            assert isinstance(candidate, Candidate)
+            if candidate.identifier == Path(newer).name:
+                (directory / "large-rejected-file").write_bytes(b"partial")
+                raise ValueError("late verification failure")
+            assert not (directory.parent / "0").exists()
+            return original(
+                self,
+                candidate,
+                directory,
+                cast(tuple[str, ...], tables),
+                **cast(dict[str, bool], kwargs),
+            )
+
+        monkeypatch.setattr(SnapshotReader, "download", download)
+        with store.reader.prepare() as prepared:
+            assert prepared.candidate.identifier == Path(older).name
+    finally:
+        source.close()
+
+
+def test_successful_restore_survives_failed_information_callbacks(
+    tmp_path: Path,
+) -> None:
+    """Both new and already-committed recovery survive unavailable notice sinks."""
+    source, target = _backend(), _backend()
+    _append_note(source)
+
+    def broken_notice(_message: str) -> None:
+        raise OSError("notice sink unavailable")
+
+    try:
+        store = SnapshotStore(str(tmp_path / "archive"))
+        uri = store.write(source, run_id="notice", manual=True)
+        assert uri is not None
+        assert store.restore(target, uri, notice=broken_notice)["notes"] == 1
+        assert store.restore(target, uri, notice=broken_notice)["notes"] == 1
+        assert target.query("SELECT * FROM restore_receipts").num_rows == 1
+    finally:
+        source.close()
+        target.close()
+
+
+def test_explicit_cloud_recovery_uses_disabled_provider_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled publication settings still authenticate an explicitly selected URI."""
+    from tests.test_bucket_gcs import MemoryGcsArchive
+    from usagebassoon.config import ConfigurationManager
+
+    archive = MemoryGcsArchive()
+    source = _backend()
+    _append_note(source)
+    uri = SnapshotStore(archive.uri, buckets=(archive,)).write(
+        source, run_id="cloud", manual=True
+    )
+    source.close()
+    assert uri is not None
+    credentials = tmp_path / "credentials.json"
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        '[snapshots.gcs]\nenable = false\nproject = "recovery-project"\n'
+        f'credentials_file = "{credentials}"\n'
+    )
+    calls: list[dict[str, object]] = []
+
+    def cloud(location: str, **kwargs: object) -> SnapshotBucket:
+        assert location == archive.uri or location.startswith(archive.uri + "/")
+        calls.append(kwargs)
+        return (
+            archive
+            if location == archive.uri
+            else ScopedSnapshotBucket(archive, location[len(archive.uri) + 1 :])
+        )
+
+    monkeypatch.setattr("usagebassoon.buckets.gcs.GcsSnapshotBucket", cloud)
+    store = SnapshotStore.from_config(ConfigurationManager(config).load())
+    assert store.destination_uris == ()
+    assert not store.selection_enabled(uri)
+    with store.reader.prepare(uri) as prepared:
+        assert prepared.rows["notes"] == 1
+    assert calls and all(
+        call["project"] == "recovery-project"
+        and call["credentials_file"] == credentials
+        for call in calls
+    )
+
+
+def test_latest_recovery_survives_unavailable_cloud_authentication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unavailable cloud adapter construction does not hide a healthy local copy."""
+    from usagebassoon.config import GcsConfig
+
+    source = _backend()
+    _append_note(source)
+    root = tmp_path / "archive"
+    SnapshotStore(str(root)).write(source, run_id="local", manual=True)
+    source.close()
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        snapshots=SnapshotsConfig(
+            local=LocalSnapshotConfig(path=root, enable=True),
+            gcs=GcsConfig(
+                uri="gs://unavailable/archive", project="unavailable", enable=True
+            ),
+        ),
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("cloud credentials unavailable")
+
+    monkeypatch.setattr("usagebassoon.buckets.gcs.GcsSnapshotBucket", unavailable)
+    warnings: list[str] = []
+    with SnapshotStore.from_config(config).reader.prepare(
+        warning=warnings.append
+    ) as prepared:
+        assert prepared.rows["notes"] == 1
+        assert prepared.warnings
+    assert any("credentials unavailable" in message for message in warnings)
+
+
+def test_portable_pin_repair_uses_authority_when_sidecar_json_is_damaged(
+    tmp_path: Path,
+) -> None:
+    """Corrupt portable metadata can be repaired without changing immutable bytes."""
+    source = _backend()
+    store = SnapshotStore(str(tmp_path / "archive"))
+    try:
+        uri = store.write(source, run_id="repair-pin", manual=True, pin=True)
+        assert uri is not None
+        manifest = (Path(uri) / "manifest.json").read_bytes()
+        (Path(uri) / "state.json").write_text("damaged")
+        bucket = LocalSnapshotBucket(str(Path(uri).parent))
+        with Catalog(bucket).hold() as catalog:
+            catalog.repair()
+        portable, _ = bucket.read_json(f"{Path(uri).name}/state.json")
+        assert portable is not None and portable["pinned"] is True
+        assert portable == Catalog(bucket).state(Path(uri).name)
+        assert (Path(uri) / "manifest.json").read_bytes() == manifest
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize("selection", ["latest", "id"])
+def test_disabled_known_archive_is_recoverable_by_id_or_latest(
+    tmp_path: Path,
+    selection: str,
+) -> None:
+    """Publication enablement cannot hide configured recovery locations."""
+    source = _backend()
+    _append_note(source)
+    root = tmp_path / "archive"
+    uri = SnapshotStore(str(root)).write(source, run_id="known", manual=True)
+    source.close()
+    assert uri is not None
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        "11111111-1111-4111-8111-111111111111",
+        "duckdb",
+        snapshots=SnapshotsConfig(local=LocalSnapshotConfig(path=root, enable=False)),
+    )
+    store = SnapshotStore.from_config(config)
+    assert store.destination_uris == ()
+    with store.reader.prepare(
+        "latest" if selection == "latest" else Path(uri).name
+    ) as prepared:
+        assert prepared.rows["notes"] == 1
+        assert not store.selection_enabled(prepared.candidate.uri)

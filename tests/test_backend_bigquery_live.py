@@ -125,7 +125,8 @@ def _local_snapshot_config(
         f'source_id = "{settings.source_id}"', f'source_id = "{source_id}"', 1
     )
     configuration.write_text(
-        content + f'\n[snapshots.local]\npath = "{directory / "snapshots"}"\n'
+        content
+        + f'\n[snapshots.local]\nenable = true\npath = "{directory / "snapshots"}"\n'
     )
     return configuration
 
@@ -1012,7 +1013,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
         assert initialized.exit_code == 0, plain_cli_output(initialized.output)
         state = remote.maintenance_status()
         assert state is not None and state[0]
-        declined = runner.invoke(app, command, input="n\n")
+        declined = runner.invoke(app, command, input="y\nn\n")
         assert declined.exit_code != 0
         assert "Aborted" in plain_cli_output(declined.output)
         # Simulate a crashed attempt with a populated, nonexpired owned stage.
@@ -1037,7 +1038,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
             disposition="WRITE_APPEND",
         )
         with _phase("BigQuery CLI restore after interrupted attempt"):
-            restored = runner.invoke(app, command, input="y\n")
+            restored = runner.invoke(app, command, input="y\ny\n")
         assert restored.exit_code == 0, (
             f"{plain_cli_output(restored.output)}\n{restored.exception!r}"
         )

@@ -15,9 +15,10 @@ import pyarrow.parquet as pq
 import typer
 
 from usagebassoon.backends.base import close_backend
+from usagebassoon.backends.factory import open_backend
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli.spinner import spinner
-from usagebassoon.config import ConfigurationError, ConfigurationManager, open_backend
+from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.privacy import sanitize_table
 from usagebassoon.sql_safety import PUBLIC_RELATIONS
 from usagebassoon.storage_model import EVENT_KEYS, STATE_KEYS

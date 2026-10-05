@@ -469,18 +469,18 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
 
 
 def test_namespaced_configuration_defaults(tmp_path: Path) -> None:
-    """Default to local twelve-hour snapshots and operational logging."""
+    """Keep automatic archives opt-in and retain the twelve-hour cadence."""
     path = tmp_path / "config.toml"
     path.write_text('source_id = "11111111-1111-4111-8111-111111111111"\n')
     config = ConfigurationManager(path).load()
     assert config.backend == "duckdb"
     assert config.local_database == default_local_database_path()
     assert config.collection.schedule.interval == "15m"
-    assert config.snapshots.local.enable
+    assert not config.snapshots.local.enable
     assert config.snapshots.local.path == default_snapshot_directory()
     assert config.snapshots.gcs is None
     assert config.snapshots.schedule.interval == "12h"
-    assert not config.snapshots.schedule.disable_weekly
+    assert not config.snapshots.local.disable_weekly
     assert not config.logging.disable
 
 
@@ -490,7 +490,7 @@ def test_namespaced_configuration_defaults(tmp_path: Path) -> None:
         '[logging]\ndisable = "true"',
         "[snapshots.local]\nenable = 1",
         '[snapshots.gcs]\nenable = "false"',
-        "[snapshots.schedule]\ndisable_weekly = 0",
+        "[snapshots.local]\ndisable_weekly = 0",
     ],
 )
 def test_enable_and_disable_flags_require_booleans(
@@ -514,7 +514,7 @@ def test_snapshot_destination_enablement(tmp_path: Path, enabled: bool) -> None:
     )
     config = ConfigurationManager(path).load()
     assert config.snapshots.enabled is enabled
-    assert config.snapshots.gcs is None
+    assert config.snapshots.gcs is not None and not config.snapshots.gcs.enable
 
 
 @pytest.mark.parametrize(
@@ -580,20 +580,36 @@ def test_update_snapshot_interval_preserves_collection_and_policy(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         '[collection.schedule]\ninterval = "30m"\n'
         '[snapshots.local]\npath = "my archive"\n'
-        + (
-            '[snapshots.schedule]\ninterval = "12h"\ndisable_weekly = true\n'
-            if existing
-            else ""
-        )
+        + ("disable_weekly = true\n" if existing else "")
+        + ('[snapshots.schedule]\ninterval = "12h"\n' if existing else "")
     )
     path.chmod(0o600)
     update_schedule_interval(path, "2d", domain="snapshots")
     config = ConfigurationManager(path).load()
     assert config.collection.schedule.interval == "30m"
     assert config.snapshots.schedule.interval == "2d"
-    assert config.snapshots.schedule.disable_weekly is existing
+    assert config.snapshots.local.disable_weekly is existing
     assert config.snapshots.local.path == Path("my archive")
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
+    tmp_path: Path,
+) -> None:
+    """Disable publication without discarding credentials for explicit recovery."""
+    path = tmp_path / "config.toml"
+    credentials = tmp_path / "credentials.json"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        "[snapshots.local]\nenable = true\ndisable_weekly = true\n"
+        "[snapshots.gcs]\nenable = false\ndisable_weekly = false\n"
+        f'project = "recovery-project"\ncredentials_file = "{credentials}"\n'
+    )
+    config = ConfigurationManager(path).load()
+    assert config.snapshots.local.disable_weekly
+    cloud = config.snapshots.gcs
+    assert cloud is not None and not cloud.enable and not cloud.disable_weekly
+    assert cloud.project == "recovery-project" and cloud.credentials_file == credentials
 
 
 def test_disabled_logging_applies_to_configuration_errors(tmp_path: Path) -> None:
@@ -616,7 +632,8 @@ def test_failed_preflight_preserves_error_when_close_fails(
 ) -> None:
     """Backend cleanup cannot hide a schema or connection preflight failure."""
     from usagebassoon.backends.duckdb_local import DuckDBBackend
-    from usagebassoon.config import UsageBassoonConfig, open_backend
+    from usagebassoon.backends.factory import open_backend
+    from usagebassoon.config import UsageBassoonConfig
 
     failure = RuntimeError("primary preflight failure")
     backend = DuckDBBackend(":memory:")
@@ -632,7 +649,9 @@ def test_failed_preflight_preserves_error_when_close_fails(
         """Return the backend whose preflight and cleanup are under test."""
         return backend
 
-    monkeypatch.setattr(config_module, "DuckDBBackend", opened_backend)
+    monkeypatch.setattr(
+        "usagebassoon.backends.duckdb_local.DuckDBBackend", opened_backend
+    )
     monkeypatch.setattr(backend, "preflight", failed_preflight)
     monkeypatch.setattr(backend, "close", failed_close)
     monkeypatch.setattr(logging.getLogger(LOGGER_NAME), "propagate", True)

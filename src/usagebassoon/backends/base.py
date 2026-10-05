@@ -283,7 +283,7 @@ class StorageBackend(Protocol):
         ...
 
     def cleanup_restore_stages(self) -> None:
-        """Remove only expired, verifiably owned abandoned restore stages."""
+        """Discard owned stages only after their jobs are terminal."""
         ...
 
     def is_retryable_error(self, error: Exception) -> bool:

@@ -138,24 +138,36 @@ class LocalSnapshotBucket:
         return candidate
 
     @staticmethod
-    def _version(payload: bytes) -> str:
-        """Return the content-addressed local version for one object."""
-        return hashlib.sha256(payload).hexdigest()
+    def _version(stat: os.stat_result) -> str:
+        """Identify a physical file revision independently of its content digest."""
+        return (
+            f"{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}:"
+            f"{stat.st_mtime_ns}:{stat.st_size}"
+        )
+
+    def _lock(self, relative_name: str) -> Path:
+        """Use bounded, stable lock stripes that survive snapshot deletion."""
+        durable_directory(self._root)
+        identity = os.path.normcase(str(self._path(relative_name)))
+        stripe = hashlib.sha256(identity.encode()).hexdigest()[:2]
+        return self._root / f".snapshot-lock-{stripe}"
 
     def read_json(
         self, relative_name: str
     ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
-        """Read a JSON object and its content-addressed version."""
+        """Read JSON and the identity of the same open file revision."""
         path = self._path(relative_name)
         if not path.exists():
             return None, None
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            raw = stream.read()
+            version = self._version(os.fstat(stream.fileno()))
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError(
                 f"snapshot JSON object {relative_name!r} must be an object"
             )
-        return payload, self._version(raw)
+        return payload, version
 
     def write_json_cas(
         self,
@@ -166,25 +178,24 @@ class LocalSnapshotBucket:
     ) -> SnapshotObject:
         """Atomically compare and replace JSON.
 
-        Verifies the local content version and writes under a
+        Verifies the physical file revision and writes under a
         process-shared filesystem lock.
         """
         path = self._path(relative_name)
         durable_directory(path.parent)
-        lock_path = path.with_name(f".{path.name}.lock")
+        lock_path = self._lock(relative_name)
         with _catalog_lock(lock_path):
-            current = path.read_bytes() if path.exists() else None
-            actual_version = None if current is None else self._version(current)
+            actual_version = self._version(path.stat()) if path.exists() else None
             if actual_version != expected_version:
                 raise SnapshotPreconditionError("local snapshot object version changed")
             raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
             durable_replace(path, raw)
-        version = self._version(raw)
+            version = self._version(path.stat())
         return SnapshotObject(
             name=validate_relative_name(relative_name),
             version=version,
             size=len(raw),
-            checksum=version,
+            checksum=hashlib.sha256(raw).hexdigest(),
         )
 
     def write_bytes(
@@ -198,19 +209,22 @@ class LocalSnapshotBucket:
         del content_type
         path = self._path(relative_name)
         durable_directory(path.parent)
-        durable_replace(path, payload)
-        version = self._version(payload)
+        with _catalog_lock(self._lock(relative_name)):
+            durable_replace(path, payload)
+            version = self._version(path.stat())
         return SnapshotObject(
             name=validate_relative_name(relative_name),
             version=version,
             size=len(payload),
-            checksum=version,
+            checksum=hashlib.sha256(payload).hexdigest(),
         )
 
     def read_bytes(self, relative_name: str, *, version: SnapshotVersion) -> bytes:
-        """Read one local object; integrity is verified by the archiver hash."""
-        del version
-        return self._path(relative_name).read_bytes()
+        """Read the requested physical revision from one open descriptor."""
+        with self._path(relative_name).open("rb") as stream:
+            if self._version(os.fstat(stream.fileno())) != version:
+                raise SnapshotPreconditionError("local snapshot object version changed")
+            return stream.read()
 
     def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Durably publish a file without buffering its complete contents."""
@@ -223,34 +237,52 @@ class LocalSnapshotBucket:
                 destination.flush()
                 os.fsync(destination.fileno())
             # Hard-link publication is atomic and fails if the identity exists.
-            os.link(temporary, target)
-            sync_directory(target.parent)
+            with _catalog_lock(self._lock(relative_name)):
+                os.link(temporary, target)
+                temporary.unlink()
+                sync_directory(target.parent)
+                with target.open("rb") as stream:
+                    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+                    stat = os.fstat(stream.fileno())
+                    version = self._version(stat)
         finally:
             _remove_temporary(temporary)
-        with target.open("rb") as stream:
-            version = hashlib.file_digest(stream, "sha256").hexdigest()
-        return SnapshotObject(relative_name, version, target.stat().st_size, version)
+        return SnapshotObject(relative_name, version, stat.st_size, checksum)
 
     def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Copy from one open revision, retaining bounded memory."""
         with self._path(relative_name).open("rb") as source, path.open("wb") as target:
             shutil.copyfileobj(source, target, length=1024 * 1024)
+            version = self._version(os.fstat(source.fileno()))
         with path.open("rb") as stream:
-            version = hashlib.file_digest(stream, "sha256").hexdigest()
-        return SnapshotObject(relative_name, version, path.stat().st_size, version)
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        return SnapshotObject(relative_name, version, path.stat().st_size, checksum)
 
     def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
-        """Delete a local object only when its content version still matches."""
+        """Delete only the requested incarnation under the publication lock."""
         path = self._path(relative_name)
         if not path.exists():
             raise SnapshotPreconditionError("local snapshot object is absent")
-        with _catalog_lock(path.with_name(f".{path.name}.lock")):
-            with path.open("rb") as stream:
-                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        with _catalog_lock(self._lock(relative_name)):
+            actual = self._version(path.stat())
             if actual != version:
                 raise SnapshotPreconditionError("local snapshot object version changed")
             path.unlink()
             sync_directory(path.parent)
+            parent = path.parent
+            while parent != self._root:
+                try:
+                    parent.rmdir()
+                except OSError as error:
+                    if error.errno not in {errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT}:
+                        _LOG.warning(
+                            "could not remove empty snapshot directory %s",
+                            parent,
+                            exc_info=True,
+                        )
+                    break
+                sync_directory(parent.parent)
+                parent = parent.parent
 
     def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List local snapshot objects below one safe relative prefix."""
@@ -265,13 +297,15 @@ class LocalSnapshotBucket:
             if path.name.startswith("."):
                 continue
             with path.open("rb") as stream:
-                version = hashlib.file_digest(stream, "sha256").hexdigest()
+                checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+                stat = os.fstat(stream.fileno())
+                version = self._version(stat)
             objects.append(
                 SnapshotObject(
                     name=path.relative_to(self._root).as_posix(),
                     version=version,
-                    size=path.stat().st_size,
-                    checksum=version,
+                    size=stat.st_size,
+                    checksum=checksum,
                 )
             )
         return tuple(objects)

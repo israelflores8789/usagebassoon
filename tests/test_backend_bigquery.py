@@ -47,6 +47,18 @@ class _OfflineClient:
     def close(self) -> None:
         """Satisfy the BigQuery client close surface."""
 
+    def list_jobs(self, **_kwargs: object) -> MagicMock:
+        """Expose an empty project-wide job page without cloud access."""
+        return _job_page([])
+
+
+def _job_page(jobs: list[object]) -> MagicMock:
+    """Provide the pagination boundary used by the official BigQuery client."""
+    pager = MagicMock()
+    pager.pages = [jobs]
+    pager.next_page_token = None
+    return pager
+
 
 class _Job:
     """Minimal completed BigQuery job with a deterministic row result."""
@@ -61,9 +73,16 @@ class _Job:
         self._rows = rows or []
         self.num_dml_affected_rows = affected_rows
 
-    def result(self, *, timeout: float | None = None) -> list[dict[str, object]]:
+    def result(
+        self,
+        *,
+        timeout: float | None = None,
+        retry: object = None,
+        job_retry: object = None,
+    ) -> list[dict[str, object]]:
         """Return the completed job's query result rows."""
-        assert timeout == 120.0
+        del retry, job_retry
+        assert timeout is not None and 0 < timeout <= 120.0
         return self._rows
 
     def cancel(self) -> None:
@@ -97,6 +116,10 @@ class _TimeoutJob:
 
 class _BatchClient:
     """Offline client recording BigQuery batch transport operations."""
+
+    def list_jobs(self, **_kwargs: object) -> MagicMock:
+        """Return no active restore jobs in completed batch scenarios."""
+        return _job_page([])
 
     def __init__(self) -> None:
         """Initialize recorded calls."""
@@ -135,8 +158,16 @@ class _BatchClient:
         self.queries.append(sql)
         return _Job()
 
-    def delete_table(self, table: str, *, not_found_ok: bool) -> None:
+    def delete_table(
+        self,
+        table: str,
+        *,
+        not_found_ok: bool,
+        retry: object = None,
+        timeout: float | None = None,
+    ) -> None:
         """Record best-effort staging cleanup."""
+        del retry, timeout
         assert not_found_ok
         assert "`" not in table
         self.deleted.append(table)
@@ -703,6 +734,8 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
             *,
             job_config: bigquery.QueryJobConfig,
             location: str,
+            retry: object = None,
+            timeout: float | None = None,
         ) -> _Job:
             """Raise the backend error after all restore assertions are assembled."""
             if sql.startswith("SELECT 1 FROM") and "restore_receipts" in sql:
@@ -727,6 +760,12 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
         return table
 
     monkeypatch.setattr(client, "create_table", create, raising=False)
+
+    def no_stages(_remaining: object) -> list[dict[str, object]]:
+        """Start with no abandoned stages in the initialized destination."""
+        return []
+
+    monkeypatch.setattr(backend, "_restore_stage_records", no_stages)
     bundle = normalize(collection_bundle)
     with pytest.raises(exception_type) as raised:
         backend.restore_tables({"daily_stats": bundle.tables["daily_stats"]})
@@ -800,6 +839,198 @@ def test_nightly_schedule_create_reuse_and_update(
         install_compaction(backend)
 
 
+def test_restore_wait_observes_terminal_job_before_allowing_stage_cleanup() -> None:
+    """Cancellation acknowledgement alone does not establish job termination."""
+    backend = _backend()
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.job_id = "restore-commit"
+    job.state = "RUNNING"
+    job.result.side_effect = FutureTimeoutError("commit wait expired")
+    states: list[str] = []
+
+    def terminal(**_kwargs: object) -> None:
+        states.append("terminal")
+        job.state = "DONE"
+
+    job.reload.side_effect = terminal
+    with pytest.raises(RuntimeError, match="exceeded"):
+        backend._wait_restore_job(job)
+    assert states == ["terminal"]
+    assert job.cancel.called
+    assert job.state == "DONE"
+    assert job.reload.call_args.kwargs["timeout"] <= 60
+
+
+def test_unsettled_restore_commit_preserves_owned_stage(
+    tmp_path: object,
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out transaction cannot dispose of input while completion is unknown."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    assert isinstance(tmp_path, Path)
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.job_id = "uncertain-commit"
+    job.state = "RUNNING"
+    job.result.side_effect = FutureTimeoutError("lost acknowledgement")
+    job.reload.side_effect = OSError("job inspection unavailable")
+    client.query.return_value = job
+    client.load_table_from_file.return_value = _Job()
+    client.list_tables.return_value = list[TableListItem]()
+
+    def no_cleanup() -> None:
+        """No previous attempt exists before this transaction is submitted."""
+
+    def no_receipt(_operation: str) -> bool:
+        """The transaction has not yet produced an observable receipt."""
+        return False
+
+    monkeypatch.setattr(backend, "cleanup_restore_stages", no_cleanup)
+    monkeypatch.setattr(backend, "restore_committed", no_receipt)
+    path = tmp_path / "daily_stats.parquet"
+    pq.write_table(normalize(collection_bundle).tables["daily_stats"], path)
+    with pytest.raises(RuntimeError, match="completion could not be determined"):
+        backend.restore_snapshot(
+            {"daily_stats": path}, operation_id="owned", snapshot_id="snapshot"
+        )
+    client.create_table.assert_called_once()
+    job.reload.assert_called_once()
+    client.delete_table.assert_not_called()
+
+
+def test_absent_receipt_with_active_job_is_unknown_without_surviving_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Job discovery does not depend on a surviving stage table."""
+    from hashlib import sha256
+
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.labels = {
+        "usagebassoon_kind": "restore_job",
+        "usagebassoon_restore": "owned",
+        "usagebassoon_destination": sha256(backend.dataset_ref.encode()).hexdigest()[
+            :63
+        ],
+    }
+    client.list_jobs.side_effect = [_job_page([]), _job_page([job])]
+
+    def absent(_operation: str, _remaining: object) -> bool:
+        return False
+
+    monkeypatch.setattr(backend, "_restore_receipt", absent)
+    with pytest.raises(RuntimeError, match="still active"):
+        backend.restore_committed("owned")
+    client.list_tables.assert_not_called()
+
+
+def test_cleanup_drains_active_restore_even_when_stages_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted empty restore is still a real transaction to settle."""
+    from hashlib import sha256
+
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.state = "RUNNING"
+    job.labels = {
+        "usagebassoon_kind": "restore_job",
+        "usagebassoon_restore": "owned",
+        "usagebassoon_destination": sha256(backend.dataset_ref.encode()).hexdigest()[
+            :63
+        ],
+    }
+    client.list_jobs.side_effect = [_job_page([]), _job_page([job])]
+    order: list[str] = []
+
+    def terminal(**_kwargs: object) -> None:
+        order.append("terminal")
+        job.state = "DONE"
+
+    def stages(_remaining: object) -> list[dict[str, object]]:
+        assert order == ["terminal"]
+        return []
+
+    job.reload.side_effect = terminal
+    monkeypatch.setattr(backend, "_restore_stage_records", stages)
+    backend.cleanup_restore_stages()
+    job.cancel.assert_called_once()
+    client.delete_table.assert_not_called()
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_manual_compaction_is_visible_without_a_transfer_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+    qualified: bool,
+) -> None:
+    """Restore rejects manual maintenance as well as Scheduled Query transfers."""
+    import usagebassoon.backends.bigquery_compaction as module
+
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.job_id = "manual-compaction"
+    job.query = (
+        "BEGIN TRANSACTION; UPDATE "
+        + (
+            f"`{backend.dataset_ref}.compaction_ledger` "
+            if qualified
+            else "compaction_ledger "
+        )
+        + "SET compacted_at = CURRENT_TIMESTAMP();"
+    )
+    job.default_dataset = (
+        None
+        if qualified
+        else bigquery.DatasetReference(backend.project, backend.dataset)
+    )
+    job.labels = dict[str, str]()
+    client.list_jobs.side_effect = [
+        _job_page([]),
+        _job_page([job]),
+        _job_page([]),
+        _job_page([job]),
+    ]
+    transfer = MagicMock(spec=bigquery_datatransfer.DataTransferServiceClient)
+    transfer.__enter__.return_value = transfer
+    pager = MagicMock()
+    pager.pages = [bigquery_datatransfer.ListTransferConfigsResponse()]
+    transfer.list_transfer_configs.return_value = pager
+    monkeypatch.setattr(
+        bigquery_datatransfer,
+        "DataTransferServiceClient",
+        MagicMock(return_value=transfer),
+    )
+    with pytest.raises(RuntimeError, match="manual-compaction"):
+        module.pause_compaction(backend)
+    enabled, detail = module.compaction_status(backend)
+    assert not enabled and "manual-compaction" in detail
+
+
+def test_restore_requires_project_wide_job_visibility_before_deleting_stages() -> None:
+    """Permission failure cannot be interpreted as an idle project."""
+    from google.api_core.exceptions import Forbidden
+
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    client.list_jobs.side_effect = Forbidden("project jobs are not visible")
+    with pytest.raises(RuntimeError, match=r"bigquery.jobs.listAll"):
+        backend.cleanup_restore_stages()
+    client.delete_table.assert_not_called()
+
+
 def test_recovery_schedule_pause_waits_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -840,6 +1071,8 @@ def test_recovery_schedule_pause_waits_and_fails_closed(
         """Keep bounded-wait behavior deterministic without wall-clock pauses."""
 
     monkeypatch.setattr(module.time, "sleep", no_sleep)
+    with pytest.raises(RuntimeError, match="run remains active"):
+        module.pause_compaction(backend)
     module.pause_compaction(backend)
     update = client.update_transfer_config.call_args.kwargs
     assert update["transfer_config"].disabled is True
@@ -1096,18 +1329,23 @@ def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(
         "usagebassoon_restore": operation,
     }
     table.expires = datetime.now(UTC) + timedelta(days=1)
-    stage = {
+    stage: dict[str, object] = {
         "table": str(table.reference),
         "operation_id": operation,
         "expires_at": table.expires,
     }
-    monkeypatch.setattr(backend, "restore_stages", lambda: [stage])
 
-    def uncommitted(_operation: str) -> bool:
+    def owned_stages(_remaining: object) -> list[dict[str, object]]:
+        """Expose the crashed attempt's nonexpired stage."""
+        return [stage]
+
+    monkeypatch.setattr(backend, "_restore_stage_records", owned_stages)
+
+    def uncommitted(_operation: str, _remaining: object) -> bool:
         """No application transaction has committed in this interrupted attempt."""
         return False
 
-    monkeypatch.setattr(backend, "restore_committed", uncommitted)
+    monkeypatch.setattr(backend, "_restore_receipt", uncommitted)
     client = MagicMock(spec=bigquery.Client)
     backend.client = cast(bigquery.Client, client)
     job = MagicMock(spec=bigquery.QueryJob)
@@ -1126,7 +1364,7 @@ def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(
         job.state = "DONE"
 
     job.reload.side_effect = finish
-    client.list_jobs.side_effect = [[job], list[bigquery.QueryJob]()]
+    client.list_jobs.side_effect = [_job_page([job]), _job_page([])]
     client.get_table.return_value = table
     backend.cleanup_restore_stages()
     job.cancel.assert_called_once()

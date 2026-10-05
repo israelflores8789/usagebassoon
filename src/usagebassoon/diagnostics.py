@@ -130,14 +130,16 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     from usagebassoon.config import parse_interval
     from usagebassoon.snapshot.catalog import Catalog
     from usagebassoon.snapshot.format import timestamp
+    from usagebassoon.snapshot.reader import SnapshotReader
 
     details: list[str] = []
     warnings: list[str] = []
     try:
         archiver = SnapshotArchiver.from_config(configuration)
-        rows = archiver.reader.listing()
+        reader = SnapshotReader(archiver._archives, archiver._bucket)
+        rows = reader.listing()
         now = datetime.now(UTC)
-        for bucket in archiver.reader.buckets:
+        for bucket in reader.buckets:
             control, _ = Catalog(bucket).control()
             last_failure = control.get("last_failure")
             repair_warnings = control.get("repair_warnings")
@@ -169,7 +171,7 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
                 "last creation verification "
                 f"{max(verified) if verified else 'unavailable'}"
             )
-            weekly = not settings.schedule.disable_weekly
+            weekly = bucket.uri in archiver._weekly
             interval = parse_interval(settings.schedule.interval)
             scheduled = [
                 timestamp(r["captured_at"])
@@ -201,26 +203,33 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
                     for r in available
                     if isinstance(r.get("roles"), list) and "weekly" in r["roles"]
                 ]
-                details.append(
-                    f"{bucket.uri}: weekly slots "
-                    f"{', '.join(sorted(slots)) or 'none'}; "
-                    f"{min(4, len(slots))}/4 recovery slots accumulated"
-                )
                 week_start = now.replace(
                     hour=0, minute=0, second=0, microsecond=0
                 ) - timedelta(days=now.weekday())
+                target_slots = {
+                    (week_start - timedelta(weeks=index)).strftime("%G-W%V")
+                    for index in range(4)
+                }
+                details.append(
+                    f"{bucket.uri}: Weekly recovery points: "
+                    f"{len(slots & target_slots)} of 4 target slots available. "
+                    f"Available weekly slots: {', '.join(sorted(slots)) or 'none'}."
+                )
+                if weekly_points:
+                    details.append(
+                        f"{bucket.uri}: Oldest available weekly recovery point: "
+                        f"{max(0, (now - min(weekly_points)).days)} days ago."
+                    )
+                missing = sorted(target_slots - slots)
+                if missing:
+                    details.append(
+                        f"{bucket.uri}: Weekly coverage gaps: {', '.join(missing)}. "
+                        "No snapshots are fabricated for weeks when instances "
+                        "were stopped."
+                    )
                 if current_slot not in slots and now >= week_start + timedelta(hours=1):
                     warnings.append(
                         f"current weekly recovery slot is overdue at {bucket.uri}"
-                    )
-                if (
-                    len(slots) < 4
-                    and weekly_points
-                    and min(weekly_points) <= now - timedelta(weeks=4)
-                ):
-                    warnings.append(
-                        f"weekly recovery coverage is incomplete at {bucket.uri}: "
-                        f"{len(slots)}/4 slots"
                     )
         warnings.extend(str(r["error"]) for r in rows if "error" in r)
     except Exception as error:

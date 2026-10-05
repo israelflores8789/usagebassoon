@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 type SnapshotVersion = int | str
 
@@ -121,3 +122,110 @@ class SnapshotBucket(Protocol):
     def lifecycle_warnings(self) -> tuple[str, ...]:
         """Report provider lifecycle settings that could remove snapshots."""
         ...
+
+
+def bucket_scheme(uri: str) -> str:
+    """Identify a URI scheme while preserving ordinary filesystem paths."""
+    return urlsplit(uri).scheme.lower() if "://" in uri else ""
+
+
+def bucket_uri(uri: str) -> str:
+    """Normalize archive roots without constructing or authenticating adapters."""
+    if not uri.strip():
+        raise ValueError("snapshot bucket URI must not be empty")
+    scheme = bucket_scheme(uri)
+    if scheme not in {"", "file"}:
+        return f"{scheme}://{uri.partition('://')[2]}".rstrip("/")
+    path = uri.partition("://")[2] if scheme == "file" else uri
+    if not path:
+        raise ValueError("snapshot bucket path must not be empty")
+    return str(Path(path).expanduser().resolve())
+
+
+class ScopedSnapshotBucket:
+    """Expose a nested archive root through any existing bucket adapter."""
+
+    def __init__(self, bucket: SnapshotBucket, prefix: str) -> None:
+        """Reuse authentication and provider operations for a confined subroot."""
+        self._bucket = bucket
+        self._prefix = validate_relative_name(prefix)
+        self.uri = f"{bucket_uri(bucket.uri)}/{self._prefix}"
+
+    def _name(self, name: str, *, allow_empty: bool = False) -> str:
+        """Translate a portable object name into the parent archive namespace."""
+        relative = validate_relative_name(name, allow_empty=allow_empty)
+        return f"{self._prefix}/{relative}"
+
+    def _object(self, obj: SnapshotObject) -> SnapshotObject:
+        """Keep provider versions while returning names relative to this root."""
+        if not obj.name.startswith(self._prefix + "/"):
+            raise ValueError("provider returned an object outside the scoped root")
+        return SnapshotObject(
+            obj.name.removeprefix(self._prefix + "/"),
+            obj.version,
+            obj.size,
+            obj.checksum,
+        )
+
+    def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Publish a bounded file under this archive root."""
+        return self._object(self._bucket.upload_file(self._name(relative_name), path))
+
+    def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
+        """Download one parent-provider revision with relative metadata."""
+        return self._object(self._bucket.download_file(self._name(relative_name), path))
+
+    def read_json(
+        self, relative_name: str
+    ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
+        """Read JSON metadata from this root."""
+        return self._bucket.read_json(self._name(relative_name))
+
+    def write_json_cas(
+        self,
+        relative_name: str,
+        payload: dict[str, object],
+        *,
+        expected_version: SnapshotVersion | None,
+    ) -> SnapshotObject:
+        """Delegate native compare-and-swap without weakening its precondition."""
+        return self._object(
+            self._bucket.write_json_cas(
+                self._name(relative_name), payload, expected_version=expected_version
+            )
+        )
+
+    def write_bytes(
+        self,
+        relative_name: str,
+        payload: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> SnapshotObject:
+        """Write one scoped object through the parent provider."""
+        return self._object(
+            self._bucket.write_bytes(
+                self._name(relative_name), payload, content_type=content_type
+            )
+        )
+
+    def read_bytes(self, relative_name: str, *, version: SnapshotVersion) -> bytes:
+        """Read exactly the requested parent-provider revision."""
+        return self._bucket.read_bytes(self._name(relative_name), version=version)
+
+    def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
+        """Delete only the scoped name at its observed parent-provider revision."""
+        self._bucket.delete(self._name(relative_name), version=version)
+
+    def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
+        """List scoped names, excluding neighboring archive prefixes."""
+        prefix = self._name(relative_prefix, allow_empty=True)
+        return tuple(
+            self._object(obj)
+            for obj in self._bucket.list(prefix.rstrip("/"))
+            if obj.name.startswith(self._prefix + "/")
+        )
+
+    def lifecycle_warnings(self) -> tuple[str, ...]:
+        """Retain the underlying provider's lifecycle inspection."""
+        return self._bucket.lifecycle_warnings()

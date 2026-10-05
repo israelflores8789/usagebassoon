@@ -25,12 +25,13 @@ from typing import Literal
 
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import close_backend
+from usagebassoon.backends.factory import open_backend
+from usagebassoon.buckets.factory import SnapshotBucketRegistry
 from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.collector import preflight_tokscale
 from usagebassoon.config import (
     ConfigurationManager,
     UsageBassoonConfig,
-    open_backend,
     parse_interval,
     update_schedule_interval,
 )
@@ -80,6 +81,8 @@ class ScheduleStatus:
     log_path: str
     command: tuple[str, ...]
     details: tuple[str, ...] = ()
+    snapshot_installed: bool | None = None
+    snapshot_active: bool | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return JSON-compatible status data."""
@@ -94,6 +97,8 @@ class ScheduleStatus:
             "log_path": self.log_path,
             "command": list(self.command),
             "details": list(self.details),
+            "snapshot_installed": self.snapshot_installed,
+            "snapshot_active": self.snapshot_active,
         }
 
 
@@ -266,12 +271,16 @@ def _collect_command(config: UsageBassoonConfig) -> tuple[str, ...]:
 def snapshot_schedule_seconds(config: UsageBassoonConfig) -> float | None:
     """Return an independent cadence for checking configured backup obligations."""
     settings = config.snapshots
-    if not settings.enabled:
+    destinations = SnapshotBucketRegistry.from_settings(settings).destinations
+    if not any(destination.enabled for destination in destinations):
         return None
     interval = parse_interval(settings.schedule.interval, units="mhd")
     assert interval is not None
     seconds = interval.total_seconds()
-    return seconds if settings.schedule.disable_weekly else min(seconds, 3600.0)
+    weekly = any(
+        destination.enabled and destination.weekly for destination in destinations
+    )
+    return min(seconds, 3600.0) if weekly else seconds
 
 
 def run_snapshot_check(config: UsageBassoonConfig) -> None:
@@ -672,6 +681,15 @@ def schedule_doctor_check(config: UsageBassoonConfig | None) -> DoctorCheck:
         return DoctorCheck("scheduling", "warning", str(error))
     if not availability.available:
         return DoctorCheck("scheduling", "warning", availability.detail)
+    if config.snapshots.enabled and (
+        status.snapshot_installed is False or status.snapshot_active is False
+    ):
+        return DoctorCheck(
+            "scheduling",
+            "warning",
+            "independent snapshot schedule is missing or inactive",
+            status.details,
+        )
     if not status.installed:
         return DoctorCheck(
             "scheduling",
@@ -1082,6 +1100,8 @@ def _systemd_status(
         )
     details.append(f"service artifact: {service}")
     seconds = snapshot_schedule_seconds(config)
+    installed_snapshot: bool | None = None
+    snapshot_active: bool | None = None
     if seconds is not None:
         installed_snapshot = (unit_dir / SNAPSHOT_TIMER_NAME).is_file()
         snapshot_active = None
@@ -1109,6 +1129,8 @@ def _systemd_status(
         log_path=_systemd_log(),
         command=command,
         details=tuple(details),
+        snapshot_installed=installed_snapshot,
+        snapshot_active=snapshot_active,
     )
 
 
@@ -1120,6 +1142,8 @@ def _launchd_status(
     """Read launchd LaunchAgent state."""
     plist = _launchd_plist()
     installed = plist.is_file()
+    installed_snapshot: bool | None = None
+    snapshot_active: bool | None = None
     active: bool | None = None
     details = list(extra_details)
     if shutil.which("launchctl"):
@@ -1135,6 +1159,7 @@ def _launchd_status(
             details.append(result.stderr.strip())
     seconds = snapshot_schedule_seconds(config)
     if seconds is not None:
+        installed_snapshot = _snapshot_plist().is_file()
         snapshot_active = None
         if shutil.which("launchctl"):
             snapshot_active = (
@@ -1159,6 +1184,8 @@ def _launchd_status(
         log_path=str(_launchd_log()),
         command=command,
         details=tuple(details),
+        snapshot_installed=installed_snapshot,
+        snapshot_active=snapshot_active,
     )
 
 

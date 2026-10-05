@@ -13,6 +13,7 @@ from typing import Annotated
 import typer
 from rich.text import Text
 
+from usagebassoon.backends.factory import open_backend
 from usagebassoon.cli._output import output_console
 from usagebassoon.cli._utils import snapshot_archiver
 from usagebassoon.cli.spinner import spinner
@@ -21,7 +22,6 @@ from usagebassoon.config import (
     ConfigurationError,
     ConfigurationManager,
     UsageBassoonConfig,
-    open_backend,
 )
 from usagebassoon.diagnostics import (
     DoctorCheck,
@@ -179,7 +179,7 @@ def doctor(
             else None,
             snapshot_warnings=(
                 _snapshot_warnings(configuration)
-                if configuration and configuration.snapshots.gcs
+                if configuration and configuration.snapshots.enabled
                 else ()
             ),
             limit=limit,
@@ -221,9 +221,9 @@ def doctor(
 
 
 def _snapshot_warnings(configuration: UsageBassoonConfig) -> tuple[str, ...]:
-    """Inspect configured GCS lifecycle rules without failing doctor outright."""
+    """Inspect enabled bucket lifecycle rules without failing doctor outright."""
     try:
         return snapshot_archiver(configuration).lifecycle_warnings()
     except Exception as error:
-        _LOG.exception("GCS lifecycle inspection failed")
-        return (f"GCS lifecycle inspection unavailable: {error}",)
+        _LOG.exception("Snapshot bucket lifecycle inspection failed")
+        return (f"Snapshot bucket lifecycle inspection unavailable: {error}",)

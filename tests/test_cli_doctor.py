@@ -191,7 +191,7 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
         "11111111-1111-4111-8111-111111111111",
         "duckdb",
         snapshots=SnapshotsConfig(
-            local=LocalSnapshotConfig(path=Path(root)),
+            local=LocalSnapshotConfig(path=Path(root), enable=True),
             schedule=SnapshotScheduleConfig(interval="1h"),
         ),
     )
@@ -221,7 +221,7 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     assert check.status == "warning"
     assert "scheduled recovery capture is overdue" in check.message
     assert "current weekly recovery slot is overdue" not in check.message
-    assert any("1/4 recovery slots" in detail for detail in check.details)
+    assert any("1 of 4 target slots available" in detail for detail in check.details)
 
 
 def test_advisory_maintenance_failure_is_logged(
@@ -277,3 +277,56 @@ def test_compaction_read_failure_is_logged_and_other_checks_continue(
         assert "compaction progress unavailable" in caplog.text
     finally:
         backend.close()
+
+
+def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Present coverage reports a missing intermediate week without a tally."""
+    from datetime import timedelta
+
+    from usagebassoon.config import (
+        LocalSnapshotConfig,
+        SnapshotsConfig,
+        UsageBassoonConfig,
+    )
+    from usagebassoon.diagnostics import snapshot_health
+    from usagebassoon.snapshot.reader import SnapshotReader
+
+    now = datetime.now(UTC)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=now.weekday()
+    )
+    root = tmp_path / "archive"
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        SOURCE_ID,
+        "duckdb",
+        snapshots=SnapshotsConfig(local=LocalSnapshotConfig(path=root, enable=True)),
+    )
+    rows: list[dict[str, object]] = [
+        {
+            "uri": str(root / str(index)),
+            "captured_at": (start - timedelta(weeks=index)).isoformat(),
+            "weekly_slot": (start - timedelta(weeks=index)).strftime("%G-W%V"),
+            "roles": ["weekly"],
+        }
+        for index in (0, 1, 3)
+    ]
+
+    def listing(
+        _reader: SnapshotReader, _selection: str = "latest"
+    ) -> list[dict[str, object]]:
+        return rows
+
+    monkeypatch.setattr(SnapshotReader, "listing", listing)
+    report = snapshot_health(config)
+    assert any("3 of 4 target slots available" in line for line in report.details)
+    assert any(
+        "Oldest available weekly recovery point" in line for line in report.details
+    )
+    missing = (start - timedelta(weeks=2)).strftime("%G-W%V")
+    assert any(
+        "Weekly coverage gaps" in line and missing in line for line in report.details
+    )

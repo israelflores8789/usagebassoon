@@ -48,6 +48,7 @@ from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import normalize
 from usagebassoon.persistence import persist_run
+from usagebassoon.snapshot.catalog import Catalog
 from usagebassoon.storage_model import (
     DEBUG_TABLES,
 )
@@ -115,7 +116,7 @@ def _append_note(backend: DuckDBBackend) -> None:
 
 def _store(archive: GcsArchive) -> SnapshotStore:
     """Create a snapshot store backed by one live archive."""
-    return SnapshotStore(archive.uri, gcs_bucket=archive)
+    return SnapshotStore(archive.uri, buckets=(archive,))
 
 
 def test_live_gcs_generation_operations(live_archive: GcsArchive) -> None:
@@ -132,6 +133,44 @@ def test_live_gcs_generation_operations(live_archive: GcsArchive) -> None:
         catalog.version,
     )
     live_archive.lifecycle_warnings()
+
+
+def test_live_gcs_retirement_forgets_only_completed_cleanup(
+    live_archive: GcsArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume interrupted native deletion and preserve the archive fence."""
+    catalog = Catalog(live_archive)
+    with catalog.hold():
+        catalog.stage(
+            "pending", {"pinned": False, "retired": False, "published": False}
+        )
+        live_archive.write_bytes("pending/data.parquet", b"disposable integration data")
+        original = live_archive.delete
+
+        def interrupt(name: str, *, version: str | int) -> None:
+            """Leave the final portable state deletion pending."""
+            if name == "pending/state.json":
+                raise OSError("interrupted final deletion")
+            original(name, version=version)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(live_archive, "delete", interrupt)
+            with pytest.raises(OSError, match="interrupted final deletion"):
+                catalog.retire("pending")
+        state = catalog.state("pending")
+        assert state is not None and state["retired"] is True
+        assert [obj.name for obj in live_archive.list("pending")] == [
+            "pending/state.json"
+        ]
+        fence = catalog.fence
+        archive_id = catalog.control()[0]["archive_id"]
+    with Catalog(live_archive).hold(enforce_policy=True) as resumed:
+        assert resumed.fence is not None and fence is not None
+        assert resumed.fence > fence
+        document, _ = resumed.control()
+        assert document["archive_id"] == archive_id
+        assert document["records"] == {}
+        assert live_archive.list("pending") == ()
 
 
 def test_live_gcs_snapshot_round_trip_verifies_downloaded_references(
@@ -157,7 +196,7 @@ def test_live_gcs_snapshot_round_trip_verifies_downloaded_references(
         _, generation = relocated.read_json("catalog.json")
         assert generation is not None
         relocated.delete("catalog.json", version=generation)
-        recovery = SnapshotStore(relocated_root, gcs_bucket=relocated)
+        recovery = SnapshotStore(relocated_root, buckets=(relocated,))
         assert recovery.reader.listing()[0]["pinned"] is True
         # Immutable emergency recovery does not need working lifecycle controls.
         relocated.write_bytes("control.json", b'{"version": 999}')

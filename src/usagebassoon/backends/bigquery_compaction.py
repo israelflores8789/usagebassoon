@@ -12,7 +12,7 @@ from importlib import resources
 from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
-    from google.cloud import bigquery_datatransfer
+    from google.cloud import bigquery, bigquery_datatransfer
 
 from google.auth.credentials import Credentials
 
@@ -24,6 +24,7 @@ class BigQueryBackendCompaction(Protocol):
     dataset: str
     location: str
     _credentials: Credentials | None
+    client: bigquery.Client
 
     def _qualify_view_sql(self, sql: str) -> str:
         """Bind the packaged maintenance SQL to this dataset."""
@@ -154,6 +155,12 @@ def pause_compaction(
                 "resolve them before restore"
             )
         if not matches:
+            jobs = _active_compaction_jobs(backend, remaining)
+            if jobs:
+                raise RuntimeError(
+                    f"Compaction is still running: {', '.join(jobs)}; "
+                    "keep writers stopped and retry after it finishes"
+                )
             return
         config = matches[0]
         if not config.disabled:
@@ -188,13 +195,81 @@ def pause_compaction(
                 if active or not token:
                     break
             if not active:
+                jobs = _active_compaction_jobs(backend, remaining)
+                if jobs:
+                    raise RuntimeError(
+                        "Scheduled compaction is disabled but compaction jobs "
+                        f"remain active: {', '.join(jobs)}; wait and retry restore"
+                    )
                 return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "scheduled compaction is disabled but a run remains active; "
-                    "wait and retry restore"
+            raise RuntimeError(
+                "scheduled compaction is disabled but a run remains active; "
+                "wait and retry restore"
+            )
+
+
+def _active_compaction_jobs(
+    backend: BigQueryBackendCompaction, remaining: Callable[[], float]
+) -> list[str]:
+    """Inspect project-wide pending/running maintenance, including manual scripts."""
+    from google.api_core.exceptions import Forbidden
+    from google.api_core.retry import Retry
+    from google.cloud import bigquery
+
+    result: list[str] = []
+    for state in ("pending", "running"):
+        token: str | None = None
+        while True:
+            try:
+                pager = backend.client.list_jobs(
+                    project=backend.project,
+                    all_users=True,
+                    state_filter=state,
+                    page_token=token,
+                    retry=Retry(predicate=lambda _error: False),
+                    timeout=remaining(),
                 )
-            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+                page = next(iter(pager.pages))
+                for job in page:
+                    if not isinstance(job, bigquery.QueryJob):
+                        continue
+                    if job.query is None:
+                        job.reload(
+                            retry=Retry(predicate=lambda _error: False),
+                            timeout=remaining(),
+                        )
+                    if job.query is None:
+                        raise RuntimeError(
+                            "Active query metadata is unavailable; "
+                            "compaction quiescence cannot be verified"
+                        )
+                    sql = job.query
+                    default_dataset = job.default_dataset
+                    targets_destination = (
+                        f"{backend.project}.{backend.dataset}." in sql
+                        or (
+                            default_dataset is not None
+                            and default_dataset.project == backend.project
+                            and default_dataset.dataset_id == backend.dataset
+                        )
+                    )
+                    if (
+                        targets_destination
+                        and "compaction_ledger" in sql
+                        and (job.labels or {}).get("usagebassoon_kind") != "restore_job"
+                        and "BEGIN TRANSACTION" in sql.upper()
+                    ):
+                        result.append(job.job_id)
+                remaining()
+                token = pager.next_page_token
+                if not token:
+                    break
+            except Forbidden as error:
+                raise RuntimeError(
+                    "Compaction job visibility requires bigquery.jobs.listAll "
+                    "on the project; restore cannot verify quiescence"
+                ) from error
+    return result
 
 
 def compaction_status(
@@ -219,14 +294,47 @@ def compaction_status(
     ) as client:
         matches = _matching_schedules(client, parent, display_name, remaining)
         if len(matches) != 1:
+            jobs = _active_compaction_jobs(backend, remaining)
             return (
                 False,
-                f"expected one UsageBassoon compaction schedule; found {len(matches)}",
+                f"expected one UsageBassoon compaction schedule; found {len(matches)}; "
+                + (
+                    f"active compaction jobs: {', '.join(jobs)}"
+                    if jobs
+                    else "no active compaction jobs observed"
+                ),
             )
         config = matches[0]
+        jobs = _active_compaction_jobs(backend, remaining)
+        token = ""
+        active_runs = False
+        while True:
+            pager = client.list_transfer_runs(
+                request={
+                    "parent": config.name,
+                    "states": [
+                        bigquery_datatransfer.TransferState.PENDING,
+                        bigquery_datatransfer.TransferState.RUNNING,
+                    ],
+                    "page_token": token,
+                },
+                retry=None,
+                timeout=remaining(),
+            )
+            page = next(iter(pager.pages))
+            active_runs = active_runs or bool(page.transfer_runs)
+            remaining()
+            token = page.next_page_token
+            if not token:
+                break
         state = (
             "disabled; run bassoon init after recovery verification"
             if config.disabled
             else "enabled at 02:00 UTC"
         )
-        return not config.disabled, f"nightly compaction {state}"
+        activity = (
+            "active work remains" if active_runs or jobs else "no active work observed"
+        )
+        if jobs:
+            activity += ": " + ", ".join(jobs)
+        return not config.disabled, f"nightly compaction {state}; {activity}"

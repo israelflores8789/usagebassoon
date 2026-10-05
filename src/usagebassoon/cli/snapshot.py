@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -33,6 +34,26 @@ def notice(message: str) -> None:
     typer.echo(message, err=True)
 
 
+def confirm_location(archiver: SnapshotArchiver, selection: str) -> None:
+    """Confirm explicit access outside enabled publication destinations."""
+    if not archiver.selection_enabled(selection):
+        message = (
+            "Warning: the given snapshot location is not enabled in the config.toml. "
+            "Would you like to proceed anyway? [Y/n]:"
+        )
+        while True:
+            notice(message)
+            answer = sys.stdin.readline()
+            if not answer:
+                raise typer.Abort()
+            answer = answer.strip().lower()
+            if answer in {"", "y", "yes"}:
+                return
+            if answer in {"n", "no"}:
+                raise typer.Abort()
+            notice("Please enter Y or n.")
+
+
 @snapshot_app.callback()
 def snapshot(
     ctx: typer.Context,
@@ -58,6 +79,8 @@ def snapshot(
     try:
         with spinner(configuration):
             archiver = snapshot_archiver(configuration)
+            if not automatic and not archiver.destination_uris:
+                archiver = SnapshotArchiver(str(configuration.snapshots.local.path))
             uri = archiver.write(
                 backend,
                 run_id="scheduled" if automatic else "manual",
@@ -103,7 +126,18 @@ def list_snapshots(
 ) -> None:
     """List every available snapshot copy globally by capture time."""
     try:
-        rows = read_archiver(_config(ctx, config)).reader.listing(selection)
+        archiver = read_archiver(_config(ctx, config))
+        rows = archiver.reader.listing(selection)
+        disabled = next(
+            (
+                str(row["uri"])
+                for row in rows
+                if not archiver.selection_enabled(str(row["uri"]))
+            ),
+            None,
+        )
+        if disabled is not None:
+            confirm_location(archiver, disabled)
         render_records(
             rows,
             columns=(),
@@ -111,6 +145,8 @@ def list_snapshots(
             save=None,
             json_payload={"snapshots": rows},
         )
+    except typer.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
 
@@ -134,9 +170,11 @@ def inspect_snapshot(
 ) -> None:
     """Explain manifest provenance and compatibility without backend writes."""
     try:
-        reader = read_archiver(_config(ctx, config)).reader
-        candidates, _ = reader.candidates(selection)
+        archiver = read_archiver(_config(ctx, config))
+        reader = archiver.reader
+        candidates, _ = reader.candidates(selection, recovery=True, warning=notice)
         manifest = reader.raw_manifest(candidates[0])[0]
+        confirm_location(archiver, candidates[0].uri)
         render_records(
             [],
             columns=(),
@@ -148,6 +186,8 @@ def inspect_snapshot(
                 "compatibility": reader.compatibility(candidates[0]),
             },
         )
+    except typer.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
 
@@ -171,9 +211,9 @@ def audit_snapshot(
 ) -> None:
     """Audit completeness, object integrity, schemas, and recoverability."""
     try:
-        with read_archiver(_config(ctx, config)).reader.prepare(
-            selection, warning=notice
-        ) as prepared:
+        archiver = read_archiver(_config(ctx, config))
+        with archiver.reader.prepare(selection, warning=notice) as prepared:
+            confirm_location(archiver, prepared.candidate.uri)
             payload: dict[str, object] = {
                 "id": prepared.candidate.identifier,
                 "uri": prepared.candidate.uri,
@@ -189,6 +229,8 @@ def audit_snapshot(
                 save=None,
                 json_payload=payload,
             )
+    except typer.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
 
@@ -263,7 +305,14 @@ def copy_snapshot(
 ) -> None:
     """Verify and copy a complete snapshot between local and GCS archives."""
     try:
-        uri = read_archiver(_config(ctx, config)).copy(selection, destination)
+        archiver = read_archiver(_config(ctx, config))
+        with archiver.reader.prepare(
+            selection, warning=notice, transform=False
+        ) as prepared:
+            confirm_location(archiver, prepared.candidate.uri)
+        uri = archiver.copy(selection, destination)
+    except typer.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(f"Copied snapshot to {uri}.")

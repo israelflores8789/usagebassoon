@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
+import pytest
 from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
@@ -150,6 +151,7 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
             "--config",
             str(tmp_path / "lost.toml"),
         ],
+        input="y\n",
     )
     assert result.exit_code == 0, plain_cli_output(result.output)
     sources = json.loads(plain_cli_output(result.stdout))
@@ -170,8 +172,54 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
             "--config",
             str(tmp_path / "lost.toml"),
         ],
+        input="y\n",
     )
     assert runs.exit_code == 0
     assert [row["run_id"] for row in json.loads(plain_cli_output(runs.stdout))] == [
         "new"
     ]
+
+
+def test_source_identity_warning_uses_complete_matching_evidence_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hardware advice needs positive evidence and never rewrites identity."""
+    from dataclasses import asdict
+
+    from usagebassoon.audit import source_identity_warning
+    from usagebassoon.snapshot.reader import PreparedSnapshot
+    from usagebassoon.system_metadata import SystemMetadata
+
+    metadata = SystemMetadata("Linux", "test", "x86_64", "test CPU", 4, 1024, "/bin/sh")
+    other = "22222222-2222-4222-8222-222222222222"
+    row: dict[str, object] = {
+        "source_id": other,
+        "last_activity": datetime.now(UTC),
+        "host": "matching-host",
+        **asdict(metadata),
+    }
+
+    def sources(
+        *_args: object, prepared: PreparedSnapshot | None = None
+    ) -> list[dict[str, object]]:
+        assert prepared is not None
+        return [row]
+
+    monkeypatch.setattr("usagebassoon.audit.audit_sources", sources)
+    monkeypatch.setattr("usagebassoon.audit.gethostname", lambda: "matching-host")
+    monkeypatch.setattr("usagebassoon.audit.capture_system_metadata", lambda: metadata)
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    store = SnapshotArchiver(str(tmp_path / "archive"))
+    try:
+        uri = store.write(backend, run_id="identity", manual=True)
+        assert uri is not None
+        with store.reader.prepare(uri) as prepared:
+            warning = source_identity_warning(SOURCE_ID, prepared)
+            assert warning is not None and other in warning
+            assert source_identity_warning(other, prepared) is None
+            row["cpu_count"] = None
+            assert source_identity_warning(SOURCE_ID, prepared) is None
+    finally:
+        backend.close()

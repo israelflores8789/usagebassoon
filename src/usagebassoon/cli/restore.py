@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -13,7 +14,7 @@ import typer
 from usagebassoon.audit import source_identity_warning
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
-from usagebassoon.cli.snapshot import notice
+from usagebassoon.cli.snapshot import confirm_location, notice
 from usagebassoon.cli.spinner import spinner
 from usagebassoon.snapshot.restore import restore_operation_id, restore_prepared
 
@@ -31,7 +32,7 @@ def restore(
         bool,
         typer.Option(
             "--cleanup-stages",
-            help="Remove expired owned restore stages before checking emptiness.",
+            help="Drain owned restore jobs and remove disposable stages.",
         ),
     ] = False,
 ) -> None:
@@ -46,16 +47,26 @@ def restore(
     try:
         with spinner(configuration):
             try:
-                with snapshot_archiver(configuration).reader.prepare(
-                    snapshot, warning=notice
-                ) as prepared:
+                archiver = snapshot_archiver(configuration)
+                with archiver.reader.prepare(snapshot, warning=notice) as prepared:
                     if cleanup_stages:
                         backend.cleanup_restore_stages()
                     if not backend.restore_committed(restore_operation_id(prepared)):
                         backend.check_restore_empty()
-                    identity_warning = source_identity_warning(
-                        configuration.source_id, prepared
-                    )
+                    confirm_location(archiver, prepared.candidate.uri)
+                    try:
+                        identity_warning = source_identity_warning(
+                            configuration.source_id, prepared
+                        )
+                    except Exception:
+                        logging.getLogger("usagebassoon").warning(
+                            "Restore source-identity advice is unavailable",
+                            exc_info=True,
+                        )
+                        identity_warning = (
+                            "Source matching is unavailable; "
+                            "restore preserves archived source IDs."
+                        )
                     if identity_warning:
                         notice(identity_warning)
                     typer.confirm(
@@ -68,7 +79,10 @@ def restore(
                     )
             except typer.Abort:
                 raise
-            except (RuntimeError, ValueError) as error:
+            except (OSError, RuntimeError, ValueError) as error:
+                raise typer.BadParameter(str(error)) from error
+            except Exception as error:
+                logging.getLogger("usagebassoon").exception("Snapshot restore failed")
                 raise typer.BadParameter(str(error)) from error
     finally:
         close_backend(backend, context="restoring a snapshot")

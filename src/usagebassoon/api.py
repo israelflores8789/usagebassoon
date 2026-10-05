@@ -10,7 +10,8 @@ from pathlib import Path
 import pyarrow as pa
 
 from usagebassoon.backends.base import StorageBackend, close_backend
-from usagebassoon.config import ConfigurationManager, open_backend
+from usagebassoon.backends.factory import open_backend
+from usagebassoon.config import ConfigurationManager
 from usagebassoon.frames import Engine, query_frame
 from usagebassoon.sql_safety import dialect_for_backend, validate_read_only_sql
 

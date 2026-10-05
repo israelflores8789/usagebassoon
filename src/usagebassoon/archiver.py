@@ -19,10 +19,14 @@ from uuid import uuid4
 import pyarrow.parquet as pq
 
 from usagebassoon.backends.base import StorageBackend
-from usagebassoon.buckets.base import SnapshotBucket, SnapshotObject
-from usagebassoon.buckets.local import LocalSnapshotBucket
+from usagebassoon.buckets.base import (
+    ScopedSnapshotBucket,
+    SnapshotBucket,
+    SnapshotObject,
+    bucket_uri,
+)
+from usagebassoon.buckets.factory import BucketFactory, SnapshotBucketRegistry
 from usagebassoon.config import (
-    GcsConfig,
     LoggingConfig,
     SnapshotsConfig,
     UsageBassoonConfig,
@@ -34,7 +38,7 @@ from usagebassoon.config import (
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.format import FORMAT_VERSION, digest, encode, timestamp
-from usagebassoon.snapshot.reader import Candidate, SnapshotReader
+from usagebassoon.snapshot.reader import Candidate, SnapshotReader, snapshot_location
 from usagebassoon.snapshot.restore import restore_prepared
 from usagebassoon.storage_model import (
     CANONICAL_TABLE_SCHEMAS,
@@ -58,52 +62,53 @@ class SnapshotArchiver:
         self,
         uri: str | None = None,
         *,
-        file_uri: str | None = None,
-        gcs_archive_uri: str | None = None,
+        destination_uris: Sequence[str] = (),
         max_snapshots: int = 3,
         interval: str | None = None,
-        gcs_bucket: SnapshotBucket | None = None,
+        buckets: Sequence[SnapshotBucket] = (),
+        bucket_factory: BucketFactory | None = None,
     ) -> None:
-        """Configure one or two snapshot destinations."""
+        """Configure destinations with optional protocol adapters or factories."""
         if max_snapshots < 1:
             raise ValueError("max_snapshots must be positive")
-        if uri is not None and (file_uri is not None or gcs_archive_uri is not None):
-            raise ValueError("uri cannot be combined with file_uri or gcs_archive_uri")
-        if file_uri is not None and file_uri.startswith("gs://"):
-            raise ValueError("file_uri must be a local path or file:// URI")
-        if gcs_archive_uri is not None and not gcs_archive_uri.startswith("gs://"):
-            raise ValueError("gcs_archive_uri must be a gs:// URI")
+        if uri is not None and destination_uris:
+            raise ValueError("uri cannot be combined with destination_uris")
         self._configuration: UsageBassoonConfig | None = None
-        self._cloud_settings: GcsConfig | None = None
-        locations = (
-            [uri] if uri else [value for value in (file_uri, gcs_archive_uri) if value]
-        )
+        locations = (uri,) if uri is not None else tuple(destination_uris)
         if not locations:
-            raise ValueError("at least one snapshot destination is required")
-        self._archives: tuple[SnapshotBucket, ...] = tuple(
-            gcs_bucket
-            if value.startswith("gs://") and gcs_bucket is not None
-            else self._bucket(value)
-            for value in locations
-        )
-        self.uri = self._archives[0].uri
+            locations = tuple(bucket.uri for bucket in buckets)
+        self._locations = tuple(dict.fromkeys(bucket_uri(value) for value in locations))
+        self._read_locations = self._locations
+        self._buckets: dict[str, SnapshotBucket] = {}
+        for bucket in buckets:
+            location = bucket_uri(bucket.uri)
+            if location in self._buckets:
+                raise ValueError("duplicate injected snapshot bucket location")
+            self._buckets[location] = bucket
+        self._bucket_factory = bucket_factory or SnapshotBucketRegistry().resolve
+        self.uri = self._locations[0] if self._locations else ""
         self.max_snapshots = max_snapshots
         self.interval = parse_interval(interval)
         self._weekly: set[str] = set()
 
     def _bucket(self, uri: str) -> SnapshotBucket:
         """Resolve an explicit URI without redirecting it through configuration."""
-        if not uri.startswith("gs://"):
-            return LocalSnapshotBucket(uri)
-        from usagebassoon.buckets.gcs import GcsSnapshotBucket
-
-        settings = self._cloud_settings
-        return GcsSnapshotBucket(
-            uri,
-            project=settings.project if settings else None,
-            credentials_file=settings.credentials_file if settings else None,
-            timeout_seconds=settings.timeout_seconds if settings else 60.0,
-        )
+        location = bucket_uri(uri)
+        if location not in self._buckets:
+            parents = [
+                root for root in self._buckets if location.startswith(root + "/")
+            ]
+            if parents:
+                root = max(parents, key=len)
+                bucket: SnapshotBucket = ScopedSnapshotBucket(
+                    self._buckets[root], location[len(root) + 1 :]
+                )
+            else:
+                bucket = self._bucket_factory(location)
+            if bucket_uri(bucket.uri) != location:
+                raise ValueError("snapshot bucket factory redirected the requested URI")
+            self._buckets[location] = bucket
+        return self._buckets[location]
 
     @classmethod
     def from_config(cls, configuration: UsageBassoonConfig) -> SnapshotArchiver:
@@ -115,38 +120,47 @@ class SnapshotArchiver:
     @classmethod
     def _from_settings(cls, settings: SnapshotsConfig) -> SnapshotArchiver:
         """Construct enabled archives from backend-independent snapshot settings."""
-        from usagebassoon.buckets.gcs import GcsSnapshotBucket
-
-        gcs = settings.gcs if settings.gcs and settings.gcs.enable else None
-        file_uri = str(settings.local.path) if settings.local.enable else None
-        cloud = (
-            GcsSnapshotBucket(
-                gcs.uri,
-                project=gcs.project,
-                credentials_file=gcs.credentials_file,
-                timeout_seconds=gcs.timeout_seconds,
-            )
-            if gcs
-            else None
-        )
+        registry = SnapshotBucketRegistry.from_settings(settings)
         result = cls(
-            file_uri=file_uri,
-            gcs_archive_uri=gcs.uri if gcs else None,
-            gcs_bucket=cloud,
+            destination_uris=[d.uri for d in registry.destinations if d.enabled],
             max_snapshots=settings.max_snapshots,
             interval=settings.schedule.interval,
+            bucket_factory=registry.resolve,
         )
-        result._cloud_settings = gcs
-        if not settings.schedule.disable_weekly:
-            result._weekly.update(bucket.uri for bucket in result._archives)
+        result._read_locations = tuple(d.uri for d in registry.destinations)
+        result._weekly = {
+            d.uri for d in registry.destinations if d.enabled and d.weekly
+        }
         return result
+
+    @property
+    def _archives(self) -> tuple[SnapshotBucket, ...]:
+        """Construct configured adapters only when their locations are needed."""
+        return tuple(self._bucket(uri) for uri in self._locations)
+
+    def selection_enabled(self, selection: str) -> bool:
+        """Determine whether an explicit location belongs to an enabled archive."""
+        if selection == "latest" or not (
+            "/" in selection
+            or selection.startswith((".", "~"))
+            or Path(selection).exists()
+        ):
+            return True
+        location = snapshot_location(selection)
+        for configured in self._locations:
+            root = bucket_uri(configured)
+            if location == root or location.startswith(root + "/"):
+                return True
+        return False
 
     @classmethod
     def for_read(cls, path: Path) -> SnapshotArchiver:
         """Read archive settings without requiring a valid backend or source ID."""
         if not path.exists():
             configure_logging(LoggingConfig())
-            return cls(str(default_snapshot_directory()))
+            result = cls()
+            result._read_locations = (str(default_snapshot_directory()),)
+            return result
         payload = tomllib.loads(path.read_text(encoding="utf-8"))
         configure_logging(_logging_config(payload.get("logging")))
         settings = _snapshots_config(payload.get("snapshots"))
@@ -155,12 +169,11 @@ class SnapshotArchiver:
     @property
     def reader(self) -> SnapshotReader:
         """Return the shared reader used by restore, inspection, and audit."""
-        return SnapshotReader(self._archives, self._bucket)
-
-    @property
-    def is_gcs(self) -> bool:
-        """Return whether a configured archive uses GCS."""
-        return any(a.uri.startswith("gs://") for a in self._archives)
+        return SnapshotReader(
+            lambda: tuple(self._bucket(uri) for uri in self._read_locations),
+            self._bucket,
+            locations=self._read_locations,
+        )
 
     @property
     def destination_uris(self) -> tuple[str, ...]:
@@ -211,6 +224,10 @@ class SnapshotArchiver:
     ) -> str | None:
         """Capture once and publish due destinations under live reservations."""
         created = _now()
+        if not self._locations:
+            if not manual:
+                return None
+            raise ValueError("at least one snapshot destination is required")
         identifier = f"{created.strftime('%Y-%m-%dT%H%M%SZ')}_{uuid4().hex}"
         catalogs = [
             Catalog(a, self.max_snapshots)
@@ -220,7 +237,7 @@ class SnapshotArchiver:
         due = [(c, roles) for c, roles in due if roles]
         if not due:
             return None
-        written: dict[SnapshotBucket, list[SnapshotObject]] = {}
+        written: dict[str, list[SnapshotObject]] = {}
         try:
             with (
                 ExitStack() as stack,
@@ -249,7 +266,7 @@ class SnapshotArchiver:
                             else None,
                         }
                         catalog.stage(identifier, initial_state)
-                        written[catalog.bucket] = []
+                        written[bucket_uri(catalog.bucket.uri)] = []
                     directory = Path(temporary)
                     specifications: dict[str, object] = {}
                     files: dict[str, Path] = {}
@@ -321,7 +338,7 @@ class SnapshotArchiver:
                     for catalog, _memberships in due:
                         catalog.check()
                         archive = catalog.bucket
-                        owned = written[archive]
+                        owned = written[bucket_uri(archive.uri)]
                         for path in [*files.values(), manifest_path]:
                             catalog.check()
                             owned.append(
@@ -369,13 +386,13 @@ class SnapshotArchiver:
         self,
         due: list[tuple[Catalog, list[str]]],
         identifier: str,
-        written: dict[SnapshotBucket, list[SnapshotObject]],
+        written: dict[str, list[SnapshotObject]],
         *,
         error: str,
     ) -> None:
         """Retire owned partial copies while their destination claims remain live."""
         for catalog, _ in due:
-            if catalog.bucket not in written:
+            if bucket_uri(catalog.bucket.uri) not in written:
                 continue
             try:
                 catalog.check()
@@ -459,6 +476,8 @@ class SnapshotArchiver:
                 state = None
             if state is None:
                 state = {"pinned": True, "roles": list[str](), "retired": False}
+            # Cleanup revisions describe the original provider's objects only.
+            state.pop("cleanup", None)
             catalog.stage(
                 identifier,
                 {

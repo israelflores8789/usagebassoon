@@ -98,6 +98,7 @@ def test_snapshot_management_and_audit_aliases_share_structured_results(
                 "--config",
                 str(tmp_path / "lost.toml"),
             ],
+            input="y\n",
         )
         assert result.exit_code == 0, plain_cli_output(result.output)
         payload = json.loads(plain_cli_output(result.stdout))
@@ -115,6 +116,7 @@ def test_snapshot_management_and_audit_aliases_share_structured_results(
             "--config",
             str(tmp_path / "lost.toml"),
         ],
+        input="y\n",
     )
     assert listed.exit_code == 0
     record = json.loads(plain_cli_output(listed.stdout))["snapshots"][0]
@@ -158,9 +160,7 @@ def test_snapshot_delete_does_not_include_copies_created_during_confirmation(
     source.apply_ddl()
     cloud = MemoryGcsArchive()
     local = tmp_path / "archive"
-    store = SnapshotStore(
-        file_uri=str(local), gcs_archive_uri=cloud.uri, gcs_bucket=cloud
-    )
+    store = SnapshotStore(destination_uris=(str(local), cloud.uri), buckets=(cloud,))
     try:
         uri = SnapshotStore(str(local)).write(
             source, run_id="manual", manual=True, pin=True
@@ -226,9 +226,73 @@ def test_inspect_exposes_verified_producer_metadata_for_unsupported_contract(
             "--config",
             str(tmp_path / "lost.toml"),
         ],
+        input="y\n",
     )
     assert result.exit_code == 0, plain_cli_output(result.output)
     payload = json.loads(plain_cli_output(result.stdout))
     assert payload["manifest"]["data_schema_version"] == 999
     assert payload["manifest"]["usagebassoon_version"]
     assert payload["compatibility"]["supported"] is False
+
+
+def test_inspect_archive_root_uses_immutables_when_controls_are_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Latest provenance remains inspectable without usable lifecycle metadata."""
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    root = tmp_path / "archive"
+    uri = SnapshotStore(str(root)).write(backend, run_id="inspect", manual=True)
+    backend.close()
+    assert uri is not None
+    (root / "control.json").write_text("damaged")
+    (root / "catalog.json").write_text("damaged")
+    (Path(uri) / "state.json").write_text("damaged")
+    result = CliRunner().invoke(
+        app,
+        [
+            "snapshot",
+            "inspect",
+            "--from-snapshot",
+            str(root),
+            "--config",
+            str(tmp_path / "lost.toml"),
+            "--json",
+        ],
+        input="y\n",
+    )
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    assert (
+        json.loads(plain_cli_output(result.stdout))["manifest"]["snapshot_id"]
+        == Path(uri).name
+    )
+
+
+def test_declining_disabled_archive_access_aborts_without_audit_output(
+    tmp_path: Path,
+) -> None:
+    """A negative permission answer is cancellation, not an invalid parameter."""
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    uri = SnapshotStore(str(tmp_path / "archive")).write(
+        backend, run_id="decline", manual=True
+    )
+    backend.close()
+    assert uri is not None
+    result = CliRunner().invoke(
+        app,
+        [
+            "snapshot",
+            "audit",
+            "--from-snapshot",
+            uri,
+            "--config",
+            str(tmp_path / "lost.toml"),
+            "--json",
+        ],
+        input="n\n",
+    )
+    assert result.exit_code != 0
+    assert "Aborted" in plain_cli_output(result.output)
+    assert '"valid": true' not in plain_cli_output(result.stdout)
+    assert (Path(uri) / "COMPLETE").exists()

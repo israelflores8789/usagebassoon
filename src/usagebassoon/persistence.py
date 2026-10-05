@@ -18,7 +18,8 @@ from usagebassoon.backends.base import (
     UpsertResult,
     close_backend,
 )
-from usagebassoon.config import UsageBassoonConfig, open_backend
+from usagebassoon.backends.factory import open_backend
+from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import IngestStatus, IngestTarget
 from usagebassoon.logger import LOGGER_NAME

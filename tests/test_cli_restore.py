@@ -21,7 +21,7 @@ def _write_config(path: Path, database: Path) -> None:
     """Write a local-DuckDB configuration for restore command tests."""
     path.write_text(
         f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'backend.duckdb.database = "{database}"\n[snapshots.local]\nenable = true\n'
     )
 
 
@@ -72,6 +72,88 @@ def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
         ]
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("answer", ["n", "y"])
+def test_explicit_restore_from_disabled_location_requires_separate_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+) -> None:
+    """Explicit local recovery bypasses disabled archives and unusable cloud auth."""
+    from usagebassoon.archiver import SnapshotArchiver
+
+    source = DuckDBBackend(":memory:")
+    source.apply_ddl()
+    uri = SnapshotArchiver(str(tmp_path / "archive")).write(
+        source, run_id="explicit", manual=True
+    )
+    source.close()
+    assert uri is not None
+    database = tmp_path / "destination.duckdb"
+    target = DuckDBBackend(database)
+    target.apply_ddl()
+    target.close()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'source_id = "{SOURCE_ID}"\nbackend.duckdb.database = "{database}"\n'
+        "[snapshots.local]\nenable = false\n"
+        '[snapshots.gcs]\nenable = true\nuri = "gs://unused/archive"\n'
+        'project = "unused"\ncredentials_file = "/missing/credentials.json"\n'
+    )
+
+    def forbidden_cloud(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("explicit local recovery must not construct GCS")
+
+    monkeypatch.setattr("usagebassoon.buckets.gcs.GcsSnapshotBucket", forbidden_cloud)
+    result = CliRunner().invoke(
+        app,
+        ["restore", "--config", str(config), "--from-snapshot", uri],
+        input=f"{answer}\ny\n",
+    )
+    output = plain_cli_output(result.output)
+    assert "not enabled in the config.toml" in output
+    assert (result.exit_code == 0) is (answer == "y")
+    target = DuckDBBackend(database)
+    try:
+        assert target.query("SELECT * FROM restore_receipts").num_rows == (
+            1 if answer == "y" else 0
+        )
+    finally:
+        target.close()
+
+
+def test_restore_source_advice_failure_does_not_block_immutable_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable advisory query cannot prevent a confirmed valid restore."""
+    from usagebassoon.archiver import SnapshotArchiver
+
+    database = tmp_path / "destination.duckdb"
+    config = tmp_path / "config.toml"
+    _write_config(config, database)
+    backend = DuckDBBackend(database)
+    backend.apply_ddl()
+    uri = SnapshotArchiver(str(tmp_path / "archive")).write(
+        backend, run_id="advisory", manual=True
+    )
+    backend.close()
+    assert uri is not None
+
+    def failed_advice(*_args: object) -> str | None:
+        raise OSError("source audit spill unavailable")
+
+    monkeypatch.setattr(
+        "usagebassoon.cli.restore.source_identity_warning", failed_advice
+    )
+    result = CliRunner().invoke(
+        app,
+        ["restore", "--config", str(config), "--from-snapshot", uri],
+        input="y\ny\n",
+    )
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    assert "Source matching is unavailable" in plain_cli_output(result.output)
 
 
 def test_restore_rejects_a_populated_destination(
@@ -127,7 +209,7 @@ def test_restore_requires_confirmation_before_writing_warehouse(
     result = CliRunner().invoke(
         app,
         ["restore", "--config", str(configuration), "--from-snapshot", uri],
-        input=answer,
+        input="y\n" + answer,
     )
     output = plain_cli_output(result.output)
     assert result.exit_code != 0

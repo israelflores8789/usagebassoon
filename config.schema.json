@@ -136,6 +136,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "disable_weekly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable weekly recovery captures at this GCS destination."
+        },
         "uri": {
           "type": "string",
           "minLength": 1,
@@ -351,8 +356,13 @@
       "properties": {
         "enable": {
           "type": "boolean",
-          "default": true,
-          "description": "Enable local snapshots; defaults to true, independently of remote enablement."
+          "default": false,
+          "description": "Enable automatic local snapshots; defaults to false, independently of remote enablement."
+        },
+        "disable_weekly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable weekly recovery captures at this local destination."
         },
         "path": {
           "$ref": "#/$defs/nonEmptyString",
@@ -380,11 +390,6 @@
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[mMhHdD]$",
           "description": "Independent snapshot cadence in minutes, hours, or days; defaults to 12h.",
           "default": "12h"
-        },
-        "disable_weekly": {
-          "type": "boolean",
-          "default": false,
-          "description": "Disable weekly recovery captures for every enabled destination; four successful UTC calendar-week slots are retained otherwise."
         }
       }
     }
