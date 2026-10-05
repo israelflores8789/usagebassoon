@@ -237,13 +237,39 @@ A new backend contribution must:
 
 ## Snapshot and recovery contracts
 
-A complete snapshot directory contains immutable `manifest.json`, immutable `COMPLETE` evidence, portable mutable `state.json`, and referenced Parquet objects. Relative names and content hashes define portable contents; provider generations are only storage concurrency metadata. Copies retain the same ID and immutable contents. `catalog.json` is a reconstructible discovery index; independent `control.json` owns authoritative retention policy, lifecycle records, and current owner/expiry/fence. Publication, pinning, and retirement authorize their transitions through the same control-document CAS as the reservation; sidecars and catalogs are projections. Lost ownership ends the attempt until the next scheduling opportunity. Repair must preserve corrupt evidence and active claims. Retirement tombstones prevent routine management from resurrecting interrupted deletion; valid surviving immutable contents remain readable for emergency recovery.
+### Snapshot contents and lifecycle
 
-Archive capture, pinning, deletion, retention, copying, and repair use fenced destination reservations. Downloads attempt a protective reservation, but inability to mutate control metadata must never prevent verified immutable recovery. Claim all participating destinations in deterministic order before reading; renew through streaming and publication. Never retire unverified lifecycle state or clean active staging based only on its age. Local writes flush and sync files and directories around atomic publication. Partial cross-location publication attempts rollback under still-owned claims; no transaction spans destinations. Retention starts only after every participating copy verifies successfully.
+- Complete snapshots contain:
+  - immutable `manifest.json`,
+  - immutable `COMPLETE` artifact,
+  - all immutable referenced Parquet objects, and
+  - mutable portable `state.json`.
+- Relative object names and hashes *define* portable contents. Provider generations are only concurrency metadata. Copies retain the ID and immutable contents.
+- `catalog.json` is rebuildable.
+- `control.json` owns retention, lifecycle, and reservation owner/expiry/fence. Publish, pin, and retire operates through its reservation CAS; catalogs and sidecars are projections.
+- Lost ownership ends an attempt until rescheduled. Repair preserves corrupt evidence and active claims. Retirement tombstones block routine resurrection after interrupted deletion; valid immutable contents remain recoverable.
 
-Manual snapshots bypass cadence and pin by default. Scheduled retention counts unpinned recovery points; four successful UTC weekly slots remain independent. Pins are exempt from both. Scheduled and weekly execution have independent native artifacts and a separate worker loop; they never wait for collection completion or require tokscale preflight. Backup health evaluates each role separately and reports accumulated weekly coverage. Archive policy cannot be silently weakened by another instance's configuration. Deletion requires explicit selected locations and the CLI's `DELETE` confirmation; partial cleanup stays retired and retryable.
+### Capture and publication
 
-Recovery requires valid immutable manifest/completion evidence and referenced objects, independent of all mutable lifecycle documents, including retirement state. Routine management eligibility is a separate contract. Verified raw provenance remains inspectable when compatibility is unsupported. Recovery validates every registered intermediate output contract, required field, and semantic validator in an isolated candidate directory before changing destination maintenance or application data. Destination emptiness covers unexpected populated tables. Stop every writer; helper checks and receipts do not constitute a collection mutex. `init --restore` provisions with maintenance disabled; restore independently pauses applicable maintenance and awaits running jobs with a bound. The native transaction rechecks emptiness and commits data with a completion receipt. BigQuery restore stages have stable logical operation IDs bound to snapshot digests, unique attempt IDs, ownership labels, and expiry as a backstop. Retrying drains labeled jobs and discards owned stages immediately; inspection and cleanup never infer ownership from a name prefix. Every maintenance RPC and wait shares an operation deadline, and all restore exits report known maintenance state without obscuring the original failure. Plain `init` is the recovery operator's explicit maintenance-resumption command.
+- Fenced reservations cover capture, pinning, deletion, retention, copying, and repair. Downloads try a reservation, but control-write failures cannot block verified recovery.
+- Claim destinations in deterministic order before reading; renew through streaming and publication. Never retire unverified lifecycle state or remove active staging by age alone.
+- Flush and sync local files and directories around atomic publication. Roll back partial cross-destination publication while claims are held; no transaction spans destinations. Retain only after every copy verifies.
+
+### Scheduling and retention
+
+- Manual snapshots bypass cadence and pin by default. Scheduled retention counts unpinned snapshots; keep four successful UTC weekly slots separately. Pins are exempt from both rules.
+- Scheduled snapshots and weekly backups use independent native artifacts and a worker loop separate from collection. They run without collection completion or tokscale preflight. Backup health reports each role and accumulated weekly coverage; another instance cannot silently weaken archive policy.
+- Deletion requires selected locations and the CLI's `DELETE` confirmation. Partial cleanup remains retired and retryable.
+
+### Restore and recovery
+
+- Recovery requires valid immutable manifest/completion evidence and all referenced objects, regardless of mutable lifecycle or retirement state. Management eligibility is separate; verified provenance remains inspectable when compatibility is unsupported.
+- Validate every registered intermediate output contract, required fields, and semantic validator in an isolated candidate directory before changing maintenance or data.
+- Stop all destination writers; checks and receipts are not a collection mutex. `init --restore` provisions with maintenance disabled. Restore pauses applicable maintenance and drains jobs within a bound; the native transaction rechecks emptiness, including unexpected populated tables, then commits data with a completion receipt.
+- BigQuery restore stages use digest-bound logical operation IDs, unique attempt IDs, ownership labels, and expiry as a backstop. Retries drain labeled jobs and discard owned stages immediately; never infer ownership from a name prefix.
+- One operation deadline covers every maintenance RPC and wait. Every exit reports known maintenance state without hiding the original failure. Plain `init` resumes maintenance explicitly.
+
+### Versioning and compatibility
 
 | Version responsibility | Owner | Meaning |
 |---|---|---|
@@ -252,11 +278,14 @@ Recovery requires valid immutable manifest/completion evidence and referenced ob
 | Snapshot-format version | `snapshot/format.py` | Manifest and file packaging/interpretation |
 | Physical backend schema version/hash | `schema_assets.py` | Installed native SQL, including scheduled compaction |
 
-Persisted data and archives are public compatibility interfaces. Incompatible public changes require a major application release; compatible additions and fixes do not automatically require one. Backend SQL upgrades and portable snapshot transformations are separate registries. Physical upgrades require dedicated native assets, complete per-dialect previous/target hashes, contiguous steps, and migration-ledger recording; baseline DDL is never a fallback migration. Automatic upgrades must preserve deliberate maintenance pauses.
+Persisted data and archives are public contracts: incompatible changes require a major application release; compatible additions and fixes do not automatically require one. Backend SQL upgrades and snapshot transformations use separate registries. Physical upgrades need native assets, complete previous/target hashes for each dialect, contiguous steps, and migration-ledger entries. Baseline DDL is never a fallback migration; automatic upgrades preserve maintenance pauses.
 
-Every publicly released archive format and data contract retains a tested recovery path. Register historical format readers, immutable Arrow contracts, forward transformations into separate files, and semantic validators in `snapshot/format.py`. Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented tested conversion path; a major release does not abandon recoverability. Historical released packages are an emergency fallback. The current prerelease baseline has no legacy migration obligation or invented conversion scripts.
+Every released format and data contract needs tested recovery: historical readers, immutable Arrow contracts, forward transformations in separate files, and semantic validators in `snapshot/format.py`. Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented, tested conversion; released packages remain an emergency fallback.
 
-Extend existing test modules before adding files. The recovery drill seeds multiple sources and every logical table, relocates local/GCS copies, removes the copied index, restores into another supported backend, compares independent expected logical data, and resumes collection with preserved source identity. Use only the dedicated `usagebassoon_it` BigQuery dataset/MotherDuck database and the mandated GCS test bucket; execute shared-destination destructive phases serially.
+### Recovery drill
+
+- Extend existing test modules. Seed multiple sources and every logical table; relocate local/GCS copies, remove the copied index, restore to another supported backend, compare with independently derived expected data, and resume collection with source IDs preserved.
+- Use only the `usagebassoon_it` BigQuery dataset, MotherDuck database, and mandated GCS test bucket. Run destructive shared-destination phases serially.
 
 ## Golden fixture policy
 
