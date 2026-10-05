@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import TracebackType
 
 import pytest
 
@@ -81,3 +83,92 @@ def test_logging_disable_closes_sinks_and_can_be_reenabled(
     configure(enabled).info("reenabled message")
     assert "reenabled message" in path.read_text()
     assert "disabled message" not in path.read_text()
+
+
+@pytest.mark.parametrize("sink", ["rotating", "fallback", "write_failure"])
+def test_operational_sinks_redact_complete_exception_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sink: str,
+) -> None:
+    """Hide arguments and chained exceptions while retaining stack context."""
+    from usagebassoon.config import UsageBassoonConfig
+    from usagebassoon.logger import _CredentialFormatter
+
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
+    monkeypatch.setenv("MOTHERDUCK_TOKEN", "opaque-backend-credential")
+    monkeypatch.setenv("EXTRA_DIAGNOSTIC", "opaque-child-credential")
+    directory = tmp_path / "logs"
+    if sink == "fallback":
+        directory.write_text("occupied")
+    logger = configure(
+        UsageBassoonConfig(
+            path=tmp_path / "config.toml",
+            source_id="11111111-1111-4111-8111-111111111111",
+            backend="duckdb",
+            tokscale_env=("EXTRA_DIAGNOSTIC",),
+            logging=LoggingConfig(directory=directory, max_files=2, max_bytes=512),
+        )
+    )
+    handler = next(
+        handler
+        for handler in logger.handlers
+        if isinstance(handler.formatter, _CredentialFormatter)
+    )
+    if sink == "write_failure":
+
+        def fail_rotation() -> None:
+            raise OSError("rotation unavailable")
+
+        monkeypatch.setattr(handler, "doRollover", fail_rotation)
+    # Capture-time values remain protected after the environment changes.
+    monkeypatch.delenv("EXTRA_DIAGNOSTIC")
+    configure(LoggingConfig(directory=directory, max_files=2, max_bytes=512))
+    cause = RuntimeError("backend failed: opaque-backend-credential")
+    failure = OSError("child failed: opaque-child-credential")
+    traceback: TracebackType | None = None
+    try:
+        try:
+            raise cause
+        except RuntimeError:
+            raise failure from cause
+    except OSError as error:
+        traceback = error.__traceback__
+        record = logging.LogRecord(
+            logger.name,
+            logging.ERROR,
+            __file__,
+            1,
+            "publication failed %s Authorization: Bearer bearer-credential "
+            "details={'password': 'structured-credential'}",
+            ("opaque-backend-credential",),
+            (type(error), error, traceback),
+            sinfo="stack context /workspace/collector.py:42",
+        )
+        handler.format(record)
+        assert record.exc_text is None
+        logger.handle(record)
+        logger.handle(record)
+    if sink == "rotating":
+        paths = [directory / "usagebassoon.log", directory / "usagebassoon.log.1"]
+        assert all(path.exists() for path in paths)
+        output = "\n".join(path.read_text() for path in paths)
+    else:
+        output = plain_cli_output(capsys.readouterr().err)
+    for secret in (
+        "opaque-backend-credential",
+        "opaque-child-credential",
+        "bearer-credential",
+        "structured-credential",
+    ):
+        assert secret not in output
+    assert "publication failed" in output
+    assert "backend failed" in output
+    assert "child failed" in output
+    assert "direct cause" in output
+    assert __file__ in output
+    assert "stack context /workspace/collector.py:42" in output
+    assert failure.__cause__ is cause
+    assert failure.__traceback__ is traceback
+    assert "opaque-child-credential" in str(failure)

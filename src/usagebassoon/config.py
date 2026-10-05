@@ -1080,5 +1080,5 @@ class ConfigurationManager:
             raise _configuration_error_with_log(path, error, decoded) from error
         from .logger import configure
 
-        configure(configuration.logging)
+        configure(configuration)
         return configuration

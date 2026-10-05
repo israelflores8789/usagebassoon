@@ -8,15 +8,51 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from copy import copy
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO, override
 
-from .config import LoggingConfig
+from .config import LoggingConfig, UsageBassoonConfig
+from .privacy import credential_values, redact_credentials
 
 LOGGER_NAME = "usagebassoon"
 LOG_DIRECTORY_ENV_VAR = "USAGEBASSOON_LOG_DIRECTORY"
 _FALLBACK_HANDLER_ATTRIBUTE = "_usagebassoon_fallback_handler"
+_CREDENTIAL_ENVIRONMENT_NAMES: tuple[str, ...] = ()
+_KNOWN_CREDENTIALS: tuple[str, ...] = ()
+
+
+def _redact(value: str) -> str:
+    """Apply the privacy policy using captured and currently active credentials."""
+    return redact_credentials(
+        value,
+        known_values=(
+            *_KNOWN_CREDENTIALS,
+            *credential_values(
+                os.environ, environment_names=_CREDENTIAL_ENVIRONMENT_NAMES
+            ),
+        ),
+    )
+
+
+class _CredentialFormatter(logging.Formatter):
+    """Redact the complete message, stack information, and exception chain."""
+
+    @override
+    def format(self, record: logging.LogRecord) -> str:
+        """Render a private copy so raw exception caches never alter other sinks."""
+        return _redact(super().format(copy(record)))
+
+
+def worker_diagnostic(message: str) -> None:
+    """Write an unattended stderr diagnostic when operational logging is enabled.
+
+    Args:
+        message: Rendered worker status or failure detail.
+    """
+    if not logging.getLogger(LOGGER_NAME).disabled:
+        print(_redact(message), file=sys.stderr, flush=True)
 
 
 class _FallbackStderrHandler(logging.StreamHandler[TextIO]):
@@ -32,10 +68,27 @@ class _FallbackStderrHandler(logging.StreamHandler[TextIO]):
 
     @override
     def handleError(self, record: logging.LogRecord) -> None:
-        """Suppress only closed-stream errors from ephemeral terminal captures."""
+        """Avoid logging's default error report, which dumps raw message arguments."""
         if getattr(self.stream, "closed", False):
             return
-        super().handleError(record)
+        if logging.raiseExceptions:
+            try:
+                print(
+                    "UsageBassoon could not write an operational log.", file=sys.stderr
+                )
+            except (OSError, ValueError):
+                return
+
+
+class _RotatingFileHandler(RotatingFileHandler):
+    """Preserve safe diagnostics on stderr if an established file sink fails."""
+
+    @override
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Use the same safe formatter instead of dumping the original record."""
+        handler = _FallbackStderrHandler(sys.stderr)
+        handler.setFormatter(self.formatter)
+        handler.handle(record)
 
 
 def _ensure_fallback_handler(logger: logging.Logger) -> None:
@@ -52,7 +105,7 @@ def _ensure_fallback_handler(logger: logging.Logger) -> None:
     handler = _FallbackStderrHandler(sys.stderr)
     setattr(handler, _FALLBACK_HANDLER_ATTRIBUTE, True)
     handler.setFormatter(
-        logging.Formatter(
+        _CredentialFormatter(
             "%(asctime)s %(levelname)s %(name)s %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         )
@@ -74,15 +127,32 @@ def _log_directory(config: LoggingConfig) -> Path:
     return Path(override).expanduser() if override else config.directory.expanduser()
 
 
-def configure(config: LoggingConfig) -> logging.Logger:
+def configure(config: LoggingConfig | UsageBassoonConfig) -> logging.Logger:
     """Configure the UsageBassoon rotating operational log.
 
     Args:
-        config: Validated file location and retention settings.
+        config: Logging settings or full runtime settings for child diagnostics.
 
     Returns:
         The package logger configured for exception diagnostics.
     """
+    global _CREDENTIAL_ENVIRONMENT_NAMES, _KNOWN_CREDENTIALS
+    if isinstance(config, UsageBassoonConfig):
+        _CREDENTIAL_ENVIRONMENT_NAMES = tuple(
+            dict.fromkeys((*_CREDENTIAL_ENVIRONMENT_NAMES, *config.tokscale_env))
+        )
+        config = config.logging
+    # Reconfiguration must still protect credentials used by in-flight operations.
+    _KNOWN_CREDENTIALS = tuple(
+        dict.fromkeys(
+            (
+                *_KNOWN_CREDENTIALS,
+                *credential_values(
+                    os.environ, environment_names=_CREDENTIAL_ENVIRONMENT_NAMES
+                ),
+            )
+        )
+    )
     logger = logging.getLogger(LOGGER_NAME)
     logger.disabled = config.disable
     if config.disable:
@@ -112,7 +182,7 @@ def configure(config: LoggingConfig) -> logging.Logger:
         return logger
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
+        handler = _RotatingFileHandler(
             log_path,
             maxBytes=config.max_bytes,
             backupCount=config.max_files - 1,
@@ -132,7 +202,7 @@ def configure(config: LoggingConfig) -> logging.Logger:
         )
         return logger
     handler.setFormatter(
-        logging.Formatter(
+        _CredentialFormatter(
             "%(asctime)s %(levelname)s %(name)s %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         )

@@ -678,6 +678,104 @@ def test_worker_continues_after_an_operational_cycle_failure(
         assert records[0].exc_info[1] is failure
 
 
+@pytest.mark.parametrize("origin", ["child", "backend"])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_worker_failure_outputs_protect_active_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    origin: str,
+    disabled: bool,
+) -> None:
+    """Child and backend failures stay secret-safe and permit another cycle."""
+    from dataclasses import replace
+    from sys import executable
+
+    import usagebassoon.scheduling as module
+    from usagebassoon.collector import _json_command
+    from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
+
+    monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(tmp_path / "logs"))
+    monkeypatch.setenv("MOTHERDUCK_TOKEN", "unlabeled-backend-credential")
+    monkeypatch.setenv("CUSTOM_INPUT", "unlabeled-child-credential")
+    config = replace(
+        _configuration(tmp_path),
+        tokscale_env=("CUSTOM_INPUT",),
+        logging=LoggingConfig(directory=tmp_path / "logs", disable=disabled),
+    )
+    log_path = tmp_path / "logs" / "usagebassoon.log"
+    previous_log = log_path.read_bytes()
+    attempts = 0
+    failures: list[RuntimeError] = []
+
+    class StopAfterTwoCycles(Event):
+        """Exercise recovery without waiting for the scheduled interval."""
+
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            if attempts == 2:
+                self.set()
+            return self.is_set()
+
+    def configuration(
+        _path: Path | None, _collection: str | None, _snapshots: str | None
+    ) -> UsageBassoonConfig:
+        return config
+
+    def preflight(_config: UsageBassoonConfig) -> tuple[str, str]:
+        return "tokscale", "test"
+
+    def collect(settings: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            try:
+                if origin == "child":
+                    _json_command(
+                        settings,
+                        [
+                            executable,
+                            "-c",
+                            "import os, sys; "
+                            "sys.stderr.write(os.environ['CUSTOM_INPUT']); sys.exit(1)",
+                        ],
+                        "graph",
+                    )
+                else:
+                    raise RuntimeError(
+                        "backend unavailable: unlabeled-backend-credential"
+                    )
+            except RuntimeError as error:
+                failures.append(error)
+                raise RuntimeError(f"collection publication failed: {error}") from error
+        return "successful-run", PersistSummary(1, 0, {})
+
+    monkeypatch.setattr(module, "Event", StopAfterTwoCycles)
+    monkeypatch.setattr(module, "_worker_configuration", configuration)
+    monkeypatch.setattr(module, "preflight_tokscale", preflight)
+    monkeypatch.setattr(module, "collect_run", collect)
+    run_worker(config.path)
+
+    output = capsys.readouterr()
+    assert attempts == 2
+    assert "scheduled run successful-run" in plain_cli_output(output.out)
+    assert len(failures) == 1
+    secret = f"unlabeled-{origin}-credential"
+    assert secret in str(failures[0])
+    if disabled:
+        assert plain_cli_output(output.err) == ""
+        assert log_path.read_bytes() == previous_log
+    else:
+        log = (tmp_path / "logs" / "usagebassoon.log").read_text()
+        assert secret not in log + output.err
+        assert "scheduled collection failed" in plain_cli_output(output.err)
+        assert "direct cause" in log
+        assert "test_scheduling.py" in log
+        if origin == "child":
+            assert "collector.py" in log
+        assert "collection publication failed" in log
+
+
 @pytest.mark.parametrize("content", ["not-a-pid", "0", "-1"])
 def test_invalid_worker_pid_state_blocks_worker_control(
     tmp_path: Path,

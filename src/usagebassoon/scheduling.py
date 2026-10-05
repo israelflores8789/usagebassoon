@@ -37,6 +37,7 @@ from usagebassoon.config import (
 )
 from usagebassoon.diagnostics import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
+from usagebassoon.logger import worker_diagnostic
 from usagebassoon.orchestrator import collect as collect_run
 from usagebassoon.version import __version__
 
@@ -294,7 +295,7 @@ def run_snapshot_check(config: UsageBassoonConfig) -> None:
 
 def _snapshot_worker(config: UsageBassoonConfig, stop: Event, seconds: float) -> None:
     """Service backup deadlines independently of the collection worker."""
-    logger = configure_logging(config.logging)
+    logger = configure_logging(config)
     while not stop.is_set():
         try:
             run_snapshot_check(config)
@@ -984,7 +985,7 @@ def run_worker(
     interval = parse_interval(configuration.collection.schedule.interval)
     if interval is None:
         raise SchedulingError("collection.schedule.interval must be positive")
-    logger = configure_logging(configuration.logging)
+    logger = configure_logging(configuration)
     logger.info("worker configuration is fixed at startup; restart after file changes")
     stop_requested = Event()
 
@@ -1024,24 +1025,16 @@ def run_worker(
                     "file and restart the worker to apply configuration changes."
                 )
                 logger.error(message)
-                print(message, file=sys.stderr, flush=True)
+                worker_diagnostic(message)
                 change_reported = True
             try:
                 run_id, summary = collect_run(configuration)
             except CollectionBusy as error:
                 logger.info("scheduled collection skipped: %s", error)
-                print(
-                    f"scheduled collection skipped: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                worker_diagnostic(f"scheduled collection skipped: {error}")
             except Exception as error:
                 logger.exception("scheduled collection cycle failed")
-                print(
-                    f"scheduled collection failed: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                worker_diagnostic(f"scheduled collection failed: {error}")
             else:
                 print(
                     f"scheduled run {run_id}: {summary.inserted} inserted, "

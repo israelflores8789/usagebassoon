@@ -154,7 +154,7 @@ def doctor(
                 "tokscale", "error", str(error), command_detail
             )
         try:
-            logger = configure_logging(configuration.logging)
+            logger = configure_logging(configuration)
         except Exception:
             logger.exception("could not configure doctor logging")
         try:

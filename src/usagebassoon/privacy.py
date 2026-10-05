@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""privacy.py — Output-only obfuscation for shareable UsageBassoon artifacts."""
+"""privacy.py — Output-only credential redaction and sharing obfuscation."""
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from urllib.parse import quote, quote_plus
 
 import pyarrow as pa
 
@@ -22,13 +24,29 @@ _PSEUDONYM_PREFIXES: Mapping[str, str] = {
     "workspace_label": "workspace",
 }
 _REDACTED_COLUMNS = frozenset({"note"})
-_URI_CREDENTIAL_PATTERN = re.compile(r"(\w+://)[^\s/@:]+:[^\s/@]+@")
+_CREDENTIAL_MARKERS = (
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "KEY",
+    "SECRET",
+    "AUTH",
+    "CREDENTIAL",
+)
+_URI_CREDENTIAL_PATTERN = re.compile(r"(\w+://)[^\s/@]+@")
 _QUERY_SECRET_PATTERN = re.compile(
-    r"(?P<prefix>[?&;](?:token|password|passwd|secret|api[_-]?key|access[_-]?token)=[^\s&#]*)",
+    r"[?&;](?P<name>[\w-]+)=[^\s&#;\"']*",
     re.IGNORECASE,
 )
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+    r"(?P<prefix>[\"']?\b(?P<name>(?=[\w-]*(?:"
+    + "|".join(_CREDENTIAL_MARKERS)
+    + r"))[A-Za-z_][A-Za-z0-9_-]*)[\"']?\s*[=:]\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;{}\[\]\"']+)",
+    re.IGNORECASE,
+)
+_AUTHORIZATION_PATTERN = re.compile(
+    r"\b(?:Bearer|Basic)\s+[^\s\"',;}\]]+", re.IGNORECASE
 )
 _WINDOWS_PATH_PATTERN = re.compile(
     r"(?<![\w:])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\s,:;)]+)[^\s,:;)]*"
@@ -63,9 +81,7 @@ def _sanitize_text(value: str, replacements: Mapping[str, str]) -> str:
     Returns:
         Share-safe free text.
     """
-    sanitized = _URI_CREDENTIAL_PATTERN.sub(r"\1<credentials>@", value)
-    sanitized = _QUERY_SECRET_PATTERN.sub("<redacted-query>", sanitized)
-    sanitized = _ENV_ASSIGNMENT_PATTERN.sub(_redact_environment_secret, sanitized)
+    sanitized = redact_credentials(value)
     for private_value in sorted(replacements, key=len, reverse=True):
         if private_value:
             sanitized = sanitized.replace(private_value, replacements[private_value])
@@ -83,9 +99,64 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
         Original assignment or a redacted value.
     """
     name = match["name"]
-    if any(token in name.upper() for token in ("TOKEN", "PASSWORD", "KEY", "SECRET")):
-        return f"{name}=<redacted>"
+    if _credential_name(name):
+        return f"{match['prefix']}<redacted>"
     return match[0]
+
+
+def _credential_name(name: str) -> bool:
+    """Return whether a field or environment name denotes authentication material."""
+    return any(token in name.upper() for token in _CREDENTIAL_MARKERS)
+
+
+def _redact_query_secret(match: re.Match[str]) -> str:
+    """Redact a credential query parameter while preserving ordinary parameters."""
+    return "<redacted-query>" if _credential_name(match["name"]) else match[0]
+
+
+def credential_values(
+    environ: Mapping[str, str], *, environment_names: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """Select active credentials, including explicitly supplied child variables.
+
+    Args:
+        environ: Active process environment.
+        environment_names: Additional potentially sensitive variable names.
+
+    Returns:
+        Nonempty values requiring exact redaction even when echoed without labels.
+    """
+    names = set(environment_names)
+    return tuple(
+        value
+        for name, value in environ.items()
+        if value and (name in names or _credential_name(name))
+    )
+
+
+def redact_credentials(value: str, *, known_values: Iterable[str] = ()) -> str:
+    """Redact authentication material while preserving diagnostic locations.
+
+    Args:
+        value: Rendered text, including exception chains or child diagnostics.
+        known_values: Active credentials that may appear without a field label.
+
+    Returns:
+        Credential-safe text with paths and ordinary diagnostic context retained.
+    """
+    variants: set[str] = set()
+    for secret in known_values:
+        if secret:
+            variants.update((secret, quote(secret, safe=""), quote_plus(secret)))
+            variants.add(json.dumps(secret)[1:-1])
+            variants.add(repr(secret)[1:-1])
+    sanitized = value
+    for secret in sorted(variants, key=len, reverse=True):
+        sanitized = sanitized.replace(secret, "<redacted>")
+    sanitized = _URI_CREDENTIAL_PATTERN.sub(r"\1<credentials>@", sanitized)
+    sanitized = _QUERY_SECRET_PATTERN.sub(_redact_query_secret, sanitized)
+    sanitized = _AUTHORIZATION_PATTERN.sub("<redacted-authorization>", sanitized)
+    return _ENV_ASSIGNMENT_PATTERN.sub(_redact_environment_secret, sanitized)
 
 
 def _sanitize_value(value: object, replacements: Mapping[str, str]) -> object:

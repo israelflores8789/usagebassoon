@@ -225,7 +225,7 @@ def collect(
     elif since is not None or until is not None:
         raise ValueError("date bounds require refresh=True")
     try:
-        logger = configure_logging(config.logging)
+        logger = configure_logging(config)
     except Exception:
         logger = _LOG
         logger.exception("could not configure collection logging")

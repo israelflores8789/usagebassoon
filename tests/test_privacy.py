@@ -6,8 +6,46 @@
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 
-from usagebassoon.privacy import sanitize_doctor_text, sanitize_table
+from usagebassoon.privacy import (
+    redact_credentials,
+    sanitize_doctor_text,
+    sanitize_table,
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "md:usagebassoon_it?motherduck_token=synthetic-secret",
+        "https://user:synthetic-secret@example.test/path",
+        "Authorization: Bearer synthetic-secret",
+        "{'Authorization': 'Basic synthetic-secret'}",
+        'details={"password": "synthetic-secret", "status": "failed"}',
+        "{'client_secret': 'synthetic-secret'}",
+        "CUSTOM_AUTH=synthetic-secret",
+        "https://example.test/?access_token=synthetic-secret&limit=1",
+    ],
+)
+def test_credential_redaction_retains_diagnostic_locations(text: str) -> None:
+    """Recognize credential forms without applying the sharing path policy."""
+    location = "/workspace/collector.py:42 C:\\Users\\Alice\\worker.py"
+    sanitized = redact_credentials(f"{location} failed: {text}")
+    assert "synthetic-secret" not in sanitized
+    assert location in sanitized
+    assert "failed" in sanitized
+
+
+def test_credential_redaction_covers_encoded_unlabeled_values() -> None:
+    """Known values remain private when encoded in URLs or structured diagnostics."""
+    secret = 'opaque /value"\ncredential'
+    sanitized = redact_credentials(
+        'opaque /value"\ncredential opaque%20%2Fvalue%22%0Acredential '
+        'opaque+%2Fvalue%22%0Acredential opaque /value\\"\\ncredential',
+        known_values=(secret,),
+    )
+    assert sanitized == "<redacted> <redacted> <redacted> <redacted>"
 
 
 def test_sanitize_table_pseudonymizes_hosts_and_embedded_sensitive_text() -> None:
