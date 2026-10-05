@@ -224,6 +224,26 @@ def build_contract(
     return PayloadContract(_payload_kind(payload_kind), tokscale_version, entries)
 
 
+def _empty_array_ancestor(value: JsonValue, path: str) -> bool:
+    """Check whether every occurrence of a required path is inside an empty array."""
+    head, separator, tail = path.partition(".")
+    array = head.endswith("[]")
+    name = head[:-2] if array else head
+    if name:
+        if not isinstance(value, dict) or name not in value:
+            return False
+        value = value[name]
+    if array:
+        if not isinstance(value, list):
+            return False
+        if not value:
+            return True
+        return bool(separator) and all(
+            _empty_array_ancestor(member, tail) for member in value
+        )
+    return bool(separator) and _empty_array_ancestor(value, tail)
+
+
 def diff_contract(
     contract: PayloadContract,
     observed: JsonValue,
@@ -262,6 +282,8 @@ def diff_contract(
     for path, entry in expected.items():
         observed_entry = observed_paths.get(path)
         if observed_entry is None:
+            if _empty_array_ancestor(observed, path):
+                continue
             if entry.required:
                 events.append(
                     make_event(
@@ -284,6 +306,9 @@ def diff_contract(
             fatal = True
             continue
         unexpected = observed_types - frozenset(entry.expected_types)
+        if "float" in entry.expected_types:
+            # JSON serializers commonly emit a whole-valued cost as an integer.
+            unexpected -= {"int"}
         if unexpected:
             events.append(
                 make_event(

@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from socket import gethostname
 from uuid import uuid4
 
@@ -39,6 +40,7 @@ from usagebassoon.persistence import (
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
 _GRAPH_MAX_STDOUT_BYTES = 16 * 1024 * 1024
+_HISTORICAL_OVERLAP_DAYS = 3
 _LOG = logging.getLogger(LOGGER_NAME)
 
 
@@ -47,6 +49,7 @@ def _collect_locked(
     run_id: str,
     started_at: datetime,
     logger: logging.Logger,
+    refresh_range: tuple[date, date] | None = None,
 ) -> PersistSummary:
     """Collect and persist while the local environment lock remains held."""
     (
@@ -71,12 +74,47 @@ def _collect_locked(
         completed = {
             target for target, status in statuses.items() if status.status == "complete"
         }
-        today = datetime.now(UTC).date()
-        candidate_days = graph_plan.candidate_days
+        today = started_at.date()
+        candidate_days = tuple(
+            sorted(
+                set(graph_plan.candidate_days)
+                | {
+                    day
+                    for (day, domain), status in statuses.items()
+                    if domain == _MODELS_DOMAIN and status.status == "provisional"
+                }
+                | {
+                    day
+                    for day in persisted_models
+                    if day >= today - timedelta(days=_HISTORICAL_OVERLAP_DAYS)
+                }
+            )
+        )
+        if refresh_range is not None:
+            since, until = refresh_range
+            candidate_days = tuple(
+                since + timedelta(days=offset)
+                for offset in range((until - since).days + 1)
+            )
+            graph_plan = replace(
+                graph_plan,
+                graph=graph_plan.graph.model_copy(
+                    update={
+                        "contributions": [
+                            item
+                            for item in graph_plan.graph.contributions
+                            if since <= item.date <= until
+                        ]
+                    }
+                ),
+            )
+        graph_plan = replace(graph_plan, candidate_days=candidate_days)
         daily_days = tuple(
             day
             for day in candidate_days
-            if day == today or (day, _MODELS_DOMAIN) not in completed
+            if refresh_range is not None
+            or day >= today - timedelta(days=_HISTORICAL_OVERLAP_DAYS)
+            or (day, _MODELS_DOMAIN) not in completed
         )
         requested_price_days = tuple(
             day
@@ -152,8 +190,40 @@ def _collect_locked(
     return persist_with_retries(config, normalize(bundle), logger)
 
 
-def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
-    """Run one complete loss-tolerant tokscale collection and persistence cycle."""
+def collect(
+    config: UsageBassoonConfig,
+    *,
+    refresh: bool = False,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[str, PersistSummary]:
+    """Collect usage, optionally refreshing an inclusive range for this source.
+
+    Args:
+        config: Collector source and storage backend configuration.
+        refresh: Bypass historical completion within the selected range.
+        since: Refresh start; defaults to 29 days before the end.
+        until: Refresh end; defaults to the collection's current UTC day.
+
+    Returns:
+        Run identity and backend publication counts. Recollection preserves
+        absent keys and existing historical prices, while filling price gaps.
+
+    Raises:
+        ValueError: If bounds are reversed, future, or used without refresh.
+    """
+    started_at = datetime.now(UTC)
+    refresh_range = None
+    if refresh:
+        end = until if until is not None else started_at.date()
+        start = since if since is not None else end - timedelta(days=29)
+        if start > end:
+            raise ValueError("--since must be on or before --until")
+        if end > started_at.date():
+            raise ValueError("--until must not be after the current UTC day")
+        refresh_range = (start, end)
+    elif since is not None or until is not None:
+        raise ValueError("date bounds require refresh=True")
     try:
         logger = configure_logging(config.logging)
     except Exception:
@@ -162,7 +232,7 @@ def collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
     run_id = str(uuid4())
     try:
         with collection_lock(config):
-            summary = _collect_locked(config, run_id, datetime.now(UTC), logger)
+            summary = _collect_locked(config, run_id, started_at, logger, refresh_range)
     except CollectionBusy:
         logger.info("collection skipped because source %s is busy", config.source_id)
         raise

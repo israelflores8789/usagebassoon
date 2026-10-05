@@ -217,6 +217,14 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
                 "failure_code",
             }:
                 value = getattr(target, field)
+            if (
+                field == "status"
+                and target.domain == "models"
+                and target.status == "complete"
+                and target.day >= bundle.started_at.date()
+            ):
+                # A successful open-day observation cannot finalize the day.
+                value = "provisional"
             values.append(value)
     if bundle.reconciliation.issues or bundle.reconciliation.resolved:
         issue_rows: list[dict[str, object]] = [

@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 
 from usagebassoon.cli.audit import audit_app
-from usagebassoon.cli.collect import collect
+from usagebassoon.cli.collect import collect_app
 from usagebassoon.cli.doctor import doctor
 from usagebassoon.cli.export import export
 from usagebassoon.cli.init import init
@@ -51,7 +51,7 @@ def main(
 
 
 app.command(name="doctor")(doctor)
-app.command(name="collect")(collect)
+app.add_typer(collect_app, name="collect")
 app.command(name="export")(export)
 app.command(name="init")(init)
 app.add_typer(tag_app, name="tag")

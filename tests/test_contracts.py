@@ -575,3 +575,22 @@ def test_secondary_contract_failures_do_not_block_required_collection(
     )
     assert "report contract validation failed" in caplog.text
     assert "pricing contract validation failed" in caplog.text
+
+
+@pytest.mark.parametrize("entries", [[], [{}], None])
+def test_empty_models_do_not_waive_nonempty_member_validation(
+    daily_raws: dict[date, JsonObject],
+    entries: JsonValue,
+) -> None:
+    """Accept zero-activity days while rejecting malformed entries and totals."""
+    payload = {**daily_raws[min(daily_raws)], "entries": entries}
+    contract = load_shipped_contracts()["models"]
+    assert diff_contract(contract, payload).fatal is (entries != [])
+    if entries == []:
+        payload["totalCost"] = 0
+        assert not diff_contract(contract, payload).fatal
+        invalid = {**payload, "totalInput": None}
+        assert diff_contract(contract, invalid).fatal
+        missing = dict(payload)
+        del missing["entries"]
+        assert diff_contract(contract, missing).fatal

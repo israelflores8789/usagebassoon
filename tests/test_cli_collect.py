@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -113,3 +114,85 @@ def test_collect_formats_unexpected_errors_without_a_traceback(
     )
     assert "Traceback" not in plain_cli_output(result.output)
     assert "unexpected collection command failure" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("options", "since", "until", "parent_config"),
+    [
+        ([], None, None, False),
+        (["--since", "2026-08-01"], date(2026, 8, 1), None, False),
+        (["--until", "2026-09-10"], None, date(2026, 9, 10), False),
+        (
+            ["--since", "2026-08-01", "--until", "2026-09-10"],
+            date(2026, 8, 1),
+            date(2026, 9, 10),
+            True,
+        ),
+    ],
+)
+def test_collect_refresh_delegates_source_and_date_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: list[str],
+    since: date | None,
+    until: date | None,
+    parent_config: bool,
+) -> None:
+    """Support ISO date bounds and configuration on either side of refresh."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "usagebassoon.duckdb")
+    calls = 0
+
+    def collect_run(
+        configuration: UsageBassoonConfig,
+        *,
+        refresh: bool,
+        since: date | None,
+        until: date | None,
+    ) -> tuple[str, PersistSummary]:
+        """Record exactly one source-scoped refresh invocation."""
+        nonlocal calls
+        calls += 1
+        assert configuration.source_id == SOURCE_ID
+        assert configuration.path == config
+        assert refresh
+        assert (since, until) == expected
+        return "refresh-run", PersistSummary(2, 1, {})
+
+    expected = (since, until)
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
+    args = (
+        ["collect", "--config", str(config), "refresh"]
+        if parent_config
+        else ["collect", "refresh", "--config", str(config)]
+    )
+    result = CliRunner().invoke(app, args + options)
+    assert result.exit_code == 0, result.output
+    assert calls == 1
+    assert "Collected run refresh-run" in plain_cli_output(result.output)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--since", "20260910"],
+        ["--until", "2026-02-30"],
+        ["--since", "2026-09-11", "--until", "2026-09-10"],
+        ["--until", (datetime.now(UTC).date() + timedelta(days=1)).isoformat()],
+    ],
+)
+def test_collect_refresh_rejects_invalid_bounds_before_acquisition(
+    tmp_path: Path,
+    options: list[str],
+) -> None:
+    """Invalid or future ranges fail without opening an uninitialized backend."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "absent.duckdb")
+    result = CliRunner().invoke(
+        app, ["collect", "refresh", "--config", str(config), *options]
+    )
+    assert result.exit_code != 0
+    output = plain_cli_output(result.output)
+    assert "--since" in output or "--until" in output
+    assert "schema" not in output
+    assert not (tmp_path / "absent.duckdb").exists()

@@ -6,15 +6,22 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from sys import executable
+from threading import Lock
 from typing import cast
 
+import pyarrow as pa
 import pytest
 
+from tests._bigquery_replay import BigQueryReplayBackend
 from usagebassoon import collector as subprocess_collector
 from usagebassoon import orchestrator as collector
+from usagebassoon import persistence
+from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
@@ -435,3 +442,263 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
 
     log = (tmp_path / "logs" / "usagebassoon.log").read_text()
     assert "collection cycle failed before completion" in log
+
+
+@pytest.mark.parametrize("architecture", ["upsert", "append"])
+def test_historical_refresh_preserves_usage_and_source_isolation(
+    architecture: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raw: JsonObject,
+) -> None:
+    """Recover midnight and late changes without duplicates or erasing history."""
+    day = max(daily_raws)
+    graph = deepcopy(graph_raw)
+    graph["contributions"] = [
+        item
+        for item in cast(JsonArray, graph["contributions"])
+        if isinstance(item, dict) and item["date"] == day.isoformat()
+    ]
+    daily = deepcopy(daily_raws[day])
+    entries = cast(list[JsonObject], daily["entries"])
+    original_input = cast(int, entries[0]["input"])
+    stamp = datetime.combine(day, datetime.min.time(), UTC) + timedelta(
+        hours=23, minutes=45
+    )
+    requests: list[tuple[date, ...]] = []
+    fail = False
+    backend = (
+        DuckDBBackend(":memory:")
+        if architecture == "upsert"
+        else BigQueryReplayBackend()
+    )
+    if isinstance(backend, DuckDBBackend):
+        backend.apply_ddl()
+    else:
+        original_append = backend.append
+        lock = Lock()
+
+        def append(table: str, data: pa.Table) -> None:
+            """Serialize only the local replay engine's independent table loads."""
+            with lock:
+                original_append(table, data)
+
+        monkeypatch.setattr(backend, "append", append)
+
+    class Clock:
+        """Provide a movable UTC clock across collection boundaries."""
+
+        @classmethod
+        def now(cls, tz: object | None = None) -> datetime:
+            """Return the controlled collection time."""
+            del cls, tz
+            return stamp
+
+    def command(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Expose an upstream graph snapshot without executing tokscale."""
+        assert arguments == ("graph",)
+        return deepcopy(graph)
+
+    def models(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        days: tuple[date, ...],
+    ) -> dict[date, JsonObject]:
+        """Expose changed session facts, or fail before publishing a refresh."""
+        requests.append(days)
+        if fail:
+            raise RuntimeError("models unavailable")
+        empty = deepcopy(daily)
+        empty_entries: JsonArray = []
+        empty["entries"] = empty_entries
+        for field in (
+            "totalInput",
+            "totalOutput",
+            "totalCacheRead",
+            "totalCacheWrite",
+            "totalMessages",
+            "totalCost",
+        ):
+            empty[field] = 0
+        return {
+            requested: deepcopy(daily if requested == day else empty)
+            for requested in days
+        }
+
+    def pricing(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        requests: dict[date, set[str]],
+        _logger: logging.Logger,
+    ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
+        """Fill only requested model-price gaps."""
+        return (
+            {
+                date: {model: {**pricing_raw, "modelId": model} for model in models}
+                for date, models in requests.items()
+            },
+            {},
+        )
+
+    monkeypatch.setattr(collector, "datetime", Clock)
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(collector, "_fetch_daily_models", models)
+    monkeypatch.setattr(collector, "_fetch_pricing", pricing)
+
+    def reports(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        days: tuple[date, ...],
+        **_kwargs: object,
+    ) -> tuple[dict[date, JsonArray], frozenset[date]]:
+        """Return the selected source's session metadata."""
+        return {
+            requested: report_raws.get(requested, []) for requested in days
+        }, frozenset()
+
+    def open_backend(_config: UsageBassoonConfig) -> StorageBackend:
+        """Reuse the pipeline's in-memory backend across cycles."""
+        return backend
+
+    def close_backend(*_args: object, **_kwargs: object) -> None:
+        """Keep the shared test backend open until the scenario ends."""
+
+    monkeypatch.setattr(collector, "_fetch_reports", reports)
+    monkeypatch.setattr(persistence, "open_backend", open_backend)
+    monkeypatch.setattr(persistence, "close_backend", close_backend)
+    config = _config(tmp_path / "config.toml")
+
+    def facts(source: str = SOURCE_ID) -> list[dict[str, object]]:
+        """Read source-specific canonical keys and counts after publication."""
+        return backend.query(
+            "SELECT client, session_id, model, input_tokens FROM current_daily_stats "
+            f"WHERE source_id = '{source}' ORDER BY client, session_id, model"
+        ).to_pylist()
+
+    def input_count() -> int:
+        """Read the fact changed after the last open-day collection."""
+        return next(
+            cast(int, row["input_tokens"])
+            for row in facts()
+            if row["session_id"] == entries[0]["sessionId"]
+            and row["model"] == entries[0]["model"]
+        )
+
+    try:
+        collector.collect(config)
+        status = backend.query(
+            "SELECT status FROM collection_status WHERE domain = 'models'"
+        ).to_pylist()
+        assert status == [{"status": "provisional"}]
+        assert input_count() == original_input
+
+        # Graph is unchanged: closing the day must still recover the final interval.
+        entries[0]["input"] = original_input + 10
+        daily["totalInput"] = cast(int, daily["totalInput"]) + 10
+        stamp += timedelta(minutes=20)
+        collector.collect(config)
+        assert requests[-1] == (day,)
+        assert input_count() == original_input + 10
+        assert backend.query(
+            "SELECT status FROM collection_status WHERE domain = 'models'"
+        ).to_pylist() == [{"status": "complete"}]
+        historical_prices = backend.query(
+            "SELECT * FROM current_price_versions ORDER BY day, model"
+        ).to_pylist()
+
+        # Overlap also repairs delayed records that the graph does not expose.
+        stamp += timedelta(days=2)
+        entries[0]["input"] = original_input + 15
+        daily["totalInput"] += 5
+        collector.collect(config)
+        assert requests[-1] == (day,)
+        assert input_count() == original_input + 15
+
+        # Changes beyond the overlap require an explicit historical refresh.
+        stamp += timedelta(days=10)
+        entries[0]["input"] = original_input + 30
+        daily["totalInput"] += 15
+        contribution = cast(JsonObject, cast(JsonArray, graph["contributions"])[0])
+        client = cast(JsonObject, cast(JsonArray, contribution["clients"])[0])
+        tokens = cast(JsonObject, client["tokens"])
+        tokens["input"] = cast(int, tokens["input"]) + 20
+        collector.collect(config)
+        assert requests[-1] == ()
+        assert input_count() == original_input + 15
+
+        other = "22222222-2222-4222-8222-222222222222"
+        collector.collect(replace(config, source_id=other))
+        other_facts = facts(other)
+
+        # Explicit refresh recovers both changed totals and session corrections.
+        stamp += timedelta(seconds=1)
+        entries[0]["input"] = original_input + 35
+        entries[1]["input"] = cast(int, entries[1]["input"]) - 5
+        collector.collect(config)
+        assert requests[-1] == ()
+        before_failure = facts()
+        fail = True
+        with pytest.raises(RuntimeError, match="models unavailable"):
+            collector.collect(config, refresh=True, since=day, until=day)
+        assert facts() == before_failure
+        fail = False
+        collector.collect(config, refresh=True)
+        assert requests[-1] == tuple(
+            stamp.date() - timedelta(days=offset) for offset in range(29, -1, -1)
+        )
+        assert input_count() == original_input + 35
+        assert (
+            next(
+                row["input_tokens"]
+                for row in facts()
+                if row["session_id"] == entries[1]["sessionId"]
+                and row["model"] == entries[1]["model"]
+            )
+            == entries[1]["input"]
+        )
+        collector.collect(config, refresh=True, since=day, until=day)
+        assert len(facts()) == len(entries)
+        assert facts(other) == other_facts
+        assert (
+            backend.query(
+                f"SELECT * FROM current_price_versions WHERE source_id = '{SOURCE_ID}' "
+                "ORDER BY day, model"
+            ).to_pylist()
+            == historical_prices
+        )
+
+        # A partial upstream scope never deletes keys missing from recollection.
+        omitted = entries.pop()
+        for total, field in (
+            ("totalInput", "input"),
+            ("totalOutput", "output"),
+            ("totalCacheRead", "cacheRead"),
+            ("totalCacheWrite", "cacheWrite"),
+            ("totalMessages", "messageCount"),
+        ):
+            daily[total] = cast(int, daily[total]) - cast(int, omitted[field])
+        daily["totalCost"] = cast(float, daily["totalCost"]) - cast(
+            float, omitted["cost"]
+        )
+        stamp += timedelta(seconds=1)
+        collector.collect(config, refresh=True, since=day, until=day)
+        assert len(facts()) == len(entries) + 1
+        collector.collect(config, refresh=True, since=day + timedelta(days=1))
+        assert day not in requests[-1]
+        assert requests[-1][0] == day + timedelta(days=1)
+        assert requests[-1][-1] == stamp.date()
+        stamp = datetime.combine(day + timedelta(days=30), datetime.min.time(), UTC)
+        collector.collect(config, refresh=True)
+        assert day not in requests[-1]
+        collector.collect(config, refresh=True, until=day)
+        assert requests[-1][-1] == day
+    finally:
+        backend.close()
