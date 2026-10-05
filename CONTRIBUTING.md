@@ -183,6 +183,58 @@ Required-field absence from a required payload is a collection error. Unknown fi
 
 `archiver.py` independently orchestrates the `snapshot/` feature. Backends stream canonical Arrow batches at one consistent read point; the archiver incrementally writes private temporary Parquet files, and `SnapshotBucket` implementations transfer files with bounded memory. `snapshot/reader.py` downloads and validates before `snapshot/restore.py` delegates atomic publication to the backend. `audit.py` queries the installed dialect-specific `audit_sources` view; snapshot audits reuse the packaged DuckDB view over verified Parquet in a private memory-limited connection with disk spilling; Python retains source summaries rather than historical run IDs. `storage_model.py` stays in the core library: it owns canonical Arrow schemas, natural keys, observation ordering, and the portable data version shared by normalization, persistence, curation, compaction, and recovery.
 
+## Architectural mandates
+
+The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.md) for more exhaustive detailed decision reasoning; read it before changing persistence, compaction, schema, snapshot, or curation behavior.
+
+- **Upsert-only.** UsageBassoon *only* appends, dedups, and updates usage data. It *never* deletes data from a data warehouse. Data deletion must be an *intentional* act of the user.
+- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe without consequence. This means duplicates are tolerated if there is a means to safely dedup records.
+- **Atomicity.** Wherever possible, updates to a data warehouse or archive are atomic. For Direct Transactional Upsert warehouses, transactions must be atomic. For Append-and-Compact warehouses, compaction transactions must be atomic. Unsuccessful transactions must *always* be rolled back safely. For snapshot archives, immutables directories, including Parquet archives and the manifest, must be created atomically.
+- **Dual-Architecture Backends.** UsageBassoon categorizes data warehouses into two broad architectures:
+  - **Direct Transactional Upsert:** For data warehouses where batched transactions is latency-cheap, collection data is normalized and batched into one atomic transaction. (Implemented: DuckDB, MotherDuck)
+  - **Append-and-Compact:** For data warehouses that reward "append-and-forget" ingestion, collection data is persisted to "raw" ephemeral append-only tables and deduped through scheduled compaction to "gold" tables. (Implemented: BigQuery)
+- **Backend Agnosticism.** UsageBassoon is built to be extensible. Data warehouse provider-specific machinery is in the `backends/` subpackage and implements the `StorageBackend` protocol. Dialect-specific SQL scripts are in their dedicated `sql/<dialect>/` directories and *must* be kept functionally in sync between dialects (the `sql_parity` test coverage, based on SQLGlot, enforces this). Data warehouse queries and parsed Tokscale payload is normalized in backend-agnostic Arrow tables.
+- **Bucket Agnosticism.** Object Storage provider-specific machinery is in the `buckets/` subpackage and implements the `SnapshotBucket` protocol.
+- **Interoperability.** UsageBassoon implements two user axioms that must never be broken:
+  - *A user should be able to snapshot their data and move it to whatever data warehouse they wish.*
+  - *A user should be able to move an existing snapshot archive to whatever object store they wish.*
+- **Canonical Command Authority.** The following Tokscale commands are canonical sources-of-truth for usage payload collection:
+  - `tokscale graph` provides candidate dates for collection only
+  - `tokscale models` provide daily statistics at the (client, session, model) level
+  - `tokscale report` provides session metadata
+  - `tokscale pricing` provides observed model rates
+- **Tolerant Collection Payload.** UsageBassoon prioritizes token usage persistence and tolerates payloads that can be gathered later in the event of an error. Mandatory canonical commands include `tokscale models` and `tokscale graph`.
+- **Tolerant Schema Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "schema drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
+- **Atomic Snapshots.** A snapshot is publishable only after *complete* table coverage and a *complete* immutable manifest and completion record, and it must include un-compacted raw observations through canonical state, for append-and-compact backends.
+- **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
+- **Protect Privacy by Default.** UsageBassoon attempts to protect sensitive user data by offering means to obfuscate. UsageBassoon also automatically obfuscates commands likely to be shared publicly (e.g. `bassoon doctor` and `bassoon export`). *Never* place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
+
+## Persistence architectures
+
+UsageBassoon chooses a persistence architecture according to how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, natural keys, ordering rules, underlying data model, and report views.
+
+| Architecture | How it works | Current backends |
+|:-------------|:-------------|:-----------------|
+| Direct transactional upsert | Each normalized batch upserts current-state tables in a bounded transaction; audit and debug streams append. | DuckDB, MotherDuck |
+| Append-and-compact | Collection appends immutable observations to raw tables. Canonical views combine gold with retained raw rows. Scheduled transactional compaction folds raw into gold. Curation tables have tombstones for delete. | BigQuery |
+
+Collection and curation on an append-and-compact backend never mutate raw or gold tables. *Only* scheduled compaction and atomic restore write gold. Concurrent collectors, including those sharing a `source_id`, are safe by idempotent appends and read-time deduplication.
+
+A new backend contribution must:
+- state which architecture it uses and why, validating the warehouse's write and concurrency behavior first (Redshift and Microsoft Fabric are candidate append-and-compact fits);
+- implement `StorageBackend` over canonical Arrow tables and provide native DDL and views functionally equivalent to other dialects;
+- keep a non-null `source_id` on every base table and include it in the natural key of every source-scoped current-state table;
+- preserve the shared ordering policy, tombstone semantics, and schema init/marker behavior;
+- support consistent snapshot capture and atomic restore into an empty destination; and
+- add structural and synthetic parity test coverage plus focused live tests against a disposable resource.
+
+## Schema, SQL, and compaction changes
+
+- Update the DuckDB and BigQuery DDL and views together, and update the `sql_parity` tests. Backend-specific raw tables, canonical ingestion views, and compaction SQL differ by design; shared logical tables and report views must not.
+- Never reshape an existing table with `CREATE TABLE IF NOT EXISTS`. A table-shape change **requires** a schema version bump and an explicit registered migration. The BigQuery schema hash includes `compaction.sql`, so a compaction change *is* a schema change.
+- Compaction changes need live BigQuery coverage. Compaction must remain idempotent, recompute affected partitions from existing gold plus retained raw rows, and commit gold and progress together.
+- Never add DDL, MERGE, staging tables, or serialization to a BigQuery collection path.
+
 ## Snapshot and recovery contracts
 
 A complete snapshot directory contains immutable `manifest.json`, immutable `COMPLETE` evidence, portable mutable `state.json`, and referenced Parquet objects. Relative names and content hashes define portable contents; provider generations are only storage concurrency metadata. Copies retain the same ID and immutable contents. `catalog.json` is a reconstructible discovery index; independent `control.json` owns authoritative retention policy, lifecycle records, and current owner/expiry/fence. Publication, pinning, and retirement authorize their transitions through the same control-document CAS as the reservation; sidecars and catalogs are projections. Lost ownership ends the attempt until the next scheduling opportunity. Repair must preserve corrupt evidence and active claims. Retirement tombstones prevent routine management from resurrecting interrupted deletion; valid surviving immutable contents remain readable for emergency recovery.
@@ -206,50 +258,6 @@ Every publicly released archive format and data contract retains a tested recove
 
 Extend existing test modules before adding files. The recovery drill seeds multiple sources and every logical table, relocates local/GCS copies, removes the copied index, restores into another supported backend, compares independent expected logical data, and resumes collection with preserved source identity. Use only the dedicated `usagebassoon_it` BigQuery dataset/MotherDuck database and the mandated GCS test bucket; execute shared-destination destructive phases serially.
 
-## Architectural mandates
-
-The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.md) for more exhaustive detail decision reasoning; read it before changing persistence, compaction, schema, snapshot, or curation behavior.
-
-- **History preservation.** Collection must preserve usage facts and permanent audit history. DuckDB/MotherDuck upsert current state; BigQuery appends raw observations and compacts them asynchronously. Raw BigQuery observations and diagnostic events expire after 90 days, durable usage facts never expire, and snapshot retention follows the archive catalog.
-- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe. Match facts by their documented natural keys, and make retries repeatable without consequence. A retry reuses its collection `run_id` and every row's `event_id`. Duplicate work and duplicate physical rows are acceptable on append-and-compact backends; canonical views and compaction deduplicate them.
-- **Backend publication.** Prepare the complete normalized Arrow batch before persistence. DuckDB/MotherDuck publish transactionally. BigQuery accepts independent atomic table appends and partial publication; write the collection ledger only after the other loads succeed so historical preflight cannot skip missing facts. Nightly compaction commits gold state and progress atomically.
-- **Deterministic ordering.** Current state is selected by `collected_at DESC`, with documented tie-breaks and `event_id DESC` as the final tie-break. The shared policy lives in `storage_model.py`; views, compaction, snapshots, and restore must all use it.
-- **Arrow Normalization.** Normalization and derived columns belong *before* storage. `StorageBackend`s accept and return canonical Arrow tables so DuckDB, MotherDuck, BigQuery, and future adapters share semantics.
-- **SQL Dialect Agnosticism.** Maintain the paired DuckDB and BigQuery DDL and views. CLI commands should query the appropriate **dialect-specific view** and *never* contain non-portable ad hoc SQL. SQLGlot `sql_parity` test coverage must pass for dialect changes.
-- **Canonical Command Authority.** `tokscale graph` provides candidate dates only; `tokscale models` provide daily statistics; `tokscale report` provides session metadata; `tokscale pricing` provides observed rates. Do *not* invent a second source of truth.
-- **Explicit Schema Management.** DDL runs only through `bassoon init` or registered, hash-gated schema upgrades. Collection never issues DDL, and a newer or unexpected schema fails closed.
-- **Separated User-Curated Data.** Data associated with `bassoon tag` and `bassoon note` are user-owned data. Tags are global; notes belong to their exact source-scoped session. Collection, normalization, restore, and snapshot workflows must not overwrite or silently remove them.
-- **Private, Atomic Snapshots.** A snapshot is publishable only after *complete* table coverage and a *complete* immutable manifest and completion record, and it must include un-compacted raw observations through canonical state. `bassoon restore` validates immutable completion evidence, integrity, and destination compatibility before appending data, and requires an initialized, empty, quiescent destination. Snapshots contain raw data at-rest which can contain private data and is *not* meant for public export.
-- **Tolerant Schema Drift.** Required-field absence from tokscale's JSON payload should fail clearly, but additive fields and compatible shape changes should be recorded, reported, and investigated without blocking safe collection.
-- **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
-- **Protect Privacy by Default.** Never place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
-
-## Persistence architectures
-
-UsageBassoon chooses a persistence architecture according to how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, natural keys, ordering rules, underlying data model, and report views.
-
-| Architecture | How it works | Current backends |
-|:-------------|:-------------|:-----------------|
-| Direct transactional upsert | Each normalized batch upserts current-state tables in a bounded transaction; audit and debug streams append. | DuckDB, MotherDuck |
-| Append-and-compact | Collection appends immutable observations to raw tables. Canonical views combine gold with retained raw rows. Scheduled transactional compaction folds raw into gold. Curation tables have tombstones for delete. | BigQuery |
-
-Collection and curation on an append-and-compact backend never mutate raw or gold tables. *Only* scheduled compaction and atomic restore write gold. Concurrent collectors, including those sharing a `source_id`, are safe by idempotent appends and read-time deduplication, so there are no leases or fencing to maintain.
-
-A new backend contribution must:
-- state which architecture it uses and why, validating the warehouse's write and concurrency behavior first (Redshift and Microsoft Fabric are candidate append-and-compact fits);
-- implement `StorageBackend` over canonical Arrow tables and provide native DDL and views;
-- keep a non-null `source_id` on every base table and include it in the natural key of every source-scoped current-state table;
-- preserve the shared ordering policy, tombstone semantics, and schema init/marker behavior;
-- support consistent snapshot capture and atomic restore into an empty destination; and
-- add structural and synthetic parity coverage plus focused live tests against a disposable resource.
-
-## Schema, SQL, and compaction changes
-
-- Update the DuckDB and BigQuery DDL and views together, and update the `sql_parity` tests. Backend-specific raw tables, canonical ingestion views, and compaction SQL differ by design; shared logical tables and report views must not.
-- Never reshape an existing table with `CREATE TABLE IF NOT EXISTS`. A table-shape change **requires** a schema version bump and an explicit registered migration. The BigQuery schema hash includes `compaction.sql`, so a compaction change *is* a schema change.
-- Compaction changes need live BigQuery coverage. Compaction must remain idempotent, recompute affected partitions from existing gold plus retained raw rows, and commit gold and progress together.
-- Never add DDL, MERGE, staging tables, or serialization to a BigQuery collection path.
-
 ## Golden fixture policy
 
 > [!CAUTION]
@@ -269,7 +277,11 @@ just spell
 uv run pre-commit run --all-files
 ```
 
-The `CI Local` workflow (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and supports manual dispatch. The `CI` workflow (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating the local checks and adding protected BigQuery, MotherDuck, and GCS integration tests. `Release` requires a successful `CI` push run on `main` for the exact tagged commit.
+The `CI Local` workflow (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and supports manual dispatch.
+
+The `CI` workflow (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating the local checks and adding protected BigQuery, MotherDuck, and GCS integration tests.
+
+The `Release` workflow requires a successful `CI` push run on `main` for the exact tagged commit.
 
 The project separates local tests from SQL dialect-parity tests:
 
