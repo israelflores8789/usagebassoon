@@ -1,26 +1,20 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_persistence.py — Transactional writes, append publication, and retries."""
+"""test_persistence.py — Shared retry budgets, batch identity, and cleanup."""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from threading import Lock
+from typing import override
 
-import duckdb
-import pyarrow as pa
 import pytest
-from google.api_core.exceptions import ServiceUnavailable
 
-from tests._bigquery_replay import BigQueryReplayBackend
-from usagebassoon.backends.base import CurrentStateWrite, PersistenceBatch
-from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.config import CollectionConfig, UsageBassoonConfig
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
-from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
+from usagebassoon.persistence import PersistSummary, persist_with_retries
 
 
 def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
@@ -30,26 +24,39 @@ def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
 ) -> None:
     """Startup and persistence share a budget; retry backoff consumes neither."""
     import usagebassoon.deadlines as deadlines
-    from usagebassoon.config import BigQueryConfig
+
+    class Config(UsageBassoonConfig):
+        """Supply a controlled budget independently of provider configuration."""
+
+        @property
+        @override
+        def backend_timeout_seconds(self) -> float:
+            """Use one ten-second allowance per complete attempt."""
+            return 10.0
 
     clock = [0.0]
     monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
-    config = UsageBassoonConfig(
+    config = Config(
         tmp_path / "config.toml",
         collection_bundle.source_id,
-        "bigquery",
-        bigquery=BigQueryConfig(
-            "usagebassoon-test", "usagebassoon_it", timeout_seconds=10
-        ),
+        "duckdb",
         collection=CollectionConfig(max_retries=2, retry_initial_seconds=1),
     )
     bundle = normalize(collection_bundle)
     scopes: list[deadlines.Deadline] = []
-    backend = DuckDBBackend(":memory:")
     closed: list[None] = []
     attempts = 0
 
-    def open_backend(_config: UsageBassoonConfig) -> DuckDBBackend:
+    class Backend:
+        """Record cleanup without opening a database."""
+
+        def close(self) -> None:
+            """Release the fake backend after a returned operation."""
+            closed.append(None)
+
+    backend = Backend()
+
+    def open_backend(_config: UsageBassoonConfig) -> Backend:
         nonlocal attempts
         deadline = deadlines.current_deadline()
         assert deadline is not None
@@ -75,69 +82,9 @@ def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
     monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
     monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
     monkeypatch.setattr("usagebassoon.persistence.time.sleep", backoff)
-    monkeypatch.setattr(backend, "close", lambda: closed.append(None))
-    try:
-        assert (
-            persist_with_retries(config, bundle, logging.getLogger("test")).inserted
-            == 1
-        )
-        assert attempts == 3 and len(closed) == 2
-        assert len({id(scope) for scope in scopes}) == 3
-    finally:
-        backend.connection.close()
-
-
-def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
-    collection_bundle: CollectionBundle,
-) -> None:
-    """Keep current and append-only facts unchanged when a run is retried."""
-    backend = DuckDBBackend(":memory:")
-    try:
-        backend.apply_ddl()
-        normalized = normalize(collection_bundle)
-        first = persist_run(backend, normalized)
-        retry = persist_run(backend, normalized)
-        assert first.inserted > 0
-        assert (retry.inserted, retry.updated, retry.per_table) == (0, 0, {})
-        assert backend.query(
-            "SELECT count(*) AS n FROM collection_runs"
-        ).to_pylist() == [{"n": 1}]
-        price_count = sum(
-            len(prices) for prices in collection_bundle.pricing_by_day.values()
-        )
-        assert backend.query(
-            "SELECT count(*) AS n FROM price_versions"
-        ).to_pylist() == [{"n": price_count}]
-    finally:
-        backend.close()
-
-
-def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
-    collection_bundle: CollectionBundle,
-) -> None:
-    bundle = normalize(collection_bundle)
-    backend = DuckDBBackend(":memory:")
-    backend.apply_ddl()
-    batch = PersistenceBatch(
-        run_id=bundle.run_id,
-        current_state=(
-            CurrentStateWrite(
-                "daily_stats",
-                bundle.tables["daily_stats"],
-                ("source_id", "day", "client", "session_id", "model"),
-                ("total_tokens",),
-            ),
-        ),
-        append_only={"missing_history": bundle.tables["collection_ledger"]},
-        collection_ledger=bundle.tables["collection_ledger"],
-    )
-    try:
-        with pytest.raises(duckdb.CatalogException, match="missing_history"):
-            backend.persist_batch(batch)
-        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
-        assert backend.query("SELECT * FROM collection_ledger").num_rows == 0
-    finally:
-        backend.close()
+    assert persist_with_retries(config, bundle, logging.getLogger("test")).inserted == 1
+    assert attempts == 3 and len(closed) == 2
+    assert len({id(scope) for scope in scopes}) == 3
 
 
 def test_persistence_retries_one_normalized_run_without_recollection(
@@ -292,44 +239,3 @@ def test_persistence_retry_limits_preserve_failure_and_close_each_backend(
     assert any(record.exc_info is not None for record in caplog.records)
     if failure_mode == "classification":
         assert "classification unavailable" in caplog.text
-
-
-def test_bigquery_partial_publication_never_marks_missing_facts_complete(
-    collection_bundle: CollectionBundle, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Fact and ledger failures leave useful data visible and safe to recollect."""
-    backend = BigQueryReplayBackend()
-    bundle = normalize(collection_bundle)
-    original_append = backend.append
-    lock = Lock()
-    failed_table = "daily_stats"
-
-    def append(table: str, data: pa.Table) -> None:
-        """Serialize the local replay engine while preserving independent loads."""
-        with lock:
-            if table == failed_table:
-                raise ServiceUnavailable("controlled publication failure")
-            original_append(table, data)
-
-    monkeypatch.setattr(backend, "append", append)
-    try:
-        with pytest.raises(ServiceUnavailable):
-            persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM current_sessions").num_rows > 0
-        assert backend.query("SELECT * FROM current_daily_stats").num_rows == 0
-        assert backend.query("SELECT * FROM collection_status").num_rows == 0
-        failed_table = "collection_ledger"
-        with pytest.raises(ServiceUnavailable):
-            persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM current_daily_stats").num_rows > 0
-        assert backend.query("SELECT * FROM collection_status").num_rows == 0
-        failed_table = ""
-        persist_run(backend, bundle)
-        assert backend.query("SELECT * FROM collection_runs").num_rows == 1
-        assert backend.query("SELECT * FROM collection_status").num_rows > 0
-        for table in ("sessions", "daily_stats", "price_versions"):
-            assert backend.query(f"SELECT * FROM current_{table}").num_rows == (
-                bundle.tables[table].num_rows
-            )
-    finally:
-        backend.close()

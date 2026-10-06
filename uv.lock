@@ -1656,6 +1656,15 @@ wheels = [
 ]
 
 [[package]]
+name = "types-grpcio"
+version = "1.84.0.20260928"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/db/c27d359c03c8d77917599d046d436424d74b08fb7e657c26d593912adb12/types_grpcio-1.84.0.20260928.tar.gz", hash = "sha256:eacb229deeb94e23a37c7ed0dd739dd2098ee63c7e432cc88340109ae3ad2fc1", size = 15892, upload-time = "2026-09-28T07:50:44.444Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/74/f2/0a9f21ae6db691facba76d7443ebb26c016e28ce2fa094642ca4a899e15b/types_grpcio-1.84.0.20260928-py3-none-any.whl", hash = "sha256:f0b54cbed12cf8fb0d8e6e7e699562da06515ca5a88014a209bf75780d6d1145", size = 15965, upload-time = "2026-09-28T07:50:43.62Z" },
+]
+
+[[package]]
 name = "types-protobuf"
 version = "7.35.1.20260906"
 source = { registry = "https://pypi.org/simple" }
@@ -1771,6 +1780,7 @@ dev = [
     { name = "pytest-md" },
     { name = "ruff" },
     { name = "twine" },
+    { name = "types-grpcio" },
     { name = "types-protobuf" },
     { name = "types-pyyaml" },
     { name = "urllib3" },
@@ -1824,6 +1834,7 @@ dev = [
     { name = "pytest-md", specifier = ">=0.2.0" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "twine", specifier = ">=7.0.0" },
+    { name = "types-grpcio", specifier = ">=1.0" },
     { name = "types-protobuf", specifier = ">=5.0" },
     { name = "types-pyyaml", specifier = ">=6.0" },
     { name = "urllib3", specifier = ">=2.8.0" },

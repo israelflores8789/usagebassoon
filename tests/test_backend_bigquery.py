@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Generator, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
+from pathlib import Path
 from threading import Barrier, Event, Lock, Thread
 from types import TracebackType
 from typing import Self, cast, override
@@ -18,15 +22,25 @@ from unittest.mock import MagicMock
 import pyarrow as pa
 import pytest
 import sqlglot
-from google.api_core.exceptions import BadRequest, NotFound
+from google.api_core.exceptions import (
+    BadRequest,
+    Conflict,
+    DeadlineExceeded,
+    NotFound,
+    RetryError,
+    ServiceUnavailable,
+    Unknown,
+)
 from google.auth.credentials import AnonymousCredentials
 from google.auth.crypt import Signer
-from google.cloud import bigquery, bigquery_datatransfer, bigquery_storage_v1
+from google.cloud import bigquery, bigquery_datatransfer
 from google.cloud.bigquery.table import TableListItem
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
+from google.cloud.bigquery_storage_v1.services import big_query_read
 from google.oauth2.service_account import Credentials
 from sqlglot import exp
 
+from tests._bigquery_replay import BigQueryReplayBackend
 from tests.test_backend_bigquery_live import (
     _drain_compaction_schedule,
     _reset_test_schema,
@@ -34,16 +48,113 @@ from tests.test_backend_bigquery_live import (
 from usagebassoon.backends.bigquery import (
     BigQueryBackend,
     _pinned_query,
+    _request_retry,
     _schema_from_arrow,
 )
 from usagebassoon.backends.bigquery_compaction import install_compaction
-from usagebassoon.deadlines import OperationTimeout, current_deadline, http_session
+from usagebassoon.config import BigQueryConfig, CollectionConfig, UsageBassoonConfig
+from usagebassoon.deadlines import (
+    OperationTimeout,
+    current_deadline,
+    http_session,
+    operation,
+)
 from usagebassoon.diagnostics import REQUIRED_RELATIONS, run_doctor
 from usagebassoon.ingest import CollectionBundle
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
-from usagebassoon.persistence import persist_run
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle, normalize
+from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 from usagebassoon.storage_model import note_id_for_session
+
+
+def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
+    collection_bundle: CollectionBundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausted metadata RPC retries remain eligible before backend open returns."""
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        collection_bundle.source_id,
+        "bigquery",
+        bigquery=BigQueryConfig("usagebassoon-test", "usagebassoon_it"),
+        collection=CollectionConfig(max_retries=1, retry_initial_seconds=0),
+    )
+    bundle = normalize(collection_bundle)
+    backend = _backend()
+    attempts: list[int] = []
+    published: list[NormalizedBundle] = []
+
+    def backoff(*_args: object, **_kwargs: object) -> Iterable[float]:
+        """Force SDK retry exhaustion without waiting in the test."""
+        return (360.0,)
+
+    def unavailable() -> None:
+        """Model a metadata request before factory construction completes."""
+        raise ServiceUnavailable("temporary metadata outage")
+
+    def open_backend(_config: UsageBassoonConfig) -> BigQueryBackend:
+        """Return the backend only after the next complete attempt starts."""
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            _request_retry()(unavailable)()
+        return backend
+
+    def persist(_backend: object, current: NormalizedBundle) -> PersistSummary:
+        """Observe that startup recovery preserves the original normalized run."""
+        published.append(current)
+        return PersistSummary(1, 0, {})
+
+    monkeypatch.setattr(
+        "google.api_core.retry.retry_unary.exponential_sleep_generator", backoff
+    )
+    monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
+    monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
+    result = persist_with_retries(config, bundle, logging.getLogger("test"))
+    assert result.inserted == 1
+    assert attempts == [1, 2]
+    assert published == [bundle] and published[0] is bundle
+
+
+def test_bigquery_partial_publication_never_marks_missing_facts_complete(
+    collection_bundle: CollectionBundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fact and ledger failures leave useful data visible and safe to recollect."""
+    backend = BigQueryReplayBackend()
+    bundle = normalize(collection_bundle)
+    original_append = backend.append
+    lock = Lock()
+    failed_table = "daily_stats"
+
+    def append(table: str, data: pa.Table) -> None:
+        """Serialize the local replay engine while preserving independent loads."""
+        with lock:
+            if table == failed_table:
+                raise ServiceUnavailable("controlled publication failure")
+            original_append(table, data)
+
+    monkeypatch.setattr(backend, "append", append)
+    try:
+        with pytest.raises(ServiceUnavailable):
+            persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM current_sessions").num_rows > 0
+        assert backend.query("SELECT * FROM current_daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM collection_status").num_rows == 0
+        failed_table = "collection_ledger"
+        with pytest.raises(ServiceUnavailable):
+            persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM current_daily_stats").num_rows > 0
+        assert backend.query("SELECT * FROM collection_status").num_rows == 0
+        failed_table = ""
+        persist_run(backend, bundle)
+        assert backend.query("SELECT * FROM collection_runs").num_rows == 1
+        assert backend.query("SELECT * FROM collection_status").num_rows > 0
+        for table in ("sessions", "daily_stats", "price_versions"):
+            assert backend.query(f"SELECT * FROM current_{table}").num_rows == (
+                bundle.tables[table].num_rows
+            )
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize("boundary", ["submission", "upload", "cancellation"])
@@ -87,7 +198,7 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
     )
     started = time.monotonic()
     try:
-        with pytest.raises(OperationTimeout):
+        with pytest.raises(OperationTimeout) as failure:
             if boundary == "submission":
                 backend.query("SELECT 1")
             elif boundary == "upload":
@@ -105,6 +216,7 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
                 )
                 backend._wait_for_job(job)
         assert time.monotonic() - started < 2
+        assert backend.is_retryable_error(failure.value)
         assert backend.is_retryable_error(OperationTimeout())
         backend.client = cast(bigquery.Client, _BatchClient())
         backend.append(
@@ -112,6 +224,126 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
         )
     finally:
         release.set()
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("boundary", ["submission", "metadata", "cancellation"])
+def test_bigquery_transient_http_requests_recover_within_the_budget(
+    boundary: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exercise actual SDK retries for a failed submission, lookup, or cancellation."""
+    import json
+
+    from requests import Session
+
+    calls: list[str] = []
+    identifiers: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self, *, cancellation: bool = False) -> None:
+            """Fail one request, then return a valid minimal BigQuery resource."""
+            calls.append(self.command)
+            reference: dict[str, str] = {
+                "projectId": "usagebassoon-test",
+                "jobId": "job",
+                "location": "US",
+            }
+            if self.command == "POST":
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if raw:
+                    body = cast(dict[str, object], json.loads(raw))
+                    reference = cast(dict[str, str], body["jobReference"])
+                    identifiers.append(reference["jobId"])
+            if len(calls) == 1:
+                self.send_response(503)
+                body_bytes = json.dumps(
+                    {"error": {"code": 503, "message": "temporarily unavailable"}}
+                ).encode()
+            else:
+                self.send_response(200)
+                job: dict[str, object] = {
+                    "jobReference": reference,
+                    "configuration": {
+                        "query": {"query": "SELECT 1", "useLegacySql": False}
+                    },
+                    "status": {"state": "DONE"},
+                }
+                resource: dict[str, object]
+                if self.command == "GET":
+                    resource = {
+                        "datasetReference": {
+                            "projectId": "usagebassoon-test",
+                            "datasetId": "usagebassoon_it",
+                        },
+                        "location": "US",
+                    }
+                else:
+                    resource = {"job": job} if cancellation else job
+                body_bytes = json.dumps(resource).encode()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
+            self.wfile.write(body_bytes)
+
+        def do_POST(self) -> None:
+            """Serve job submissions and cancellation acknowledgements."""
+            self.respond(cancellation="/cancel" in self.path)
+
+        def do_GET(self) -> None:
+            """Serve the dataset metadata lookup."""
+            self.respond()
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            """Avoid the HTTP server's independent diagnostic sink."""
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    credentials = AnonymousCredentials()
+    client = bigquery.Client(
+        project="usagebassoon-test",
+        credentials=credentials,
+        _http=cast(Session, http_session(credentials)),
+        client_options={"api_endpoint": f"http://127.0.0.1:{server.server_port}"},
+    )
+    backend = BigQueryBackend(
+        "usagebassoon-test", "usagebassoon_it", client=client, timeout_seconds=2
+    )
+    try:
+        if boundary == "submission":
+            monkeypatch.setattr(backend, "_wait_for_job", MagicMock(return_value=[]))
+            monkeypatch.setattr(
+                backend, "_read_query_arrow", MagicMock(return_value=pa.table({}))
+            )
+            backend.query("SELECT 1")
+            assert len(identifiers) == 2 and len(set(identifiers)) == 1
+        elif boundary == "metadata":
+            marker = bigquery.Table("usagebassoon-test.usagebassoon_it.schema_marker")
+            marker.labels = {
+                "usagebassoon_schema_version": str(SCHEMA_VERSION),
+                "usagebassoon_schema_hash": schema_hash("bigquery"),
+            }
+            monkeypatch.setattr(client, "get_table", MagicMock(return_value=marker))
+            backend.preflight()
+        else:
+            job = bigquery.QueryJob("job", "SELECT 1", client)
+            monkeypatch.setattr(
+                job, "result", MagicMock(side_effect=FutureTimeoutError)
+            )
+            with pytest.raises(OperationTimeout):
+                backend._wait_for_job(job)
+        assert len(calls) == 2
+        assert "retrying within operation budget" in caplog.text
+        assert "could not cancel" not in caplog.text
+    finally:
         client.close()
         server.shutdown()
         server.server_close()
@@ -466,22 +698,25 @@ class _StorageReadClient:
 
     def read_rows(
         self,
-        name: str,
         *,
+        read_stream: str,
+        offset: int,
         retry: object,
         timeout: float,
-    ) -> list[bigquery_storage_types.ReadRowsResponse]:
+    ) -> Iterable[bigquery_storage_types.ReadRowsResponse]:
         """Record a stream name and return one serialized Arrow response."""
         assert retry is None
-        assert 0 < timeout <= 30.0
-        self.stream_names.append(name)
+        assert 0 < timeout <= 180.0
+        assert offset == 0
+        self.stream_names.append(read_stream)
         return [
             bigquery_storage_types.ReadRowsResponse(
+                row_count=self._table.num_rows,
                 arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
                     serialized_record_batch=self._table.to_batches()[0]
                     .serialize()
                     .to_pybytes()
-                )
+                ),
             )
         ]
 
@@ -553,7 +788,7 @@ def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
         return storage_reader
 
     monkeypatch.setattr(
-        bigquery_storage_v1,
+        big_query_read,
         "BigQueryReadClient",
         make_storage_reader,
     )
@@ -570,6 +805,358 @@ def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
 
     assert result.equals(expected)
     assert storage_reader.stream_names == [stream_name]
+
+
+@pytest.mark.parametrize("boundary", ["initial", "midstream"])
+@pytest.mark.parametrize(
+    "failure_type", [DeadlineExceeded, ServiceUnavailable, Unknown]
+)
+def test_bigquery_read_recovery_preserves_rows_and_operation_budget(
+    boundary: str,
+    failure_type: type[Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resume initial and partial failures without replaying consumed Arrow rows."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+
+    def advance(delay: float) -> None:
+        """Account for retry backoff in the operation clock."""
+        clock[0] += delay
+
+    monkeypatch.setattr(
+        "usagebassoon.backends.bigquery.time.sleep",
+        advance,
+    )
+    expected = pa.table({"value": [1, 2, 3, 4]})
+    calls: list[tuple[int, float]] = []
+
+    class Reader(_StorageReadClient):
+        @override
+        def read_rows(
+            self, *, read_stream: str, offset: int, retry: object, timeout: float
+        ) -> Generator[bigquery_storage_types.ReadRowsResponse]:
+            """Fail once, then return only the rows after the saved offset."""
+            assert retry is None and read_stream == "stream"
+            calls.append((offset, timeout))
+            clock[0] += 35
+            if len(calls) == 1:
+                if boundary == "midstream":
+                    batch = expected.slice(0, 2).to_batches()[0]
+                    yield bigquery_storage_types.ReadRowsResponse(
+                        row_count=2,
+                        arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
+                            serialized_record_batch=batch.serialize().to_pybytes()
+                        ),
+                    )
+                raise failure_type("transient read failure")
+            batch = expected.slice(offset).to_batches()[0]
+            yield bigquery_storage_types.ReadRowsResponse(
+                row_count=batch.num_rows,
+                arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
+                    serialized_record_batch=batch.serialize().to_pybytes()
+                ),
+            )
+
+    reader = Reader("stream", expected)
+
+    def make_reader(*, credentials: object) -> Reader:
+        """Use the recording reader without opening a cloud channel."""
+        del credentials
+        return reader
+
+    monkeypatch.setattr(big_query_read, "BigQueryReadClient", make_reader)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.destination = bigquery.TableReference.from_string(
+        "usagebassoon-test.usagebassoon_it.result"
+    )
+    actual = _backend()._read_query_arrow(job)
+    assert actual.equals(expected)
+    assert calls[0] == (0, 180)
+    assert calls[1][0] == (2 if boundary == "midstream" else 0)
+    assert 0 < calls[1][1] <= 145
+    assert "retrying from row offset" in caplog.text
+
+
+@pytest.mark.parametrize("overrun", [False, True])
+def test_bigquery_progressing_stream_uses_remaining_budget(
+    overrun: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Healthy streams may exceed 30s, but progress cannot renew the operation."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    expected = pa.table({"value": [1, 2]})
+    timeouts: list[float] = []
+
+    class Reader(_StorageReadClient):
+        @override
+        def read_rows(
+            self, *, read_stream: str, offset: int, retry: object, timeout: float
+        ) -> Generator[bigquery_storage_types.ReadRowsResponse]:
+            """Advance real work beyond a short request timeout."""
+            assert offset == 0 and retry is None and read_stream == "stream"
+            timeouts.append(timeout)
+            for _ in range(4 if overrun else 2):
+                clock[0] += 35
+                yield bigquery_storage_types.ReadRowsResponse(
+                    row_count=2,
+                    arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
+                        serialized_record_batch=expected.to_batches()[0]
+                        .serialize()
+                        .to_pybytes()
+                    ),
+                )
+
+    reader = Reader("stream", expected)
+
+    def make_reader(*, credentials: object) -> Reader:
+        """Use the recording reader without opening a cloud channel."""
+        del credentials
+        return reader
+
+    monkeypatch.setattr(big_query_read, "BigQueryReadClient", make_reader)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.destination = bigquery.TableReference.from_string(
+        "usagebassoon-test.usagebassoon_it.result"
+    )
+
+    def consume() -> pa.Table:
+        """Share the budget already partly consumed by submission and execution."""
+        with operation(180):
+            clock[0] += 70
+            return _backend()._read_query_arrow(job)
+
+    if overrun:
+        with pytest.raises(OperationTimeout):
+            consume()
+    else:
+        assert consume().to_pylist() == expected.to_pylist() * 2
+    assert timeouts == [110]
+
+
+def test_bigquery_repeated_read_failures_do_not_extend_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated reconnects expire, and a later operation receives a fresh budget."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+
+    def advance(delay: float) -> None:
+        """Account for retry backoff in the operation clock."""
+        clock[0] += delay
+
+    monkeypatch.setattr(
+        "usagebassoon.backends.bigquery.time.sleep",
+        advance,
+    )
+    expected = pa.table({"value": [1]})
+    calls: list[float] = []
+    fail = True
+
+    class Reader(_StorageReadClient):
+        @override
+        def read_rows(
+            self, *, read_stream: str, offset: int, retry: object, timeout: float
+        ) -> Iterable[bigquery_storage_types.ReadRowsResponse]:
+            """Consume the shared allowance without producing a response."""
+            assert read_stream == "stream" and offset == 0 and retry is None
+            calls.append(timeout)
+            if fail:
+                clock[0] += min(60, timeout)
+                raise DeadlineExceeded("stalled read")
+            return super().read_rows(
+                read_stream=read_stream, offset=offset, retry=retry, timeout=timeout
+            )
+
+    reader = Reader("stream", expected)
+
+    def make_reader(*, credentials: object) -> Reader:
+        """Use the recording reader without opening a cloud channel."""
+        del credentials
+        return reader
+
+    monkeypatch.setattr(big_query_read, "BigQueryReadClient", make_reader)
+    job = MagicMock(spec=bigquery.QueryJob)
+    job.destination = bigquery.TableReference.from_string(
+        "usagebassoon-test.usagebassoon_it.result"
+    )
+    backend = _backend()
+    with pytest.raises(OperationTimeout):
+        backend._read_query_arrow(job)
+    assert len(calls) == 3 and calls[0] > calls[1] > calls[2]
+    assert current_deadline() is None
+    fail = False
+    assert backend._read_query_arrow(job).equals(expected)
+    assert calls[-1] == 180
+
+
+def test_bigquery_upload_retry_rewinds_and_resolves_the_same_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost acknowledgement cannot submit a second load under a new ID."""
+    from io import BytesIO
+    from typing import BinaryIO
+
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+
+    def advance(delay: float) -> None:
+        """Account for retry backoff in the operation clock."""
+        clock[0] += delay
+
+    monkeypatch.setattr(
+        "google.api_core.retry.retry_unary.time.sleep",
+        advance,
+    )
+    client = MagicMock(spec=bigquery.Client)
+    accepted = MagicMock(spec=bigquery.LoadJob)
+    client.get_job.return_value = accepted
+    identifiers: list[str] = []
+    payloads: list[bytes] = []
+
+    def upload(
+        payload: BinaryIO, _destination: str, *, job_id: str, **_kwargs: object
+    ) -> bigquery.LoadJob:
+        """Model an accepted upload whose acknowledgement was lost."""
+        identifiers.append(job_id)
+        payloads.append(payload.read())
+        if len(identifiers) == 1:
+            clock[0] += 2
+            raise ServiceUnavailable("acknowledgement lost")
+        raise Conflict("job already exists")
+
+    client.load_table_from_file.side_effect = upload
+    backend = BigQueryBackend("usagebassoon-test", "usagebassoon_it", client=client)
+    payload = BytesIO(b"same parquet payload")
+    result = backend._submit_load(
+        payload,
+        "usagebassoon-test.usagebassoon_it.raw_daily_stats",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+    )
+    assert result is accepted
+    assert len(identifiers) == 2 and len(set(identifiers)) == 1
+    assert payloads == [b"same parquet payload"] * 2
+    assert client.get_job.call_args.args == (identifiers[0],)
+    assert backend.is_retryable_error(DeadlineExceeded("deadline"))
+    assert backend.is_retryable_error(
+        RetryError("exhausted", ServiceUnavailable("busy"))
+    )
+    assert not backend.is_retryable_error(
+        RetryError("invalid", BadRequest("bad query"))
+    )
+
+
+@pytest.mark.parametrize("boundary", ["initial", "midstream"])
+def test_bigquery_native_read_deadline_stops_stalls_and_allows_next_operation(
+    boundary: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise native gRPC cancellation before and after the first Arrow batch."""
+    import grpc
+    from google.cloud.bigquery_storage_v1.services.big_query_read.transports import (
+        grpc as storage_transport,
+    )
+
+    expected = pa.table({"value": [1]})
+    serialized_schema = pa.BufferOutputStream()
+    with pa.ipc.new_stream(serialized_schema, expected.schema):
+        pass
+    session = bigquery_storage_types.ReadSession(
+        arrow_schema=bigquery_storage_types.ArrowSchema(
+            serialized_schema=serialized_schema.getvalue().to_pybytes()
+        ),
+        streams=[bigquery_storage_types.ReadStream(name="stream")],
+    )
+    response = bigquery_storage_types.ReadRowsResponse(
+        row_count=1,
+        arrow_record_batch=bigquery_storage_types.ArrowRecordBatch(
+            serialized_record_batch=expected.to_batches()[0].serialize().to_pybytes()
+        ),
+    )
+    release = Event()
+    observed: list[int] = []
+
+    def create_session(
+        *_args: object, **_kwargs: object
+    ) -> bigquery_storage_types.ReadSession:
+        """Serve a real Storage Read session over the local gRPC transport."""
+        return session
+
+    def read(
+        *args: object, **_kwargs: object
+    ) -> Generator[bigquery_storage_types.ReadRowsResponse]:
+        """Hold the RPC open until the client's native deadline cancels it."""
+        request = cast(bigquery_storage_types.ReadRowsRequest, args[0])
+        observed.append(request.offset)
+        if release.is_set():
+            yield response
+            return
+        if boundary == "midstream":
+            yield response
+        release.wait(2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        server = grpc.server(executor)
+        server.add_generic_rpc_handlers(
+            [
+                grpc.method_handlers_generic_handler(
+                    "google.cloud.bigquery.storage.v1.BigQueryRead",
+                    {
+                        "CreateReadSession": grpc.unary_unary_rpc_method_handler(
+                            create_session,
+                            request_deserializer=bigquery_storage_types.CreateReadSessionRequest.deserialize,
+                            response_serializer=bigquery_storage_types.ReadSession.serialize,
+                        ),
+                        "ReadRows": grpc.unary_stream_rpc_method_handler(
+                            read,
+                            request_deserializer=bigquery_storage_types.ReadRowsRequest.deserialize,
+                            response_serializer=bigquery_storage_types.ReadRowsResponse.serialize,
+                        ),
+                    },
+                )
+            ]
+        )
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        constructor = big_query_read.BigQueryReadClient
+
+        def reader(*, credentials: object) -> big_query_read.BigQueryReadClient:
+            """Connect the real generated client to the isolated local server."""
+            del credentials
+            return constructor(
+                transport=storage_transport.BigQueryReadGrpcTransport(
+                    channel=grpc.insecure_channel(f"127.0.0.1:{port}")
+                )
+            )
+
+        monkeypatch.setattr(big_query_read, "BigQueryReadClient", reader)
+        backend = _backend()
+        backend.timeout_seconds = 0.2
+        job = MagicMock(spec=bigquery.QueryJob)
+        job.destination = bigquery.TableReference.from_string(
+            "usagebassoon-test.usagebassoon_it.result"
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(OperationTimeout):
+                backend._read_query_arrow(job)
+            assert time.monotonic() - started < 2
+            assert current_deadline() is None
+            release.set()
+            assert backend._read_query_arrow(job).equals(expected)
+            assert observed == [0, 0]
+        finally:
+            release.set()
+            server.stop(grace=None).wait(timeout=2)
 
 
 def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:
@@ -621,7 +1208,6 @@ def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
 
 
 def test_bigquery_classifies_transient_publication_failures() -> None:
-    from google.api_core.exceptions import ServiceUnavailable
 
     backend = _backend()
     assert backend.is_retryable_error(ServiceUnavailable("unavailable"))
@@ -686,7 +1272,6 @@ def test_partial_publication_replays_event_ids_and_withholds_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Concurrent facts finish before coverage is certified, including on retry."""
-    from google.api_core.exceptions import ServiceUnavailable
 
     backend = _backend()
     bundle = normalize(collection_bundle)
@@ -1293,7 +1878,9 @@ def test_recovery_schedule_pause_waits_and_fails_closed(
         module.pause_compaction(backend, timeout=1.0)
 
 
-def test_bigquery_snapshot_stream_handles_empty_pages() -> None:
+def test_bigquery_snapshot_stream_handles_empty_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Bounded Arrow streams ignore zero-row pages while retaining real observations."""
     client = MagicMock(spec=bigquery.Client)
     backend = BigQueryBackend(
@@ -1326,7 +1913,13 @@ def test_bigquery_snapshot_stream_handles_empty_pages() -> None:
         ],
         schema=schema,
     ).to_batches()[0]
-    data_job.result.return_value.to_arrow_iterable.return_value = (empty, data)
+
+    def result_batches(_job: bigquery.QueryJob) -> Generator[pa.RecordBatch]:
+        """Provide bounded Arrow batches without opening a cloud transport."""
+        yield empty
+        yield data
+
+    monkeypatch.setattr(backend, "_read_query_batches", result_batches)
     client.query.side_effect = (timestamp_job, data_job)
     with backend.stream_snapshot(("notes",)) as captured:
         assert captured.captured_at == stamp

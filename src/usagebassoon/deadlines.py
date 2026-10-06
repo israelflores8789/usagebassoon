@@ -69,10 +69,12 @@ def current_deadline() -> Deadline | None:
     return _CURRENT.get()
 
 
-def remaining_seconds(cap: float = REQUEST_SECONDS) -> float:
-    """Bound a request by both its internal limit and the enclosing operation."""
+def remaining_seconds(cap: float | None = REQUEST_SECONDS) -> float:
+    """Return a capped allowance, or the whole operation allowance for ``None``."""
     deadline = current_deadline()
-    return cap if deadline is None else deadline.remaining(cap)
+    if deadline is None:
+        return REQUEST_SECONDS if cap is None else cap
+    return deadline.remaining(cap)
 
 
 @contextmanager

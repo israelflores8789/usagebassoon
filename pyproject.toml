@@ -69,6 +69,7 @@ dev = [
     "ruff>=0.8",
     "pyrefly>=0.20",
     "twine>=7.0.0",
+    "types-grpcio>=1.0",
     "types-protobuf>=5.0",
     "types-PyYAML>=6.0",
 ]

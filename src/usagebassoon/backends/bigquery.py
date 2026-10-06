@@ -15,13 +15,14 @@ from contextlib import contextmanager
 from contextvars import copy_context
 from copy import copy
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from hashlib import sha256
 from importlib import resources
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
-from typing import Protocol, cast, override
+from typing import BinaryIO, cast, override
 from uuid import uuid4
 
 import pyarrow as pa
@@ -29,18 +30,20 @@ import pyarrow.parquet as pq
 import sqlglot
 from google.api_core.exceptions import (
     BadRequest,
+    Conflict,
+    DeadlineExceeded,
     GoogleAPICallError,
-    InternalServerError,
     NotFound,
-    ServiceUnavailable,
-    TooManyRequests,
+    RetryError,
+    Unknown,
 )
-from google.api_core.retry import Retry
+from google.api_core.retry import Retry, exponential_sleep_generator, if_transient_error
 from google.auth import default as default_credentials
 from google.auth.credentials import Credentials
 from google.auth.exceptions import GoogleAuthError
-from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud import bigquery
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
+from google.cloud.bigquery_storage_v1.services import big_query_read
 from google.oauth2 import service_account
 from pandas_gbq.arrow import from_read_rows_response
 from requests import Session
@@ -180,17 +183,65 @@ class _RestoreUncertain(RuntimeError):
     """A submitted restore job has not been observed in a terminal state."""
 
 
-class _StorageReadClient(Protocol):
-    """Expose the high-level Storage client's stream-name read method."""
+def _transient_request_error(error: Exception) -> bool:
+    """Recognize transport failures that permit replay with stable identities."""
+    return if_transient_error(error) or isinstance(
+        error, (OperationTimeout, DeadlineExceeded)
+    )
 
-    def read_rows(
+
+class _RequestRetry(Retry):
+    """Report retry exhaustion as an operation timeout, including backend startup."""
+
+    @override
+    def __call__[**P, T](
         self,
-        name: str,
-        *,
-        timeout: float,
-        retry: object = None,
-    ) -> Iterable[bigquery_storage_types.ReadRowsResponse]:
-        """Return response messages for the named Storage read stream."""
+        func: Callable[P, T],
+        on_error: Callable[[Exception], object] | None = None,
+    ) -> Callable[P, T]:
+        """Preserve the SDK retry interface and the shared timeout exception."""
+        retried = super().__call__(func, on_error)
+
+        @wraps(func)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
+            """Keep exhausted startup requests eligible for a new attempt."""
+            try:
+                return retried(*args, **kwargs)
+            except RetryError as error:
+                if not _transient_request_error(error.cause):
+                    raise
+                raise OperationTimeout(
+                    "BigQuery request could not recover within the operation budget"
+                ) from error
+
+        return wrapped
+
+
+def _request_retry(remaining: Callable[[], float] | None = None) -> Retry:
+    """Retry transient RPC failures without extending the enclosing deadline."""
+    allowance = remaining or (lambda: remaining_seconds(None))
+
+    def retryable(error: Exception) -> bool:
+        """Stop recovery before an expired operation issues another request."""
+        if not _transient_request_error(error):
+            return False
+        allowance()
+        return True
+
+    def report(error: Exception) -> None:
+        """Record handled transport failures without logging request payloads."""
+        _LOG.warning(
+            "transient BigQuery request failed; retrying within operation budget",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+    return _RequestRetry(
+        predicate=retryable,
+        initial=0.5,
+        maximum=5.0,
+        timeout=allowance(),
+        on_error=report,
+    )
 
 
 def _validate_project(project: str) -> None:
@@ -364,7 +415,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
@@ -415,7 +466,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 Iterable[Mapping[str, object]],
                 job.result(
                     timeout=remaining_seconds(120.0),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                 ),
             )
         except FutureTimeoutError as error:
@@ -424,7 +475,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 with cleanup_budget():
                     job.cancel(
                         timeout=remaining_seconds(),
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(),
                     )
             except Exception:
                 _LOG.exception("could not cancel timed-out BigQuery job %s", job_id)
@@ -458,16 +509,9 @@ class BigQueryBackend(AbstractStorageBackend):
     @override
     def is_retryable_error(self, error: Exception) -> bool:
         """Retry transient publication failures without changing observation IDs."""
-        return isinstance(
-            error,
-            (
-                _JobTimeout,
-                OperationTimeout,
-                ServiceUnavailable,
-                TooManyRequests,
-                InternalServerError,
-            ),
-        )
+        if isinstance(error, RetryError):
+            return self.is_retryable_error(error.cause)
+        return _transient_request_error(error)
 
     @override
     @bounded
@@ -516,7 +560,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
@@ -567,7 +611,7 @@ class BigQueryBackend(AbstractStorageBackend):
             actual = self.client.get_dataset(
                 self.dataset_ref,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         except NotFound:
             actual = bigquery.Dataset(self.dataset_ref)
@@ -575,7 +619,7 @@ class BigQueryBackend(AbstractStorageBackend):
             actual = self.client.create_dataset(
                 actual,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         if str(actual.location).casefold() != self.location.casefold():
             raise ValueError("configured BigQuery location does not match the dataset")
@@ -583,7 +627,7 @@ class BigQueryBackend(AbstractStorageBackend):
             marker = self.client.get_table(
                 self._table_id("schema_marker"),
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         except NotFound:
             marker = None
@@ -604,7 +648,7 @@ class BigQueryBackend(AbstractStorageBackend):
             for table in self.client.list_tables(
                 self.dataset_ref,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         }
         if initializing:
@@ -627,14 +671,14 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
             marker = self.client.get_table(
                 self._table_id("schema_marker"),
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
             existing.add("schema_marker")
         marker.labels = {
@@ -646,7 +690,7 @@ class BigQueryBackend(AbstractStorageBackend):
             marker,
             ["labels"],
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         )
         pending: list[str] = []
         for statement in definitions:
@@ -678,7 +722,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
@@ -691,14 +735,14 @@ class BigQueryBackend(AbstractStorageBackend):
                 job_config=self._query_config(),
                 location=self.location,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
                 job_retry=None,
             )
         )
         marker = self.client.get_table(
             self._table_id("schema_marker"),
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         )
         marker.labels = {
             "usagebassoon_schema_version": str(SCHEMA_VERSION),
@@ -709,7 +753,7 @@ class BigQueryBackend(AbstractStorageBackend):
             marker,
             ["labels"],
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         )
 
     def _check_existing_definition(self, statement: exp.Create) -> None:
@@ -718,7 +762,7 @@ class BigQueryBackend(AbstractStorageBackend):
         table = self.client.get_table(
             self._table_id(name),
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         )
         aliases = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL"}
         actual = [
@@ -750,7 +794,7 @@ class BigQueryBackend(AbstractStorageBackend):
         table = self.client.get_table(
             self._table_id(name),
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         )
         fields: list[str] = []
         if table.expires is not None:
@@ -768,7 +812,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 table,
                 fields,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
 
     @override
@@ -779,7 +823,7 @@ class BigQueryBackend(AbstractStorageBackend):
             actual = self.client.get_dataset(
                 self.dataset_ref,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         except NotFound as error:
             raise RuntimeError(
@@ -791,7 +835,7 @@ class BigQueryBackend(AbstractStorageBackend):
             marker = self.client.get_table(
                 self._table_id("schema_marker"),
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
         except NotFound as error:
             raise RuntimeError(
@@ -822,7 +866,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(parameters=parameters[:1]),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
@@ -838,7 +882,7 @@ class BigQueryBackend(AbstractStorageBackend):
                         job_config=self._query_config(),
                         location=self.location,
                         timeout=remaining_seconds(),
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(),
                         job_retry=None,
                     )
                 )
@@ -851,7 +895,7 @@ class BigQueryBackend(AbstractStorageBackend):
                         job_config=self._query_config(parameters=parameters),
                         location=self.location,
                         timeout=remaining_seconds(),
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(),
                         job_retry=None,
                     )
                 )
@@ -870,7 +914,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 marker,
                 ["labels"],
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
             )
 
     def _snapshot_stream(self, tables: Sequence[str]) -> SnapshotStream:
@@ -883,7 +927,7 @@ class BigQueryBackend(AbstractStorageBackend):
                         job_config=self._query_config(),
                         location=self.location,
                         timeout=remaining_seconds(),
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(),
                         job_retry=None,
                     )
                 )
@@ -947,7 +991,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 ),
                 location=self.location,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
                 job_retry=None,
             )
             self._wait_for_job(job)
@@ -957,12 +1001,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 query_job: bigquery.QueryJob = job, canonical: pa.Schema = schema
             ) -> Iterable[pa.RecordBatch]:
                 """Read bounded result pages as canonical Arrow batches."""
-                rows = query_job.result(
-                    timeout=remaining_seconds(120.0), page_size=65536
-                )
-                for batch in rows.to_arrow_iterable(
-                    max_queue_size=1, max_stream_count=1
-                ):
+                for batch in self._read_query_batches(query_job):
                     yield from (
                         pa.Table.from_batches([batch])
                         .select(canonical.names)
@@ -1038,7 +1077,7 @@ class BigQueryBackend(AbstractStorageBackend):
         for item in self.client.list_tables(
             self.dataset_ref,
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         ):
             if item.table_type == "VIEW" or item.table_id in {
                 "schema_marker",
@@ -1050,7 +1089,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 table = self.client.get_table(
                     item.reference,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                 )
                 labels = table.labels or {}
                 if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
@@ -1069,7 +1108,7 @@ class BigQueryBackend(AbstractStorageBackend):
                     job_config=self._query_config(),
                     location=self.location,
                     timeout=remaining_seconds(),
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(),
                     job_retry=None,
                 )
             )
@@ -1109,13 +1148,13 @@ class BigQueryBackend(AbstractStorageBackend):
                 ]
             ),
             location=self.location,
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(remaining),
             timeout=remaining(),
             job_retry=None,
         )
         rows = job.result(
             timeout=remaining(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(remaining),
             job_retry=None,
         )
         return next(iter(rows), None) is not None
@@ -1153,7 +1192,7 @@ class BigQueryBackend(AbstractStorageBackend):
                         all_users=True,
                         state_filter=state,
                         page_token=token,
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(remaining),
                         timeout=remaining(),
                     )
                     page = next(iter(pager.pages))
@@ -1194,14 +1233,14 @@ class BigQueryBackend(AbstractStorageBackend):
             pager = self.client.list_tables(
                 self.dataset_ref,
                 page_token=token,
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(remaining),
                 timeout=remaining(),
             )
             page = next(iter(pager.pages))
             for item in page:
                 table = self.client.get_table(
                     item.reference,
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(remaining),
                     timeout=remaining(),
                 )
                 labels = table.labels or {}
@@ -1265,9 +1304,9 @@ class BigQueryBackend(AbstractStorageBackend):
     ) -> None:
         """Observe the exact submitted job until cancellation or completion settles."""
         if job.state != "DONE":
-            job.cancel(retry=Retry(predicate=lambda _error: False), timeout=remaining())
+            job.cancel(retry=_request_retry(remaining), timeout=remaining())
         while job.state != "DONE":
-            job.reload(retry=Retry(predicate=lambda _error: False), timeout=remaining())
+            job.reload(retry=_request_retry(remaining), timeout=remaining())
             if job.state != "DONE":
                 time.sleep(min(0.5, remaining()))
 
@@ -1276,7 +1315,7 @@ class BigQueryBackend(AbstractStorageBackend):
     ) -> Iterable[Mapping[str, object]]:
         """Resolve a failed wait using the exact submitted job reference."""
         try:
-            options = Retry(predicate=lambda _error: False)
+            options = _request_retry()
             rows = (
                 job.result(
                     timeout=remaining_seconds(120.0), retry=options, job_retry=None
@@ -1361,14 +1400,14 @@ class BigQueryBackend(AbstractStorageBackend):
                     self.client.create_table(
                         owned,
                         timeout=remaining_seconds(),
-                        retry=Retry(predicate=lambda _error: False),
+                        retry=_request_retry(),
                     )
                     stages[table] = stage
                     options = bigquery.ParquetOptions()
                     options.enable_list_inference = True
                     with path.open("rb") as payload:
                         self._wait_restore_job(
-                            self.client.load_table_from_file(
+                            self._submit_load(
                                 payload,
                                 stage,
                                 job_config=bigquery.LoadJobConfig(
@@ -1385,9 +1424,6 @@ class BigQueryBackend(AbstractStorageBackend):
                                     write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
                                     create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
                                 ),
-                                location=self.location,
-                                timeout=remaining_seconds(),
-                                num_retries=0,
                             )
                         )
                 self._commit_restore(stages, operation_id, snapshot_id)
@@ -1435,7 +1471,7 @@ class BigQueryBackend(AbstractStorageBackend):
         for item in self.client.list_tables(
             self.dataset_ref,
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
         ):
             if (
                 item.table_type == "VIEW"
@@ -1488,10 +1524,50 @@ class BigQueryBackend(AbstractStorageBackend):
                 job_config=options,
                 location=self.location,
                 timeout=remaining_seconds(),
-                retry=Retry(predicate=lambda _error: False),
+                retry=_request_retry(),
                 job_retry=None,
             )
         )
+
+    @bounded
+    def _submit_load(
+        self,
+        payload: BinaryIO,
+        destination: str,
+        *,
+        job_config: bigquery.LoadJobConfig,
+    ) -> bigquery.LoadJob:
+        """Retry a rewound upload using one job ID, resolving accepted duplicates."""
+        job_id = "usagebassoon_" + uuid4().hex
+
+        def submit() -> bigquery.LoadJob:
+            """Recalculate the allowance before each upload or job inspection."""
+            payload.seek(0)
+            try:
+                return self.client.load_table_from_file(
+                    payload,
+                    destination,
+                    job_config=job_config,
+                    job_id=job_id,
+                    location=self.location,
+                    timeout=remaining_seconds(),
+                    # Retry ownership stays here so each attempt gets remaining time.
+                    num_retries=0,
+                )
+            except Conflict as error:
+                job = self.client.get_job(
+                    job_id,
+                    location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=_request_retry(),
+                )
+                if not isinstance(job, bigquery.LoadJob):
+                    raise RuntimeError(
+                        "BigQuery upload ID resolved to a non-load job"
+                    ) from error
+                return job
+
+        return _request_retry()(submit)()
 
     @bounded
     def _load(
@@ -1509,7 +1585,7 @@ class BigQueryBackend(AbstractStorageBackend):
             pq.write_table(data, payload)
             payload.seek(0)
             self._wait_for_job(
-                self.client.load_table_from_file(
+                self._submit_load(
                     payload,
                     destination,
                     job_config=bigquery.LoadJobConfig(
@@ -1527,9 +1603,6 @@ class BigQueryBackend(AbstractStorageBackend):
                             else bigquery.CreateDisposition.CREATE_IF_NEEDED
                         ),
                     ),
-                    location=self.location,
-                    timeout=remaining_seconds(),
-                    num_retries=0,
                 )
             )
 
@@ -1551,7 +1624,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 self.client.delete_table(
                     stage,
                     not_found_ok=True,
-                    retry=Retry(predicate=lambda _error: False),
+                    retry=_request_retry(remaining),
                     timeout=remaining() if remaining else self.timeout_seconds,
                 )
                 _LOG.info("removed BigQuery staging table %s", stage)
@@ -1708,7 +1781,7 @@ class BigQueryBackend(AbstractStorageBackend):
             job_config=self._query_config(parameters=query_parameters),
             location=self.location,
             timeout=remaining_seconds(),
-            retry=Retry(predicate=lambda _error: False),
+            retry=_request_retry(),
             job_retry=None,
         )
         self._wait_for_job(job)
@@ -1716,59 +1789,110 @@ class BigQueryBackend(AbstractStorageBackend):
 
     @bounded
     def _read_query_arrow(self, job: bigquery.job.QueryJob) -> pa.Table:
-        """Read one completed query destination through the Storage Read API.
+        """Read a completed query as Arrow within the enclosing operation budget."""
+        return pa.Table.from_batches(list(self._read_query_batches(job)))
 
-        Args:
-            job: Completed query job with a result destination table.
-
-        Returns:
-            Query rows as one canonical Arrow table.
-
-        Raises:
-            RuntimeError: If the completed job has no readable destination.
-        """
-        destination = job.destination
-        if destination is None:
-            raise RuntimeError("BigQuery query completed without a result destination")
-        table = (
-            f"projects/{destination.project}/datasets/{destination.dataset_id}/"
-            f"tables/{destination.table_id}"
-        )
-        with bigquery_storage_v1.BigQueryReadClient(
-            credentials=self._credentials
-        ) as reader:
-            session = reader.create_read_session(
-                parent=f"projects/{self.project}",
-                read_session=bigquery_storage_types.ReadSession(
-                    table=table,
-                    data_format=bigquery_storage_types.DataFormat.ARROW,
-                ),
-                max_stream_count=1,
-                retry=None,
-                timeout=remaining_seconds(30.0),
-            )
-            arrow_schema = pa.ipc.read_schema(
-                pa.BufferReader(session.arrow_schema.serialized_schema)
-            )
-            tables: list[pa.Table] = []
-            for stream in session.streams:
-                responses = cast(_StorageReadClient, reader).read_rows(
-                    stream.name,
-                    retry=None,
-                    timeout=remaining_seconds(30.0),
+    def _read_query_batches(
+        self, job: bigquery.job.QueryJob
+    ) -> Generator[pa.RecordBatch]:
+        """Yield result batches using explicit, deadline-aware stream recovery."""
+        with operation_budget(self.timeout_seconds):
+            destination = job.destination
+            if destination is None:
+                raise RuntimeError(
+                    "BigQuery query completed without a result destination"
                 )
-                batches = [
-                    cast(
-                        pa.RecordBatch,
-                        from_read_rows_response(response, arrow_schema),
+            table = (
+                f"projects/{destination.project}/datasets/{destination.dataset_id}/"
+                f"tables/{destination.table_id}"
+            )
+            # The generated client avoids hidden reconnects with a stale timeout.
+            with big_query_read.BigQueryReadClient(
+                credentials=self._credentials
+            ) as reader:
+
+                def create_session() -> bigquery_storage_types.ReadSession:
+                    """Recalculate the RPC deadline on every session retry."""
+                    return reader.create_read_session(
+                        parent=f"projects/{self.project}",
+                        read_session=bigquery_storage_types.ReadSession(
+                            table=table,
+                            data_format=bigquery_storage_types.DataFormat.ARROW,
+                        ),
+                        max_stream_count=1,
+                        retry=None,
+                        timeout=remaining_seconds(),
                     )
-                    for response in responses
-                    if response.arrow_record_batch.serialized_record_batch
-                ]
-                tables.append(pa.Table.from_batches(batches, schema=arrow_schema))
-        if not tables:
-            return pa.Table.from_batches([], schema=arrow_schema)
-        return pa.concat_tables(tables)
+
+                session = _request_retry()(create_session)()
+                remaining_seconds(None)
+                arrow_schema = pa.ipc.read_schema(
+                    pa.BufferReader(session.arrow_schema.serialized_schema)
+                )
+                # Preserve the result schema even when the session has no rows.
+                yield pa.RecordBatch.from_pylist([], schema=arrow_schema)
+                for stream in session.streams:
+                    yield from self._read_stream_batches(
+                        reader, stream.name, arrow_schema
+                    )
+
+    def _read_stream_batches(
+        self,
+        reader: big_query_read.BigQueryReadClient,
+        stream_name: str,
+        schema: pa.Schema,
+    ) -> Generator[pa.RecordBatch]:
+        """Resume transient read failures at the last consumed row offset."""
+        offset = 0
+        delays = exponential_sleep_generator(initial=0.5, maximum=5.0)
+        while True:
+            try:
+                responses = reader.read_rows(
+                    read_stream=stream_name,
+                    offset=offset,
+                    retry=None,
+                    timeout=remaining_seconds(None),
+                )
+                try:
+                    for response in responses:
+                        remaining_seconds(None)
+                        if not response.arrow_record_batch.serialized_record_batch:
+                            continue
+                        batch = cast(
+                            pa.RecordBatch, from_read_rows_response(response, schema)
+                        )
+                        offset += batch.num_rows
+                        if batch.num_rows:
+                            delays = exponential_sleep_generator(
+                                initial=0.5, maximum=5.0
+                            )
+                        yield batch
+                        remaining_seconds(None)
+                finally:
+                    cancel = getattr(responses, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cast(Callable[[], bool], cancel)()
+                        except Exception:
+                            _LOG.exception("could not close BigQuery result stream")
+                return
+            except Exception as error:
+                if not _transient_request_error(error) and not isinstance(
+                    error, Unknown
+                ):
+                    raise
+                allowance = remaining_seconds(None)
+                delay = next(delays)
+                if delay >= allowance:
+                    raise OperationTimeout(
+                        "BigQuery read recovery exceeds the operation budget"
+                    ) from error
+                _LOG.warning(
+                    "transient BigQuery read failed; retrying from row offset %s",
+                    offset,
+                    exc_info=True,
+                )
+                time.sleep(delay)
 
     @override
     @bounded

@@ -9,11 +9,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+import duckdb
 import pyarrow as pa
 import pytest
 
 from tests._sql_parity import normalized_records
-from usagebassoon.backends.base import StorageBackend
+from usagebassoon.backends.base import (
+    CurrentStateWrite,
+    PersistenceBatch,
+    StorageBackend,
+)
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.factory import StorageBackendRegistry, open_backend
 from usagebassoon.backends.motherduck import MotherDuckBackend
@@ -24,6 +29,8 @@ from usagebassoon.config import (
     UsageBassoonConfig,
 )
 from usagebassoon.ingest import CollectionBundle
+from usagebassoon.normalizer import normalize
+from usagebassoon.persistence import persist_run
 
 
 @pytest.mark.parametrize(
@@ -193,6 +200,60 @@ def test_backend_factory_rejects_missing_selected_settings(
     )
     with pytest.raises(ValueError, match="missing"):
         open_backend(configuration)
+
+
+def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Keep current and append-only facts unchanged when a run is retried."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        normalized = normalize(collection_bundle)
+        first = persist_run(backend, normalized)
+        retry = persist_run(backend, normalized)
+        assert first.inserted > 0
+        assert (retry.inserted, retry.updated, retry.per_table) == (0, 0, {})
+        assert backend.query(
+            "SELECT count(*) AS n FROM collection_runs"
+        ).to_pylist() == [{"n": 1}]
+        price_count = sum(
+            len(prices) for prices in collection_bundle.pricing_by_day.values()
+        )
+        assert backend.query(
+            "SELECT count(*) AS n FROM price_versions"
+        ).to_pylist() == [{"n": price_count}]
+    finally:
+        backend.close()
+
+
+def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Roll back every table when a later batch append fails."""
+    bundle = normalize(collection_bundle)
+    backend = DuckDBBackend(":memory:")
+    backend.apply_ddl()
+    batch = PersistenceBatch(
+        run_id=bundle.run_id,
+        current_state=(
+            CurrentStateWrite(
+                "daily_stats",
+                bundle.tables["daily_stats"],
+                ("source_id", "day", "client", "session_id", "model"),
+                ("total_tokens",),
+            ),
+        ),
+        append_only={"missing_history": bundle.tables["collection_ledger"]},
+        collection_ledger=bundle.tables["collection_ledger"],
+    )
+    try:
+        with pytest.raises(duckdb.CatalogException, match="missing_history"):
+            backend.persist_batch(batch)
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM collection_ledger").num_rows == 0
+    finally:
+        backend.close()
 
 
 def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
