@@ -226,6 +226,11 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 ### Important Design Decisions
 
+- **Interoperability:** The following axioms must **never** be broken:
+  - **Backend-Agnosticism:** A user should be able to snapshot their data and move it to whatever data warehouse they wish.
+  - **Bucket-Agnosticism:** A user should be able to move an existing snapshot archive to whatever object store they wish.
+  - *Important Corallary:* Snapshots stored in any bucket must be able to be restored to any backend.
+
 - **tokscale derived metrics:** We invoke `tokscale` as a subprocess and treat its stdout as the only source of truth for token usage statistics. A future major version may make token statistics collection native.
 
 - **Daily tokscale pricing:** `price_versions` stores the tokscale rates observed for each model with activity on a processed day. `daily_cost` calculates `cost_usd` from those rates and daily token components; `tokscale_cost_usd` remains diagnostic. Historical price drift before collection is the downstream user's responsibility.
