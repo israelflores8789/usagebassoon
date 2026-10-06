@@ -188,13 +188,13 @@ Required-field absence from a required payload is a collection error. Unknown fi
 The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.md) for more exhaustive detailed decision reasoning; read it before changing persistence, compaction, schema, snapshot, or curation behavior.
 
 - **Upsert-only.** UsageBassoon *only* appends, dedups, and updates usage data. It *never* deletes data from a data warehouse. Data deletion must be an *intentional* act of the user.
-- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe without consequence. This means duplicates are tolerated if there is a means to safely dedup records.
-- **Atomicity.** Wherever possible, updates to a data warehouse or archive are atomic. For Direct Transactional Upsert warehouses, transactions must be atomic. For Append-and-Compact warehouses, compaction transactions must be atomic. Unsuccessful transactions must *always* be rolled back safely. For snapshot archives, immutables directories, including Parquet archives and the manifest, must be created atomically.
 - **Dual-Architecture Backends.** UsageBassoon categorizes data warehouses into two broad architectures:
   - **Direct Transactional Upsert:** For data warehouses where batched transactions is latency-cheap, collection data is normalized and batched into one atomic transaction. (Implemented: DuckDB, MotherDuck)
-  - **Append-and-Compact:** For data warehouses that reward "append-and-forget" ingestion, collection data is persisted to "raw" ephemeral append-only tables and deduped through scheduled compaction to "gold" tables. (Implemented: BigQuery)
+  - **Append-and-Compact:** For data warehouses that reward "append-and-forget" ingestion, collection data is persisted to "raw" ephemeral append-only tables and deduped through scheduled compaction to "gold" tables. Queries, views, and snapshot archives *must* contain complete data from *both* the gold tables *and* deduped records from raw tables. (Implemented: BigQuery)
 - **Backend Agnosticism.** UsageBassoon is built to be extensible. Data warehouse provider-specific machinery is in the `backends/` subpackage and implements the `StorageBackend` protocol. Dialect-specific SQL scripts are in their dedicated `sql/<dialect>/` directories and *must* be kept functionally in sync between dialects (the `sql_parity` test coverage, based on SQLGlot, enforces this). Data warehouse queries and parsed Tokscale payload is normalized in backend-agnostic Arrow tables.
 - **Bucket Agnosticism.** Object Storage provider-specific machinery is in the `buckets/` subpackage and implements the `SnapshotBucket` protocol.
+- **Idempotency.** Repeating a collection from one or many ephemeral environments must be safe without consequence. This means duplicates are tolerated if there is a means to safely dedup records.
+- **Atomicity.** Wherever possible, updates to a data warehouse or archive are atomic. For *Direct Transactional Upsert* warehouses, transactions must be atomic. For *Append-and-Compact* warehouses, compaction transactions must be atomic. Unsuccessful transactions must *always* be rolled back safely. For *snapshot* archives, immutables directories, including Parquet archives and the manifest, must be created atomically. A snapshot is publishable only after *complete* table coverage, a *complete* immutable manifest, and a immutable completion record.
 - **Interoperability.** UsageBassoon implements two user axioms that must never be broken:
   - *A user should be able to snapshot their data and move it to whatever data warehouse they wish.*
   - *A user should be able to move an existing snapshot archive to whatever object store they wish.*
@@ -205,41 +205,47 @@ The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.m
   - `tokscale pricing` provides observed model rates
 - **Tolerant Collection Payload.** UsageBassoon prioritizes token usage persistence and tolerates payloads that can be gathered later in the event of an error. Mandatory canonical commands include `tokscale models` and `tokscale graph`.
 - **Tolerant Schema Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "schema drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
-- **Atomic Snapshots.** A snapshot is publishable only after *complete* table coverage and a *complete* immutable manifest and completion record, and it must include un-compacted raw observations through canonical state, for append-and-compact backends.
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
 - **Protect Privacy by Default.** UsageBassoon attempts to protect sensitive user data by offering means to obfuscate. UsageBassoon also automatically obfuscates commands likely to be shared publicly (e.g. `bassoon doctor` and `bassoon export`). *Never* place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
 
 ## Persistence architectures
 
-UsageBassoon chooses a persistence architecture according to how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, natural keys, ordering rules, underlying data model, and report views.
+UsageBassoon categorizes data warehouses into two broad architectures and chooses a persistence architecture largely driven by how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, underlying data model (natural keys, ordering rules, and canonical views), and canonical data flow. The difference lies in *how* data is persisted at collection-time, not in the data model or internal shuttling.
 
 | Architecture | How it works | Current backends |
 |:-------------|:-------------|:-----------------|
 | Direct transactional upsert | Each normalized batch upserts current-state tables in a bounded transaction; audit and debug streams append. | DuckDB, MotherDuck |
 | Append-and-compact | Collection appends immutable observations to raw tables. Canonical views combine gold with retained raw rows. Scheduled transactional compaction folds raw into gold. Curation tables have tombstones for delete. | BigQuery |
 
-Collection and curation on an append-and-compact backend never mutate raw or gold tables. *Only* scheduled compaction and atomic restore write gold. Concurrent collectors, including those sharing a `source_id`, are safe by idempotent appends and read-time deduplication.
+Collection and curation on an append-and-compact backend *never* mutate raw or gold tables. *Only* scheduled compaction and atomic restore write gold tables. Concurrent collectors, including those sharing a `source_id`, are safe by idempotent appends and read-time deduplication.
+
+The entire **purpose** behind this architectural duality is to leverage warehouse-specific behavior. With the BigQuery implementation, we saw simple collection queries take over 72 seconds to complete an atomic upsert transaction! This is by architectural design of the warehouse. In the case of BigQuery, the warehouse rewards an "append-and-forget" ingest posture and punishes complex queries for time-sensitive use cases. Obviously, 72 seconds to complete a collect run is impractical for UsageBassoon, so we adopted an architecture inspired by DataBricks's [Medallion Architecture](https://www.databricks.com/blog/what-is-medallion-architecture) while maintaining the underlying data model we had already implemented in DuckDB/MotherDuck. An "append-and-forget" posture reduced collection query time down to 6 seconds with this architecture on BigQuery. Of course, upsert transactions are a couple seconds on MotherDuck, so we retained the original Direct Transactional Upsert architecture there.
+
+> [!IMPORTANT]
+> In general, the "gold" tables for Append-and-Compact warehouses are *the same* as the Direct Transactional Upsert tables. "Raw" append tables generally have the same fields as gold tables with slight differences for compaction management.
 
 A new backend contribution must:
-- state which architecture it uses and why, validating the warehouse's write and concurrency behavior first (Redshift and Microsoft Fabric are candidate append-and-compact fits);
-- implement `StorageBackend` over canonical Arrow tables and provide native DDL and views functionally equivalent to other dialects;
-- keep a non-null `source_id` on every base table and include it in the natural key of every source-scoped current-state table;
+- state which architecture it uses and why, validating the warehouse's write and concurrency behavior first;
+- implement `StorageBackend` and integrate into the data flow model with canonical Arrow tables;
+- provide native DDL and views functionally equivalent to other dialects;
+- follow the current data model including the use of `source_id`, natural keys, table fields, and canonical views;
 - preserve the shared ordering policy, tombstone semantics, and schema init/marker behavior;
 - support consistent snapshot capture and atomic restore into an empty destination; and
 - add structural and synthetic parity test coverage plus focused live tests against a disposable resource.
 
-## Schema, SQL, and compaction changes
-
-- Update the DuckDB and BigQuery DDL and views together, and update the `sql_parity` tests. Backend-specific raw tables, canonical ingestion views, and compaction SQL differ by design; shared logical tables and report views must not.
-- Never reshape an existing table with `CREATE TABLE IF NOT EXISTS`. A table-shape change **requires** a schema version bump and an explicit registered migration. The BigQuery schema hash includes `compaction.sql`, so a compaction change *is* a schema change.
-- Compaction changes need live BigQuery coverage. Compaction must remain idempotent, recompute affected partitions from existing gold plus retained raw rows, and commit gold and progress together.
-- Never add DDL, MERGE, staging tables, or serialization to a BigQuery collection path.
+SQL schema changes are rare, but when they occur, they follow these rules:
+- DDLs and views *must* be updated together for all backend dialects, including the `sql_parity` tests.
+- Never reshape an existing table with `CREATE TABLE IF NOT EXISTS`. A table-shape change **requires** a schema version bump and an explicit registered migration. The Append-and-Compact warehouses have a schema hash that includes `compaction.sql`, so a compaction change *is* a schema change.
+- Compaction script changes *require* an update to the live test coverage.
+- Compaction must remain *idempotent*, recompute affected partitions from existing gold plus retained raw rows, and commit gold and progress together.
 
 ## Snapshot and recovery contracts
 
-UsageBassoon captures a consistent, point-in-time view of a storage backend as a portable archive of Parquet data and snapshot metadata. A snapshot bucket stores that archive independently of the backend, so copies can move between local and object-storage providers. Immutable manifests, completion evidence, and object hashes define recoverable contents; catalog and control documents support discovery, retention, and concurrency. Restore validates archive integrity and compatibility before changing destination maintenance, then commits data and a completion receipt into an empty, quiescent backend. Scheduled snapshots and weekly backups run independently of collection, and every released archive format and data contract must retain a tested recovery path.
+UsageBassoon captures a consistent, point-in-time view of a storage backend as a portable archive of Parquet data and snapshot metadata. A snapshot bucket stores that archive independently of the backend, so copies can move between local and object-storage providers. Immutable manifests, completion evidence, and object hashes define recoverable contents; catalog and control documents support discovery, retention, and concurrency. Restore validates archive integrity and compatibility before changing destination maintenance, then commits data and a completion receipt into an *empty*, *quiescent* backend. Scheduled snapshots and weekly backups run independently of collection, and every released archive format and data contract must retain a tested recovery path.
 
 ### Snapshot contents and lifecycle
+
+Snapshot archives are generally divided into two components: **immutables** and **mutables**. "Immutables" are the complete directories required for restoring usage data to a given data warehouse. "Mutables" are items that contain descriptions of archive state, inconsequential metadata, and can generally be ignored or rebuilt in an emergency restore use case.
 
 - Complete snapshots contain:
   - immutable `manifest.json`,
@@ -262,26 +268,51 @@ Capture and lifecycle operations can run for a while and involve several archive
 
 ### Scheduling and retention
 
-Manual, scheduled, and weekly snapshots serve different recovery needs. Keep their retention and health rules distinct.
+*When enabled*, snapshots have an independent cadence from usage collection runs, and there are generally two snapshot cadences:
+- user-defined cadence in `config.toml` (default is 15 minutes), and
+- automatic weekly cadence, based on UTC.
 
-- A manual snapshot bypasses cadence and is pinned by default. Pinning removes it from rotation.
-- Scheduled retention counts unpinned snapshots. Keep four successful UTC weekly slots separately; pins are exempt from both retention rules.
-- Give scheduled and weekly backups independent native artifacts and a worker loop separate from collection. They must run without waiting for collection or tokscale preflight, so a collection problem cannot stop backup coverage.
-- Report scheduled and weekly health separately, including accumulated weekly coverage, so one obligation cannot hide a gap in the other.
-- Deletion requires explicitly selected locations and the CLI's `DELETE` confirmation. If cleanup is partial, keep the snapshot retired and retryable.
+Both cadences are dependent on at least one UsageBassoon instance running, and care has been taken to ensure concurrent UsageBassoon instances with potentially different configured cadences perform snapshots safely.
+
+Snapshots *bucket-agnostic* and rotate based on archive freshness. For user-defined cadence, the default max number of snapshots in rotation is 3. For weekly cadence, 4 snapshots (roughly a month) are in rotation. Snapshots can be **pinned** by the user to be removed from rotation and held indefinitely until an explicit user DELETE (requires a CLI confirmation).
 
 ### Restore and recovery
 
-Restore should let users recover valid archived data even when the files used for routine snapshot management are damaged. Contributors should preserve these guarantees:
+Restore is designed to be *durable* and should let users recover valid archived data even when *mutables* used for snapshot management are damaged. All contributions should preserve these guarantees:
 
-- **Immutable archive contents are enough.** Restore requires a valid immutable `manifest.json`, the immutable `COMPLETE` marker, and every referenced immutable Parquet object.
-- **Mutable management files are optional.** `state.json`, `catalog.json`, `control.json`, retirement markers, and other files used to list or manage snapshots may be missing or corrupt. They must never be prerequisites for restoring verified immutable contents.
+- **Immutable archive contents are enough.** Restore requires *only* the "immutables" of an archive, including:
+  - a valid immutable `manifest.json`,
+  - the immutable `COMPLETE` marker, and
+  - every referenced immutable Parquet object.
+- **Mutable management artifacts are optional.** `state.json`, `catalog.json`, `control.json`, retirement markers, and other files used to list or manage snapshots may be missing or corrupt, but restore must **never** depend on mutable snapshot management artifacts.
 - **Validate before writing.** Check archive integrity and format compatibility before changing destination maintenance or data. If a supported conversion is needed, validate each intermediate result separately and preserve the original archive. A failed conversion leaves the destination untouched.
-- **Require a stopped, empty destination.** Stopping every UsageBassoon instance that can publish data is a hard requirement. Concurrent writes can unsafely mix data into the restore. A CLI confirmation or receipt does not stop writers. Recheck emptiness, including unexpected populated tables, in the same transaction that writes the restored data and completion receipt.
-- **Prevent maintenance from racing with restore.** Initialize with compaction disabled and bound maintenance changes and waits with one operation deadline. Report the known maintenance state after success or failure without hiding the original error. Plain `bassoon init` is the explicit command for resuming maintenance.
-- **Keep unsupported archives useful.** If the installed release cannot restore an archive, users should still be able to inspect its verified producer and schema details and identify a compatible release.
+- **Require a stopped, empty destination.** Stopping every UsageBassoon instance that can publish data is a *hard* requirement. Concurrent writes can unsafely mix data into the restore, and there's currently no reasonable way for UsageBassoon to guarantee that all publishing instances are stopped. Instead, several checks are implemented, mainly checking for warehouse emptiness and unexpected populated tables in the same transaction that writes the restored data and completion receipt.
+- **Prevent compaction from racing with restore.** Restore must handle the edge case that a restore operation could co-occur with a scheduled compaction job. UsageBassoon handles this by disabling compaction and monitoring the warehouse for existing running compaction jobs. Users are directed to invoke `bassoon init` after restore to enable compaction again.
+- **Keep unsupported archives useful.** While UsageBassoon will make its best effort to support legacy data snapshots, users should always be able to inspect a snapshot's verified producer and schema details to identify a compatible release in rare edge cases. This is currently implemented with `bassoon snapshot inspect`.
+
+The test suite does its best to "drill" a restore scenario to keep critical behavior consistent across updates. When making *any* changes to snapshot-restore behavior, contributions *must* remain compliant with the behavior current enforced by the recovery drill test suite or extend it with clear reasoning for the proposed behavior change.
+
+Right now, there are two live recovery drills. One verifies that a *relocated* GCS snapshot can recover into DuckDB using only its *immutable* archive data (local archive --> GCS --> local DuckDB). This tests *interoperability of the archive* while also enforcing the "immutables-versus-mutables" boundary.
+
+**GCS recovery drill**
+- seed a DuckDB snapshot with multiple source IDs and rows for every snapshot table, then record canonical or replay query results as the expected data;
+- copy the snapshot to a local directory, then copy it to a relocated GCS prefix;
+- remove the copied `catalog.json` index and corrupt the mutable `control.json` and `state.json` lifecycle metadata;
+- restore the GCS copy into an empty DuckDB backend and compare restored row counts and table contents with the pre-capture query results; and
+- append collection again using an existing source ID and assert that daily-fact counts and source IDs are preserved.
+
+The other drill verifies that a DuckDB snapshot can safely restore into BigQuery and resume collection after recovery (local DuckDB --> local archive --> BigQuery). This tests *interoperability of the warehouse* and enforces backend-agnosticism:
+
+**BigQuery recovery drill**
+- seed a DuckDB snapshot with multiple source IDs and rows for every snapshot table, then record canonical or replay query results as the expected data;
+- copy the snapshot to a relocated local directory, remove the copied `catalog.json` index, and corrupt the mutable `state.json` lifecycle metadata;
+- verify that restore into a populated BigQuery destination is rejected, reset the disposable schema, then restore into BigQuery, including recovery from a simulated interrupted restore stage;
+- compare restored table contents with the pre-capture DuckDB query results; and
+- append collection again using an existing source ID and assert that daily-fact counts and source IDs are preserved; verify that compaction preserves token totals and maintenance is re-enabled.
 
 ### Versioning and compatibility
+
+There are 4 versioning concepts in UsageBassoon, which can be understood from the context of snapshots and recovery requirements:
 
 | Version responsibility | Owner | Meaning |
 |---|---|---|
@@ -290,7 +321,9 @@ Restore should let users recover valid archived data even when the files used fo
 | Snapshot-format version | `snapshot/format.py` | Manifest and file packaging/interpretation |
 | Physical backend schema version/hash | `schema_assets.py` | Installed native SQL, including scheduled compaction |
 
-Persisted data and archives are public contracts: changes follow [Semantic Version](https://semver.org/) requirements for major and minor version releases. Backend SQL upgrades and snapshot transformations use separate registries. Each backend schema change needs a dialect-specific SQL migration asset and the expected schema hash before and after that step for every dialect. Registered steps must form a gap-free path between supported schemas, and completed steps are recorded in `schema_migrations`. Baseline DDL is **never** a substitute for a migration.
+Changes to persisted data schema and snapshot archive schema follow [Semantic Version](https://semver.org/) requirements for major and minor version releases of the application version. Each backend schema change needs a dialect-specific SQL migration asset and the expected schema hash before and after that step for every dialect.
+
+Registered migration steps must form a gap-free path between supported schemas, and completed steps are recorded in `schema_migrations`. Baseline DDL is **never** a substitute for a migration.
 
 Every released format and data contract needs tested recovery:
 - historical readers,
@@ -300,10 +333,10 @@ Every released format and data contract needs tested recovery:
 
 Preserve original archives, source IDs, event IDs, pricing, and curation semantics. Removing a direct reader requires a documented, tested conversion.
 
-### Recovery drill
+## A note on the test suite
 
-- Extend existing test modules. Seed multiple sources and every logical table; relocate local/remote copies, remove the copied index, restore to another supported backend, compare with independently derived expected data, and resume collection with source IDs preserved.
-- Use only the `usagebassoon_it` BigQuery dataset, MotherDuck database, and mandated GCS test bucket. Run destructive shared-destination phases serially.
+> [!IMPORTANT]
+> The test suite is designed to be comprehensive of edge cases encountered during development. Some tests are there specifically to assist in agentic development, giving agents hard feedback on intended behavior. Keep this in mind when submitting PRs. Do *not* attempt to submit a PR that materially truncates the test suite without offering both an audit and explicit reasoning for why the removed tests are irrelevant or harmful in the current test suite.
 
 ## Golden fixture policy
 
@@ -407,6 +440,7 @@ UsageBassoon is intentionally modular, and contributions are welcome with key ne
 - **Improve collection resilience:**
   - Add a local cache that allows UsageBassoon to be resilient against network hiccups maintaining the idempotency and atomicity standards.
   - Investigate and harden against tokscale hangs when LiteLLM calls do not resolve; improve timeouts, cancellation, diagnostics, and recovery behavior.
+- **Improve historical data reconciliation** to detect and recover divergences caused by late imports, changed collection scope, or upstream corrections beyond the automatic refresh window while preserving source identity, historical pricing, and both persistence architectures.
 - **UsageBassoon-Native token usage collection:**
   - Pricing data is currently snapshot over time from Tokscale which uses LiteLLM. A downstream major version should bring this in-house with scheduled API calls to either LiteLLM or Models.dev.
   - UsageBassoon v1 currently relies on Tokscale for token usage aggregation. A downstream major version should make this native to UsageBassoon with a schema we can control more closely. One option is to investigate porting Tokscale’s MIT-licensed Rust binary making it a native tool call. Token aggregation itself should always be driven by a compiled, memory-safe language like Rust to limit execution time. The user-facing project remains in Python which aligns with the data science utility and expectations.
