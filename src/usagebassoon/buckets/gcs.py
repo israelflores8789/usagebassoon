@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
+from time import monotonic, sleep
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
@@ -18,9 +21,93 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
-from usagebassoon.deadlines import bounded, http_session, operation, remaining_seconds
+from usagebassoon.deadlines import (
+    OperationTimeout,
+    bounded,
+    http_session,
+    limited,
+    operation,
+    remaining_seconds,
+)
 
 _LOG = logging.getLogger("usagebassoon")
+_MUTATION_INTERVAL = 1.1
+_RETRY_SECONDS = 60.0
+_RETRY_ATTEMPTS = 5
+
+
+class _MutationGate:
+    """Share same-object pacing across adapters in this process."""
+
+    def __init__(self) -> None:
+        """Create an idle gate without retaining provider data."""
+        self.lock = Lock()
+        self.next_at = 0.0
+        self.users = 0
+
+
+_MUTATION_GATES: dict[tuple[str, str], _MutationGate] = {}
+_MUTATION_LOCK = Lock()
+
+
+def _pause(seconds: float) -> None:
+    """Wait only when the current operation can afford the full delay."""
+    if seconds >= remaining_seconds(None):
+        raise OperationTimeout("GCS pacing or backoff exceeds the operation budget")
+    if seconds > 0:
+        sleep(seconds)
+    remaining_seconds()
+
+
+@contextmanager
+def _mutation(bucket_name: str, object_name: str) -> Generator[None]:
+    """Pace each same-object attempt, including retries and deletes."""
+    key = (bucket_name, object_name)
+    with _MUTATION_LOCK:
+        now = monotonic()
+        for expired in [
+            name
+            for name, gate in _MUTATION_GATES.items()
+            if not gate.users and gate.next_at <= now
+        ]:
+            del _MUTATION_GATES[expired]
+        gate = _MUTATION_GATES.setdefault(key, _MutationGate())
+        gate.users += 1
+    acquired = False
+    try:
+        acquired = gate.lock.acquire(timeout=remaining_seconds(None))
+        if not acquired:
+            raise OperationTimeout("GCS mutation pacing exhausted the operation budget")
+        _pause(max(0.0, gate.next_at - monotonic()))
+        try:
+            yield
+        finally:
+            gate.next_at = monotonic() + _MUTATION_INTERVAL
+    finally:
+        if acquired:
+            gate.lock.release()
+        with _MUTATION_LOCK:
+            gate.users -= 1
+
+
+def _retryable(error: Exception) -> bool:
+    """Recognize documented transient GCS failures without retrying conflicts."""
+    from google.api_core.exceptions import GoogleAPICallError
+    from google.api_core.retry import if_transient_error
+    from requests.exceptions import Timeout as RequestTimeout
+
+    return (
+        if_transient_error(error)
+        or isinstance(error, ConnectionError | RequestTimeout)
+        or (
+            isinstance(error, GoogleAPICallError)
+            and error.code in {408, 429, 500, 502, 503, 504}
+        )
+        or (
+            isinstance(error, OperationTimeout)
+            and isinstance(error.__cause__, RequestTimeout)
+        )
+    )
 
 
 class GcsBlob(Protocol):
@@ -147,6 +234,9 @@ class GcsSnapshotBucket:
     GCS generations supply immutable object versions and compare-and-swap
     publication. The GCS SDK protocols above are private adapter seams, not
     extension contracts; new providers implement ``SnapshotBucket`` directly.
+    One adapter retry loop owns jitter, pacing and deadlines. SDK retries stay
+    disabled to avoid nested retries. Unfenced writes are never replayed, and
+    ambiguous committed mutations fail closed on a subsequent conflict.
     """
 
     def __init__(
@@ -244,6 +334,43 @@ class GcsSnapshotBucket:
             self.client = client_value
             self.bucket = client_value.bucket(self.bucket_name)
 
+    def _request[T](
+        self,
+        name: str,
+        request: Callable[[], T],
+        *,
+        mutation: str | None = None,
+        retry: bool = True,
+    ) -> T:
+        """Retry one SDK operation for at most sixty seconds and five attempts.
+
+        Full jitter grows from one to eight seconds. A shorter caller budget
+        also bounds requests, pacing, backoff and lock acquisition.
+        """
+        from google.api_core.retry import exponential_sleep_generator
+
+        delays = exponential_sleep_generator(initial=1.0, maximum=8.0)
+        with limited(_RETRY_SECONDS):
+            for attempt in range(1, _RETRY_ATTEMPTS + 1):
+                remaining_seconds()
+                try:
+                    if mutation is None:
+                        return request()
+                    with _mutation(self.bucket_name, mutation):
+                        return request()
+                except Exception as error:
+                    if not retry or not _retryable(error) or attempt == _RETRY_ATTEMPTS:
+                        raise
+                    _LOG.warning(
+                        "GCS %s failed on attempt %s; "
+                        "retrying within the operation budget",
+                        name,
+                        attempt,
+                        exc_info=True,
+                    )
+                    _pause(next(delays))
+        raise AssertionError("unreachable")
+
     def key(self, relative_name: str) -> str:
         """Return an archive-root-relative name as a bucket object name."""
         relative = validate_relative_name(relative_name, allow_empty=True)
@@ -261,8 +388,12 @@ class GcsSnapshotBucket:
     def _object(self, blob: GcsBlob) -> SnapshotObject:
         """Materialize stable metadata from a loaded cloud blob."""
         if blob.generation is None or blob.size is None:
-            blob.reload(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            self._request(
+                "object metadata",
+                lambda: blob.reload(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
         if blob.generation is None or blob.size is None:
             raise RuntimeError(f"GCS did not return metadata for {blob.name!r}")
@@ -290,10 +421,13 @@ class GcsSnapshotBucket:
         generation = self._generation(version)
         blob = self.bucket.blob(self.key(relative_name), generation=generation)
         try:
-            return blob.download_as_bytes(
-                if_generation_match=generation,
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
+            return self._request(
+                "read",
+                lambda: blob.download_as_bytes(
+                    if_generation_match=generation,
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
@@ -311,15 +445,24 @@ class GcsSnapshotBucket:
         """Write an object and return immutable generation metadata."""
         blob = self.bucket.blob(self.key(relative_name))
         try:
-            blob.upload_from_string(
-                payload,
-                content_type=content_type,
-                if_generation_match=if_generation_match,
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
+            self._request(
+                "write",
+                lambda: blob.upload_from_string(
+                    payload,
+                    content_type=content_type,
+                    if_generation_match=if_generation_match,
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
+                mutation=self.key(relative_name),
+                retry=if_generation_match is not None,
             )
-            blob.reload(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            self._request(
+                "object metadata",
+                lambda: blob.reload(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
         except Exception as error:
             self._raise_precondition(error)
@@ -330,14 +473,22 @@ class GcsSnapshotBucket:
         """Upload a file with create-only generation fencing."""
         blob = self.bucket.blob(self.key(relative_name))
         try:
-            blob.upload_from_filename(
-                str(path),
-                if_generation_match=0,
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
+            self._request(
+                "upload",
+                lambda: blob.upload_from_filename(
+                    str(path),
+                    if_generation_match=0,
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
+                mutation=self.key(relative_name),
             )
-            blob.reload(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            self._request(
+                "object metadata",
+                lambda: blob.reload(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
         except Exception as error:
             self._raise_precondition(error)
@@ -347,16 +498,22 @@ class GcsSnapshotBucket:
     def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Resolve this location's generation and download that exact revision."""
         blob = self.bucket.blob(self.key(relative_name))
-        blob.reload(
-            timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+        self._request(
+            "object metadata",
+            lambda: blob.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            ),
         )
         ref = self._object(blob)
         try:
-            blob.download_to_filename(
-                str(path),
-                if_generation_match=self._generation(ref.version),
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
+            self._request(
+                "download",
+                lambda: blob.download_to_filename(
+                    str(path),
+                    if_generation_match=self._generation(ref.version),
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
@@ -370,12 +527,20 @@ class GcsSnapshotBucket:
         blob = self.bucket.blob(self.key(relative_name))
         payload: object = None
         try:
-            if not blob.exists(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            if not self._request(
+                "existence",
+                lambda: blob.exists(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             ):
                 return None, None
-            blob.reload(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            self._request(
+                "object metadata",
+                lambda: blob.reload(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
             reference = self._object(blob)
             payload = json.loads(
@@ -418,24 +583,31 @@ class GcsSnapshotBucket:
     def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List loaded object metadata under an archive-relative prefix."""
         prefix = self.key(relative_prefix)
-        return tuple(
-            self._object(blob)
-            for blob in self.client.list_blobs(
-                self.bucket,
-                prefix=prefix,
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
-            )
+        blobs = self._request(
+            "list",
+            lambda: tuple(
+                self.client.list_blobs(
+                    self.bucket,
+                    prefix=prefix,
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                )
+            ),
         )
+        return tuple(self._object(blob) for blob in blobs)
 
     @bounded
     def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
         """Delete exactly the published generation of an object."""
         try:
-            self.bucket.blob(self.key(relative_name)).delete(
-                if_generation_match=self._generation(version),
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
-                retry=None,
+            self._request(
+                "delete",
+                lambda: self.bucket.blob(self.key(relative_name)).delete(
+                    if_generation_match=self._generation(version),
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
+                mutation=self.key(relative_name),
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
@@ -444,8 +616,12 @@ class GcsSnapshotBucket:
     def lifecycle_warnings(self) -> tuple[str, ...]:
         """Report lifecycle delete rules that could apply to this archive root."""
         try:
-            self.bucket.reload(
-                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            self._request(
+                "bucket metadata",
+                lambda: self.bucket.reload(
+                    timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                    retry=None,
+                ),
             )
             rules = self.bucket.lifecycle_rules
         except Exception as error:

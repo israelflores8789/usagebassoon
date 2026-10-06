@@ -20,6 +20,7 @@ from usagebassoon.deadlines import (
     checked,
     cleanup_budget,
     current_deadline,
+    limited,
     operation,
     remaining_seconds,
 )
@@ -181,6 +182,37 @@ def test_expired_operation_has_one_independent_cleanup_allowance(clock: Clock) -
         assert current_deadline() is parent
         raise failure
     assert caught.value is failure
+    assert current_deadline() is None
+
+
+def test_limited_scopes_tighten_restore_and_share_cleanup(clock: Clock) -> None:
+    """Child bounds preserve parent time, context and one cleanup allowance."""
+    with operation(100) as parent:
+        with limited(50) as child:
+            assert child is not parent
+            assert remaining_seconds(None) == 50
+            with limited(200):
+                assert remaining_seconds(None) == 50
+                clock.advance(5)
+            assert current_deadline() is child
+            assert remaining_seconds(None) == 45
+            with limited(20), cleanup_budget():
+                assert remaining_seconds(None) == 15
+                clock.advance(10)
+            assert current_deadline() is child
+            assert remaining_seconds(None) == 35
+            with cleanup_budget():
+                assert remaining_seconds(None) == 5
+            clock.advance(6)
+            with cleanup_budget(), pytest.raises(OperationTimeout):
+                remaining_seconds()
+        assert current_deadline() is parent
+        assert remaining_seconds(None) == 79
+        failure = RuntimeError("limited operation failed")
+        with pytest.raises(RuntimeError) as caught, limited(1):
+            raise failure
+        assert caught.value is failure
+        assert current_deadline() is parent
     assert current_deadline() is None
 
 

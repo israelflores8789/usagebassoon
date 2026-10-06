@@ -7,15 +7,21 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from threading import Barrier, Event, Lock
-from typing import cast, override
+from typing import Self, cast, override
 from unittest.mock import ANY, MagicMock
 
 import pyarrow as pa
 import pytest
-from google.api_core.exceptions import NotFound, PreconditionFailed, ServiceUnavailable
+from google.api_core.exceptions import (
+    Forbidden,
+    NotFound,
+    PreconditionFailed,
+    ServiceUnavailable,
+    TooManyRequests,
+)
 
 from tests._snapshot_fakes import TableBackend
 from usagebassoon.archiver import SNAPSHOT_TABLES, SnapshotWriteError
@@ -30,15 +36,249 @@ from usagebassoon.config import ConfigurationError
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
 
+@pytest.fixture
+def gcs_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Advance pacing and backoff deterministically without real sleeps."""
+    import usagebassoon.buckets.gcs as gcs
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(gcs, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gcs, "sleep", sleep)
+    monkeypatch.setattr(gcs, "_MUTATION_GATES", {})
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    return clock
+
+
+def test_gcs_paces_shared_object_across_adapters(gcs_clock: list[float]) -> None:
+    """Creation, overwrite and deletion share pacing; distinct names do not."""
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    blob.name = "archive/control.json"
+    blob.generation, blob.size, blob.crc32c = 7, 3, None
+    first = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    second = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    first.write_bytes("control.json", b"one", if_generation_match=0)
+    second.write_bytes("control.json", b"two", if_generation_match=7)
+    assert gcs_clock[0] == pytest.approx(1.1)
+    first.delete("control.json", version=7)
+    assert gcs_clock[0] == pytest.approx(2.2)
+    second.write_bytes("other", b"three", if_generation_match=0)
+    assert gcs_clock[0] == pytest.approx(2.2)
+
+
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_contended_mutation_times_out_without_sending_or_leaking_gate() -> None:
+    """A blocked mutation expires safely and leaves the gate reusable."""
+    from usagebassoon.deadlines import OperationTimeout, operation
+
+    entered, release = Event(), Event()
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    blob.name = "archive/control.json"
+    blob.generation, blob.size, blob.crc32c = 7, 3, None
+    first = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    second = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+
+    def held_upload(*_args: object, **_kwargs: object) -> None:
+        """Keep the first adapter's native request in flight until released."""
+        entered.set()
+        assert release.wait(timeout=5)
+
+    blob.upload_from_string.side_effect = held_upload
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            first.write_bytes, "control.json", b"one", if_generation_match=0
+        )
+        try:
+            assert entered.wait(timeout=5)
+            with operation(0.01), pytest.raises(OperationTimeout):
+                second.write_bytes("control.json", b"two", if_generation_match=7)
+            assert blob.upload_from_string.call_count == 1
+        finally:
+            release.set()
+        future.result(timeout=5)
+    second.delete("control.json", version=7)
+    blob.delete.assert_called_once()
+
+
+def test_gcs_retries_rate_limit_with_jitter_and_stable_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    gcs_clock: list[float],
+) -> None:
+    """Recover 429 bursts with truncated full jitter and unchanged CAS bytes."""
+    import google.api_core.retry as retry
+
+    import usagebassoon.buckets.gcs as gcs
+
+    delays = MagicMock(return_value=iter([0.25, 1.5]))
+    waits = MagicMock(wraps=gcs.sleep)
+    monkeypatch.setattr(retry, "exponential_sleep_generator", delays)
+    monkeypatch.setattr(gcs, "sleep", waits)
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    blob.name = "archive/control.json"
+    blob.generation, blob.size, blob.crc32c = 7, 3, None
+    blob.upload_from_string.side_effect = [TooManyRequests("limited")] * 2 + [None]
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    archive.write_bytes("control.json", b"same", if_generation_match=6)
+    delays.assert_called_with(initial=1.0, maximum=8.0)
+    pauses = [call.args[0] for call in waits.call_args_list]
+    assert 0.25 in pauses and 1.5 in pauses
+    assert gcs_clock[0] == pytest.approx(sum(pauses))
+    assert blob.upload_from_string.call_count == 3
+    for call in blob.upload_from_string.call_args_list:
+        assert call.args == (b"same",)
+        assert call.kwargs["if_generation_match"] == 6
+        assert call.kwargs["retry"] is None
+
+
+@pytest.mark.parametrize("boundary", ["backoff", "cleanup_pacing", "request_ceiling"])
+def test_gcs_waits_and_requests_respect_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+    gcs_clock: list[float],
+    boundary: str,
+) -> None:
+    """Bound backoff, cleanup pacing and requests under a longer caller budget."""
+    import google.api_core.retry as retry
+
+    from usagebassoon.deadlines import OperationTimeout, cleanup_budget, operation
+
+    monkeypatch.setattr(
+        retry, "exponential_sleep_generator", MagicMock(return_value=iter([1.0]))
+    )
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    if boundary == "backoff":
+        failure = TooManyRequests("limited")
+        blob.download_as_bytes.side_effect = failure
+        with operation(0.5), pytest.raises(OperationTimeout) as caught:
+            archive.read_bytes("data", version=7)
+        assert caught.value.__context__ is failure
+        assert blob.download_as_bytes.call_count == 1
+        assert gcs_clock[0] == 0
+    elif boundary == "cleanup_pacing":
+        with operation(100):
+            with cleanup_budget():
+                gcs_clock[0] = 14.5
+                archive.delete("data", version=7)
+            with cleanup_budget(), pytest.raises(OperationTimeout):
+                archive.delete("data", version=7)
+        assert blob.delete.call_count == 1
+        assert gcs_clock[0] == 14.5
+    else:
+
+        def delayed_read(*_args: object, **_kwargs: object) -> bytes:
+            """Model a successful response arriving after the provider ceiling."""
+            gcs_clock[0] += 61
+            return b"late response"
+
+        blob.download_as_bytes.side_effect = delayed_read
+        with operation(120), pytest.raises(OperationTimeout):
+            archive.read_bytes("data", version=7)
+        assert blob.download_as_bytes.call_count == 1
+
+
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_lost_write_response_never_removes_generation_guard() -> None:
+    """An ambiguous commit followed by 412 fails closed rather than overwriting."""
+    from requests.exceptions import ConnectionError as RequestConnectionError
+
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    conflict = PreconditionFailed("already committed or superseded")
+    blob.upload_from_string.side_effect = [RequestConnectionError("lost"), conflict]
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    with pytest.raises(GcsPreconditionError) as caught:
+        archive.write_bytes("control.json", b"same", if_generation_match=6)
+    assert caught.value.__cause__ is conflict
+    assert blob.upload_from_string.call_count == 2
+    assert all(
+        call.kwargs["if_generation_match"] == 6
+        for call in blob.upload_from_string.call_args_list
+    )
+    blob.reload.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", [None, 0])
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_unsafe_writes_and_permanent_failures_are_not_retried(
+    guard: int | None,
+) -> None:
+    """Never replay unfenced writes or permanent authorization failures."""
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    failure = ServiceUnavailable("uncertain") if guard is None else Forbidden("denied")
+    blob.upload_from_string.side_effect = failure
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    with pytest.raises(type(failure)):
+        archive.write_bytes("data", b"same", if_generation_match=guard)
+    assert blob.upload_from_string.call_count == 1
+
+
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_metadata_retry_does_not_replay_successful_upload() -> None:
+    """A failed metadata read retries independently of a completed mutation."""
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    blob.name = "archive/data"
+    blob.generation, blob.size, blob.crc32c = 7, 3, None
+    blob.reload.side_effect = [ServiceUnavailable("metadata"), None]
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    assert archive.write_bytes("data", b"one", if_generation_match=0).version == 7
+    assert blob.reload.call_count == 2
+    assert blob.upload_from_string.call_count == 1
+
+
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_listing_metadata_failure_does_not_multiply_retries() -> None:
+    """Keep paginator and individual metadata recovery in separate retry scopes."""
+    client = MagicMock(spec=GcsClient)
+    blob = MagicMock(spec=GcsBlob)
+    blob.name = "archive/data"
+    blob.generation, blob.size = None, None
+    failure = ServiceUnavailable("metadata")
+    blob.reload.side_effect = failure
+    client.list_blobs.return_value = [blob]
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    with pytest.raises(ServiceUnavailable):
+        archive.list("")
+    assert blob.reload.call_count == 5
+    assert client.list_blobs.call_count == 1
+
+
+@pytest.mark.usefixtures("gcs_clock")
+def test_gcs_partial_listing_restarts_without_duplicate_results() -> None:
+    """Retry a failed pagination pass without retaining its incomplete results."""
+    from collections.abc import Generator
+
+    client = MagicMock(spec=GcsClient)
+    blob = MagicMock(spec=GcsBlob)
+    blob.name = "archive/data"
+    blob.generation, blob.size, blob.crc32c = 7, 3, None
+
+    def partial() -> Generator[GcsBlob]:
+        yield cast(GcsBlob, blob)
+        raise TooManyRequests("next page")
+
+    client.list_blobs.side_effect = [partial(), [blob]]
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    assert archive.list("") == (GcsObject("data", 7, 3, None),)
+    assert client.list_blobs.call_count == 2
+
+
 def test_gcs_transfer_and_metadata_consume_the_same_operation_budget(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    gcs_clock: list[float],
 ) -> None:
     """A transfer's metadata request cannot receive a fresh snapshot timeout."""
     import usagebassoon.deadlines as deadlines
 
-    clock = [0.0]
-    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
     client = MagicMock(spec=GcsClient)
     blob = client.bucket.return_value.blob.return_value
     blob.name = "archive/table.parquet"
@@ -51,7 +291,7 @@ def test_gcs_transfer_and_metadata_consume_the_same_operation_budget(
         _path: str, *, if_generation_match: int, timeout: float, retry: object
     ) -> None:
         assert if_generation_match == 0 and retry is None and timeout == 10
-        clock[0] = 8
+        gcs_clock[0] = 8
 
     blob.upload_from_filename.side_effect = upload
     with deadlines.operation(10):
@@ -319,6 +559,7 @@ def test_gcs_archive_uses_configured_request_timeout() -> None:
 @pytest.mark.parametrize(
     "operation", ["read", "json", "create", "replace", "upload", "download", "delete"]
 )
+@pytest.mark.usefixtures("gcs_clock")
 def test_gcs_adapter_passes_generation_guards_and_timeouts(
     tmp_path: Path, operation: str
 ) -> None:
@@ -395,6 +636,7 @@ def test_gcs_adapter_passes_generation_guards_and_timeouts(
 @pytest.mark.parametrize(
     "error_type", [NotFound, PreconditionFailed, ServiceUnavailable]
 )
+@pytest.mark.usefixtures("gcs_clock")
 def test_gcs_adapter_distinguishes_generation_conflicts_from_service_failures(
     operation: str, error_type: type[Exception]
 ) -> None:
@@ -424,6 +666,9 @@ def test_gcs_adapter_distinguishes_generation_conflicts_from_service_failures(
         assert caught.value.__cause__ is failure
     else:
         assert caught.value is failure
+    assert getattr(blob, method).call_count == (
+        5 if error_type is ServiceUnavailable else 1
+    )
 
 
 def test_gcs_reservation_expires_during_slow_snapshot() -> None:
@@ -442,6 +687,10 @@ def test_gcs_reservation_expires_during_slow_snapshot() -> None:
         and second.fence is not None
         and second.fence > first.fence
     )
+    generation = archive.next_generation
+    with pytest.raises(ArchiveBusy, match="lost"):
+        first.check()
+    assert archive.next_generation == generation
     with pytest.raises(ArchiveBusy, match="lost"):
         first.publish("stale", datetime.now(UTC).isoformat())
     assert first.entries() == []
@@ -456,6 +705,79 @@ def test_gcs_reservation_can_be_renewed_before_expiry() -> None:
         assert catalog.fence == fence
         with pytest.raises(ArchiveBusy), Catalog(archive).hold():
             pytest.fail("second archive owner entered")
+
+
+def test_catalog_checks_read_authority_without_rewriting_each_time() -> None:
+    """Fresh reservations permit repeated checks without control mutation bursts."""
+    archive = MemoryGcsArchive()
+    catalog = Catalog(archive)
+    catalog._update_reservation(claim=True)
+    version = archive.next_generation
+    for _ in range(2):
+        catalog.check()
+    assert archive.next_generation == version
+    document, current = catalog.control()
+    reservation = document["reservation"]
+    assert isinstance(reservation, dict)
+    reservation["expires_at"] = (datetime.now(UTC) + timedelta(seconds=150)).isoformat()
+    archive.write_json_cas("control.json", document, expected_version=current)
+    version = archive.next_generation
+    catalog.check()
+    assert archive.next_generation == version + 1
+    document, _ = catalog.control()
+    reservation = document["reservation"]
+    assert isinstance(reservation, dict)
+    assert datetime.fromisoformat(str(reservation["expires_at"])) > (
+        datetime.now(UTC) + timedelta(seconds=290)
+    )
+
+
+def test_catalog_renewal_cannot_outlive_observed_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound provider-neutral CAS work by its original reservation expiry."""
+    import usagebassoon.deadlines as deadlines
+    import usagebassoon.snapshot.catalog as catalog_module
+    from tests.test_deadlines import Clock
+
+    clock = Clock()
+
+    class ControlledDatetime(datetime):
+        """Derive reservation wall time from the same controlled monotonic clock."""
+
+        @classmethod
+        @override
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            """Return the current controlled instant in the requested timezone."""
+            return cls.fromtimestamp(clock.now, tz)
+
+    monkeypatch.setattr(catalog_module, "datetime", ControlledDatetime)
+    monkeypatch.setattr(deadlines, "monotonic", clock)
+    archive = MemoryGcsArchive()
+    catalog = Catalog(archive)
+    catalog._update_reservation(claim=True)
+    document, version = catalog.control()
+    reservation = document["reservation"]
+    assert isinstance(reservation, dict)
+    reservation["expires_at"] = (
+        ControlledDatetime.now(UTC) + timedelta(seconds=10)
+    ).isoformat()
+    archive.write_json_cas("control.json", document, expected_version=version)
+    original = archive.write_json_cas
+
+    def delayed_cas(
+        name: str, payload: dict[str, object], *, expected_version: str | int | None
+    ) -> GcsObject:
+        """Model a provider checking its budget before completing a slow CAS."""
+        assert deadlines.remaining_seconds(None) == 10
+        clock.advance(11)
+        deadlines.remaining_seconds()
+        return original(name, payload, expected_version=expected_version)
+
+    monkeypatch.setattr(archive, "write_json_cas", delayed_cas)
+    with pytest.raises(deadlines.OperationTimeout):
+        catalog._update_reservation()
+    assert catalog.control()[0] == document
 
 
 def test_snapshot_renews_reservation_during_long_capture(

@@ -19,7 +19,7 @@ from usagebassoon.buckets.base import (
     SnapshotPreconditionError,
     SnapshotVersion,
 )
-from usagebassoon.deadlines import cleanup_budget, remaining_seconds
+from usagebassoon.deadlines import cleanup_budget, limited, remaining_seconds
 from usagebassoon.snapshot.format import (
     CATALOG_NAME,
     FORMAT_VERSION,
@@ -148,6 +148,7 @@ class Catalog:
     def mutate(self, change: Callable[[dict[str, object]], None]) -> None:
         """Atomically authorize a transition against the reservation's own version."""
         with self._control_lock:
+            self.check()
             if self._failure is not None:
                 raise ArchiveBusy(
                     "archive reservation renewal failed"
@@ -166,9 +167,14 @@ class Catalog:
                     )
                 change(document)
                 try:
-                    self.bucket.write_json_cas(
-                        CONTROL_NAME, document, expected_version=version
-                    )
+                    with limited(
+                        (
+                            timestamp(reservation["expires_at"]) - datetime.now(UTC)
+                        ).total_seconds()
+                    ):
+                        self.bucket.write_json_cas(
+                            CONTROL_NAME, document, expected_version=version
+                        )
                 except SnapshotPreconditionError:
                     continue
                 return
@@ -389,6 +395,13 @@ class Catalog:
                     raise ArchiveBusy(
                         f"snapshot reservation was lost: {self.bucket.uri}"
                     )
+                if claim:
+                    allowance = LEASE_SECONDS
+                else:
+                    assert isinstance(reservation, dict)
+                    allowance = (
+                        timestamp(reservation["expires_at"]) - datetime.now(UTC)
+                    ).total_seconds()
                 document["fence"] = self.fence
                 document.setdefault("archive_id", uuid4().hex)
                 document["reservation"] = {
@@ -397,9 +410,10 @@ class Catalog:
                     "expires_at": (now + timedelta(seconds=LEASE_SECONDS)).isoformat(),
                 }
                 try:
-                    self.bucket.write_json_cas(
-                        CONTROL_NAME, document, expected_version=version
-                    )
+                    with limited(allowance):
+                        self.bucket.write_json_cas(
+                            CONTROL_NAME, document, expected_version=version
+                        )
                 except SnapshotPreconditionError:
                     continue
                 return
@@ -407,9 +421,25 @@ class Catalog:
 
     def check(self) -> None:
         """Verify ownership before publishing completion or retiring objects."""
-        if self._failure is not None:
-            raise ArchiveBusy("archive reservation renewal failed") from self._failure
-        self._update_reservation()
+        with self._control_lock:
+            if self._failure is not None:
+                raise ArchiveBusy(
+                    "archive reservation renewal failed"
+                ) from self._failure
+            document, _ = self.control()
+            reservation = document.get("reservation")
+            now = datetime.now(UTC)
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("owner") != self.owner
+                or reservation.get("fence") != self.fence
+                or timestamp(reservation.get("expires_at")) <= now
+            ):
+                raise ArchiveBusy(f"snapshot reservation was lost: {self.bucket.uri}")
+            if (
+                timestamp(reservation["expires_at"]) - now
+            ).total_seconds() <= LEASE_SECONDS * 2 / 3:
+                self._update_reservation()
 
     def record_outcome(self, identifier: str, *, error: str | None = None) -> None:
         """Commit last-attempt evidence with the current mutation authority."""

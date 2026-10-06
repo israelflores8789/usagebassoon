@@ -4,8 +4,9 @@
 """deadlines.py — Shared monotonic operation and bounded cleanup budgets.
 
 Remote operations reuse an enclosing budget, including concurrent publication.
-Retries start a new budget; backoff is outside it. Cleanup shares at most fifteen
-additional seconds. Snapshot capture and restore use separate, longer scopes.
+Collection retries start a new budget; their backoff is outside it. Provider
+retries consume the enclosing budget. Cleanup shares at most fifteen additional
+seconds. Snapshot capture and restore use separate, longer scopes.
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ class OperationTimeout(TimeoutError, RuntimeError):
 class Deadline:
     """Track elapsed time and share one cleanup allowance across workers."""
 
-    def __init__(self, seconds: float) -> None:
+    def __init__(self, seconds: float, *, parent: Deadline | None = None) -> None:
         """Start a positive, finite monotonic budget."""
         if not isfinite(seconds) or seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
         self.expires = monotonic() + seconds
+        self._parent = parent
         self._cleanup: Deadline | None = None
         self._lock = Lock()
 
@@ -52,6 +54,8 @@ class Deadline:
 
     def cleanup(self) -> Deadline:
         """Allocate one shared cleanup grace, never one allowance per object."""
+        if self._parent is not None:
+            return self._parent.cleanup()
         with self._lock:
             if self._cleanup is None:
                 self._cleanup = Deadline(CLEANUP_SECONDS)
@@ -100,6 +104,25 @@ def cleanup_budget() -> Generator[None]:
     token = _CURRENT.set(parent.cleanup() if parent else Deadline(CLEANUP_SECONDS))
     try:
         yield
+    finally:
+        _CURRENT.reset(token)
+
+
+@contextmanager
+def limited(seconds: float) -> Generator[Deadline]:
+    """Tighten an enclosing budget while retaining its shared cleanup allowance."""
+    if seconds <= 0:
+        raise OperationTimeout("operation authority or retry budget expired")
+    parent = current_deadline()
+    if parent is not None:
+        seconds = min(seconds, parent.remaining())
+    deadline = Deadline(seconds, parent=parent)
+    if parent is not None:
+        deadline.expires = min(deadline.expires, parent.expires)
+    token = _CURRENT.set(deadline)
+    try:
+        yield deadline
+        deadline.remaining()
     finally:
         _CURRENT.reset(token)
 
