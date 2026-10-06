@@ -296,3 +296,41 @@ def test_declining_disabled_archive_access_aborts_without_audit_output(
     assert "Aborted" in plain_cli_output(result.output)
     assert '"valid": true' not in plain_cli_output(result.stdout)
     assert (Path(uri) / "COMPLETE").exists()
+
+
+def test_partial_snapshot_failure_reports_retained_copy_and_exits_unsuccessfully(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed destination must not turn a retained healthy copy into CLI success."""
+    config = tmp_path / "config.toml"
+    database = tmp_path / "usagebassoon.duckdb"
+    root = tmp_path / "archive"
+    config.write_text(
+        f'source_id = "{SOURCE_ID}"\n'
+        f'backend.provider = "duckdb"\nbackend.duckdb.database = "{database}"\n'
+        f'[snapshots.local]\nenable = true\npath = "{root}"\n'
+        '[snapshots.gcs]\nenable = true\nproject = "test"\nuri = "gs://unavailable/archive"\n'
+    )
+    backend = DuckDBBackend(database)
+    backend.apply_ddl()
+    backend.close()
+
+    def unavailable(
+        uri: str, *, project: str | None = None, credentials_file: Path | None = None
+    ) -> None:
+        """Fail cloud adapter construction before any network request."""
+        del uri, project, credentials_file
+        raise OSError("destination unavailable")
+
+    monkeypatch.setattr("usagebassoon.buckets.gcs.GcsSnapshotBucket", unavailable)
+    result = CliRunner().invoke(app, ["snapshot", "--config", str(config)])
+    output = " ".join(plain_cli_output(result.output).replace("│", "").split())
+    assert result.exit_code != 0
+    assert "Snapshot failed at gs://unavailable/archive" in output
+    assert "verified copies retained at:" in output
+    assert "Created private raw snapshot" not in output
+    store = SnapshotStore(str(root))
+    with store.reader.prepare() as prepared:
+        assert prepared.candidate.bucket.uri == str(root)
+        assert prepared.manifest["run_id"] == "manual"

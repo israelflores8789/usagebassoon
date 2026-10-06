@@ -63,6 +63,22 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+class SnapshotWriteError(RuntimeError):
+    """Report destination failures while preserving verified snapshot copies."""
+
+    def __init__(
+        self, published_uris: Sequence[str], failed_destinations: Sequence[str]
+    ) -> None:
+        """Expose retained copies and destinations requiring another attempt."""
+        self.published_uris = tuple(published_uris)
+        self.failed_destinations = tuple(dict.fromkeys(failed_destinations))
+        retained = ", ".join(self.published_uris) or "none"
+        super().__init__(
+            f"Snapshot failed at {', '.join(self.failed_destinations)}; "
+            f"verified copies retained at: {retained}"
+        )
+
+
 class SnapshotArchiver:
     """Coordinate canonical Arrow capture, archive lifecycle, and recovery."""
 
@@ -191,7 +207,7 @@ class SnapshotArchiver:
     @property
     def destination_uris(self) -> tuple[str, ...]:
         """Return the configured archive locations."""
-        return tuple(a.uri for a in self._archives)
+        return self._locations
 
     def lifecycle_warnings(self) -> tuple[str, ...]:
         """Return provider lifecycle risks affecting configured archives."""
@@ -240,6 +256,9 @@ class SnapshotArchiver:
 
         The default is ten minutes. Failure cleanup shares at most fifteen
         additional seconds. Local file work checks the budget between chunks.
+        Destination failures preserve published copies and raise SnapshotWriteError
+        for multiple destinations or retained copies; otherwise the original error
+        is raised.
         """
         created = _now()
         if not self._locations:
@@ -247,30 +266,37 @@ class SnapshotArchiver:
                 return None
             raise ValueError("at least one snapshot destination is required")
         identifier = f"{created.strftime('%Y-%m-%dT%H%M%SZ')}_{uuid4().hex}"
-        catalogs = [
-            Catalog(a, self.max_snapshots)
-            for a in sorted(self._archives, key=_bucket_uri)
-        ]
-        due = [(c, self._roles(c, created, manual=manual)) for c in catalogs]
-        due = [(c, roles) for c, roles in due if roles]
-        if not due:
-            return None
+        failures: list[tuple[str, Exception]] = []
+        published: list[str] = []
+        due: list[tuple[Catalog, list[str]]] = []
         written: dict[str, list[SnapshotObject]] = {}
-        try:
-            with (
-                ExitStack() as stack,
-                TemporaryDirectory(prefix="usagebassoon-snapshot-") as temporary,
-            ):
-                for catalog, _ in due:
-                    stack.enter_context(catalog.hold(enforce_policy=True))
-                due = [(c, self._roles(c, created, manual=manual)) for c, _ in due]
-                due = [(c, roles) for c, roles in due if roles]
-                if not due:
-                    return None
+
+        def release(claim: ExitStack, location: str) -> None:
+            """Release one reservation without hiding another destination's result."""
+            try:
+                claim.close()
+            except Exception as error:
+                failures.append((location, error))
+                _LOG.exception("Snapshot reservation check failed at %s", location)
+
+        with ExitStack() as stack:
+            for location in sorted(self._locations):
+                claim = ExitStack()
+                catalog: Catalog | None = None
                 try:
-                    for catalog, memberships in due:
-                        catalog.check()
-                        initial_state: dict[str, object] = {
+                    catalog = Catalog(self._bucket(location), self.max_snapshots)
+                    memberships = self._roles(catalog, created, manual=manual)
+                    if not memberships:
+                        continue
+                    claim.enter_context(catalog.hold(enforce_policy=True))
+                    memberships = self._roles(catalog, created, manual=manual)
+                    if not memberships:
+                        release(claim, location)
+                        continue
+                    written[bucket_uri(catalog.bucket.uri)] = []
+                    catalog.stage(
+                        identifier,
+                        {
                             "kind": "snapshot_stage",
                             "owner": catalog.owner,
                             "fence": catalog.fence,
@@ -282,127 +308,153 @@ class SnapshotArchiver:
                             "weekly_slot": created.strftime("%G-W%V")
                             if "weekly" in memberships
                             else None,
-                        }
-                        catalog.stage(identifier, initial_state)
-                        written[bucket_uri(catalog.bucket.uri)] = []
-                    directory = Path(temporary)
-                    specifications: dict[str, object] = {}
-                    files: dict[str, Path] = {}
-                    with backend.stream_snapshot(SNAPSHOT_TABLES) as stream:
-                        captured_at = stream.captured_at.isoformat()
-                        for table in SNAPSHOT_TABLES:
-                            remaining_seconds()
-                            schema = CANONICAL_TABLE_SCHEMAS[table]
-                            path = directory / f"{table}.parquet"
-                            rows = 0
-                            with pq.ParquetWriter(path, schema) as writer:
-                                for batch in stream.tables[table]:
-                                    remaining_seconds()
-                                    batch = batch.cast(schema)
-                                    writer.write_batch(batch)
-                                    rows += batch.num_rows
-                            refs: list[dict[str, object]] = []
-                            if rows:
-                                files[table] = path
-                                refs.append(
-                                    {
-                                        "name": path.name,
-                                        "size": path.stat().st_size,
-                                        "sha256": digest(path),
-                                    }
-                                )
-                            specifications[table] = {
-                                "status": "complete",
-                                "rows": rows,
-                                "schema_ipc": b64encode(
-                                    schema.serialize().to_pybytes()
-                                ).decode(),
-                                "objects": refs,
-                            }
-                    roles = sorted(
-                        {role for _, memberships in due for role in memberships}
-                    )
-                    manifest: dict[str, object] = {
-                        "snapshot_id": identifier,
-                        "snapshot_format_version": FORMAT_VERSION,
-                        "data_schema_version": DATA_SCHEMA_VERSION,
-                        "usagebassoon_version": __version__,
-                        **backend.snapshot_provenance(),
-                        "created_at": created.isoformat(),
-                        "captured_at": captured_at,
-                        "run_id": run_id,
-                        "cadence": {
-                            "trigger": "manual" if manual else "automatic",
-                            "roles": roles,
-                            "interval_seconds": self.interval.total_seconds()
-                            if self.interval
-                            else None,
-                            "weekly_slot": created.strftime("%G-W%V")
-                            if "weekly" in roles
-                            else None,
                         },
-                        "tables": specifications,
-                    }
-                    raw = encode(manifest)
-                    manifest_path = directory / "manifest.json"
-                    manifest_path.write_bytes(raw)
-                    completion_path = directory / "COMPLETE"
-                    completion_path.write_bytes(
-                        encode(
-                            {
-                                "snapshot_id": identifier,
-                                "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-                            }
-                        )
                     )
-                    for catalog, _memberships in due:
-                        catalog.check()
-                        archive = catalog.bucket
-                        owned = written[bucket_uri(archive.uri)]
-                        for path in [*files.values(), manifest_path]:
-                            catalog.check()
-                            owned.append(
-                                archive.upload_file(f"{identifier}/{path.name}", path)
-                            )
-                        owned.append(
-                            archive.upload_file(
-                                f"{identifier}/COMPLETE", completion_path
-                            )
-                        )
-                        verified = directory / f"verify-{catalog.owner}"
-                        verified.mkdir()
-                        self.reader.download(
-                            Candidate(archive, identifier, captured_at),
-                            verified,
-                            SNAPSHOT_TABLES,
-                            allow_staging=True,
-                        )
-                        remaining_seconds()
-                        catalog.publish(identifier, captured_at)
-                    for catalog, _ in due:
-                        catalog.record_outcome(identifier)
-                        try:
-                            catalog.rotate()
-                        except Exception:
-                            _LOG.exception(
-                                "Snapshot publication succeeded; "
-                                "retention cleanup failed at %s",
-                                catalog.bucket.uri,
-                            )
-                    return f"{due[0][0].bucket.uri}/{identifier}"
+                    due.append((catalog, memberships))
+                    stack.callback(release, claim, location)
                 except Exception as error:
-                    with cleanup_budget():
-                        self._rollback(due, identifier, written, error=str(error))
-                    raise
-
-        except ArchiveBusy:
-            _LOG.warning(
-                "Snapshot attempt stopped after contention or ownership loss; "
-                "next cadence will retry"
-            )
-            if not manual:
+                    failures.append((location, error))
+                    _LOG.exception("Snapshot preparation failed at %s", location)
+                    if catalog is not None:
+                        with cleanup_budget():
+                            self._rollback(
+                                [(catalog, [])], identifier, written, error=str(error)
+                            )
+                    release(claim, location)
+            if due:
+                with TemporaryDirectory(prefix="usagebassoon-snapshot-") as temporary:
+                    try:
+                        directory = Path(temporary)
+                        specifications: dict[str, object] = {}
+                        files: dict[str, Path] = {}
+                        with backend.stream_snapshot(SNAPSHOT_TABLES) as stream:
+                            captured_at = stream.captured_at.isoformat()
+                            for table in SNAPSHOT_TABLES:
+                                remaining_seconds()
+                                schema = CANONICAL_TABLE_SCHEMAS[table]
+                                path = directory / f"{table}.parquet"
+                                rows = 0
+                                with pq.ParquetWriter(path, schema) as writer:
+                                    for batch in stream.tables[table]:
+                                        remaining_seconds()
+                                        batch = batch.cast(schema)
+                                        writer.write_batch(batch)
+                                        rows += batch.num_rows
+                                refs: list[dict[str, object]] = []
+                                if rows:
+                                    files[table] = path
+                                    refs.append(
+                                        {
+                                            "name": path.name,
+                                            "size": path.stat().st_size,
+                                            "sha256": digest(path),
+                                        }
+                                    )
+                                specifications[table] = {
+                                    "status": "complete",
+                                    "rows": rows,
+                                    "schema_ipc": b64encode(
+                                        schema.serialize().to_pybytes()
+                                    ).decode(),
+                                    "objects": refs,
+                                }
+                        roles = sorted(
+                            {role for _, memberships in due for role in memberships}
+                        )
+                        manifest: dict[str, object] = {
+                            "snapshot_id": identifier,
+                            "snapshot_format_version": FORMAT_VERSION,
+                            "data_schema_version": DATA_SCHEMA_VERSION,
+                            "usagebassoon_version": __version__,
+                            **backend.snapshot_provenance(),
+                            "created_at": created.isoformat(),
+                            "captured_at": captured_at,
+                            "run_id": run_id,
+                            "cadence": {
+                                "trigger": "manual" if manual else "automatic",
+                                "roles": roles,
+                                "interval_seconds": self.interval.total_seconds()
+                                if self.interval
+                                else None,
+                                "weekly_slot": created.strftime("%G-W%V")
+                                if "weekly" in roles
+                                else None,
+                            },
+                            "tables": specifications,
+                        }
+                        raw = encode(manifest)
+                        manifest_path = directory / "manifest.json"
+                        manifest_path.write_bytes(raw)
+                        completion_path = directory / "COMPLETE"
+                        completion_path.write_bytes(
+                            encode(
+                                {
+                                    "snapshot_id": identifier,
+                                    "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+                                }
+                            )
+                        )
+                        for catalog, _memberships in due:
+                            try:
+                                catalog.check()
+                                archive = catalog.bucket
+                                owned = written[bucket_uri(archive.uri)]
+                                for path in [*files.values(), manifest_path]:
+                                    catalog.check()
+                                    owned.append(
+                                        archive.upload_file(
+                                            f"{identifier}/{path.name}", path
+                                        )
+                                    )
+                                owned.append(
+                                    archive.upload_file(
+                                        f"{identifier}/COMPLETE", completion_path
+                                    )
+                                )
+                                verified = directory / f"verify-{catalog.owner}"
+                                verified.mkdir()
+                                self.reader.download(
+                                    Candidate(archive, identifier, captured_at),
+                                    verified,
+                                    SNAPSHOT_TABLES,
+                                    allow_staging=True,
+                                )
+                                remaining_seconds()
+                                catalog.publish(identifier, captured_at)
+                                published.append(f"{archive.uri}/{identifier}")
+                                catalog.record_outcome(identifier)
+                                catalog.rotate()
+                            except Exception as error:
+                                failures.append((catalog.bucket.uri, error))
+                                _LOG.exception(
+                                    "Snapshot destination failed at %s",
+                                    catalog.bucket.uri,
+                                )
+                                with cleanup_budget():
+                                    retained = self._rollback(
+                                        [(catalog, [])],
+                                        identifier,
+                                        written,
+                                        error=str(error),
+                                    )
+                                    published.extend(
+                                        uri for uri in retained if uri not in published
+                                    )
+                    except Exception as error:
+                        with cleanup_budget():
+                            self._rollback(due, identifier, written, error=str(error))
+                        raise
+        if failures:
+            if (
+                not published
+                and not manual
+                and all(isinstance(e, ArchiveBusy) for _, e in failures)
+            ):
                 return None
-            raise
+            if len(self._locations) == 1 and not published:
+                raise failures[0][1]
+            raise SnapshotWriteError(published, [uri for uri, _ in failures])
+        return published[0] if published else None
 
     def _rollback(
         self,
@@ -411,13 +463,20 @@ class SnapshotArchiver:
         written: dict[str, list[SnapshotObject]],
         *,
         error: str,
-    ) -> None:
+    ) -> list[str]:
         """Retire owned partial copies while their destination claims remain live."""
+        retained: list[str] = []
         for catalog, _ in due:
             if bucket_uri(catalog.bucket.uri) not in written:
                 continue
             try:
                 catalog.check()
+                state = catalog.state(identifier)
+                if state is not None and state.get("published") is True:
+                    retained.append(f"{catalog.bucket.uri}/{identifier}")
+                    # Publication is durable even if later bookkeeping fails.
+                    catalog.record_outcome(identifier, error=error)
+                    continue
                 catalog.record_outcome(identifier, error=error)
                 catalog.retire(identifier)
             except Exception:
@@ -425,6 +484,7 @@ class SnapshotArchiver:
                     "Snapshot rollback could not clean owned objects at %s",
                     catalog.bucket.uri,
                 )
+        return retained
 
     def list_snapshots(self) -> list[str]:
         """List unique snapshot identities across configured destinations."""

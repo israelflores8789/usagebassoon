@@ -68,7 +68,7 @@ def durable_directory(path: Path) -> None:
         missing.append(current)
         current = current.parent
     for directory in reversed(missing):
-        directory.mkdir(exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
         sync_directory(directory.parent)
         sync_directory(directory)
 
@@ -78,7 +78,9 @@ def durable_replace(path: Path, payload: bytes) -> None:
     durable_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        with temporary.open("xb") as stream:
+        with os.fdopen(
+            os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -95,7 +97,7 @@ def _catalog_lock(path: Path) -> Generator[None]:
     Yields:
         No value while the lock is held.
     """
-    with path.open("a+b") as lock_file:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "a+b") as lock_file:
         if os.name == "nt":
             import msvcrt
 
@@ -260,7 +262,13 @@ class LocalSnapshotBucket:
         durable_directory(target.parent)
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         try:
-            with path.open("rb") as source, temporary.open("xb") as destination:
+            with (
+                path.open("rb") as source,
+                os.fdopen(
+                    os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                    "wb",
+                ) as destination,
+            ):
                 while chunk := source.read(1024 * 1024):
                     remaining_seconds()
                     destination.write(chunk)

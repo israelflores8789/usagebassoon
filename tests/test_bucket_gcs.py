@@ -18,13 +18,14 @@ import pytest
 from google.api_core.exceptions import NotFound, PreconditionFailed, ServiceUnavailable
 
 from tests._snapshot_fakes import TableBackend
-from usagebassoon.archiver import SNAPSHOT_TABLES
+from usagebassoon.archiver import SNAPSHOT_TABLES, SnapshotWriteError
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.buckets.base import SnapshotObject as GcsObject
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
 from usagebassoon.buckets.gcs import GcsBlob, GcsBucket, GcsClient
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
+from usagebassoon.buckets.local import LocalSnapshotBucket
 from usagebassoon.config import ConfigurationError
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
@@ -613,10 +614,10 @@ def test_pending_destination_renews_during_slow_publication(
     assert renewed.is_set()
 
 
-def test_dual_publication_failure_does_not_prune_previous_snapshots(
+def test_dual_publication_failure_keeps_new_healthy_and_previous_failed_copies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Do not rotate either destination after an incomplete dual publication."""
+    """Rotate healthy copies and preserve the failed destination's recovery point."""
     archive = MemoryGcsArchive()
     store = SnapshotStore(
         destination_uris=(str(tmp_path / "local"), archive.uri),
@@ -633,25 +634,23 @@ def test_dual_publication_failure_does_not_prune_previous_snapshots(
         original(self, identifier, captured_at)
 
     monkeypatch.setattr(Catalog, "publish", fail)
-    with pytest.raises(RuntimeError, match="catalog publication failed"):
+    with pytest.raises(SnapshotWriteError) as caught:
         store.write(cast(StorageBackend, TableBackend()), run_id="second")
+    assert caught.value.failed_destinations == (archive.uri,)
+    assert len(caught.value.published_uris) == 1
+    second = caught.value.published_uris[0]
+    with store.reader.prepare(second) as prepared:
+        assert prepared.candidate.identifier != first.rsplit("/", 1)[-1]
     candidates, _ = store.reader.candidates()
-    # Both destinations preserve their prior recovery point after rollback.
-    with store.reader.prepare() as prepared:
-        assert prepared.candidate.identifier == first.rsplit("/", 1)[-1]
     assert len(candidates) == 2
-    assert all(c.identifier == first.rsplit("/", 1)[-1] for c in candidates)
-    for bucket in store.reader.buckets:
-        assert Catalog(bucket).entries() == [
-            {
-                "snapshot_id": first.rsplit("/", 1)[-1],
-                "captured_at": candidates[0].captured_at,
-            }
-        ]
-        assert any(
-            obj.name == first.rsplit("/", 1)[-1] + "/COMPLETE"
-            for obj in bucket.list("")
-        )
+    assert {c.identifier for c in candidates} == {Path(first).name, Path(second).name}
+    assert Catalog(archive).entries()[0]["snapshot_id"] == Path(first).name
+    local = LocalSnapshotBucket(str(tmp_path / "local"))
+    assert Catalog(local).entries()[0]["snapshot_id"] == Path(second).name
+    assert not any(
+        obj.name.startswith(Path(first).name + "/") for obj in local.list("")
+    )
+    assert any(obj.name == Path(first).name + "/COMPLETE" for obj in archive.list(""))
 
 
 @pytest.mark.parametrize("project", ["ci-test-project", None])

@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from copy import copy
+from io import TextIOWrapper
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO, override
@@ -38,6 +40,8 @@ def _redact(value: str) -> str:
 
 class _CredentialFormatter(logging.Formatter):
     """Redact the complete message, stack information, and exception chain."""
+
+    converter = staticmethod(time.gmtime)
 
     @override
     def format(self, record: logging.LogRecord) -> str:
@@ -82,6 +86,18 @@ class _FallbackStderrHandler(logging.StreamHandler[TextIO]):
 
 class _RotatingFileHandler(RotatingFileHandler):
     """Preserve safe diagnostics on stderr if an established file sink fails."""
+
+    @override
+    def _open(self) -> TextIOWrapper:
+        """Create every active log privately, including after rotation."""
+        descriptor = os.open(
+            self.baseFilename, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+        )
+        try:
+            return open(descriptor, "a", encoding=self.encoding, errors=self.errors)
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     @override
     def handleError(self, record: logging.LogRecord) -> None:
@@ -181,7 +197,13 @@ def configure(config: LoggingConfig | UsageBassoonConfig) -> logging.Logger:
         _remove_fallback_handlers(logger)
         return logger
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        missing: list[Path] = []
+        current = directory
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for parent in reversed(missing):
+            parent.mkdir(mode=0o700, exist_ok=True)
         handler = _RotatingFileHandler(
             log_path,
             maxBytes=config.max_bytes,

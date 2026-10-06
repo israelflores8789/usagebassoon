@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import stat
+import time
 from pathlib import Path
 from types import TracebackType
 
@@ -172,3 +175,68 @@ def test_operational_sinks_redact_complete_exception_records(
     assert failure.__cause__ is cause
     assert failure.__traceback__ is traceback
     assert "opaque-child-credential" in str(failure)
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="process timezone switching")
+@pytest.mark.parametrize("fallback", [False, True])
+def test_operational_timestamps_use_utc_in_non_utc_timezone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fallback: bool,
+) -> None:
+    """Both durable and fallback logs must label the actual UTC instant."""
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
+    directory = tmp_path / "logs"
+    if fallback:
+        directory.write_text("occupied")
+    record = logging.LogRecord(
+        "usagebassoon", logging.ERROR, __file__, 1, "UTC clock", (), None
+    )
+    record.created = 0
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("TZ", "EST5EDT")
+            time.tzset()
+            assert time.localtime(0).tm_hour != time.gmtime(0).tm_hour
+            logger = configure(LoggingConfig(directory=directory))
+            logger.handle(record)
+            for handler in logger.handlers:
+                handler.flush()
+            output = (
+                capsys.readouterr().err
+                if fallback
+                else (directory / "usagebassoon.log").read_text()
+            )
+            assert "1970-01-01T00:00:00Z ERROR usagebassoon UTC clock" in output
+    finally:
+        time.tzset()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
+def test_log_files_remain_private_after_rollover_with_permissive_umask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every rollover private without changing the process umask."""
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    directory = shared / "new-parent" / "logs"
+    previous = os.umask(0)
+    try:
+        logger = configure(
+            LoggingConfig(directory=directory, max_files=3, max_bytes=128)
+        )
+        for index in range(5):
+            logger.error("private log message %s %s", index, "x" * 100)
+        files = list(directory.iterdir())
+        assert len(files) == 3
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files)
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert stat.S_IMODE(directory.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+        assert os.umask(0) == 0
+    finally:
+        os.umask(previous)

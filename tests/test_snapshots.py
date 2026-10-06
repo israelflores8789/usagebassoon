@@ -8,6 +8,8 @@ from __future__ import annotations
 import ast
 import errno
 import json
+import os
+import stat
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +26,7 @@ import pytest
 
 from tests._observations import observations
 from tests._snapshot_fakes import TableBackend
-from usagebassoon.archiver import SNAPSHOT_TABLES
+from usagebassoon.archiver import SNAPSHOT_TABLES, SnapshotWriteError
 from usagebassoon.archiver import SnapshotArchiver as SnapshotStore
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -1358,12 +1360,13 @@ def test_archiver_uses_only_enabled_destinations(
         [archive.uri] if gcs_enabled else []
     )
     assert store.destination_uris == tuple(expected)
-    assert calls == ([archive.uri] if gcs_enabled else [])
+    assert calls == []
     assert store.interval == timedelta(hours=12)
     assert store._weekly == set(expected)
     assert (
         store.write(cast(StorageBackend, TableBackend()), run_id="shared") is not None
     )
+    assert calls == ([archive.uri] if gcs_enabled else [])
     for bucket in store._archives:
         control, _ = Catalog(bucket).control()
         assert control["policy"] == {"max_snapshots": 5, "weekly_slots": 4}
@@ -1930,3 +1933,164 @@ def test_disabled_known_archive_is_recoverable_by_id_or_latest(
     ) as prepared:
         assert prepared.rows["notes"] == 1
         assert not store.selection_enabled(prepared.candidate.uri)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "resolve",
+        "reserve",
+        "stage",
+        "upload",
+        "verify",
+        "publish_ack",
+        "outcome",
+        "retention",
+    ],
+)
+@pytest.mark.parametrize("failed_first", [True, False])
+def test_destination_failure_preserves_healthy_snapshot_and_retries_only_due_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, failed_first: bool
+) -> None:
+    """Capture once, retain verified copies, and retry each destination's cadence."""
+    healthy = LocalSnapshotBucket(
+        str(tmp_path / ("z-healthy" if failed_first else "a-healthy"))
+    )
+    failed = LocalSnapshotBucket(
+        str(tmp_path / ("a-failed" if failed_first else "z-failed"))
+    )
+    backend = TableBackend()
+    store = SnapshotStore(
+        destination_uris=[healthy.uri, failed.uri], interval="1h", max_snapshots=1
+    )
+
+    def resolve(uri: str) -> SnapshotBucket:
+        """Resolve independent protocol adapters without remote credentials."""
+        return healthy if uri == healthy.uri else failed
+
+    store._bucket_factory = resolve
+    with monkeypatch.context() as patch:
+        if phase == "resolve":
+
+            def unavailable(uri: str) -> SnapshotBucket:
+                """Simulate client construction failure."""
+                if uri == failed.uri:
+                    raise OSError("destination unavailable")
+                return resolve(uri)
+
+            patch.setattr(store, "_bucket_factory", unavailable)
+        elif phase in {"reserve", "stage"}:
+            original_cas = failed.write_json_cas
+
+            def write_json(
+                relative_name: str,
+                payload: dict[str, object],
+                *,
+                expected_version: SnapshotVersion | None,
+            ) -> SnapshotObject:
+                """Fail catalog access or initial staging."""
+                if phase == "reserve" or payload.get("kind") == "snapshot_stage":
+                    raise OSError("destination unavailable")
+                return original_cas(
+                    relative_name, payload, expected_version=expected_version
+                )
+
+            patch.setattr(failed, "write_json_cas", write_json)
+        elif phase in {"upload", "verify"}:
+
+            def fail_transfer(_relative_name: str, _path: Path) -> SnapshotObject:
+                """Simulate a transfer failure after staging."""
+                raise OSError("destination unavailable")
+
+            patch.setattr(
+                failed,
+                "upload_file" if phase == "upload" else "download_file",
+                fail_transfer,
+            )
+        else:
+            original_publish = Catalog.publish
+            original_outcome = Catalog.record_outcome
+            original_rotate = Catalog.rotate
+
+            def fail_outcome(
+                catalog: Catalog, identifier: str, *, error: str | None = None
+            ) -> None:
+                """Fail outcome recording after verified publication."""
+                if catalog.bucket.uri == failed.uri:
+                    raise OSError("destination unavailable")
+                original_outcome(catalog, identifier, error=error)
+
+            def fail_retention(catalog: Catalog) -> None:
+                """Fail retention after verified publication."""
+                if catalog.bucket.uri == failed.uri:
+                    raise OSError("destination unavailable")
+                original_rotate(catalog)
+
+            def fail_publish_ack(
+                catalog: Catalog, identifier: str, captured_at: str
+            ) -> None:
+                """Lose acknowledgement after committing verified publication."""
+                original_publish(catalog, identifier, captured_at)
+                if catalog.bucket.uri == failed.uri:
+                    raise OSError("destination unavailable")
+
+            if phase == "publish_ack":
+                patch.setattr(Catalog, "publish", fail_publish_ack)
+            elif phase == "outcome":
+                patch.setattr(Catalog, "record_outcome", fail_outcome)
+            else:
+                patch.setattr(Catalog, "rotate", fail_retention)
+        # Listing configured destinations must not instantiate an unavailable client.
+        assert store.destination_uris == (healthy.uri, failed.uri)
+        with pytest.raises(SnapshotWriteError) as caught:
+            store.write(cast(StorageBackend, backend), run_id="partial")
+    assert backend.queries == len(SNAPSHOT_TABLES)
+    assert failed.uri in caught.value.failed_destinations
+    healthy_uri = next(
+        uri for uri in caught.value.published_uris if uri.startswith(healthy.uri + "/")
+    )
+    with store.reader.prepare(healthy_uri) as prepared:
+        assert prepared.rows["notes"] == 1
+    healthy_catalog = Catalog(healthy, 1)
+    assert healthy_catalog.control()[0]["last_success"] is not None
+    assert healthy_catalog.control()[0]["last_failure"] is None
+    assert healthy_catalog.control()[0]["reservation"] is None
+    prior_queries = backend.queries
+    recovered = store.write(cast(StorageBackend, backend), run_id="retry")
+    if phase in {"publish_ack", "outcome", "retention"}:
+        assert recovered is None
+        assert backend.queries == prior_queries
+    else:
+        assert recovered is not None and recovered.startswith(failed.uri + "/")
+        assert backend.queries == prior_queries + len(SNAPSHOT_TABLES)
+    assert healthy_catalog.entries()[0]["snapshot_id"] == healthy_uri.rsplit("/", 1)[-1]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
+def test_local_archive_creates_private_objects_without_changing_shared_ancestors(
+    tmp_path: Path,
+) -> None:
+    """A permissive umask must never expose newly created snapshot data."""
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    root = shared / "new-parent" / "archive"
+    previous = os.umask(0)
+    try:
+        store = SnapshotStore(str(root))
+        uri = store.write(
+            cast(StorageBackend, TableBackend()),
+            run_id="private",
+            manual=True,
+            pin=True,
+        )
+        assert uri is not None
+        store.pin(uri)
+        for path in (root.parent, root, *root.rglob("*")):
+            assert stat.S_IMODE(path.stat().st_mode) == (
+                0o700 if path.is_dir() else 0o600
+            ), path
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+        assert os.umask(0) == 0
+    finally:
+        os.umask(previous)
