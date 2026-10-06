@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import UTC, datetime
-from io import BytesIO
 from pathlib import Path
 
 import pyarrow as pa
@@ -106,25 +107,15 @@ def test_doctor_reports_configured_tokscale_command_and_version(
         stream.write('\n[tokscale]\nbin = "npx tokscale@latest"\n')
     calls: list[list[str]] = []
 
-    class FakeProcess:
-        """Supply fresh pipes for each Tokscale version probe."""
+    popen = subprocess.Popen
 
-        pid = 12345
-        returncode = 0
-
-        def __init__(self) -> None:
-            self.stdout = BytesIO(b"tokscale 4.15.1\n")
-            self.stderr = BytesIO(b"")
-
-        def poll(self) -> int:
-            return self.returncode
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+    def fake_popen(command: list[str], **_kwargs: object) -> subprocess.Popen[bytes]:
         calls.append(command)
-        return FakeProcess()
+        return popen(
+            [sys.executable, "-c", "print('tokscale 4.15.1')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
 

@@ -6,12 +6,18 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import subprocess
+import time
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from sys import executable
 from threading import Lock
+from threading import enumerate as enumerate_threads
 from typing import cast
 
 import pyarrow as pa
@@ -23,6 +29,7 @@ from usagebassoon import orchestrator as collector
 from usagebassoon import persistence
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.collection_lock import collection_lock
 from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
@@ -165,12 +172,158 @@ def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
         tokscale_timeout_seconds=0.05,
     )
 
-    with pytest.raises(RuntimeError, match="exceeded 0 seconds and was killed"):
+    with pytest.raises(RuntimeError, match="exceeded 0 seconds; termination requested"):
         collector._json_command(
             configuration,
             [executable, "-c", "import time; time.sleep(30)"],
             "graph",
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires detached POSIX descendants")
+@pytest.mark.parametrize(
+    ("pipe_name", "excessive"),
+    [("stdout", False), ("stderr", False), ("stdout", True)],
+)
+def test_tokscale_cleanup_bounds_surviving_pipe_holders(
+    tmp_path: Path, pipe_name: str, excessive: bool
+) -> None:
+    """Bound timeout/size cleanup, close pipes, and release the collection lock."""
+    ready = tmp_path / "holder.pid"
+    descriptor = 1 if pipe_name == "stdout" else 2
+    script = (
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        f"    os.close({3 - descriptor})\n"
+        f"    Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(8)\n"
+        "    os._exit(0)\n"
+        "time.sleep(0.1)\n"
+        + ("os.write(1, b'x' * 4096)\n" if excessive else "")
+        + "time.sleep(8)\n"
+    )
+    process = subprocess.Popen(
+        [executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    configuration = _config(tmp_path / "config.toml")
+    threads = set(enumerate_threads())
+    started = time.monotonic()
+    try:
+        with (
+            pytest.raises(
+                RuntimeError, match="byte limit" if excessive else "exceeded 1 seconds"
+            ),
+            collection_lock(configuration),
+        ):
+            subprocess_collector._capture_process(
+                process,
+                timeout_seconds=1.0,
+                max_stdout_bytes=128 if excessive else 4096,
+                max_stderr_bytes=4096,
+            )
+        assert time.monotonic() - started < 4.0
+        assert ready.exists(), "detached pipe holder must have started"
+        assert process.poll() is not None
+        assert process.stdout is not None and process.stdout.closed
+        assert process.stderr is not None and process.stderr.closed
+        assert set(enumerate_threads()) == threads
+        with collection_lock(configuration):
+            assert (
+                collector._json_command(
+                    configuration, [executable, "-c", "print('{}')"], "graph"
+                )
+                == {}
+            )
+    finally:
+        if ready.exists():
+            with suppress(ProcessLookupError):
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+
+@pytest.mark.parametrize("fault", ["kill", "read", "closed-pipes"])
+def test_tokscale_cleanup_bounds_process_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: str,
+) -> None:
+    """Fail boundedly on unsuccessful kills, read errors, or early pipe EOF."""
+    script = "import time; time.sleep(8)"
+    if fault == "closed-pipes":
+        script = "import os; os.close(1); os.close(2); " + script
+    process = subprocess.Popen(
+        [executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    def failed_kill(*_args: object) -> None:
+        """Simulate both group and direct termination failure."""
+        raise PermissionError("termination denied")
+
+    def failed_read(_descriptor: int, _size: int) -> bytes:
+        """Simulate an unreadable child pipe."""
+        raise OSError("pipe read failed")
+
+    started = time.monotonic()
+    try:
+        with monkeypatch.context() as patch:
+            if fault == "kill":
+                patch.setattr(
+                    subprocess_collector.os, "killpg", failed_kill, raising=False
+                )
+                patch.setattr(process, "kill", failed_kill)
+            elif fault == "read":
+                patch.setattr(subprocess_collector.os, "read", failed_read)
+            with pytest.raises(
+                RuntimeError, match="could not read" if fault == "read" else "exceeded"
+            ):
+                subprocess_collector._capture_process(
+                    process,
+                    timeout_seconds=0.1,
+                    max_stdout_bytes=4096,
+                    max_stderr_bytes=4096,
+                )
+        assert time.monotonic() - started < 3.0
+        assert process.stdout is not None and process.stdout.closed
+        assert process.stderr is not None and process.stderr.closed
+        if fault == "kill":
+            assert process.poll() is None
+            assert "could not terminate tokscale" in caplog.text
+            assert "did not exit before cleanup deadline" in caplog.text
+        else:
+            assert process.poll() is not None
+        if fault == "read":
+            assert "could not read tokscale" in caplog.text
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+
+def test_tokscale_preserves_slow_valid_output(tmp_path: Path) -> None:
+    """Capture incremental valid JSON before the hard maximum, without spinners."""
+    configuration = replace(
+        _config(tmp_path / "config.toml"), tokscale_timeout_seconds=2.0
+    )
+    script = (
+        "import os, sys, time\n"
+        "assert sys.argv[1] == '--no-spinner'\n"
+        "for chunk in [b'{', b'\"value\":', b'42', b'}']:\n"
+        "    os.write(1, chunk)\n"
+        "    time.sleep(0.05)\n"
+    )
+    assert collector._json_command(
+        configuration, [executable, "-c", script], "graph"
+    ) == {"value": 42}
 
 
 def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:

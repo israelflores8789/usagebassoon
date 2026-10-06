@@ -78,7 +78,8 @@ _SNAPSHOT_CONFIG_KEYS = frozenset({"path", "enable", "disable_weekly"})
 _SNAPSHOTS_CONFIG_KEYS = frozenset({"local", "gcs", "schedule", "max_snapshots"})
 DEFAULT_SCHEDULE_INTERVAL = "15m"
 DEFAULT_SNAPSHOT_INTERVAL = "12h"
-DEFAULT_TOKSCALE_TIMEOUT = "180s"
+DEFAULT_TOKSCALE_TIMEOUT = "120s"
+TOKSCALE_CLEANUP_TIMEOUT_SECONDS = 2.0
 DEFAULT_BIGQUERY_TIMEOUT = "120s"
 DEFAULT_GCS_TIMEOUT = "60s"
 
@@ -349,7 +350,7 @@ class UsageBassoonConfig:
     bigquery: BigQueryConfig | None = None
     tokscale_bin: str | None = None
     tokscale_env: tuple[str, ...] = ()
-    tokscale_timeout_seconds: float = 180.0
+    tokscale_timeout_seconds: float = 120.0
     tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
     tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
     collection: CollectionConfig = CollectionConfig()
@@ -815,9 +816,13 @@ def _parse_config(
     collection = _collection_config(collection_table)
     interval_duration = parse_interval(collection.schedule.interval, units="mh")
     assert interval_duration is not None
-    if interval_duration.total_seconds() <= tokscale_timeout_seconds:
+    if (
+        interval_duration.total_seconds()
+        <= tokscale_timeout_seconds + TOKSCALE_CLEANUP_TIMEOUT_SECONDS
+    ):
         raise ConfigurationError(
-            "collection.schedule.interval must be greater than tokscale.timeout"
+            "collection.schedule.interval must be greater than tokscale.timeout "
+            f"plus {TOKSCALE_CLEANUP_TIMEOUT_SECONDS:g} seconds for cleanup"
         )
     snapshots_table = _table(
         payload.get("snapshots"), "snapshots", _SNAPSHOTS_CONFIG_KEYS

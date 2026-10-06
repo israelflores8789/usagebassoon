@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import logging
-from io import BytesIO
+import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from typing import NoReturn, override
@@ -69,25 +71,15 @@ def test_tokscale_preflight_honors_configured_package_runner(
     configuration = _configuration(tmp_path, tokscale_bin="npx tokscale@latest")
     calls: list[list[str]] = []
 
-    class FakeProcess:
-        """Small bounded-pipe process double for the version probe."""
+    popen = subprocess.Popen
 
-        pid = 12345
-        returncode = 0
-
-        def __init__(self) -> None:
-            self.stdout = BytesIO(b"tokscale 4.15.1\n")
-            self.stderr = BytesIO(b"")
-
-        def poll(self) -> int:
-            return self.returncode
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command: list[str], **_: object) -> FakeProcess:
+    def fake_popen(command: list[str], **_: object) -> subprocess.Popen[bytes]:
         calls.append(command)
-        return FakeProcess()
+        return popen(
+            [sys.executable, "-c", "print('tokscale 4.15.1')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
 
@@ -603,7 +595,12 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("role", "failure_kind"),
-    [("collection", "error"), ("collection", "busy"), ("snapshot", "error")],
+    [
+        ("collection", "error"),
+        ("collection", "busy"),
+        ("collection", "timeout"),
+        ("snapshot", "error"),
+    ],
 )
 def test_worker_continues_after_an_operational_cycle_failure(
     tmp_path: Path,
@@ -615,7 +612,8 @@ def test_worker_continues_after_an_operational_cycle_failure(
 ) -> None:
     """Failed cycles remain observable and do not prevent the next scheduled run."""
     import usagebassoon.scheduling as module
-    from usagebassoon.collection_lock import CollectionBusy
+    from usagebassoon.collection_lock import CollectionBusy, collection_lock
+    from usagebassoon.collector import _json_command
 
     config = _configuration(tmp_path)
     attempts: list[UsageBassoonConfig] = []
@@ -638,7 +636,23 @@ def test_worker_continues_after_an_operational_cycle_failure(
             return self.is_set()
 
     def cycle(configuration: UsageBassoonConfig) -> None:
+        nonlocal failure
         attempts.append(configuration)
+        if failure_kind == "timeout":
+            command = (
+                "import time; time.sleep(8)" if len(attempts) == 1 else "print('{}')"
+            )
+            try:
+                with collection_lock(configuration):
+                    _json_command(
+                        replace(configuration, tokscale_timeout_seconds=0.1),
+                        [sys.executable, "-c", command],
+                        "graph",
+                    )
+            except RuntimeError as error:
+                failure = error
+                raise
+            return
         if len(attempts) == 1:
             raise failure
 

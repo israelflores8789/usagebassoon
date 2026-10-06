@@ -94,7 +94,7 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
 
     assert configuration.collection.schedule.interval == "15m"
     assert configuration.spinner == "pong"
-    assert configuration.tokscale_timeout_seconds == 180.0
+    assert configuration.tokscale_timeout_seconds == 120.0
     assert configuration.logging.max_files == 5
     assert configuration.logging.max_bytes == 5 * 1024 * 1024
 
@@ -166,11 +166,11 @@ def test_backend_defaults_to_duckdb(tmp_path: Path) -> None:
     assert ConfigurationManager(path).load().backend == "duckdb"
 
 
-@pytest.mark.parametrize("interval", ["3m", "2m"])
+@pytest.mark.parametrize("interval", ["1m", "2m", "2.02m"])
 def test_schedule_interval_must_exceed_tokscale_timeout(
     tmp_path: Path, interval: str
 ) -> None:
-    """Reject schedules no longer than one permitted tokscale invocation."""
+    """Reject schedules that cannot accommodate a command and its cleanup."""
     path = tmp_path / "config.toml"
     path.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'

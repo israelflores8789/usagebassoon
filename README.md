@@ -286,7 +286,7 @@ bin = "bunx tokscale@latest"                        # Command prefix with runner
                                                     #           `bunx tokscale@latest`, or
                                                     #           `deno x npm:tokscale@latest`.
 env = ["YOUR_ENV_VAR"]                              # Optional; additional env-vars for the tokscale subprocess.
-timeout = "180s"                                    # Optional; max duration of one tokscale subprocess call.
+timeout = "120s"                                    # Optional; max duration of one tokscale subprocess call.
 max_stdout_bytes = 67108864                         # Optional; max stdout captured from tokscale for one command.
 max_stderr_bytes = 8388608                          # Optional; this and the above prevent memory-leaks and abuse.
 

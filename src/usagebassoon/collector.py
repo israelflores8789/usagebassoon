@@ -16,11 +16,9 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from queue import Empty, Queue
-from threading import Thread
-from typing import BinaryIO, cast
+from typing import cast
 
-from usagebassoon.config import UsageBassoonConfig
+from usagebassoon.config import TOKSCALE_CLEANUP_TIMEOUT_SECONDS, UsageBassoonConfig
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
@@ -184,24 +182,6 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
             _LOG.exception("could not terminate tokscale process %s", process.pid)
 
 
-def _read_pipe(
-    name: str,
-    pipe: BinaryIO,
-    queue: Queue[tuple[str, bytes | None]],
-) -> None:
-    """Read one process pipe in bounded chunks until it reaches EOF."""
-    try:
-        while chunk := pipe.read(64 * 1024):
-            queue.put((name, chunk))
-    except Exception:
-        _LOG.exception("could not read tokscale %s", name)
-    finally:
-        try:
-            queue.put((name, None))
-        except Exception:
-            _LOG.exception("could not signal tokscale %s completion", name)
-
-
 def _capture_process(
     process: subprocess.Popen[bytes],
     *,
@@ -209,60 +189,100 @@ def _capture_process(
     max_stdout_bytes: int,
     max_stderr_bytes: int,
 ) -> tuple[bytes, bytes]:
-    """Capture bounded process output and kill the process on hard limits."""
+    """Capture output within a command deadline and a fixed cleanup allowance.
+
+    Nonblocking reads keep pipe ownership in this thread, including when a
+    surviving descendant holds a writer open. Cleanup drains and reaps only
+    within its shared deadline; incomplete or unreadable output always fails.
+    """
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("tokscale subprocess pipes were not configured")
-    events: Queue[tuple[str, bytes | None]] = Queue(maxsize=2)
-    readers = [
-        Thread(target=_read_pipe, args=("stdout", process.stdout, events), daemon=True),
-        Thread(target=_read_pipe, args=("stderr", process.stderr, events), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
+    pipes = {"stdout": process.stdout, "stderr": process.stderr}
     outputs = {"stdout": bytearray(), "stderr": bytearray()}
     limits = {"stdout": max_stdout_bytes, "stderr": max_stderr_bytes}
     complete: set[str] = set()
     deadline = time.monotonic() + timeout_seconds
-    exceeded: str | None = None
-    timed_out = False
-    terminated = False
-    while len(complete) != 2:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 and not terminated:
-            timed_out = True
-            _terminate_process(process)
-            terminated = True
-            remaining = 1.0
-        try:
-            name, chunk = events.get(timeout=max(0.01, min(remaining, 0.1)))
-        except Empty:
-            continue
-        if chunk is None:
-            complete.add(name)
-            continue
-        output = outputs[name]
-        available = limits[name] - len(output)
-        if available > 0:
-            output.extend(chunk[:available])
-        if len(chunk) > available and exceeded is None:
-            exceeded = name
-            if not terminated:
+    cleanup_deadline: float | None = None
+    failure: RuntimeError | None = None
+    try:
+        for pipe in pipes.values():
+            os.set_blocking(pipe.fileno(), False)
+        while len(complete) != 2 or process.poll() is None:
+            now = time.monotonic()
+            if cleanup_deadline is not None:
+                if now >= cleanup_deadline:
+                    break
+            elif now >= deadline and failure is None:
+                failure = RuntimeError(
+                    f"tokscale exceeded {timeout_seconds:.0f} seconds; "
+                    "termination requested"
+                )
+            if failure is not None and cleanup_deadline is None:
+                cleanup_deadline = now + TOKSCALE_CLEANUP_TIMEOUT_SECONDS
                 _terminate_process(process)
-                terminated = True
-    for reader in readers:
-        reader.join(timeout=1.0)
-    if process.poll() is None:
-        _terminate_process(process)
-    process.wait()
-    if timed_out:
-        raise RuntimeError(
-            f"tokscale exceeded {timeout_seconds:.0f} seconds and was killed"
-        )
-    if exceeded is not None:
-        raise RuntimeError(
-            f"tokscale {exceeded} exceeded its {limits[exceeded]} byte limit "
-            "and was killed"
-        )
+            progressed = False
+            for name, pipe in pipes.items():
+                if name in complete:
+                    continue
+                try:
+                    chunk = os.read(pipe.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    _LOG.exception("could not read tokscale %s", name)
+                    complete.add(name)
+                    if failure is None:
+                        failure = RuntimeError(f"could not read tokscale {name}")
+                        failure.__cause__ = error
+                    continue
+                progressed = True
+                if not chunk:
+                    complete.add(name)
+                    continue
+                output = outputs[name]
+                available = limits[name] - len(output)
+                if available > 0:
+                    output.extend(chunk[:available])
+                if len(chunk) > available and failure is None:
+                    failure = RuntimeError(
+                        f"tokscale {name} exceeded its {limits[name]} byte limit; "
+                        "termination requested"
+                    )
+            if not progressed:
+                active_deadline = cleanup_deadline or deadline
+                time.sleep(max(0.0, min(0.01, active_deadline - time.monotonic())))
+    except BaseException:
+        if cleanup_deadline is None:
+            cleanup_deadline = time.monotonic() + TOKSCALE_CLEANUP_TIMEOUT_SECONDS
+            _terminate_process(process)
+        raise
+    finally:
+        if failure is not None and cleanup_deadline is None:
+            cleanup_deadline = time.monotonic() + TOKSCALE_CLEANUP_TIMEOUT_SECONDS
+            _terminate_process(process)
+        for name, pipe in pipes.items():
+            try:
+                pipe.close()
+            except OSError:
+                _LOG.exception("could not close tokscale %s", name)
+        try:
+            process.wait(
+                timeout=max(0.0, (cleanup_deadline or deadline) - time.monotonic())
+            )
+        except subprocess.TimeoutExpired:
+            _LOG.warning(
+                "tokscale process %s did not exit before cleanup deadline",
+                process.pid,
+                exc_info=True,
+            )
+            if failure is None:
+                failure = RuntimeError("tokscale did not exit before its deadline")
+        except OSError:
+            _LOG.exception("could not reap tokscale process %s", process.pid)
+            if failure is None:
+                failure = RuntimeError("could not reap tokscale process")
+    if failure is not None:
+        raise failure
     return bytes(outputs["stdout"]), bytes(outputs["stderr"])
 
 
@@ -273,7 +293,7 @@ def _json_command(
     max_stdout_bytes: int | None = None,
 ) -> JsonValue:
     """Run one bounded tokscale JSON command and decode its standard output."""
-    command = [*prefix, *arguments]
+    command = [*prefix, "--no-spinner", *arguments]
     command_name = sanitize_display(" ".join(arguments))
     try:
         process = subprocess.Popen(
