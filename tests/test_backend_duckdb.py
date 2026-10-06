@@ -26,6 +26,54 @@ from usagebassoon.config import (
 from usagebassoon.ingest import CollectionBundle
 
 
+@pytest.mark.parametrize(
+    ("sql", "parameters", "expected"),
+    [
+        ("SELECT 'provider:session' AS value", None, {"value": "provider:session"}),
+        (
+            "SELECT 'provider:session' AS \"field:name\", :client AS bound "
+            "/* :block */ -- :line\n",
+            {"client": "bound:value"},
+            {"field:name": "provider:session", "bound": "bound:value"},
+        ),
+        (
+            "SELECT 'it''s:session' AS value, :client AS bound",
+            {"client": "bound:value"},
+            {"value": "it's:session", "bound": "bound:value"},
+        ),
+        (
+            r"SELECT E'it\'s:session' AS value, :client AS bound",
+            {"client": "bound:value"},
+            {"value": "it's:session", "bound": "bound:value"},
+        ),
+        (
+            "SELECT $tag$provider:session$tag$ AS value, :client AS bound",
+            {"client": "bound:value"},
+            {"value": "provider:session", "bound": "bound:value"},
+        ),
+        (
+            "SELECT $client AS value, :other::VARCHAR AS bound",
+            {"client": "native:value", "other": "bound:value"},
+            {"value": "native:value", "bound": "bound:value"},
+        ),
+        (
+            "SELECT :select AS value, :select AS bound",
+            {"select": "keyword:value"},
+            {"value": "keyword:value", "bound": "keyword:value"},
+        ),
+    ],
+)
+def test_duckdb_query_preserves_quoted_sql_and_binds_only_parameters(
+    sql: str, parameters: dict[str, str] | None, expected: dict[str, str]
+) -> None:
+    """Preserve dialect literals and identifiers while binding named values."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        assert backend.query(sql, parameters).to_pylist() == [expected]
+    finally:
+        backend.close()
+
+
 @pytest.mark.parametrize("provider", ["duckdb", "motherduck", "bigquery"])
 @pytest.mark.parametrize("initialize", [False, True])
 def test_backend_factory_applies_settings_and_enforces_readiness(

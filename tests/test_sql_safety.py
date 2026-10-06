@@ -14,6 +14,7 @@ from tests._cli import plain_cli_output
 from usagebassoon import query, query_arrow
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
+from usagebassoon.curation import NoteAssignment, set_note
 from usagebassoon.sql_safety import build_relation_query, validate_read_only_sql
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
@@ -109,6 +110,25 @@ def test_python_query_apis_apply_the_public_validator(
         )
     with pytest.raises(ValueError):
         read("SELECT * FROM daily_cost", config=initialized_config)
+
+
+def test_public_query_preserves_colon_containing_session_identity(
+    initialized_config: Path,
+) -> None:
+    """Return the exact stored session rather than a rewritten literal."""
+    backend = DuckDBBackend(initialized_config.parent / "usage.duckdb")
+    try:
+        set_note(
+            backend, NoteAssignment(SOURCE_ID, "codex", "provider:session", "note")
+        )
+    finally:
+        backend.close()
+    result = query_arrow(
+        "SELECT session_id FROM session_notes "
+        "WHERE session_id = 'provider:session' /* :comment */ LIMIT 1",
+        config=initialized_config,
+    )
+    assert result.to_pylist() == [{"session_id": "provider:session"}]
 
 
 @pytest.mark.parametrize(

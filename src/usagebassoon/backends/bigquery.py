@@ -16,6 +16,7 @@ from copy import copy
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import resources
+from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
 from typing import Protocol, cast, override
@@ -42,6 +43,7 @@ from google.oauth2 import service_account
 from pandas_gbq.arrow import from_read_rows_response
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
+from sqlglot.tokens import TokenType
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
@@ -1481,7 +1483,19 @@ class BigQueryBackend(AbstractStorageBackend):
         invalid = [name for name in bindings if not is_simple_identifier(name)]
         if invalid:
             raise ValueError(f"invalid BigQuery parameter names: {invalid!r}")
-        statement = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"@\1", sql)
+        tokens = sqlglot.tokenize(sql, read="bigquery")
+        parts: list[str] = []
+        position = 0
+        for token, following in pairwise(tokens):
+            if (
+                token.token_type == TokenType.COLON
+                and following.start == token.end + 1
+                and is_simple_identifier(sql[following.start : following.end + 1])
+            ):
+                parts.extend((sql[position : token.start], "@"))
+                position = token.end + 1
+        parts.append(sql[position:])
+        statement = "".join(parts)
         query_parameters = [
             bigquery.ScalarQueryParameter(name, "STRING", value)
             for name, value in bindings.items()

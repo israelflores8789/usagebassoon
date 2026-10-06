@@ -220,6 +220,72 @@ def _backend() -> BigQueryBackend:
     )
 
 
+@pytest.mark.parametrize(
+    ("sql", "parameters", "expected"),
+    [
+        (
+            "SELECT * FROM daily_cost WHERE session_id = 'provider:session' LIMIT 1",
+            None,
+            "SELECT * FROM daily_cost WHERE session_id = 'provider:session' LIMIT 1",
+        ),
+        (
+            "SELECT 'provider:session' AS `field:name`, :client AS bound "
+            "/* :block */ -- :line\n",
+            {"client": "bound:value"},
+            "SELECT 'provider:session' AS `field:name`, @client AS bound "
+            "/* :block */ -- :line\n",
+        ),
+        (
+            'SELECT "provider:session" AS value, :client AS bound # :comment\n',
+            {"client": "bound:value"},
+            'SELECT "provider:session" AS value, @client AS bound # :comment\n',
+        ),
+        (
+            r"SELECT 'it\'s:session' AS value, :client AS bound",
+            {"client": "bound:value"},
+            r"SELECT 'it\'s:session' AS value, @client AS bound",
+        ),
+        (
+            "SELECT r'''provider:session''' AS value, :client AS bound",
+            {"client": "bound:value"},
+            "SELECT r'''provider:session''' AS value, @client AS bound",
+        ),
+        (
+            "SELECT @client AS value, :other AS bound",
+            {"client": "native:value", "other": "bound:value"},
+            "SELECT @client AS value, @other AS bound",
+        ),
+        (
+            "SELECT :select AS value, :select AS bound",
+            {"select": "keyword:value"},
+            "SELECT @select AS value, @select AS bound",
+        ),
+    ],
+)
+def test_bigquery_query_preserves_sql_outside_parameter_spans(
+    monkeypatch: pytest.MonkeyPatch,
+    sql: str,
+    parameters: dict[str, str] | None,
+    expected: str,
+) -> None:
+    """Send exact SQL and separate bound values to the official driver."""
+    backend = _backend()
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = client
+
+    def arrow_result(_job: bigquery.QueryJob) -> pa.Table:
+        """Avoid the Storage transport while inspecting query submission."""
+        return pa.table({})
+
+    monkeypatch.setattr(backend, "_read_query_arrow", arrow_result)
+    backend.query(sql, parameters)
+    assert client.query.call_args.args[0] == expected
+    bindings = client.query.call_args.kwargs["job_config"].query_parameters
+    assert [(item.name, item.type_, item.value) for item in bindings] == [
+        (name, "STRING", value) for name, value in (parameters or {}).items()
+    ]
+
+
 class _StorageReadClient:
     """Fake Storage Read API client recording stream-name arguments."""
 

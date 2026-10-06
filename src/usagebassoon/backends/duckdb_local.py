@@ -6,11 +6,11 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from importlib import resources
+from itertools import pairwise
 from pathlib import Path
 from typing import cast, override
 from uuid import uuid4
@@ -18,6 +18,8 @@ from uuid import uuid4
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import sqlglot
+from sqlglot.tokens import TokenType
 
 from usagebassoon.backends.base import (
     AbstractStorageBackend,
@@ -433,7 +435,19 @@ class _DuckDBStorage(AbstractStorageBackend):
             Materialized Arrow result table.
         """
         bindings = parameters or {}
-        statement = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"$\1", sql)
+        tokens = sqlglot.tokenize(sql, read="duckdb")
+        parts: list[str] = []
+        position = 0
+        for token, following in pairwise(tokens):
+            if (
+                token.token_type == TokenType.COLON
+                and following.start == token.end + 1
+                and is_simple_identifier(sql[following.start : following.end + 1])
+            ):
+                parts.extend((sql[position : token.start], "$"))
+                position = token.end + 1
+        parts.append(sql[position:])
+        statement = "".join(parts)
         return self.connection.execute(statement, bindings).arrow().read_all()
 
     @override
