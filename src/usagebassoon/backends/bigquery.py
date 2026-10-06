@@ -12,11 +12,13 @@ from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from contextvars import copy_context
 from copy import copy
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import resources
 from itertools import pairwise
+from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
 from typing import Protocol, cast, override
@@ -41,6 +43,7 @@ from google.cloud import bigquery, bigquery_storage_v1
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
 from google.oauth2 import service_account
 from pandas_gbq.arrow import from_read_rows_response
+from requests import Session
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 from sqlglot.tokens import TokenType
@@ -57,6 +60,18 @@ from usagebassoon.backends.base import (
     StorageBackend,
     UpsertResult,
     is_simple_identifier,
+)
+from usagebassoon.deadlines import (
+    RESTORE_SECONDS,
+    SNAPSHOT_SECONDS,
+    OperationTimeout,
+    bounded,
+    cleanup_budget,
+    http_session,
+    remaining_seconds,
+)
+from usagebassoon.deadlines import (
+    operation as operation_budget,
 )
 from usagebassoon.schema_assets import (
     SCHEMA_VERSION,
@@ -157,7 +172,7 @@ def _pinned_query(sql: str, views: Mapping[str, str], dataset_ref: str) -> str:
     return tree.transform(pin_clock).sql(dialect="bigquery")
 
 
-class _JobTimeout(RuntimeError):
+class _JobTimeout(OperationTimeout):
     """A job wait expired; replaying a publication keeps its event identifiers."""
 
 
@@ -173,6 +188,7 @@ class _StorageReadClient(Protocol):
         name: str,
         *,
         timeout: float,
+        retry: object = None,
     ) -> Iterable[bigquery_storage_types.ReadRowsResponse]:
         """Return response messages for the named Storage read stream."""
 
@@ -263,7 +279,7 @@ class BigQueryBackend(AbstractStorageBackend):
         credentials: Credentials | None = None,
         credentials_file: Path | None = None,
         maximum_bytes_billed: int = 1_073_741_824,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 180.0,
         client: bigquery.Client | None = None,
     ) -> None:
         """Create a backend bound to a validated BigQuery dataset.
@@ -275,7 +291,7 @@ class BigQueryBackend(AbstractStorageBackend):
             credentials: Explicit Google credentials, normally for tests.
             credentials_file: Service-account JSON file, preferred over ADC.
             maximum_bytes_billed: Billing cap applied to query jobs.
-            timeout_seconds: Maximum wait for one job or Storage Read request.
+            timeout_seconds: Complete operation budget; cleanup adds at most 15s.
             client: Injected client for offline unit tests.
 
         Raises:
@@ -286,45 +302,50 @@ class BigQueryBackend(AbstractStorageBackend):
         _validate_location(location)
         if maximum_bytes_billed < 1:
             raise ValueError("maximum_bytes_billed must be positive")
-        if timeout_seconds <= 0:
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if credentials is not None and credentials_file is not None:
             raise ValueError("credentials and credentials_file cannot be combined")
-        resolved_credentials = credentials
-        if credentials_file is not None:
-            try:
-                resolved_credentials = (
-                    service_account.Credentials.from_service_account_file(
-                        str(credentials_file)
+        with operation_budget(timeout_seconds):
+            resolved_credentials = credentials
+            if credentials_file is not None:
+                try:
+                    resolved_credentials = (
+                        service_account.Credentials.from_service_account_file(
+                            str(credentials_file)
+                        )
                     )
+                except (GoogleAuthError, OSError, ValueError) as error:
+                    raise RuntimeError(
+                        "BigQuery credentials file could not be loaded"
+                    ) from error
+            self._read_at: datetime | None = None
+            self._read_views: dict[str, str] = {}
+            self.project = project
+            self.dataset = dataset
+            self.location = location
+            self.maximum_bytes_billed = maximum_bytes_billed
+            self.timeout_seconds = timeout_seconds
+            self.dataset_ref = f"{project}.{dataset}"
+            try:
+                if resolved_credentials is None and client is None:
+                    from google.auth.transport.requests import Request
+
+                    resolved_credentials, _ = default_credentials(
+                        request=Request(session=cast(Session, http_session())),
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    )
+                self._credentials = resolved_credentials
+                self.client = client or bigquery.Client(
+                    project=project,
+                    credentials=resolved_credentials,
+                    location=location,
+                    _http=cast("Session", http_session(resolved_credentials)),
                 )
-            except (GoogleAuthError, OSError, ValueError) as error:
+            except GoogleAuthError as error:
                 raise RuntimeError(
-                    "BigQuery credentials file could not be loaded"
+                    "BigQuery authentication failed; configure ADC or credentials_file"
                 ) from error
-        self._read_at: datetime | None = None
-        self._read_views: dict[str, str] = {}
-        self.project = project
-        self.dataset = dataset
-        self.location = location
-        self.maximum_bytes_billed = maximum_bytes_billed
-        self.timeout_seconds = timeout_seconds
-        self.dataset_ref = f"{project}.{dataset}"
-        try:
-            if resolved_credentials is None and client is None:
-                resolved_credentials, _ = default_credentials(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            self._credentials = resolved_credentials
-            self.client = client or bigquery.Client(
-                project=project,
-                credentials=resolved_credentials,
-                location=location,
-            )
-        except GoogleAuthError as error:
-            raise RuntimeError(
-                "BigQuery authentication failed; configure ADC or credentials_file"
-            ) from error
 
     @contextmanager
     @override
@@ -334,33 +355,47 @@ class BigQueryBackend(AbstractStorageBackend):
         Concurrent workers share a scoped copy, leaving ordinary backend reads
         unaffected. Transaction-job metadata remains a live operational check.
         """
-        rows = self._wait_for_job(
-            self.client.query(
-                "SELECT CURRENT_TIMESTAMP() AS captured_at, ARRAY("
-                "SELECT AS STRUCT table_name, view_definition FROM "
-                f"`{self.dataset_ref}.INFORMATION_SCHEMA.VIEWS`) AS views",
-                job_config=self._query_config(),
-                location=self.location,
+        with operation_budget(self.timeout_seconds):
+            rows = self._wait_for_job(
+                self.client.query(
+                    "SELECT CURRENT_TIMESTAMP() AS captured_at, ARRAY("
+                    "SELECT AS STRUCT table_name, view_definition FROM "
+                    f"`{self.dataset_ref}.INFORMATION_SCHEMA.VIEWS`) AS views",
+                    job_config=self._query_config(),
+                    location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
+                )
             )
-        )
-        row = next(iter(rows))
-        timestamp = row["captured_at"]
-        definitions = row["views"]
-        if not isinstance(timestamp, datetime) or not isinstance(definitions, list):
-            raise RuntimeError("BigQuery did not return diagnostic snapshot metadata")
-        views: dict[str, str] = {}
-        for definition in definitions:
-            if not isinstance(definition, Mapping):
-                raise RuntimeError("BigQuery returned invalid installed view metadata")
-            name, sql = definition.get("table_name"), definition.get("view_definition")
-            if not isinstance(name, str) or not isinstance(sql, str):
-                raise RuntimeError("BigQuery returned invalid installed view metadata")
-            views[name] = sql
-        scoped = copy(self)
-        scoped._read_at = timestamp
-        scoped._read_views = views
+            row = next(iter(rows))
+            timestamp = row["captured_at"]
+            definitions = row["views"]
+            if not isinstance(timestamp, datetime) or not isinstance(definitions, list):
+                raise RuntimeError(
+                    "BigQuery did not return diagnostic snapshot metadata"
+                )
+            views: dict[str, str] = {}
+            for definition in definitions:
+                if not isinstance(definition, Mapping):
+                    raise RuntimeError(
+                        "BigQuery returned invalid installed view metadata"
+                    )
+                name, sql = (
+                    definition.get("table_name"),
+                    definition.get("view_definition"),
+                )
+                if not isinstance(name, str) or not isinstance(sql, str):
+                    raise RuntimeError(
+                        "BigQuery returned invalid installed view metadata"
+                    )
+                views[name] = sql
+            scoped = copy(self)
+            scoped._read_at = timestamp
+            scoped._read_views = views
         yield scoped
 
+    @bounded
     def _wait_for_job(
         self, job: bigquery.job.QueryJob | bigquery.job.LoadJob
     ) -> Iterable[Mapping[str, object]]:
@@ -378,17 +413,24 @@ class BigQueryBackend(AbstractStorageBackend):
         try:
             return cast(
                 Iterable[Mapping[str, object]],
-                job.result(timeout=self.timeout_seconds),
+                job.result(
+                    timeout=remaining_seconds(120.0),
+                    retry=Retry(predicate=lambda _error: False),
+                ),
             )
         except FutureTimeoutError as error:
             job_id = job.job_id or "unknown"
             try:
-                job.cancel()
-            except GoogleAPICallError:
+                with cleanup_budget():
+                    job.cancel(
+                        timeout=remaining_seconds(),
+                        retry=Retry(predicate=lambda _error: False),
+                    )
+            except Exception:
                 _LOG.exception("could not cancel timed-out BigQuery job %s", job_id)
             raise _JobTimeout(
-                f"BigQuery job {job_id} exceeded {self.timeout_seconds:.0f} seconds "
-                "and cancellation was requested"
+                f"BigQuery job {job_id} wait timed out; "
+                "completion may be uncertain after attempted cancellation"
             ) from error
 
     def _table_id(self, table: str) -> str:
@@ -418,10 +460,17 @@ class BigQueryBackend(AbstractStorageBackend):
         """Retry transient publication failures without changing observation IDs."""
         return isinstance(
             error,
-            (_JobTimeout, ServiceUnavailable, TooManyRequests, InternalServerError),
+            (
+                _JobTimeout,
+                OperationTimeout,
+                ServiceUnavailable,
+                TooManyRequests,
+                InternalServerError,
+            ),
         )
 
     @override
+    @bounded
     def compaction_backlog(self) -> pa.Table | None:
         """Read every overdue arrival bucket through the installed health view."""
         return self.query(
@@ -431,6 +480,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def active_transactions(self, limit: int) -> tuple[ActiveTransaction, ...]:
         """Return running transaction jobs that mutate this configured dataset.
 
@@ -465,6 +515,9 @@ class BigQueryBackend(AbstractStorageBackend):
                     statement,
                     job_config=self._query_config(),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
                 )
             )
         except GoogleAPICallError as error:
@@ -507,18 +560,31 @@ class BigQueryBackend(AbstractStorageBackend):
         return pattern.sub(qualify, sql)
 
     @override
+    @bounded
     def apply_ddl(self) -> None:
         """Initialize explicitly, including safe replay of an interrupted init."""
         try:
-            actual = self.client.get_dataset(self.dataset_ref)
+            actual = self.client.get_dataset(
+                self.dataset_ref,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         except NotFound:
             actual = bigquery.Dataset(self.dataset_ref)
             actual.location = self.location
-            actual = self.client.create_dataset(actual)
+            actual = self.client.create_dataset(
+                actual,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         if str(actual.location).casefold() != self.location.casefold():
             raise ValueError("configured BigQuery location does not match the dataset")
         try:
-            marker = self.client.get_table(self._table_id("schema_marker"))
+            marker = self.client.get_table(
+                self._table_id("schema_marker"),
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         except NotFound:
             marker = None
         labels = marker.labels or {} if marker is not None else {}
@@ -534,7 +600,12 @@ class BigQueryBackend(AbstractStorageBackend):
             if statement is not None
         ]
         existing: set[str] = {
-            str(table.table_id) for table in self.client.list_tables(self.dataset_ref)
+            str(table.table_id)
+            for table in self.client.list_tables(
+                self.dataset_ref,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         }
         if initializing:
             if labels.get("usagebassoon_schema_hash") != schema_hash("bigquery"):
@@ -555,16 +626,28 @@ class BigQueryBackend(AbstractStorageBackend):
                     marker_sql,
                     job_config=self._query_config(),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
                 )
             )
-            marker = self.client.get_table(self._table_id("schema_marker"))
+            marker = self.client.get_table(
+                self._table_id("schema_marker"),
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
             existing.add("schema_marker")
         marker.labels = {
             "usagebassoon_schema_version": str(SCHEMA_VERSION),
             "usagebassoon_schema_hash": schema_hash("bigquery"),
             "usagebassoon_initializing": "true",
         }
-        marker = self.client.update_table(marker, ["labels"])
+        marker = self.client.update_table(
+            marker,
+            ["labels"],
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        )
         pending: list[str] = []
         for statement in definitions:
             if isinstance(statement, exp.Create):
@@ -594,6 +677,9 @@ class BigQueryBackend(AbstractStorageBackend):
                     ";\n".join(pending),
                     job_config=self._query_config(),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
                 )
             )
         for statement in definitions:
@@ -604,20 +690,36 @@ class BigQueryBackend(AbstractStorageBackend):
                 self._qualify_view_sql(package.joinpath("views.sql").read_text()),
                 job_config=self._query_config(),
                 location=self.location,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+                job_retry=None,
             )
         )
-        marker = self.client.get_table(self._table_id("schema_marker"))
+        marker = self.client.get_table(
+            self._table_id("schema_marker"),
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        )
         marker.labels = {
             "usagebassoon_schema_version": str(SCHEMA_VERSION),
             "usagebassoon_schema_hash": schema_hash("bigquery"),
             "usagebassoon_initializing": "false",
         }
-        self.client.update_table(marker, ["labels"])
+        self.client.update_table(
+            marker,
+            ["labels"],
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        )
 
     def _check_existing_definition(self, statement: exp.Create) -> None:
         """Reject partial-init objects whose columns differ from the native baseline."""
         name = statement.this.this.name
-        table = self.client.get_table(self._table_id(name))
+        table = self.client.get_table(
+            self._table_id(name),
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        )
         aliases = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL"}
         actual = [
             (
@@ -645,7 +747,11 @@ class BigQueryBackend(AbstractStorageBackend):
 
     def _apply_retention(self, name: str) -> None:
         """Override dataset expiration defaults so durable history never expires."""
-        table = self.client.get_table(self._table_id(name))
+        table = self.client.get_table(
+            self._table_id(name),
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        )
         fields: list[str] = []
         if table.expires is not None:
             table.expires = None
@@ -658,13 +764,23 @@ class BigQueryBackend(AbstractStorageBackend):
                 table.time_partitioning = partition
                 fields.append("time_partitioning")
         if fields:
-            self.client.update_table(table, fields)
+            self.client.update_table(
+                table,
+                fields,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
 
     @override
+    @bounded
     def preflight(self) -> None:
         """Validate schema metadata with no query jobs on the common path."""
         try:
-            actual = self.client.get_dataset(self.dataset_ref)
+            actual = self.client.get_dataset(
+                self.dataset_ref,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         except NotFound as error:
             raise RuntimeError(
                 "warehouse is not initialized; run bassoon init"
@@ -672,7 +788,11 @@ class BigQueryBackend(AbstractStorageBackend):
         if str(actual.location).casefold() != self.location.casefold():
             raise ValueError("configured BigQuery location does not match the dataset")
         try:
-            marker = self.client.get_table(self._table_id("schema_marker"))
+            marker = self.client.get_table(
+                self._table_id("schema_marker"),
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
         except NotFound as error:
             raise RuntimeError(
                 "warehouse is not initialized; run bassoon init"
@@ -701,6 +821,9 @@ class BigQueryBackend(AbstractStorageBackend):
                     "WHERE version = @version",
                     job_config=self._query_config(parameters=parameters[:1]),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
                 )
             )
             recorded = list(ledger)
@@ -714,6 +837,9 @@ class BigQueryBackend(AbstractStorageBackend):
                         self._qualify_view_sql(step.sql("bigquery")),
                         job_config=self._query_config(),
                         location=self.location,
+                        timeout=remaining_seconds(),
+                        retry=Retry(predicate=lambda _error: False),
+                        job_retry=None,
                     )
                 )
                 self._wait_for_job(
@@ -724,10 +850,15 @@ class BigQueryBackend(AbstractStorageBackend):
                         "@version, @hash, CURRENT_TIMESTAMP())",
                         job_config=self._query_config(parameters=parameters),
                         location=self.location,
+                        timeout=remaining_seconds(),
+                        retry=Retry(predicate=lambda _error: False),
+                        job_retry=None,
                     )
                 )
             if step.version == SCHEMA_VERSION:
-                from usagebassoon.backends.bigquery_compaction import install_compaction
+                from usagebassoon.backends.bigquery_compaction import (
+                    install_compaction,
+                )
 
                 install_compaction(self, enabled=None)
             marker.labels = {
@@ -735,7 +866,12 @@ class BigQueryBackend(AbstractStorageBackend):
                 "usagebassoon_schema_version": str(step.version),
                 "usagebassoon_schema_hash": step.target_hashes["bigquery"],
             }
-            self.client.update_table(marker, ["labels"])
+            self.client.update_table(
+                marker,
+                ["labels"],
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+            )
 
     def _snapshot_stream(self, tables: Sequence[str]) -> SnapshotStream:
         """Pin canonical gold and raw query streams to one warehouse instant."""
@@ -746,6 +882,9 @@ class BigQueryBackend(AbstractStorageBackend):
                         "SELECT CURRENT_TIMESTAMP() AS captured_at",
                         job_config=self._query_config(),
                         location=self.location,
+                        timeout=remaining_seconds(),
+                        retry=Retry(predicate=lambda _error: False),
+                        job_retry=None,
                     )
                 )
             )
@@ -807,6 +946,9 @@ class BigQueryBackend(AbstractStorageBackend):
                     ]
                 ),
                 location=self.location,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+                job_retry=None,
             )
             self._wait_for_job(job)
             schema = CANONICAL_TABLE_SCHEMAS[table]
@@ -815,7 +957,9 @@ class BigQueryBackend(AbstractStorageBackend):
                 query_job: bigquery.QueryJob = job, canonical: pa.Schema = schema
             ) -> Iterable[pa.RecordBatch]:
                 """Read bounded result pages as canonical Arrow batches."""
-                rows = query_job.result(timeout=self.timeout_seconds, page_size=65536)
+                rows = query_job.result(
+                    timeout=remaining_seconds(120.0), page_size=65536
+                )
                 for batch in rows.to_arrow_iterable(
                     max_queue_size=1, max_stream_count=1
                 ):
@@ -837,12 +981,13 @@ class BigQueryBackend(AbstractStorageBackend):
         Yields:
             Canonical Arrow batch streams.
         """
-        yield self._snapshot_stream(tables)
+        with operation_budget(SNAPSHOT_SECONDS):
+            yield self._snapshot_stream(tables)
 
     @override
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:
         """Materialize a consistent read for callers explicitly requesting tables."""
-        with self.stream_snapshot(tables) as stream:
+        with operation_budget(SNAPSHOT_SECONDS), self.stream_snapshot(tables) as stream:
             result = {
                 name: pa.Table.from_batches(
                     list(batches), schema=CANONICAL_TABLE_SCHEMAS[name]
@@ -852,6 +997,7 @@ class BigQueryBackend(AbstractStorageBackend):
             return SnapshotRead(stream.captured_at, result)
 
     @override
+    @bounded
     def configure_maintenance(self, *, enabled: bool) -> str | None:
         """Provision the native maintenance schedule in the requested state."""
         from usagebassoon.backends.bigquery_compaction import install_compaction
@@ -868,6 +1014,7 @@ class BigQueryBackend(AbstractStorageBackend):
         }
 
     @override
+    @bounded
     def prepare_recovery(self, *, notice: Callable[[str], None] | None = None) -> None:
         """Disable scheduled compaction and wait briefly for existing runs."""
         from usagebassoon.backends.bigquery_compaction import pause_compaction
@@ -877,6 +1024,7 @@ class BigQueryBackend(AbstractStorageBackend):
         pause_compaction(self, timeout=min(60.0, self.timeout_seconds))
 
     @override
+    @bounded
     def maintenance_status(self) -> tuple[bool, str] | None:
         """Inspect native schedule state through the authorized lazy SDK path."""
         from usagebassoon.backends.bigquery_compaction import compaction_status
@@ -884,9 +1032,14 @@ class BigQueryBackend(AbstractStorageBackend):
         return compaction_status(self, timeout=min(30.0, self.timeout_seconds))
 
     @override
+    @bounded
     def check_restore_empty(self) -> None:
         """Reject populated gold, raw, progress, and unexpected base tables."""
-        for item in self.client.list_tables(self.dataset_ref):
+        for item in self.client.list_tables(
+            self.dataset_ref,
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        ):
             if item.table_type == "VIEW" or item.table_id in {
                 "schema_marker",
                 "schema_migrations",
@@ -894,7 +1047,11 @@ class BigQueryBackend(AbstractStorageBackend):
             }:
                 continue
             if item.table_id.startswith("_stage_"):
-                table = self.client.get_table(item.reference)
+                table = self.client.get_table(
+                    item.reference,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                )
                 labels = table.labels or {}
                 if labels.get("usagebassoon_kind") == "restore_stage" and labels.get(
                     "usagebassoon_restore"
@@ -911,15 +1068,19 @@ class BigQueryBackend(AbstractStorageBackend):
                     "LIMIT 1",
                     job_config=self._query_config(),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    retry=Retry(predicate=lambda _error: False),
+                    job_retry=None,
                 )
             )
             if next(iter(rows), None) is not None:
                 raise ValueError("restore requires an empty warehouse")
 
     @override
+    @bounded
     def restore_committed(self, operation_id: str) -> bool:
         """Resolve restore completion from the receipt committed with its rows."""
-        deadline = time.monotonic() + min(60.0, self.timeout_seconds)
+        deadline = time.monotonic() + remaining_seconds(15.0)
         remaining = self._recovery_budget(deadline)
         committed = self._restore_receipt(operation_id, remaining)
         if not committed and any(
@@ -950,6 +1111,7 @@ class BigQueryBackend(AbstractStorageBackend):
             location=self.location,
             retry=Retry(predicate=lambda _error: False),
             timeout=remaining(),
+            job_retry=None,
         )
         rows = job.result(
             timeout=remaining(),
@@ -1015,10 +1177,11 @@ class BigQueryBackend(AbstractStorageBackend):
         return result
 
     @override
+    @bounded
     def restore_stages(self) -> list[dict[str, object]]:
         """Inspect only label-owned restore stages, including their expiry."""
         return self._restore_stage_records(
-            self._recovery_budget(time.monotonic() + min(60.0, self.timeout_seconds))
+            self._recovery_budget(time.monotonic() + remaining_seconds(15.0))
         )
 
     def _restore_stage_records(
@@ -1058,9 +1221,10 @@ class BigQueryBackend(AbstractStorageBackend):
                 return result
 
     @override
+    @bounded
     def cleanup_restore_stages(self) -> None:
         """Drain owned restore jobs and immediately discard disposable stages."""
-        deadline = time.monotonic() + min(60.0, self.timeout_seconds)
+        deadline = time.monotonic() + remaining_seconds(15.0)
         remaining = self._recovery_budget(deadline)
         self._drain_restore_jobs(remaining)
         stages = self._restore_stage_records(remaining)
@@ -1114,19 +1278,22 @@ class BigQueryBackend(AbstractStorageBackend):
         try:
             options = Retry(predicate=lambda _error: False)
             rows = (
-                job.result(timeout=self.timeout_seconds, retry=options, job_retry=None)
+                job.result(
+                    timeout=remaining_seconds(120.0), retry=options, job_retry=None
+                )
                 if isinstance(job, bigquery.QueryJob)
-                else job.result(timeout=self.timeout_seconds, retry=options)
+                else job.result(timeout=remaining_seconds(120.0), retry=options)
             )
             return cast(Iterable[Mapping[str, object]], rows)
         except Exception as wait_error:
             try:
-                self._drain_restore_job(
-                    job,
-                    self._recovery_budget(
-                        time.monotonic() + min(60.0, self.timeout_seconds)
-                    ),
-                )
+                with cleanup_budget():
+                    self._drain_restore_job(
+                        job,
+                        self._recovery_budget(
+                            time.monotonic() + remaining_seconds(15.0)
+                        ),
+                    )
             except Exception as error:
                 _LOG.warning(
                     "Restore job completion remains unknown; preserving staging",
@@ -1146,7 +1313,10 @@ class BigQueryBackend(AbstractStorageBackend):
     @override
     def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
         """Restore library-owned Arrow data through the verified file path."""
-        with TemporaryDirectory(prefix="usagebassoon-restore-") as temporary:
+        with (
+            operation_budget(RESTORE_SECONDS),
+            TemporaryDirectory(prefix="usagebassoon-restore-") as temporary,
+        ):
             files: dict[str, Path] = {}
             for table, data in tables.items():
                 if table not in SNAPSHOT_TABLES:
@@ -1163,79 +1333,88 @@ class BigQueryBackend(AbstractStorageBackend):
         self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
     ) -> None:
         """Stage verified Parquet then publish gold and the receipt atomically."""
-        if set(files) - set(SNAPSHOT_TABLES):
-            raise ValueError("unsupported restore tables")
-        if self.restore_committed(operation_id):
-            return
-        self.cleanup_restore_stages()
-        attempt_id = uuid4().hex
-        stages: dict[str, str] = {}
-        cleanup_allowed = True
-        try:
-            for table, path in files.items():
-                stage = self._stage_id(table, attempt_id)
-                schema = CANONICAL_TABLE_SCHEMAS[table]
-                owned = bigquery.Table(
-                    stage,
-                    schema=_schema_from_arrow(pa.Table.from_batches([], schema=schema)),
-                )
-                owned.labels = {
-                    "usagebassoon_kind": "restore_stage",
-                    "usagebassoon_restore": operation_id,
-                    "usagebassoon_attempt": attempt_id,
-                }
-                owned.expires = datetime.now(UTC) + timedelta(days=1)
-                self.client.create_table(owned)
-                stages[table] = stage
-                options = bigquery.ParquetOptions()
-                options.enable_list_inference = True
-                with path.open("rb") as payload:
-                    self._wait_restore_job(
-                        self.client.load_table_from_file(
-                            payload,
-                            stage,
-                            job_config=bigquery.LoadJobConfig(
-                                labels={
-                                    "usagebassoon_kind": "restore_job",
-                                    "usagebassoon_restore": operation_id,
-                                    "usagebassoon_destination": sha256(
-                                        self.dataset_ref.encode()
-                                    ).hexdigest()[:63],
-                                },
-                                source_format=bigquery.SourceFormat.PARQUET,
-                                parquet_options=options,
-                                schema=owned.schema,
-                                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                                create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
-                            ),
-                            location=self.location,
+        with operation_budget(RESTORE_SECONDS):
+            if set(files) - set(SNAPSHOT_TABLES):
+                raise ValueError("unsupported restore tables")
+            if self.restore_committed(operation_id):
+                return
+            self.cleanup_restore_stages()
+            attempt_id = uuid4().hex
+            stages: dict[str, str] = {}
+            cleanup_allowed = True
+            try:
+                for table, path in files.items():
+                    stage = self._stage_id(table, attempt_id)
+                    schema = CANONICAL_TABLE_SCHEMAS[table]
+                    owned = bigquery.Table(
+                        stage,
+                        schema=_schema_from_arrow(
+                            pa.Table.from_batches([], schema=schema)
+                        ),
+                    )
+                    owned.labels = {
+                        "usagebassoon_kind": "restore_stage",
+                        "usagebassoon_restore": operation_id,
+                        "usagebassoon_attempt": attempt_id,
+                    }
+                    owned.expires = datetime.now(UTC) + timedelta(days=1)
+                    self.client.create_table(
+                        owned,
+                        timeout=remaining_seconds(),
+                        retry=Retry(predicate=lambda _error: False),
+                    )
+                    stages[table] = stage
+                    options = bigquery.ParquetOptions()
+                    options.enable_list_inference = True
+                    with path.open("rb") as payload:
+                        self._wait_restore_job(
+                            self.client.load_table_from_file(
+                                payload,
+                                stage,
+                                job_config=bigquery.LoadJobConfig(
+                                    labels={
+                                        "usagebassoon_kind": "restore_job",
+                                        "usagebassoon_restore": operation_id,
+                                        "usagebassoon_destination": sha256(
+                                            self.dataset_ref.encode()
+                                        ).hexdigest()[:63],
+                                    },
+                                    source_format=bigquery.SourceFormat.PARQUET,
+                                    parquet_options=options,
+                                    schema=owned.schema,
+                                    write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                                    create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
+                                ),
+                                location=self.location,
+                                timeout=remaining_seconds(),
+                                num_retries=0,
+                            )
                         )
-                    )
-            self._commit_restore(stages, operation_id, snapshot_id)
-        except _RestoreUncertain:
-            cleanup_allowed = False
-            raise
-        except BadRequest as error:
-            if "restore requires an empty warehouse" in str(error):
-                raise ValueError("restore requires an empty warehouse") from error
-            raise
-        except BaseException:
-            cleanup_allowed = False
-            raise
-        finally:
-            if cleanup_allowed:
-                try:
-                    remaining = self._recovery_budget(
-                        time.monotonic() + min(60.0, self.timeout_seconds)
-                    )
-                    self._drain_restore_jobs(remaining)
-                    self._delete_stages(tuple(stages.values()), remaining=remaining)
-                except Exception:
-                    _LOG.warning(
-                        "Restore jobs could not be drained; "
-                        "owned staging remains for retry",
-                        exc_info=True,
-                    )
+                self._commit_restore(stages, operation_id, snapshot_id)
+            except _RestoreUncertain:
+                cleanup_allowed = False
+                raise
+            except BadRequest as error:
+                if "restore requires an empty warehouse" in str(error):
+                    raise ValueError("restore requires an empty warehouse") from error
+                raise
+            except BaseException:
+                cleanup_allowed = False
+                raise
+            finally:
+                if cleanup_allowed:
+                    try:
+                        remaining = self._recovery_budget(
+                            time.monotonic() + remaining_seconds(15.0)
+                        )
+                        self._drain_restore_jobs(remaining)
+                        self._delete_stages(tuple(stages.values()), remaining=remaining)
+                    except Exception:
+                        _LOG.warning(
+                            "Restore jobs could not be drained; "
+                            "owned staging remains for retry",
+                            exc_info=True,
+                        )
 
     def _commit_restore(
         self, stages: Mapping[str, str], operation_id: str, snapshot_id: str
@@ -1253,7 +1432,11 @@ class BigQueryBackend(AbstractStorageBackend):
         )
         # Include both gold and bronze, diagnostics, progress, and foreign tables.
         # The schema/control bootstrap is metadata and deliberately exempt.
-        for item in self.client.list_tables(self.dataset_ref):
+        for item in self.client.list_tables(
+            self.dataset_ref,
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+        ):
             if (
                 item.table_type == "VIEW"
                 or item.full_table_id.replace(":", ".") in stages.values()
@@ -1304,9 +1487,13 @@ class BigQueryBackend(AbstractStorageBackend):
                 "\n".join(statements),
                 job_config=options,
                 location=self.location,
+                timeout=remaining_seconds(),
+                retry=Retry(predicate=lambda _error: False),
+                job_retry=None,
             )
         )
 
+    @bounded
     def _load(
         self,
         data: pa.Table,
@@ -1341,6 +1528,8 @@ class BigQueryBackend(AbstractStorageBackend):
                         ),
                     ),
                     location=self.location,
+                    timeout=remaining_seconds(),
+                    num_retries=0,
                 )
             )
 
@@ -1370,6 +1559,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 _LOG.exception("could not remove BigQuery staging table %s", stage)
 
     @override
+    @bounded
     def has_committed_run(self, run_id: str) -> bool:
         """Read a deduplicated collection summary when explicitly requested."""
         return bool(
@@ -1380,6 +1570,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def upsert(
         self,
         table: str,
@@ -1422,6 +1613,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def append(self, table: str, data: pa.Table) -> None:
         """Append observations to their declared physical publication table."""
         if table not in CANONICAL_TABLE_SCHEMAS:
@@ -1445,6 +1637,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def persist_batch(self, batch: PersistenceBatch) -> BatchPersistResult:
         """Publish independent Arrow tables concurrently, then append the run ledger.
 
@@ -1457,7 +1650,7 @@ class BigQueryBackend(AbstractStorageBackend):
         errors: list[Exception] = []
         with ThreadPoolExecutor(max_workers=max(1, len(writes))) as executor:
             futures = [
-                executor.submit(self.append, table, data)
+                executor.submit(copy_context().run, self.append, table, data)
                 for table, data in writes.items()
                 if data.num_rows
             ]
@@ -1477,6 +1670,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
         """Run BigQuery Standard SQL with named string parameters as Arrow."""
         bindings = parameters or {}
@@ -1513,10 +1707,14 @@ class BigQueryBackend(AbstractStorageBackend):
             statement,
             job_config=self._query_config(parameters=query_parameters),
             location=self.location,
+            timeout=remaining_seconds(),
+            retry=Retry(predicate=lambda _error: False),
+            job_retry=None,
         )
         self._wait_for_job(job)
         return self._read_query_arrow(job)
 
+    @bounded
     def _read_query_arrow(self, job: bigquery.job.QueryJob) -> pa.Table:
         """Read one completed query destination through the Storage Read API.
 
@@ -1546,7 +1744,8 @@ class BigQueryBackend(AbstractStorageBackend):
                     data_format=bigquery_storage_types.DataFormat.ARROW,
                 ),
                 max_stream_count=1,
-                timeout=self.timeout_seconds,
+                retry=None,
+                timeout=remaining_seconds(30.0),
             )
             arrow_schema = pa.ipc.read_schema(
                 pa.BufferReader(session.arrow_schema.serialized_schema)
@@ -1555,7 +1754,8 @@ class BigQueryBackend(AbstractStorageBackend):
             for stream in session.streams:
                 responses = cast(_StorageReadClient, reader).read_rows(
                     stream.name,
-                    timeout=self.timeout_seconds,
+                    retry=None,
+                    timeout=remaining_seconds(30.0),
                 )
                 batches = [
                     cast(
@@ -1571,6 +1771,7 @@ class BigQueryBackend(AbstractStorageBackend):
         return pa.concat_tables(tables)
 
     @override
+    @bounded
     def delete_curated(self, identity: CuratedIdentity) -> int:
         """Append a deletion observation without mutating the existing assignment."""
         data = self._curated_rows(identity)
@@ -1603,6 +1804,7 @@ class BigQueryBackend(AbstractStorageBackend):
         )
 
     @override
+    @bounded
     def rename_curated(
         self,
         source: CuratedIdentity,

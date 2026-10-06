@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 import json
 import time
@@ -12,6 +13,8 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from importlib import resources
+from importlib.util import resolve_name
 from pathlib import Path
 from threading import Barrier
 from typing import cast
@@ -39,8 +42,102 @@ from usagebassoon.config import (
     SnapshotsConfig,
     UsageBassoonConfig,
 )
+from usagebassoon.ingest import CollectionBundle
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.reader import SnapshotReader
+
+
+def test_bucket_modules_do_not_depend_on_snapshot_orchestration() -> None:
+    """Keep provider adapters below snapshot format and lifecycle modules."""
+    for module in resources.files("usagebassoon.buckets").iterdir():
+        if not module.name.endswith(".py"):
+            continue
+        tree = ast.parse(module.read_text())
+        for node in ast.walk(tree):
+            imports: list[str]
+            if isinstance(node, ast.Import):
+                imports = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                module_name = node.module or ""
+                if node.level:
+                    module_name = resolve_name(
+                        "." * node.level + module_name, "usagebassoon.buckets"
+                    )
+                imports = [
+                    module_name,
+                    *(f"{module_name}.{alias.name}" for alias in node.names),
+                ]
+            else:
+                continue
+            assert not any(
+                name == "usagebassoon.archiver"
+                or name == "usagebassoon.snapshot"
+                or name.startswith("usagebassoon.snapshot.")
+                for name in imports
+            ), f"{module.name}: bucket imports snapshot orchestration"
+
+
+def test_snapshot_deadline_prevents_publication_and_allows_next_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound the whole backup rather than granting a new budget per file."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
+    store = SnapshotStore(buckets=[bucket], timeout_seconds=10)
+    original = bucket.upload_file
+    expire = True
+
+    def upload(relative_name: str, path: Path) -> SnapshotObject:
+        result = original(relative_name, path)
+        if expire:
+            clock[0] = 11
+        return result
+
+    monkeypatch.setattr(bucket, "upload_file", upload)
+    backend = cast(StorageBackend, TableBackend())
+    with pytest.raises(deadlines.OperationTimeout):
+        store.write(backend, run_id="expired", manual=True)
+    assert store.list_snapshots() == []
+    control, _ = bucket.read_json("control.json")
+    assert control is not None and control["last_failure"] is not None
+    expire = False
+    assert store.write(backend, run_id="next", manual=True) is not None
+    assert len(store.list_snapshots()) == 1
+
+
+def test_snapshot_deadline_interrupts_local_capture_and_releases_transaction(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Enforce the snapshot budget even before a native query yields its first batch."""
+    import duckdb
+
+    from usagebassoon.deadlines import OperationTimeout, operation
+    from usagebassoon.normalizer import normalize
+    from usagebassoon.persistence import persist_run
+
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(collection_bundle))
+        backend.connection.execute(
+            "CREATE OR REPLACE VIEW current_sessions AS SELECT sessions.* "
+            "FROM sessions WHERE (SELECT sum(x::DOUBLE * y::DOUBLE) "
+            "FROM range(1000000) a(x), range(1000000) b(y)) > 0"
+        )
+        with (
+            pytest.raises(OperationTimeout) as failure,
+            operation(0.3),
+            backend.stream_snapshot(["sessions"]) as stream,
+        ):
+            next(iter(stream.tables["sessions"]))
+        assert isinstance(failure.value.__cause__, duckdb.InterruptException)
+        assert backend.query("SELECT 42 AS value").to_pylist() == [{"value": 42}]
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize("provider", ["local", "gcs"])
@@ -1231,9 +1328,9 @@ def test_archiver_uses_only_enabled_destinations(
     calls: list[str] = []
 
     def cloud(
-        uri: str, *, project: str, credentials_file: Path | None, timeout_seconds: float
+        uri: str, *, project: str, credentials_file: Path | None
     ) -> MemoryGcsArchive:
-        del project, credentials_file, timeout_seconds
+        del project, credentials_file
         calls.append(uri)
         return archive
 

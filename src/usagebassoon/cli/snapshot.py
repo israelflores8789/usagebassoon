@@ -80,7 +80,10 @@ def snapshot(
         with spinner(configuration):
             archiver = snapshot_archiver(configuration)
             if not automatic and not archiver.destination_uris:
-                archiver = SnapshotArchiver(str(configuration.snapshots.local.path))
+                archiver = SnapshotArchiver(
+                    str(configuration.snapshots.local.path),
+                    timeout_seconds=configuration.snapshots.timeout_seconds,
+                )
             uri = archiver.write(
                 backend,
                 run_id="scheduled" if automatic else "manual",

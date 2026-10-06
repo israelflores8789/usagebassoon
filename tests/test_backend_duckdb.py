@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_backend_duckdb.py — Tests for local DuckDB and offline MotherDuck validation."""
+"""test_backend_duckdb.py — Tests for local DuckDB and shared backend behavior."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def test_backend_factory_applies_settings_and_enforces_readiness(
         if provider == "duckdb":
             expected = ((configuration.local_database,), {})
         elif provider == "motherduck":
-            expected = (("usagebassoon_it",), {})
+            expected = (("usagebassoon_it",), {"timeout_seconds": 120.0})
         else:
             expected = (
                 ("test-project", "usagebassoon_it"),
@@ -258,23 +258,6 @@ def test_local_backend_merges_current_state_in_place(
         backend.close()
 
 
-def test_motherduck_rejects_invalid_database_name() -> None:
-    """Assert MotherDuck rejects empty and already-prefixed database names."""
-    with pytest.raises(ValueError, match="database name"):
-        MotherDuckBackend("")
-    with pytest.raises(ValueError, match="database name"):
-        MotherDuckBackend("md:usagebassoon")
-
-
-def test_motherduck_requires_token_before_connecting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Assert a missing MotherDuck token fails without contacting the service."""
-    monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
-    with pytest.raises(RuntimeError, match="MOTHERDUCK_TOKEN"):
-        MotherDuckBackend("usagebassoon")
-
-
 @pytest.mark.parametrize("backend_type", [DuckDBBackend, MotherDuckBackend])
 def test_transactional_read_session_preserves_snapshot_after_external_commit(
     backend_type: type[DuckDBBackend] | type[MotherDuckBackend],
@@ -284,7 +267,10 @@ def test_transactional_read_session_preserves_snapshot_after_external_commit(
     # Avoid MotherDuck credentials while exercising its explicit scope implementation.
     backend = object.__new__(backend_type)
     backend.connection = connection_backend.connection
-    writer = backend.connection.cursor()
+    if isinstance(backend, MotherDuckBackend):
+        backend.timeout_seconds = 120.0
+        backend._watchdog = None
+    writer = connection_backend.connection.cursor()
     try:
         backend.apply_ddl()
         backend.query("CREATE TABLE values_at_read (value INTEGER)")
@@ -363,7 +349,8 @@ def test_transaction_preserves_failure_when_rollback_fails(
     class BrokenRollback:
         """Fail only the rollback performed during exception unwinding."""
 
-        def execute(self, sql: str) -> None:
+        def execute(self, sql: str, parameters: object = None) -> None:
+            del parameters
             calls.append(sql)
             if sql == "ROLLBACK":
                 raise RuntimeError("rollback failure")

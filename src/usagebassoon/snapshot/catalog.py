@@ -9,6 +9,7 @@ import hashlib
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from contextvars import copy_context
 from datetime import UTC, datetime, timedelta
 from threading import Event, RLock, Thread
 from uuid import uuid4
@@ -18,6 +19,7 @@ from usagebassoon.buckets.base import (
     SnapshotPreconditionError,
     SnapshotVersion,
 )
+from usagebassoon.deadlines import cleanup_budget, remaining_seconds
 from usagebassoon.snapshot.format import (
     CATALOG_NAME,
     FORMAT_VERSION,
@@ -451,7 +453,10 @@ class Catalog:
                     )
                     return
 
-        thread = Thread(target=renew, name="snapshot-reservation", daemon=True)
+        context = copy_context()
+        thread = Thread(
+            target=lambda: context.run(renew), name="snapshot-reservation", daemon=True
+        )
         thread.start()
         try:
             if enforce_policy:
@@ -474,38 +479,47 @@ class Catalog:
             self.check()
         finally:
             stop.set()
-            thread.join()
-            try:
-                for _ in range(8):
-                    document, version = self.control()
-                    reservation = document.get("reservation")
-                    if (
-                        not isinstance(reservation, dict)
-                        or reservation.get("owner") != self.owner
-                        or reservation.get("fence") != self.fence
-                    ):
-                        break
-                    document["reservation"] = None
-                    try:
-                        self.bucket.write_json_cas(
-                            CONTROL_NAME, document, expected_version=version
-                        )
-                    except SnapshotPreconditionError:
-                        continue
-                    break
-                else:
+            with cleanup_budget():
+                try:
+                    thread.join(timeout=remaining_seconds())
+                except Exception:
                     _LOG.warning(
-                        "Snapshot reservation release exhausted CAS retries at %s",
+                        "Snapshot reservation shutdown exceeded cleanup budget at %s",
                         self.bucket.uri,
+                        exc_info=True,
                     )
-            except Exception:
-                _LOG.warning(
-                    "Snapshot reservation release failed at %s; claim will expire",
-                    self.bucket.uri,
-                    exc_info=True,
-                )
-            finally:
-                self.fence = None
+            with cleanup_budget():
+                try:
+                    for _ in range(8):
+                        document, version = self.control()
+                        reservation = document.get("reservation")
+                        if (
+                            not isinstance(reservation, dict)
+                            or reservation.get("owner") != self.owner
+                            or reservation.get("fence") != self.fence
+                        ):
+                            break
+                        document["reservation"] = None
+                        try:
+                            self.bucket.write_json_cas(
+                                CONTROL_NAME, document, expected_version=version
+                            )
+                        except SnapshotPreconditionError:
+                            continue
+                        break
+                    else:
+                        _LOG.warning(
+                            "Snapshot reservation release exhausted CAS retries at %s",
+                            self.bucket.uri,
+                        )
+                except Exception:
+                    _LOG.warning(
+                        "Snapshot reservation release failed at %s; claim will expire",
+                        self.bucket.uri,
+                        exc_info=True,
+                    )
+                finally:
+                    self.fence = None
 
     def publish(self, identifier: str, captured_at: str) -> None:
         """Authorize a verified complete snapshot in the fenced control document."""

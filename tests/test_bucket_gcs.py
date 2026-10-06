@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from typing import cast, override
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pyarrow as pa
 import pytest
@@ -26,6 +26,35 @@ from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditi
 from usagebassoon.buckets.gcs import GcsBlob, GcsBucket, GcsClient
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
+
+
+def test_gcs_transfer_and_metadata_consume_the_same_operation_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transfer's metadata request cannot receive a fresh snapshot timeout."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    client = MagicMock(spec=GcsClient)
+    blob = client.bucket.return_value.blob.return_value
+    blob.name = "archive/table.parquet"
+    blob.generation, blob.size, blob.crc32c = 7, 3, "checksum"
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    path = tmp_path / "table.parquet"
+    path.write_bytes(b"abc")
+
+    def upload(
+        _path: str, *, if_generation_match: int, timeout: float, retry: object
+    ) -> None:
+        assert if_generation_match == 0 and retry is None and timeout == 10
+        clock[0] = 8
+
+    blob.upload_from_filename.side_effect = upload
+    with deadlines.operation(10):
+        archive.upload_file("table.parquet", path)
+    blob.reload.assert_called_once_with(timeout=2, retry=None)
 
 
 class _RecordingBucket:
@@ -63,10 +92,11 @@ class _RecordingClient:
         return self.recording_bucket
 
     def list_blobs(
-        self, bucket: _RecordingBucket, *, prefix: str, timeout: float
+        self, bucket: _RecordingBucket, *, prefix: str, timeout: float, retry: object
     ) -> tuple[object, ...]:
         """Record an attempted listing."""
         del bucket, prefix
+        assert retry is None
         self.list_calls += 1
         self.list_timeout = timeout
         return ()
@@ -224,7 +254,7 @@ def test_gcs_archive_uses_configured_request_timeout() -> None:
     )
 
     assert archive.list("") == ()
-    assert client.list_timeout == 25.0
+    assert client.list_timeout is not None and 0 < client.list_timeout <= 25.0
 
 
 @pytest.mark.parametrize(
@@ -251,7 +281,7 @@ def test_gcs_adapter_passes_generation_guards_and_timeouts(
             blob.download_as_bytes.return_value = b'{"value": 42}'
             assert archive.read_json("copy/data.parquet") == ({"value": 42}, 7)
             bucket.blob.assert_any_call("archive/copy/data.parquet", generation=7)
-            blob.reload.assert_called_once_with(timeout=17)
+            blob.reload.assert_called_once_with(timeout=ANY, retry=None)
         else:
             blob.download_as_bytes.return_value = b"abc"
             assert archive.read_bytes("copy/data.parquet", version=7) == b"abc"
@@ -259,7 +289,7 @@ def test_gcs_adapter_passes_generation_guards_and_timeouts(
                 "archive/copy/data.parquet", generation=7
             )
         blob.download_as_bytes.assert_called_once_with(
-            if_generation_match=7, timeout=17
+            if_generation_match=7, timeout=ANY, retry=None
         )
     elif operation in {"create", "replace"}:
         reference = archive.write_json_cas(
@@ -272,30 +302,34 @@ def test_gcs_adapter_passes_generation_guards_and_timeouts(
         assert kwargs == {
             "content_type": "application/json",
             "if_generation_match": 0 if operation == "create" else 6,
-            "timeout": 17,
+            "timeout": ANY,
+            "retry": None,
         }
         assert reference.version == 7
     elif operation == "upload":
         reference = archive.upload_file("copy/data.parquet", path)
         blob.upload_from_filename.assert_called_once_with(
-            str(path), if_generation_match=0, timeout=17
+            str(path), if_generation_match=0, timeout=ANY, retry=None
         )
         assert reference == GcsObject("copy/data.parquet", 7, 3, "checksum")
     elif operation == "download":
 
-        def reload(*, timeout: float) -> None:
-            assert timeout == 17
+        def reload(*, timeout: float, retry: object) -> None:
+            assert 0 < timeout <= 17
+            assert retry is None
             blob.generation = 8
 
         blob.reload.side_effect = reload
         reference = archive.download_file("copy/data.parquet", path)
         blob.download_to_filename.assert_called_once_with(
-            str(path), if_generation_match=8, timeout=17
+            str(path), if_generation_match=8, timeout=ANY, retry=None
         )
         assert reference.version == 8
     else:
         archive.delete("copy/data.parquet", version=7)
-        blob.delete.assert_called_once_with(if_generation_match=7, timeout=17)
+        blob.delete.assert_called_once_with(
+            if_generation_match=7, timeout=ANY, retry=None
+        )
 
 
 @pytest.mark.parametrize("operation", ["read", "delete", "replace"])

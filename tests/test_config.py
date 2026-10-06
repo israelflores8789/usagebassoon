@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -95,8 +97,54 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     assert configuration.collection.schedule.interval == "15m"
     assert configuration.spinner == "pong"
     assert configuration.tokscale_timeout_seconds == 120.0
+    assert configuration.snapshots.timeout_seconds == 600.0
     assert configuration.logging.max_files == 5
     assert configuration.logging.max_bytes == 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "provider, default", [("bigquery", 180.0), ("motherduck", 120.0)]
+)
+def test_remote_operation_timeouts_and_snapshot_budget(
+    tmp_path: Path,
+    provider: str,
+    default: float,
+) -> None:
+    """Expose whole-operation budgets and reject the removed GCS request knob."""
+    path = tmp_path / "config.toml"
+    settings = (
+        'project = "usagebassoon-test"\ndataset = "usagebassoon_it"\n'
+        if provider == "bigquery"
+        else 'database = "usagebassoon_it"\n'
+    )
+    content = (
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        f'backend.provider = "{provider}"\n[backend.{provider}]\n{settings}'
+    )
+    path.write_text(content)
+    assert ConfigurationManager(path).load().backend_timeout_seconds == default
+    schema: dict[str, object] = json.loads(
+        (Path(__file__).parents[1] / "config.schema.json").read_text()
+    )
+    definitions = cast(dict[str, dict[str, object]], schema["$defs"])
+    for section, seconds in ((provider, default), ("snapshots", 600.0)):
+        properties = cast(
+            dict[str, dict[str, object]], definitions[section]["properties"]
+        )
+        duration = properties["timeout"]["default"]
+        assert isinstance(duration, str)
+        parsed = config_module.parse_interval(duration)
+        assert parsed is not None and parsed.total_seconds() == seconds
+    assert "timeout" not in cast(dict[str, object], definitions["gcs"]["properties"])
+    path.write_text(content + 'timeout = "45s"\n[snapshots]\ntimeout = "20m"\n')
+    configuration = ConfigurationManager(path).load()
+    assert configuration.backend_timeout_seconds == 45.0
+    assert configuration.snapshots.timeout_seconds == 1200.0
+    path.write_text(content + '[snapshots.gcs]\ntimeout = "60s"\n')
+    with pytest.raises(
+        ConfigurationError, match=r"unknown key.*snapshots\.gcs.*timeout"
+    ):
+        ConfigurationManager(path).load()
 
 
 @pytest.mark.parametrize("name", ["pong", "dots", "bouncingBall"])
@@ -215,7 +263,7 @@ def test_schedule_durations_are_limited_to_minutes_or_hours(
     [
         ("tokscale", 'timeout = "1h"', "tokscale.timeout"),
         ("backend.bigquery", 'timeout = "1h"', "bigquery.timeout"),
-        ("snapshots.gcs", 'timeout = "1h"', "gcs.timeout"),
+        ("snapshots", 'timeout = "1d"', "snapshots.timeout"),
         ("snapshots.schedule", 'interval = "1s"', "snapshots.schedule.interval"),
         ("snapshots.schedule", 'interval = "1w"', "snapshots.schedule.interval"),
     ],
@@ -461,7 +509,7 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     assert config.snapshots.gcs is not None
     assert config.snapshots.gcs.uri == "gs://bucket/archive"
     assert config.snapshots.gcs.project == "usagebassoon-test"
-    assert config.snapshots.gcs.timeout_seconds == 60.0
+    assert config.snapshots.timeout_seconds == 600.0
     assert config.snapshots.gcs.credentials_file == credentials
     assert config.snapshots is not None
     assert config.snapshots.local.path == tmp_path / "snapshots"

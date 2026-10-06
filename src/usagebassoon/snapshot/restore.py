@@ -11,6 +11,8 @@ from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid5
 
 from usagebassoon.backends.base import StorageBackend
+from usagebassoon.deadlines import RESTORE_SECONDS
+from usagebassoon.deadlines import operation as operation_budget
 from usagebassoon.snapshot.reader import PreparedSnapshot
 
 _LOG = logging.getLogger("usagebassoon")
@@ -37,49 +39,54 @@ def restore_prepared(
     preflight_checked: bool = False,
 ) -> dict[str, int]:
     """Prepare maintenance then commit validated files, resolving lost replies."""
-    operation = restore_operation_id(prepared)
-    if backend.restore_committed(operation):
+    with operation_budget(RESTORE_SECONDS):
+        operation = restore_operation_id(prepared)
+        if backend.restore_committed(operation):
+            deliver_notice(
+                notice,
+                "This snapshot restore already committed: "
+                f"{prepared.candidate.identifier}",
+            )
+            report_maintenance(backend, notice)
+            return prepared.rows
+        if not preflight_checked:
+            backend.check_restore_empty()
+        try:
+            backend.prepare_recovery(
+                notice=lambda message: deliver_notice(notice, message)
+            )
+            try:
+                backend.restore_snapshot(
+                    prepared.files,
+                    operation_id=operation,
+                    snapshot_id=prepared.candidate.identifier,
+                )
+            except Exception:
+                try:
+                    committed = backend.restore_committed(operation)
+                except Exception as inspection_error:
+                    raise RuntimeError(
+                        "Restore completion could not be determined; "
+                        "retry receipt inspection before further writes."
+                    ) from inspection_error
+                if not committed:
+                    raise
+                _LOG.warning(
+                    "Restore committed; its acknowledgement was interrupted",
+                    exc_info=True,
+                )
+                deliver_notice(
+                    notice, "Restore committed; its acknowledgement was interrupted."
+                )
+        finally:
+            report_maintenance(backend, notice)
         deliver_notice(
             notice,
-            f"This snapshot restore already committed: {prepared.candidate.identifier}",
+            f"Recovered {prepared.candidate.uri}, "
+            f"captured {prepared.candidate.captured_at}. Run bassoon init after "
+            "verification to resume applicable maintenance.",
         )
-        report_maintenance(backend, notice)
         return prepared.rows
-    if not preflight_checked:
-        backend.check_restore_empty()
-    try:
-        backend.prepare_recovery(notice=lambda message: deliver_notice(notice, message))
-        try:
-            backend.restore_snapshot(
-                prepared.files,
-                operation_id=operation,
-                snapshot_id=prepared.candidate.identifier,
-            )
-        except Exception:
-            try:
-                committed = backend.restore_committed(operation)
-            except Exception as inspection_error:
-                raise RuntimeError(
-                    "Restore completion could not be determined; "
-                    "retry receipt inspection before further writes."
-                ) from inspection_error
-            if not committed:
-                raise
-            _LOG.warning(
-                "Restore committed; its acknowledgement was interrupted", exc_info=True
-            )
-            deliver_notice(
-                notice, "Restore committed; its acknowledgement was interrupted."
-            )
-    finally:
-        report_maintenance(backend, notice)
-    deliver_notice(
-        notice,
-        f"Recovered {prepared.candidate.uri}, "
-        f"captured {prepared.candidate.captured_at}. Run bassoon init after "
-        "verification to resume applicable maintenance.",
-    )
-    return prepared.rows
 
 
 def deliver_notice(notice: Callable[[str], None] | None, message: str) -> None:

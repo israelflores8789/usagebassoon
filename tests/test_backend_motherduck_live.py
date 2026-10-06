@@ -26,7 +26,7 @@ import json
 import logging
 import os
 import signal
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -59,6 +59,7 @@ from usagebassoon.backends.base import (
     CurrentStateWrite,
     PersistenceBatch,
     StorageBackend,
+    UpsertResult,
     is_simple_identifier,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
@@ -66,6 +67,7 @@ from usagebassoon.backends.motherduck import MotherDuckBackend
 from usagebassoon.cli.app import app
 from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
 from usagebassoon.curation import NoteAssignment, TagAssignment, add_tag, set_note
+from usagebassoon.deadlines import OperationTimeout
 from usagebassoon.diagnostics import run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
@@ -484,6 +486,55 @@ def test_live_batch_rolls_back_after_late_failure(
             ).num_rows
             == 0
         )
+    finally:
+        backend.close()
+
+
+def test_live_native_deadline_rolls_back_and_replays_stable_batch(
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel a transaction after a remote upsert and replay on the native handle."""
+    bundle = _normalized_bundle(collection_bundle, str(uuid4()))
+    backend = _backend()
+    connection = backend.connection
+    assert isinstance(connection, duckdb.DuckDBPyConnection)
+    original = backend.upsert
+    wrote_remote_facts = False
+
+    def delayed_upsert(
+        table: str,
+        data: pa.Table,
+        natural_keys: Sequence[str],
+        change_fields: Sequence[str],
+    ) -> UpsertResult:
+        nonlocal wrote_remote_facts
+        result = original(table, data, natural_keys, change_fields)
+        wrote_remote_facts = True
+        backend.query(
+            "SELECT sum(x::DOUBLE * y::DOUBLE) "
+            "FROM range(1000000) a(x), range(1000000) b(y)"
+        )
+        return result
+
+    try:
+        backend.timeout_seconds = 10.0
+        with monkeypatch.context() as patch:
+            patch.setattr(backend, "upsert", delayed_upsert)
+            with pytest.raises(OperationTimeout):
+                persist_run(backend, bundle)
+        assert wrote_remote_facts
+        backend.timeout_seconds = 120.0
+        assert backend.connection is connection
+        assert not backend.has_committed_run(bundle.run_id)
+        assert backend.query("SELECT * FROM daily_stats").num_rows == 0
+        assert backend.query("SELECT * FROM sessions").num_rows == 0
+        persist_run(backend, bundle)
+        assert backend.has_committed_run(bundle.run_id)
+        assert backend.query("SELECT * FROM current_daily_stats").num_rows == (
+            bundle.tables["daily_stats"].num_rows
+        )
+        assert backend._watchdog is None
     finally:
         backend.close()
 

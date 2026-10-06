@@ -43,7 +43,7 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     assert configuration.collection.schedule.interval == "30m"
     assert configuration.bigquery is not None
     assert configuration.bigquery.maximum_bytes_billed == 1_048_576
-    assert configuration.bigquery.timeout_seconds == 120.0
+    assert configuration.bigquery.timeout_seconds == 180.0
 
 
 @pytest.mark.parametrize(

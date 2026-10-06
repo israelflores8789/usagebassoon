@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 
 from usagebassoon.buckets.base import SnapshotBucket, bucket_uri, validate_relative_name
 from usagebassoon.buckets.factory import bucket_label
+from usagebassoon.deadlines import remaining_seconds
 from usagebassoon.snapshot.catalog import Catalog
 from usagebassoon.snapshot.format import (
     DATA_CONTRACTS,
@@ -373,6 +374,7 @@ class SnapshotReader:
         counts: dict[str, int] = {}
         selected = tuple(contract) if version != DATA_SCHEMA_VERSION else tables
         for table in selected:
+            remaining_seconds()
             if table not in contract:
                 raise ValueError(f"unsupported snapshot table: {table}")
             spec = specifications[table]
@@ -427,6 +429,7 @@ class SnapshotReader:
                         f"snapshot table {table} row count or schema does not match"
                     )
                 for batch in parquet.iter_batches(batch_size=65536):
+                    remaining_seconds()
                     batch.validate(full=True)
                     for field in schema:
                         if (

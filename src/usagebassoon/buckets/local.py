@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import os
-import shutil
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,8 +22,19 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
+from usagebassoon.deadlines import checked, remaining_seconds
 
 _LOG = logging.getLogger("usagebassoon")
+
+
+def _file_metadata(path: Path) -> tuple[str, os.stat_result]:
+    """Hash bounded chunks and identify the same open file revision."""
+    checksum = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            remaining_seconds()
+            checksum.update(chunk)
+        return checksum.hexdigest(), os.fstat(stream.fileno())
 
 
 def _remove_temporary(path: Path) -> None:
@@ -89,7 +100,13 @@ def _catalog_lock(path: Path) -> Generator[None]:
             import msvcrt
 
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                remaining_seconds()
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(min(0.05, remaining_seconds()))
             try:
                 yield
             finally:
@@ -104,7 +121,13 @@ def _catalog_lock(path: Path) -> Generator[None]:
         else:
             import fcntl
 
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            while True:
+                remaining_seconds()
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.05, remaining_seconds()))
             try:
                 yield
             finally:
@@ -152,6 +175,7 @@ class LocalSnapshotBucket:
         stripe = hashlib.sha256(identity.encode()).hexdigest()[:2]
         return self._root / f".snapshot-lock-{stripe}"
 
+    @checked
     def read_json(
         self, relative_name: str
     ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
@@ -169,6 +193,7 @@ class LocalSnapshotBucket:
             )
         return payload, version
 
+    @checked
     def write_json_cas(
         self,
         relative_name: str,
@@ -198,6 +223,7 @@ class LocalSnapshotBucket:
             checksum=hashlib.sha256(raw).hexdigest(),
         )
 
+    @checked
     def write_bytes(
         self,
         relative_name: str,
@@ -219,6 +245,7 @@ class LocalSnapshotBucket:
             checksum=hashlib.sha256(payload).hexdigest(),
         )
 
+    @checked
     def read_bytes(self, relative_name: str, *, version: SnapshotVersion) -> bytes:
         """Read the requested physical revision from one open descriptor."""
         with self._path(relative_name).open("rb") as stream:
@@ -226,6 +253,7 @@ class LocalSnapshotBucket:
                 raise SnapshotPreconditionError("local snapshot object version changed")
             return stream.read()
 
+    @checked
     def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Durably publish a file without buffering its complete contents."""
         target = self._path(relative_name)
@@ -233,7 +261,9 @@ class LocalSnapshotBucket:
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         try:
             with path.open("rb") as source, temporary.open("xb") as destination:
-                shutil.copyfileobj(source, destination, length=1024 * 1024)
+                while chunk := source.read(1024 * 1024):
+                    remaining_seconds()
+                    destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
             # Hard-link publication is atomic and fails if the identity exists.
@@ -241,23 +271,24 @@ class LocalSnapshotBucket:
                 os.link(temporary, target)
                 temporary.unlink()
                 sync_directory(target.parent)
-                with target.open("rb") as stream:
-                    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
-                    stat = os.fstat(stream.fileno())
-                    version = self._version(stat)
+                checksum, stat = _file_metadata(target)
+                version = self._version(stat)
         finally:
             _remove_temporary(temporary)
         return SnapshotObject(relative_name, version, stat.st_size, checksum)
 
+    @checked
     def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Copy from one open revision, retaining bounded memory."""
         with self._path(relative_name).open("rb") as source, path.open("wb") as target:
-            shutil.copyfileobj(source, target, length=1024 * 1024)
+            while chunk := source.read(1024 * 1024):
+                remaining_seconds()
+                target.write(chunk)
             version = self._version(os.fstat(source.fileno()))
-        with path.open("rb") as stream:
-            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
-        return SnapshotObject(relative_name, version, path.stat().st_size, checksum)
+        checksum, stat = _file_metadata(path)
+        return SnapshotObject(relative_name, version, stat.st_size, checksum)
 
+    @checked
     def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
         """Delete only the requested incarnation under the publication lock."""
         path = self._path(relative_name)
@@ -284,6 +315,7 @@ class LocalSnapshotBucket:
                 sync_directory(parent.parent)
                 parent = parent.parent
 
+    @checked
     def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List local snapshot objects below one safe relative prefix."""
         prefix = validate_relative_name(relative_prefix, allow_empty=True)
@@ -296,10 +328,8 @@ class LocalSnapshotBucket:
                 continue
             if path.name.startswith("."):
                 continue
-            with path.open("rb") as stream:
-                checksum = hashlib.file_digest(stream, "sha256").hexdigest()
-                stat = os.fstat(stream.fileno())
-                version = self._version(stat)
+            checksum, stat = _file_metadata(path)
+            version = self._version(stat)
             objects.append(
                 SnapshotObject(
                     name=path.relative_to(self._root).as_posix(),

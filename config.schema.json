@@ -114,8 +114,8 @@
         "timeout": {
           "type": "string",
           "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
-          "default": "120s",
-          "description": "Maximum wait for one BigQuery job or Storage Read request, in seconds or minutes. Defaults to `120s`."
+          "default": "180s",
+          "description": "Complete BigQuery backend operation budget, including submission and result retrieval, in seconds or minutes. Defaults to `180s`. Cleanup has a shared additional 15-second allowance."
         }
       }
     },
@@ -129,6 +129,12 @@
         "database": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "MotherDuck database name without the `md:` prefix. Required when `backend.provider` is `motherduck`."
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
+          "default": "120s",
+          "description": "Cooperative deadline for a complete MotherDuck backend operation, including startup or a persistence transaction and commit, in seconds or minutes. Defaults to `120s`. Native interruption may take additional time to unwind."
         }
       }
     },
@@ -154,12 +160,6 @@
         "credentials_file": {
           "$ref": "#/$defs/nonEmptyString",
           "description": "Optional service-account credentials file path. When omitted, Google Application Default Credentials are used."
-        },
-        "timeout": {
-          "type": "string",
-          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmM]$",
-          "default": "60s",
-          "description": "Maximum wait for one GCS request, in seconds or minutes. Defaults to `60s`; snapshots have no overall timeout."
         },
         "enable": {
           "type": "boolean",
@@ -254,6 +254,12 @@
       "additionalProperties": false,
       "description": "Local and at most one enabled remote snapshot bucket, with shared cadence.",
       "properties": {
+        "timeout": {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])\\d+(?:\\.\\d+)?[sSmMhH]$",
+          "default": "10m",
+          "description": "Complete snapshot creation budget, including capture, serialization, transfer, verification, and publication, in seconds, minutes, or hours. Defaults to `10m`. Cleanup has a shared additional 15-second allowance."
+        },
         "local": {
           "$ref": "#/$defs/snapshotLocal"
         },

@@ -36,15 +36,17 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 - [Getting Started](#getting-started)
 - [Terminal Reports](#terminal-reports)
 - [Config.toml](#configtoml)
-- [How Persistence Works](#how-persistence-works)
 - [Automated Scheduling](#automated-scheduling)
 - [Tags and Notes](#tags-and-notes)
 - [Python API](#python-api)
 - [Privacy and sharing](#privacy-and-sharing)
 - [Snapshots](#snapshots)
-- [MotherDuck setup and permissions](#motherduck-setup-and-permissions)
-- [BigQuery setup and permissions](#bigquery-setup-and-permissions)
-- [Google Cloud Storage setup and permissions](#google-cloud-storage-setup-and-permissions)
+- [Restoring Your Data](#restoring-your-data)
+- [How Persistence Works](#how-persistence-works)
+- [Remote Storage Providers Setup](#remote-storage-providers-setup)
+  - [MotherDuck setup and permissions](#motherduck-setup-and-permissions)
+  - [BigQuery setup and permissions](#bigquery-setup-and-permissions)
+  - [Google Cloud Storage setup and permissions](#google-cloud-storage-setup-and-permissions)
 - [Why AGPL?](#why-agpl)
 - [License & Disclaimers](#license--disclaimers)
 
@@ -305,11 +307,12 @@ dataset = "usagebassoon"                            # Required; BigQuery dataset
 location = "US"                                     # Optional; dataset and job location.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
 maximum_bytes_billed = 1073741824                   # Optional; per-job maximum bytes billed for BigQuery queries.
-timeout = "120s"                                    # Optional; max wait for one BigQuery job or Storage Read request.
+timeout = "180s"                                    # Optional; max budget for one BigQuery persistence operation.
 
 [backend.motherduck]                                # Required when backend.provider is `motherduck`.
 database = "usagebassoon"                           # Required; MotherDuck database name without the `md:` prefix.
                                                     # Don't forget to set your MOTHERDUCK_TOKEN environment variable!
+timeout = "120s"                                    # Optional; max budget for one MotherDuck persistence operation.
 
 [collection]                                        # Optional; persistence retry settings.
 max_retries = 3                                     # Optional; additional attempts after the first persistence failure.
@@ -319,7 +322,8 @@ retry_initial_seconds = 1.0                         # Optional; positive initial
 interval = "15m"                                    # Optional; minutes or hours; must exceed tokscale.timeout.
 
 [snapshots]
-max_snapshots = 3                                   # Optional; maximum snapshots in rotation
+max_snapshots = 3                                   # Optional; maximum snapshots in rotation.
+timeout = "10m"                                     # Optional; max bugdet for one whole snapshot operation.
 
 [snapshots.schedule]                                # Optional; automatic snapshot cadence settings.
 interval = "12h"                                    # Optional; minutes, hours, or days.
@@ -339,7 +343,6 @@ disable_weekly = false
 uri = "gs://my-private-bucket/usagebassoon"         # Required; private Google Cloud Storage URI.
 project = "my-gcp-project"                          # Required; Google Cloud project ID.
 credentials_file = "path/to/gcp-sa-secret.json"     # Optional; default uses Application Default Credentials.
-timeout = "60s"                                     # Optional; max wait for one GCS request, not the whole snapshot.
 
 [logging]                                           # Optional; operational logging is enabled by default.
 disable = false

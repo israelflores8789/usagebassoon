@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from importlib import resources
 from itertools import pairwise
 from pathlib import Path
+from threading import Timer
 from typing import cast, override
 from uuid import uuid4
 
@@ -31,6 +32,13 @@ from usagebassoon.backends.base import (
     StorageBackend,
     UpsertResult,
     is_simple_identifier,
+)
+from usagebassoon.deadlines import (
+    SNAPSHOT_SECONDS,
+    OperationTimeout,
+    cleanup_budget,
+    operation,
+    remaining_seconds,
 )
 from usagebassoon.schema_assets import (
     RUNTIME_SCHEMA_ASSETS,
@@ -77,10 +85,25 @@ class _DuckDBStorage(AbstractStorageBackend):
         """
         self.connection = connection
 
+    def _execute(
+        self, sql: str, parameters: object = None
+    ) -> duckdb.DuckDBPyConnection:
+        """Check the active operation deadline before and after a native statement."""
+        remaining_seconds()
+        result = self.connection.execute(sql, parameters)
+        remaining_seconds()
+        return result
+
+    @contextmanager
+    def _transaction_cleanup(self) -> Generator[None]:
+        """Allow rollback to consume the operation's shared cleanup grace."""
+        with cleanup_budget():
+            yield
+
     @override
     def apply_ddl(self) -> None:
         """Provision a fresh baseline or validate an existing initialized schema."""
-        exists = self.connection.execute(
+        exists = self._execute(
             "SELECT 1 FROM information_schema.tables "
             "WHERE table_name = 'schema_marker' "
             "AND table_schema = current_schema() AND table_catalog = current_database()"
@@ -91,8 +114,8 @@ class _DuckDBStorage(AbstractStorageBackend):
         package = resources.files("usagebassoon.sql.duckdb")
         with self.transaction():
             for filename in RUNTIME_SCHEMA_ASSETS:
-                self.connection.execute(package.joinpath(filename).read_text())
-            self.connection.execute(
+                self._execute(package.joinpath(filename).read_text())
+            self._execute(
                 "INSERT INTO schema_marker VALUES (?, ?, ?)",
                 [
                     "00000000-0000-0000-0000-000000000000",
@@ -105,7 +128,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def preflight(self) -> None:
         """Read the schema marker; never implicitly provision a fresh database."""
         try:
-            row = self.connection.execute(
+            row = self._execute(
                 "SELECT version, schema_hash FROM schema_marker"
             ).fetchone()
         except duckdb.CatalogException as error:
@@ -120,8 +143,8 @@ class _DuckDBStorage(AbstractStorageBackend):
         if steps:
             with self.transaction():
                 for step in steps:
-                    self.connection.execute(step.sql("duckdb"))
-                    self.connection.execute(
+                    self._execute(step.sql("duckdb"))
+                    self._execute(
                         "INSERT INTO schema_migrations "
                         "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                         [
@@ -130,7 +153,7 @@ class _DuckDBStorage(AbstractStorageBackend):
                             step.target_hashes["duckdb"],
                         ],
                     )
-                self.connection.execute(
+                self._execute(
                     "UPDATE schema_marker SET version = ?, schema_hash = ?",
                     [SCHEMA_VERSION, schema_hash("duckdb")],
                 )
@@ -172,7 +195,6 @@ class _DuckDBStorage(AbstractStorageBackend):
         Yields:
             Lazy sequential streams from the owned connection.
         """
-        from collections.abc import Iterable
 
         def batches(table: str) -> Iterable[pa.RecordBatch]:
             """Consume one canonical relation without whole-table materialization."""
@@ -180,7 +202,7 @@ class _DuckDBStorage(AbstractStorageBackend):
                 raise ValueError(f"unsupported snapshot table: {table}")
             relation = ("replay_" if table in DEBUG_TABLES else "current_") + table
             schema = CANONICAL_TABLE_SCHEMAS[table]
-            reader = self.connection.execute(
+            reader = self._execute(
                 f"SELECT * FROM {_identifier(relation)}"
             ).to_arrow_reader(65536)
             for batch in reader:
@@ -201,7 +223,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     @override
     def check_restore_empty(self) -> None:
         """Inspect all destination base tables, including unexpected tables."""
-        names = self.connection.execute(
+        names = self._execute(
             "SELECT table_schema, table_name FROM information_schema.tables "
             "WHERE table_catalog = current_database() AND table_type = 'BASE TABLE'"
         ).fetchall()
@@ -215,7 +237,7 @@ class _DuckDBStorage(AbstractStorageBackend):
             quoted_schema = '"' + str(namespace).replace('"', '""') + '"'
             quoted_name = '"' + str(name).replace('"', '""') + '"'
             if (
-                self.connection.execute(
+                self._execute(
                     f"SELECT 1 FROM {quoted_schema}.{quoted_name} LIMIT 1"
                 ).fetchone()
                 is not None
@@ -262,7 +284,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def restore_committed(self, operation_id: str) -> bool:
         """Read the atomic completion receipt for a restore operation."""
         return (
-            self.connection.execute(
+            self._execute(
                 "SELECT 1 FROM restore_receipts WHERE operation_id = ?", [operation_id]
             ).fetchone()
             is not None
@@ -287,7 +309,7 @@ class _DuckDBStorage(AbstractStorageBackend):
                             CANONICAL_TABLE_SCHEMAS[table]
                         ),
                     )
-            self.connection.execute(
+            self._execute(
                 "INSERT INTO restore_receipts VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                 ["00000000-0000-0000-0000-000000000000", operation_id, snapshot_id],
             )
@@ -343,7 +365,7 @@ class _DuckDBStorage(AbstractStorageBackend):
 
         self.connection.register("_usagebassoon_upsert_batch", data)
         try:
-            counted = self.connection.execute(
+            counted = self._execute(
                 f"SELECT "
                 f"count(*) FILTER (WHERE "
                 f"target.{_identifier(natural_keys[0])} IS NULL), "
@@ -356,7 +378,7 @@ class _DuckDBStorage(AbstractStorageBackend):
             if counted is None:
                 return UpsertResult()
             inserted, updated = counted
-            self.connection.execute(
+            self._execute(
                 f"MERGE INTO {quoted_table} target "
                 f"USING _usagebassoon_upsert_batch source ON {join} "
                 f"WHEN MATCHED AND ({change_predicate}) THEN UPDATE SET "
@@ -365,7 +387,7 @@ class _DuckDBStorage(AbstractStorageBackend):
                 f"VALUES ({source_values})"
             )
             if table == "sessions":
-                self.connection.execute(
+                self._execute(
                     f"UPDATE {quoted_table} AS target SET "
                     "first_seen_at = "
                     "LEAST(target.first_seen_at, source.first_seen_at), "
@@ -392,14 +414,14 @@ class _DuckDBStorage(AbstractStorageBackend):
         if data.num_rows == 0:
             return
         if table in DEBUG_TABLES:
-            self.connection.execute(
+            self._execute(
                 f"DELETE FROM {_identifier(table)} "
                 "WHERE collected_at < CURRENT_TIMESTAMP - INTERVAL '90 days'"
             )
         quoted_columns = ", ".join(map(_identifier, data.column_names))
         self.connection.register("_usagebassoon_append_batch", data)
         try:
-            self.connection.execute(
+            self._execute(
                 f"INSERT INTO {_identifier(table)} ({quoted_columns}) "
                 f"SELECT {quoted_columns} FROM _usagebassoon_append_batch"
             )
@@ -415,7 +437,7 @@ class _DuckDBStorage(AbstractStorageBackend):
     def has_committed_run(self, run_id: str) -> bool:
         """Return whether this run's collection summary was committed atomically."""
         return (
-            self.connection.execute(
+            self._execute(
                 "SELECT 1 FROM collection_ledger "
                 "WHERE run_id = ? AND domain = 'collection'",
                 [run_id],
@@ -448,7 +470,7 @@ class _DuckDBStorage(AbstractStorageBackend):
                 position = token.end + 1
         parts.append(sql[position:])
         statement = "".join(parts)
-        return self.connection.execute(statement, bindings).arrow().read_all()
+        return self._execute(statement, bindings).arrow().read_all()
 
     @override
     def delete_curated(self, identity: CuratedIdentity) -> int:
@@ -456,7 +478,7 @@ class _DuckDBStorage(AbstractStorageBackend):
         predicates = " AND ".join(
             f"{_identifier(name)} = ${name}" for name, _ in identity.target_values
         )
-        result = self.connection.execute(
+        result = self._execute(
             f"DELETE FROM {_identifier(identity.table)} WHERE {predicates} RETURNING 1",
             identity.parameters(),
         ).fetchall()
@@ -491,13 +513,13 @@ class _DuckDBStorage(AbstractStorageBackend):
             for name, _ in destination.target_values
         )
         with self.transaction():
-            source_exists = self.connection.execute(
+            source_exists = self._execute(
                 f'SELECT EXISTS(SELECT 1 FROM "tags" WHERE {source_predicate})',
                 source_parameters,
             ).fetchone()
             if source_exists is None or not source_exists[0]:
                 return CuratedRenameResult(renamed=False)
-            destination_exists = self.connection.execute(
+            destination_exists = self._execute(
                 f'SELECT EXISTS(SELECT 1 FROM "tags" WHERE {destination_predicate})',
                 destination_parameters,
             ).fetchone()
@@ -512,11 +534,11 @@ class _DuckDBStorage(AbstractStorageBackend):
                 "$event_id, 'upsert', $op_id FROM \"tags\" WHERE "
                 f"{source_predicate}"
             )
-            self.connection.execute(
+            self._execute(
                 insert_sql,
                 insert_parameters,
             )
-            deleted = self.connection.execute(
+            deleted = self._execute(
                 f'DELETE FROM "tags" WHERE {source_predicate} RETURNING 1',
                 source_parameters,
             ).fetchall()
@@ -534,19 +556,19 @@ class _DuckDBStorage(AbstractStorageBackend):
         Yields:
             No value.
         """
-        self.connection.execute("BEGIN TRANSACTION")
+        self._execute("BEGIN TRANSACTION")
         try:
             yield
+            self._execute("COMMIT")
         except BaseException:
             try:
-                self.connection.execute("ROLLBACK")
+                with self._transaction_cleanup():
+                    self._execute("ROLLBACK")
             except Exception:
                 _LOG.exception(
                     "could not roll back failed backend transaction; close the backend"
                 )
             raise
-        else:
-            self.connection.execute("COMMIT")
 
     @override
     def close(self) -> None:
@@ -574,6 +596,25 @@ class DuckDBBackend(_DuckDBStorage):
     def compaction_backlog(self) -> pa.Table | None:
         """Return None because transactional upserts require no compaction."""
         return None
+
+    @contextmanager
+    @override
+    def stream_snapshot(self, tables: Sequence[str]) -> Generator[SnapshotStream]:
+        """Interrupt local capture when the enclosing snapshot budget expires."""
+        with operation(SNAPSHOT_SECONDS):
+            timer = Timer(
+                remaining_seconds(SNAPSHOT_SECONDS), self.connection.interrupt
+            )
+            timer.daemon = True
+            timer.start()
+            try:
+                with super().stream_snapshot(tables) as stream:
+                    yield stream
+            except duckdb.InterruptException as error:
+                raise OperationTimeout("snapshot capture deadline exceeded") from error
+            finally:
+                timer.cancel()
+                timer.join()
 
     def __init__(self, database: str | Path) -> None:
         """Open a local database, creating parent directories as needed.

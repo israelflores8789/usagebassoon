@@ -64,7 +64,7 @@ _BIGQUERY_CONFIG_KEYS = frozenset(
         "timeout",
     }
 )
-_MOTHERDUCK_CONFIG_KEYS = frozenset({"database"})
+_MOTHERDUCK_CONFIG_KEYS = frozenset({"database", "timeout"})
 _BACKEND_CONFIG_KEYS = frozenset({"provider", "duckdb", "motherduck", "bigquery"})
 _COLLECTION_CONFIG_KEYS = frozenset(
     {"max_retries", "retry_initial_seconds", "schedule"}
@@ -72,16 +72,19 @@ _COLLECTION_CONFIG_KEYS = frozenset(
 _SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
 _LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes", "disable"})
 _GCS_CONFIG_KEYS = frozenset(
-    {"uri", "project", "credentials_file", "timeout", "enable", "disable_weekly"}
+    {"uri", "project", "credentials_file", "enable", "disable_weekly"}
 )
 _SNAPSHOT_CONFIG_KEYS = frozenset({"path", "enable", "disable_weekly"})
-_SNAPSHOTS_CONFIG_KEYS = frozenset({"local", "gcs", "schedule", "max_snapshots"})
+_SNAPSHOTS_CONFIG_KEYS = frozenset(
+    {"local", "gcs", "schedule", "max_snapshots", "timeout"}
+)
 DEFAULT_SCHEDULE_INTERVAL = "15m"
 DEFAULT_SNAPSHOT_INTERVAL = "12h"
 DEFAULT_TOKSCALE_TIMEOUT = "120s"
 TOKSCALE_CLEANUP_TIMEOUT_SECONDS = 2.0
-DEFAULT_BIGQUERY_TIMEOUT = "120s"
-DEFAULT_GCS_TIMEOUT = "60s"
+DEFAULT_BIGQUERY_TIMEOUT = "180s"
+DEFAULT_MOTHERDUCK_TIMEOUT = "120s"
+DEFAULT_SNAPSHOT_TIMEOUT = "10m"
 
 
 def _application_directory_name() -> str:
@@ -185,7 +188,7 @@ class BigQueryConfig:
         location: BigQuery dataset and job location.
         credentials_file: Optional service-account credential file path.
         maximum_bytes_billed: Per-query billing cap for user-facing reads.
-        timeout_seconds: Maximum wait for one BigQuery job or read request.
+        timeout_seconds: Complete operation budget, including result retrieval.
     """
 
     project: str
@@ -193,7 +196,7 @@ class BigQueryConfig:
     location: str = "US"
     credentials_file: Path | None = None
     maximum_bytes_billed: int = 1_073_741_824
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 180.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,13 +209,11 @@ class GcsConfig:
         uri: GCS archive root used for snapshots.
         project: GCP project identifier used by the Storage client.
         credentials_file: Optional service-account credential file path.
-        timeout_seconds: Maximum wait for one GCS request.
     """
 
     uri: str
     project: str
     credentials_file: Path | None = None
-    timeout_seconds: float = 60.0
     enable: bool = False
     disable_weekly: bool = False
 
@@ -223,9 +224,11 @@ class MotherDuckConfig:
 
     Attributes:
         database: MotherDuck database name without the ``md:`` prefix.
+        timeout_seconds: Complete backend operation budget, including commit.
     """
 
     database: str
+    timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,12 +305,14 @@ class SnapshotsConfig:
     """Snapshot destinations and their shared scheduling policy.
 
     Attributes:
+        timeout_seconds: Complete creation budget, including capture and verification.
         max_snapshots: Shared retention ceiling for each enabled destination.
         local: Local archive enablement and location.
         gcs: Enabled Google Cloud Storage destination, when configured.
         schedule: Independent archive cadence and weekly policy.
     """
 
+    timeout_seconds: float = 600.0
     max_snapshots: int = 3
     local: LocalSnapshotConfig = field(default_factory=LocalSnapshotConfig)
     gcs: GcsConfig | None = None
@@ -356,6 +361,15 @@ class UsageBassoonConfig:
     collection: CollectionConfig = CollectionConfig()
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     snapshots: SnapshotsConfig = field(default_factory=SnapshotsConfig)
+
+    @property
+    def backend_timeout_seconds(self) -> float | None:
+        """Resolve the active provider budget at the configuration boundary."""
+        if self.backend == "bigquery" and self.bigquery is not None:
+            return self.bigquery.timeout_seconds
+        if self.backend == "motherduck" and self.motherduck is not None:
+            return self.motherduck.timeout_seconds
+        return None
 
 
 def _reject_unknown_keys(
@@ -447,7 +461,12 @@ def _snapshots_config(value: object | None) -> SnapshotsConfig:
         units="mhd",
     )
     assert interval is not None
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_SNAPSHOT_TIMEOUT), "snapshots.timeout", units="smh"
+    )
+    assert timeout is not None
     return SnapshotsConfig(
+        timeout_seconds=timeout.total_seconds(),
         max_snapshots=_positive_int(
             table.get("max_snapshots", 3), "snapshots.max_snapshots"
         ),
@@ -685,7 +704,13 @@ def _motherduck_config(value: object | None) -> MotherDuckConfig | None:
     )
     if database is None:
         raise ConfigurationError("backend.motherduck.database is required")
-    return MotherDuckConfig(database=database)
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_MOTHERDUCK_TIMEOUT),
+        "backend.motherduck.timeout",
+        units="sm",
+    )
+    assert timeout is not None
+    return MotherDuckConfig(database=database, timeout_seconds=timeout.total_seconds())
 
 
 def _local_database_config(
@@ -735,10 +760,6 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
     credentials_file = _string(
         table.get("credentials_file"), "snapshots.gcs.credentials_file"
     )
-    _, timeout = _duration(
-        table.get("timeout", DEFAULT_GCS_TIMEOUT), "snapshots.gcs.timeout", units="sm"
-    )
-    assert timeout is not None
     if uri is not None:
         from usagebassoon.buckets.gcs import parse_gcs_uri
 
@@ -752,7 +773,6 @@ def _gcs_config(value: object | None) -> GcsConfig | None:
         credentials_file=Path(credentials_file).expanduser()
         if credentials_file
         else None,
-        timeout_seconds=timeout.total_seconds(),
         enable=enable,
         disable_weekly=_boolean(
             table.get("disable_weekly", False), "snapshots.gcs.disable_weekly"

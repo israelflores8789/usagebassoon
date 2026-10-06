@@ -20,6 +20,7 @@ from usagebassoon.backends.base import (
 )
 from usagebassoon.backends.factory import open_backend
 from usagebassoon.config import UsageBassoonConfig
+from usagebassoon.deadlines import OperationTimeout, operation
 from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import IngestStatus, IngestTarget
 from usagebassoon.logger import LOGGER_NAME
@@ -212,11 +213,14 @@ def persist_with_retries(
     for attempt in range(1, attempts + 1):
         backend: StorageBackend | None = None
         try:
-            backend = open_backend(config)
-            return persist_run(backend, bundle)
+            with operation(config.backend_timeout_seconds):
+                backend = open_backend(config)
+                return persist_run(backend, bundle)
         except Exception as error:
             try:
-                retryable = backend is not None and backend.is_retryable_error(error)
+                retryable = isinstance(error, OperationTimeout) or (
+                    backend is not None and backend.is_retryable_error(error)
+                )
             except Exception:
                 logger.exception(
                     "could not classify collection run %s failure for retry",

@@ -39,7 +39,6 @@ def _gcs_bucket(uri: str, *, settings: GcsConfig | None = None) -> SnapshotBucke
         uri,
         project=settings.project or None if settings else None,
         credentials_file=settings.credentials_file if settings else None,
-        timeout_seconds=settings.timeout_seconds if settings else 60.0,
     )
 
 

@@ -18,6 +18,7 @@ from usagebassoon.buckets.base import (
     SnapshotVersion,
     validate_relative_name,
 )
+from usagebassoon.deadlines import bounded, http_session, operation, remaining_seconds
 
 _LOG = logging.getLogger("usagebassoon")
 
@@ -31,32 +32,46 @@ class GcsBlob(Protocol):
     crc32c: str | None
 
     def upload_from_filename(
-        self, filename: str, *, if_generation_match: int, timeout: float
+        self,
+        filename: str,
+        *,
+        if_generation_match: int,
+        timeout: float,
+        retry: object = None,
     ) -> None:
         """Upload a file through the SDK's resumable transfer."""
         ...
 
     def download_to_filename(
-        self, filename: str, *, if_generation_match: int, timeout: float
+        self,
+        filename: str,
+        *,
+        if_generation_match: int,
+        timeout: float,
+        retry: object = None,
     ) -> None:
         """Download one stable revision through the SDK."""
         ...
 
-    def reload(self, *, timeout: float) -> None:
+    def reload(self, *, timeout: float, retry: object = None) -> None:
         """Refresh object metadata."""
         ...
 
-    def exists(self, *, timeout: float) -> bool:
+    def exists(self, *, timeout: float, retry: object = None) -> bool:
         """Return whether the object exists."""
         ...
 
     def download_as_bytes(
-        self, *, if_generation_match: int | None = None, timeout: float
+        self,
+        *,
+        if_generation_match: int | None = None,
+        timeout: float,
+        retry: object = None,
     ) -> bytes:
         """Download object bytes with an optional generation precondition."""
         ...
 
-    def download_as_text(self, *, timeout: float) -> str:
+    def download_as_text(self, *, timeout: float, retry: object = None) -> str:
         """Download object text."""
         ...
 
@@ -67,11 +82,14 @@ class GcsBlob(Protocol):
         content_type: str,
         if_generation_match: int | None,
         timeout: float,
+        retry: object = None,
     ) -> None:
         """Upload object bytes with an optional generation precondition."""
         ...
 
-    def delete(self, *, if_generation_match: int, timeout: float) -> None:
+    def delete(
+        self, *, if_generation_match: int, timeout: float, retry: object = None
+    ) -> None:
         """Delete with an exact generation precondition."""
         ...
 
@@ -85,7 +103,7 @@ class GcsBucket(Protocol):
         """Return one blob handle."""
         ...
 
-    def reload(self, *, timeout: float) -> None:
+    def reload(self, *, timeout: float, retry: object = None) -> None:
         """Refresh bucket metadata."""
         ...
 
@@ -98,7 +116,7 @@ class GcsClient(Protocol):
         ...
 
     def list_blobs(
-        self, bucket: GcsBucket, *, prefix: str, timeout: float
+        self, bucket: GcsBucket, *, prefix: str, timeout: float, retry: object = None
     ) -> Iterable[GcsBlob]:
         """List blob handles below one prefix."""
         ...
@@ -146,7 +164,7 @@ class GcsSnapshotBucket:
             uri: GCS archive root.
             project: Optional GCP project identifier.
             credentials_file: Optional service-account credential file.
-            timeout_seconds: Maximum wait for one GCS request.
+            timeout_seconds: Fallback budget for direct adapter operations.
             client: Injectable ``google.cloud.storage.Client`` for tests.
 
         Raises:
@@ -159,53 +177,67 @@ class GcsSnapshotBucket:
         self.project = project
         self.credentials_file = credentials_file
         self.timeout_seconds = timeout_seconds
-        if client is None:
-            try:
-                from google.cloud import storage
-            except ImportError as error:
-                raise RuntimeError(
-                    "GCS snapshots require the usagebassoon[gcs] extra"
-                ) from error
-            resolved_credentials = None
-            if credentials_file is not None:
+        with operation(timeout_seconds):
+            if client is None:
                 try:
-                    from google.auth.exceptions import GoogleAuthError
-                    from google.oauth2 import service_account
+                    from google.cloud import storage
                 except ImportError as error:
                     raise RuntimeError(
                         "GCS snapshots require the usagebassoon[gcs] extra"
                     ) from error
-                try:
-                    resolved_credentials = (
-                        service_account.Credentials.from_service_account_file(
-                            str(credentials_file)
+                resolved_credentials = None
+                if credentials_file is not None:
+                    try:
+                        from google.auth.exceptions import GoogleAuthError
+                        from google.oauth2 import service_account
+                    except ImportError as error:
+                        raise RuntimeError(
+                            "GCS snapshots require the usagebassoon[gcs] extra"
+                        ) from error
+                    try:
+                        resolved_credentials = (
+                            service_account.Credentials.from_service_account_file(
+                                str(credentials_file)
+                            )
                         )
+                    except (GoogleAuthError, OSError, ValueError) as error:
+                        raise RuntimeError(
+                            "GCS credentials file could not be loaded"
+                        ) from error
+                if resolved_credentials is None:
+                    from google.auth import default as default_credentials
+                    from google.auth.transport.requests import Request
+                    from requests import Session
+
+                    resolved_credentials, _ = default_credentials(
+                        scopes=[
+                            "https://www.googleapis.com/auth/devstorage.full_control"
+                        ],
+                        request=Request(session=cast(Session, http_session())),
                     )
-                except (GoogleAuthError, OSError, ValueError) as error:
-                    raise RuntimeError(
-                        "GCS credentials file could not be loaded"
-                    ) from error
-            try:
-                client_value = cast(
-                    GcsClient,
-                    storage.Client(
-                        project=project,
-                        credentials=resolved_credentials,
-                    ),
-                )
-            except Exception as error:
-                if error.__class__.__name__ in {
-                    "DefaultCredentialsError",
-                    "GoogleAuthError",
-                }:
-                    raise RuntimeError(
-                        "GCS authentication failed; configure ADC or credentials_file"
-                    ) from error
-                raise
-        else:
-            client_value = client
-        self.client = client_value
-        self.bucket = client_value.bucket(self.bucket_name)
+                try:
+                    client_value = cast(
+                        GcsClient,
+                        storage.Client(
+                            project=project,
+                            credentials=resolved_credentials,
+                            _http=http_session(resolved_credentials),
+                        ),
+                    )
+                except Exception as error:
+                    if error.__class__.__name__ in {
+                        "DefaultCredentialsError",
+                        "GoogleAuthError",
+                    }:
+                        raise RuntimeError(
+                            "GCS authentication failed; "
+                            "configure ADC or credentials_file"
+                        ) from error
+                    raise
+            else:
+                client_value = client
+            self.client = client_value
+            self.bucket = client_value.bucket(self.bucket_name)
 
     def key(self, relative_name: str) -> str:
         """Return an archive-root-relative name as a bucket object name."""
@@ -224,7 +256,9 @@ class GcsSnapshotBucket:
     def _object(self, blob: GcsBlob) -> SnapshotObject:
         """Materialize stable metadata from a loaded cloud blob."""
         if blob.generation is None or blob.size is None:
-            blob.reload(timeout=self.timeout_seconds)
+            blob.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            )
         if blob.generation is None or blob.size is None:
             raise RuntimeError(f"GCS did not return metadata for {blob.name!r}")
         return SnapshotObject(
@@ -245,18 +279,22 @@ class GcsSnapshotBucket:
             raise SnapshotPreconditionError("GCS object generation changed") from error
         raise error
 
+    @bounded
     def read_bytes(self, relative_name: str, *, version: SnapshotVersion) -> bytes:
         """Read one object at its exact published GCS generation."""
         generation = self._generation(version)
         blob = self.bucket.blob(self.key(relative_name), generation=generation)
         try:
             return blob.download_as_bytes(
-                if_generation_match=generation, timeout=self.timeout_seconds
+                if_generation_match=generation,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
         raise AssertionError("unreachable")
 
+    @bounded
     def write_bytes(
         self,
         relative_name: str,
@@ -272,40 +310,54 @@ class GcsSnapshotBucket:
                 payload,
                 content_type=content_type,
                 if_generation_match=if_generation_match,
-                timeout=self.timeout_seconds,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
-            blob.reload(timeout=self.timeout_seconds)
+            blob.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            )
         except Exception as error:
             self._raise_precondition(error)
         return self._object(blob)
 
+    @bounded
     def upload_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Upload a file with create-only generation fencing."""
         blob = self.bucket.blob(self.key(relative_name))
         try:
             blob.upload_from_filename(
-                str(path), if_generation_match=0, timeout=self.timeout_seconds
+                str(path),
+                if_generation_match=0,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
-            blob.reload(timeout=self.timeout_seconds)
+            blob.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            )
         except Exception as error:
             self._raise_precondition(error)
         return self._object(blob)
 
+    @bounded
     def download_file(self, relative_name: str, path: Path) -> SnapshotObject:
         """Resolve this location's generation and download that exact revision."""
         blob = self.bucket.blob(self.key(relative_name))
-        blob.reload(timeout=self.timeout_seconds)
+        blob.reload(
+            timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+        )
         ref = self._object(blob)
         try:
             blob.download_to_filename(
                 str(path),
                 if_generation_match=self._generation(ref.version),
-                timeout=self.timeout_seconds,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
         return ref
 
+    @bounded
     def read_json(
         self, relative_name: str
     ) -> tuple[dict[str, object] | None, SnapshotVersion | None]:
@@ -313,9 +365,13 @@ class GcsSnapshotBucket:
         blob = self.bucket.blob(self.key(relative_name))
         payload: object = None
         try:
-            if not blob.exists(timeout=self.timeout_seconds):
+            if not blob.exists(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            ):
                 return None, None
-            blob.reload(timeout=self.timeout_seconds)
+            blob.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            )
             reference = self._object(blob)
             payload = json.loads(
                 self.read_bytes(relative_name, version=reference.version)
@@ -328,6 +384,7 @@ class GcsSnapshotBucket:
             raise RuntimeError(f"GCS did not return generation for {relative_name!r}")
         return payload, int(blob.generation)
 
+    @bounded
     def write_json_cas(
         self,
         relative_name: str,
@@ -352,30 +409,39 @@ class GcsSnapshotBucket:
             raise ValueError("GCS object versions must be integer generations")
         return version
 
+    @bounded
     def list(self, relative_prefix: str) -> tuple[SnapshotObject, ...]:
         """List loaded object metadata under an archive-relative prefix."""
         prefix = self.key(relative_prefix)
         return tuple(
             self._object(blob)
             for blob in self.client.list_blobs(
-                self.bucket, prefix=prefix, timeout=self.timeout_seconds
+                self.bucket,
+                prefix=prefix,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
         )
 
+    @bounded
     def delete(self, relative_name: str, *, version: SnapshotVersion) -> None:
         """Delete exactly the published generation of an object."""
         try:
             self.bucket.blob(self.key(relative_name)).delete(
                 if_generation_match=self._generation(version),
-                timeout=self.timeout_seconds,
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)),
+                retry=None,
             )
         except Exception as error:
             self._raise_precondition(error, exact_generation=True)
 
+    @bounded
     def lifecycle_warnings(self) -> tuple[str, ...]:
         """Report lifecycle delete rules that could apply to this archive root."""
         try:
-            self.bucket.reload(timeout=self.timeout_seconds)
+            self.bucket.reload(
+                timeout=remaining_seconds(min(30.0, self.timeout_seconds)), retry=None
+            )
             rules = self.bucket.lifecycle_rules
         except Exception as error:
             _LOG.exception("could not inspect GCS lifecycle rules for %s", self.uri)

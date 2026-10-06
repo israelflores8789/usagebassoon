@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from usagebassoon.deadlines import remaining_seconds
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS, DATA_SCHEMA_VERSION
 
 FORMAT_VERSION = 1
@@ -74,8 +75,12 @@ def decode_manifest(document: dict[str, object]) -> dict[str, object]:
 
 def digest(path: Path) -> str:
     """Hash a file without materializing its contents."""
+    checksum = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        while chunk := stream.read(1024 * 1024):
+            remaining_seconds()
+            checksum.update(chunk)
+    return checksum.hexdigest()
 
 
 def validate_manifest(document: dict[str, object], identifier: str) -> None:

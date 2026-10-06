@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock, Thread
 from types import TracebackType
 from typing import Self, cast, override
 from unittest.mock import MagicMock
@@ -17,6 +19,7 @@ import pyarrow as pa
 import pytest
 import sqlglot
 from google.api_core.exceptions import BadRequest, NotFound
+from google.auth.credentials import AnonymousCredentials
 from google.auth.crypt import Signer
 from google.cloud import bigquery, bigquery_datatransfer, bigquery_storage_v1
 from google.cloud.bigquery.table import TableListItem
@@ -34,12 +37,135 @@ from usagebassoon.backends.bigquery import (
     _schema_from_arrow,
 )
 from usagebassoon.backends.bigquery_compaction import install_compaction
+from usagebassoon.deadlines import OperationTimeout, current_deadline, http_session
 from usagebassoon.diagnostics import REQUIRED_RELATIONS, run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
 from usagebassoon.persistence import persist_run
 from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 from usagebassoon.storage_model import note_id_for_session
+
+
+@pytest.mark.parametrize("boundary", ["submission", "upload", "cancellation"])
+def test_bigquery_stalled_transport_returns_and_next_operation_runs(
+    boundary: str,
+    collection_bundle: CollectionBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise real SDK requests stalled before submission or during cancellation."""
+    from requests import Session
+
+    release = Event()
+
+    class StalledHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            release.wait(2)
+            self.send_response(200)
+            self.end_headers()
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
+    server.daemon_threads = True
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    credentials = AnonymousCredentials()
+    session = cast(Session, http_session(credentials))
+    client = bigquery.Client(
+        project="usagebassoon-test",
+        credentials=credentials,
+        _http=session,
+        client_options={"api_endpoint": f"http://127.0.0.1:{server.server_port}"},
+    )
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_it",
+        client=client,
+        timeout_seconds=0.15,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(OperationTimeout):
+            if boundary == "submission":
+                backend.query("SELECT 1")
+            elif boundary == "upload":
+                backend.append(
+                    "daily_stats", normalize(collection_bundle).tables["daily_stats"]
+                )
+            else:
+                # Bound cancellation separately after job polling fails.
+                job = bigquery.QueryJob("stuck", "SELECT 1", client)
+                import usagebassoon.deadlines as deadlines
+
+                monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.15)
+                monkeypatch.setattr(
+                    job, "result", MagicMock(side_effect=FutureTimeoutError)
+                )
+                backend._wait_for_job(job)
+        assert time.monotonic() - started < 2
+        assert backend.is_retryable_error(OperationTimeout())
+        backend.client = cast(bigquery.Client, _BatchClient())
+        backend.append(
+            "daily_stats", normalize(collection_bundle).tables["daily_stats"]
+        )
+    finally:
+        release.set()
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_bigquery_parallel_loads_and_ledger_share_one_attempt_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Concurrent loads cannot each reset the budget or certify an expired attempt."""
+    import usagebassoon.deadlines as deadlines
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    backend = _backend()
+    backend.timeout_seconds = 10
+    bundle = normalize(collection_bundle)
+    tables = [
+        name
+        for name, data in bundle.tables.items()
+        if name != "collection_ledger" and data.num_rows
+    ]
+    barrier = Barrier(len(tables))
+    lock = Lock()
+    scopes: list[object] = []
+    observed: list[str] = []
+    expire = True
+
+    def append(table: str, _data: pa.Table) -> None:
+        if table != "collection_ledger":
+            barrier.wait(timeout=2)
+        deadline = current_deadline()
+        assert deadline is not None
+        with lock:
+            scopes.append(deadline)
+            observed.append(table)
+            if expire:
+                clock[0] = 11
+            deadline.remaining()
+
+    monkeypatch.setattr(backend, "append", append)
+    with pytest.raises(OperationTimeout):
+        persist_run(backend, bundle)
+    assert "collection_ledger" not in observed
+    assert len({id(scope) for scope in scopes}) == 1
+    first_scope = scopes[0]
+    expire = False
+    scopes.clear()
+    observed.clear()
+    persist_run(backend, bundle)
+    assert observed[-1] == "collection_ledger"
+    assert len({id(scope) for scope in scopes}) == 1
+    assert scopes[0] is not first_scope
 
 
 class _OfflineClient:
@@ -83,7 +209,7 @@ class _Job:
     ) -> list[dict[str, object]]:
         """Return the completed job's query result rows."""
         del retry, job_retry
-        assert timeout is not None and 0 < timeout <= 120.0
+        assert timeout is not None and 0 < timeout <= 180.0
         return self._rows
 
     def cancel(self) -> None:
@@ -105,13 +231,16 @@ class _TimeoutJob:
         self.cancelled = False
         self.expected_timeout = expected_timeout
 
-    def result(self, *, timeout: float | None = None) -> None:
+    def result(self, *, timeout: float | None = None, retry: object = None) -> None:
         """Raise the same timeout exposed by the BigQuery client."""
-        assert timeout == self.expected_timeout
+        del retry
+        assert timeout is not None and 0 < timeout <= min(120.0, self.expected_timeout)
         raise FutureTimeoutError
 
-    def cancel(self) -> None:
+    def cancel(self, *, timeout: float, retry: object) -> None:
         """Record the backend's best-effort cancellation."""
+        assert 0 < timeout <= 15
+        del retry
         self.cancelled = True
 
 
@@ -135,6 +264,7 @@ class _BatchClient:
         *,
         job_config: bigquery.LoadJobConfig,
         location: str,
+        **_transport: object,
     ) -> _Job:
         """Record one explicit-schema Parquet publication or restore load."""
         assert location == "US"
@@ -152,6 +282,7 @@ class _BatchClient:
         *,
         job_config: bigquery.QueryJobConfig,
         location: str,
+        **_transport: object,
     ) -> _Job:
         """Record maintenance queries without imposing collection DML semantics."""
         assert job_config.maximum_bytes_billed == 1_073_741_824
@@ -173,7 +304,7 @@ class _BatchClient:
         assert "`" not in table
         self.deleted.append(table)
 
-    def get_table(self, table_id: str) -> bigquery.Table:
+    def get_table(self, table_id: str, **_transport: object) -> bigquery.Table:
         """Return a table with required fields for direct-append testing."""
         return bigquery.Table(
             table_id,
@@ -200,6 +331,7 @@ class _TransactionClient:
         *,
         job_config: bigquery.QueryJobConfig,
         location: str,
+        **_transport: object,
     ) -> _Job:
         """Return one running transaction job for diagnostic assertions."""
         assert job_config.default_dataset is not None
@@ -313,13 +445,15 @@ class _StorageReadClient:
         parent: str,
         read_session: bigquery_storage_types.ReadSession,
         max_stream_count: int,
+        retry: object,
         timeout: float,
     ) -> bigquery_storage_types.ReadSession:
         """Return a session containing one stream."""
+        assert retry is None
         assert parent == "projects/usagebassoon-test"
         assert read_session.data_format == bigquery_storage_types.DataFormat.ARROW
         assert max_stream_count == 1
-        assert timeout == 120.0
+        assert 0 < timeout <= 30.0
         serialized_schema = pa.BufferOutputStream()
         with pa.ipc.new_stream(serialized_schema, self._table.schema):
             pass
@@ -334,10 +468,12 @@ class _StorageReadClient:
         self,
         name: str,
         *,
+        retry: object,
         timeout: float,
     ) -> list[bigquery_storage_types.ReadRowsResponse]:
         """Record a stream name and return one serialized Arrow response."""
-        assert timeout == 120.0
+        assert retry is None
+        assert 0 < timeout <= 30.0
         self.stream_names.append(name)
         return [
             bigquery_storage_types.ReadRowsResponse(
@@ -353,7 +489,7 @@ class _StorageReadClient:
 @pytest.mark.parametrize("timeout", [None, 45.0])
 def test_bigquery_job_timeout_cancels_and_is_retryable(timeout: float | None) -> None:
     """Honor default/custom waits, cancel stuck jobs, and report retryable failure."""
-    expected = 120.0 if timeout is None else timeout
+    expected = 180.0 if timeout is None else timeout
     job = _TimeoutJob(expected_timeout=expected)
     backend = (
         _backend()
@@ -365,9 +501,7 @@ def test_bigquery_job_timeout_cancels_and_is_retryable(timeout: float | None) ->
             client=cast(bigquery.Client, _OfflineClient()),
         )
     )
-    with pytest.raises(
-        RuntimeError, match=f"stuck-job exceeded {expected:g} seconds"
-    ) as failure:
+    with pytest.raises(RuntimeError, match="stuck-job wait timed out") as failure:
         backend._wait_for_job(cast(bigquery.job.QueryJob, job))
     assert job.cancelled
     assert backend.is_retryable_error(failure.value)
@@ -587,13 +721,13 @@ def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
     """Validate an initialized warehouse without schema or data queries."""
 
     class Client(_BatchClient):
-        def get_dataset(self, _: str) -> bigquery.Dataset:
+        def get_dataset(self, _: str, **_transport: object) -> bigquery.Dataset:
             dataset = bigquery.Dataset("usagebassoon-test.usagebassoon_emulated")
             dataset.location = "US"
             return dataset
 
         @override
-        def get_table(self, table_id: str) -> bigquery.Table:
+        def get_table(self, table_id: str, **_transport: object) -> bigquery.Table:
             table = super().get_table(table_id)
             table.labels = {
                 "usagebassoon_schema_version": str(SCHEMA_VERSION),
@@ -630,22 +764,24 @@ class _InitClient(_BatchClient):
         self.created: list[str] = []
         self.fail_views = True
 
-    def get_dataset(self, _: str) -> bigquery.Dataset:
+    def get_dataset(self, _: str, **_transport: object) -> bigquery.Dataset:
         dataset = bigquery.Dataset("usagebassoon-test.usagebassoon_emulated")
         dataset.location = "US"
         return dataset
 
-    def list_tables(self, _: str) -> list[bigquery.Table]:
+    def list_tables(self, _: str, **_transport: object) -> list[bigquery.Table]:
         return list(self.tables.values())
 
     @override
-    def get_table(self, table_id: str) -> bigquery.Table:
+    def get_table(self, table_id: str, **_transport: object) -> bigquery.Table:
         name = table_id.rsplit(".", 1)[-1]
         if name not in self.tables:
             raise NotFound("missing initialization object")
         return bigquery.Table.from_api_repr(self.tables[name].to_api_repr())
 
-    def update_table(self, table: bigquery.Table, _: list[str]) -> bigquery.Table:
+    def update_table(
+        self, table: bigquery.Table, _: list[str], **_transport: object
+    ) -> bigquery.Table:
         self.tables[table.table_id] = table
         return table
 
@@ -656,6 +792,7 @@ class _InitClient(_BatchClient):
         *,
         job_config: bigquery.QueryJobConfig,
         location: str,
+        **_transport: object,
     ) -> _Job:
         assert location == "US" and job_config.default_dataset is not None
         self.queries.append(sql)
@@ -772,7 +909,9 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
     class Client(_BatchClient):
         """Expose one destination table and reject the restore transaction."""
 
-        def list_tables(self, dataset: str) -> list[TableListItem]:
+        def list_tables(
+            self, dataset: str, **_transport: object
+        ) -> list[TableListItem]:
             """Return the initialized destination table for emptiness validation."""
             assert dataset == "usagebassoon-test.usagebassoon_emulated"
             return [
@@ -798,6 +937,7 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
             location: str,
             retry: object = None,
             timeout: float | None = None,
+            **_transport: object,
         ) -> _Job:
             """Raise the backend error after all restore assertions are assembled."""
             if sql.startswith("SELECT 1 FROM") and "restore_receipts" in sql:
@@ -814,7 +954,7 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
     )
     staged: list[str] = []
 
-    def create(table: bigquery.Table) -> bigquery.Table:
+    def create(table: bigquery.Table, **_transport: object) -> bigquery.Table:
         """Record ownership and expiry before a verified Parquet load."""
         assert table.labels["usagebassoon_kind"] == "restore_stage"
         assert table.expires is not None

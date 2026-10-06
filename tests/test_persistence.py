@@ -23,6 +23,70 @@ from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 
 
+def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
+    collection_bundle: CollectionBundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup and persistence share a budget; retry backoff consumes neither."""
+    import usagebassoon.deadlines as deadlines
+    from usagebassoon.config import BigQueryConfig
+
+    clock = [0.0]
+    monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
+    config = UsageBassoonConfig(
+        tmp_path / "config.toml",
+        collection_bundle.source_id,
+        "bigquery",
+        bigquery=BigQueryConfig(
+            "usagebassoon-test", "usagebassoon_it", timeout_seconds=10
+        ),
+        collection=CollectionConfig(max_retries=2, retry_initial_seconds=1),
+    )
+    bundle = normalize(collection_bundle)
+    scopes: list[deadlines.Deadline] = []
+    backend = DuckDBBackend(":memory:")
+    closed: list[None] = []
+    attempts = 0
+
+    def open_backend(_config: UsageBassoonConfig) -> DuckDBBackend:
+        nonlocal attempts
+        deadline = deadlines.current_deadline()
+        assert deadline is not None
+        scopes.append(deadline)
+        attempts += 1
+        clock[0] += 11 if attempts == 1 else 4
+        deadline.remaining()
+        return backend
+
+    def persist(_backend: object, current: NormalizedBundle) -> PersistSummary:
+        assert current is bundle
+        deadline = deadlines.current_deadline()
+        assert deadline is scopes[-1]
+        assert deadline.remaining() == 6
+        clock[0] += 7 if attempts == 2 else 2
+        deadline.remaining()
+        return PersistSummary(1, 0, {})
+
+    def backoff(_delay: float) -> None:
+        assert deadlines.current_deadline() is None
+        clock[0] += 100
+
+    monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
+    monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
+    monkeypatch.setattr("usagebassoon.persistence.time.sleep", backoff)
+    monkeypatch.setattr(backend, "close", lambda: closed.append(None))
+    try:
+        assert (
+            persist_with_retries(config, bundle, logging.getLogger("test")).inserted
+            == 1
+        )
+        assert attempts == 3 and len(closed) == 2
+        assert len({id(scope) for scope in scopes}) == 3
+    finally:
+        backend.connection.close()
+
+
 def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
     collection_bundle: CollectionBundle,
 ) -> None:

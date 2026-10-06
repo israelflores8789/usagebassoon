@@ -12,6 +12,7 @@ from base64 import b64encode
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
@@ -34,6 +35,13 @@ from usagebassoon.config import (
     _snapshots_config,
     default_snapshot_directory,
     parse_interval,
+)
+from usagebassoon.deadlines import (
+    RESTORE_SECONDS,
+    bounded,
+    cleanup_budget,
+    operation,
+    remaining_seconds,
 )
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
@@ -64,11 +72,14 @@ class SnapshotArchiver:
         *,
         destination_uris: Sequence[str] = (),
         max_snapshots: int = 3,
+        timeout_seconds: float = 600.0,
         interval: str | None = None,
         buckets: Sequence[SnapshotBucket] = (),
         bucket_factory: BucketFactory | None = None,
     ) -> None:
         """Configure destinations with optional protocol adapters or factories."""
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive and finite")
         if max_snapshots < 1:
             raise ValueError("max_snapshots must be positive")
         if uri is not None and destination_uris:
@@ -88,6 +99,7 @@ class SnapshotArchiver:
         self._bucket_factory = bucket_factory or SnapshotBucketRegistry().resolve
         self.uri = self._locations[0] if self._locations else ""
         self.max_snapshots = max_snapshots
+        self.timeout_seconds = timeout_seconds
         self.interval = parse_interval(interval)
         self._weekly: set[str] = set()
 
@@ -124,6 +136,7 @@ class SnapshotArchiver:
         result = cls(
             destination_uris=[d.uri for d in registry.destinations if d.enabled],
             max_snapshots=settings.max_snapshots,
+            timeout_seconds=settings.timeout_seconds,
             interval=settings.schedule.interval,
             bucket_factory=registry.resolve,
         )
@@ -214,6 +227,7 @@ class SnapshotArchiver:
             roles.append("weekly")
         return roles
 
+    @bounded
     def write(
         self,
         backend: StorageBackend,
@@ -222,7 +236,11 @@ class SnapshotArchiver:
         manual: bool = False,
         pin: bool = False,
     ) -> str | None:
-        """Capture once and publish due destinations under live reservations."""
+        """Bound capture, serialization, transfers and verified publication together.
+
+        The default is ten minutes. Failure cleanup shares at most fifteen
+        additional seconds. Local file work checks the budget between chunks.
+        """
         created = _now()
         if not self._locations:
             if not manual:
@@ -273,11 +291,13 @@ class SnapshotArchiver:
                     with backend.stream_snapshot(SNAPSHOT_TABLES) as stream:
                         captured_at = stream.captured_at.isoformat()
                         for table in SNAPSHOT_TABLES:
+                            remaining_seconds()
                             schema = CANONICAL_TABLE_SCHEMAS[table]
                             path = directory / f"{table}.parquet"
                             rows = 0
                             with pq.ParquetWriter(path, schema) as writer:
                                 for batch in stream.tables[table]:
+                                    remaining_seconds()
                                     batch = batch.cast(schema)
                                     writer.write_batch(batch)
                                     rows += batch.num_rows
@@ -357,6 +377,7 @@ class SnapshotArchiver:
                             SNAPSHOT_TABLES,
                             allow_staging=True,
                         )
+                        remaining_seconds()
                         catalog.publish(identifier, captured_at)
                     for catalog, _ in due:
                         catalog.record_outcome(identifier)
@@ -370,7 +391,8 @@ class SnapshotArchiver:
                             )
                     return f"{due[0][0].bucket.uri}/{identifier}"
                 except Exception as error:
-                    self._rollback(due, identifier, written, error=str(error))
+                    with cleanup_budget():
+                        self._rollback(due, identifier, written, error=str(error))
                     raise
 
         except ArchiveBusy:
@@ -416,8 +438,11 @@ class SnapshotArchiver:
         *,
         notice: Callable[[str], None] | None = None,
     ) -> dict[str, int]:
-        """Validate the selected archive then restore with all writers stopped."""
-        with self.reader.prepare(snapshot, warning=notice) as prepared:
+        """Restore with stopped writers under a separate ten-minute budget."""
+        with (
+            operation(RESTORE_SECONDS),
+            self.reader.prepare(snapshot, warning=notice) as prepared,
+        ):
             return restore_prepared(backend, prepared, notice=notice)
 
     def pin(self, selection: str) -> None:

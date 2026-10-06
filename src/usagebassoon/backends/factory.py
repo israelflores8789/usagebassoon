@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.deadlines import cleanup_budget, operation
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -31,7 +32,9 @@ def _motherduck_backend(config: UsageBassoonConfig) -> StorageBackend:
         raise ValueError("MotherDuck settings are missing")
     from usagebassoon.backends.motherduck import MotherDuckBackend
 
-    return MotherDuckBackend(config.motherduck.database)
+    return MotherDuckBackend(
+        config.motherduck.database, timeout_seconds=config.motherduck.timeout_seconds
+    )
 
 
 def _bigquery_backend(config: UsageBassoonConfig) -> StorageBackend:
@@ -81,14 +84,18 @@ class StorageBackendRegistry:
             raise ValueError(
                 f"unsupported storage backend provider: {config.backend!r}"
             )
-        backend = factory(config)
-        if not initialize:
-            try:
-                backend.preflight()
-            except BaseException:
-                close_backend(backend, context="failed backend preflight")
-                raise
-        return backend
+        backend: StorageBackend | None = None
+        try:
+            with operation(config.backend_timeout_seconds):
+                backend = factory(config)
+                if not initialize:
+                    backend.preflight()
+                return backend
+        except BaseException:
+            if backend is not None:
+                with cleanup_budget():
+                    close_backend(backend, context="failed backend preflight")
+            raise
 
 
 def open_backend(
