@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
@@ -53,19 +54,40 @@ def test_collect_reports_the_delegated_persistence_summary(
     )
 
 
+@pytest.mark.parametrize(
+    "override", [None, "STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"]
+)
 def test_collect_formats_configuration_errors_as_cli_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    override: str | None,
 ) -> None:
-    """Avoid exposing a traceback when the requested configuration is absent."""
+    """Report fatal configuration failures before starting collection."""
     missing = tmp_path / "missing.toml"
+    if override is not None:
+        _write_config(missing, tmp_path / "usagebassoon.duckdb")
+        with missing.open("a") as stream:
+            stream.write(
+                '[snapshots.gcs]\nenable = true\nuri = "gs://bucket/archive"\n'
+                'project = "usagebassoon-test"\n'
+            )
+        for variable in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+            monkeypatch.delenv(variable, raising=False)
+        monkeypatch.setenv(override, "http://localhost:4443")
+    collect = MagicMock()
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect)
     monkeypatch.setenv("FORCE_COLOR", "1")
     monkeypatch.setenv("TERM", "xterm-256color")
 
     result = CliRunner().invoke(app, ["collect", "--config", str(missing)])
 
-    assert result.exit_code != 0
-    assert "--config" in plain_cli_output(result.output)
+    assert result.exit_code == 2
+    output = plain_cli_output(result.output)
+    assert "--config" in output
+    if override is not None:
+        assert f"{override} must be unset" in output
+        assert "http://localhost:4443" not in output
+    collect.assert_not_called()
 
 
 def test_collect_reports_local_collection_contention(

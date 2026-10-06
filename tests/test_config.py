@@ -516,6 +516,41 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     assert config.snapshots.max_snapshots == 5
 
 
+@pytest.mark.parametrize("name", ["STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"])
+@pytest.mark.parametrize(
+    "endpoint", ["http://localhost:4443", "https://example.invalid", ""]
+)
+def test_gcs_endpoint_overrides_fail_configuration_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    endpoint: str,
+) -> None:
+    """Reject endpoint overrides for enabled GCS without exposing their values."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        '[snapshots.gcs]\nenable = true\nuri = "gs://bucket/archive"\n'
+        'project = "usagebassoon-test"\n'
+    )
+    for variable in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(name, endpoint)
+
+    with pytest.raises(ConfigurationError, match=f"{name} must be unset") as captured:
+        ConfigurationManager(path).load()
+    log_content = (default_log_directory() / "usagebassoon.log").read_text()
+    assert f"{name} must be unset" in log_content
+    if endpoint:
+        assert endpoint not in str(captured.value)
+        assert endpoint not in log_content
+
+    path.write_text(path.read_text().replace("enable = true", "enable = false"))
+    configuration = ConfigurationManager(path).load()
+    assert configuration.snapshots.gcs is not None
+    assert not configuration.snapshots.gcs.enable
+
+
 def test_namespaced_configuration_defaults(tmp_path: Path) -> None:
     """Keep automatic archives opt-in and retain the twelve-hour cadence."""
     path = tmp_path / "config.toml"

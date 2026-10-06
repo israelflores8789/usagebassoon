@@ -30,13 +30,17 @@ dependencies = [
 [project.optional-dependencies]
 polars = ["polars>=1.0"]
 bigquery = [
+    "oauthlib>=4.0.0",
+    "urllib3>=2.8.0",
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-datatransfer>=3.15",
     "google-cloud-bigquery-storage>=2.24",
     "pandas-gbq>=0.35.2",
 ]
-gcs = ["google-cloud-storage>=3.0"]
+gcs = ["google-cloud-storage>=3.0", "urllib3>=2.8.0"]
 full = [
+    "oauthlib>=4.0.0",
+    "urllib3>=2.8.0",
     "polars>=1.0",
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-datatransfer>=3.15",
@@ -51,6 +55,8 @@ usagebassoon = "usagebassoon.cli:app"
 
 [dependency-groups]
 dev = [
+    "oauthlib>=4.0.0",
+    "urllib3>=2.8.0",
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-datatransfer>=3.15",
     "google-cloud-bigquery-storage>=2.24",

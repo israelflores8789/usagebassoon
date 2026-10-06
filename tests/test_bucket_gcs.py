@@ -25,6 +25,7 @@ from usagebassoon.buckets.base import SnapshotObject as GcsObject
 from usagebassoon.buckets.base import SnapshotPreconditionError as GcsPreconditionError
 from usagebassoon.buckets.gcs import GcsBlob, GcsBucket, GcsClient
 from usagebassoon.buckets.gcs import GcsSnapshotBucket as GcsArchive
+from usagebassoon.config import ConfigurationError
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
 
@@ -244,6 +245,63 @@ def test_gcs_archive_rejects_unsafe_names_before_provider_calls(
 
     assert client.recording_bucket.blob_calls == 0
     assert client.list_calls == 0
+
+
+@pytest.mark.parametrize("name", ["STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"])
+def test_gcs_endpoint_overrides_fail_before_credentials_or_client_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """Guard direct library use while preserving explicitly injected clients."""
+    from google.cloud import storage
+    from google.oauth2 import service_account
+
+    for variable in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(name, "http://localhost:4443")
+    sdk_client = MagicMock()
+    credentials = MagicMock()
+    monkeypatch.setattr(storage, "Client", sdk_client)
+    monkeypatch.setattr(
+        service_account.Credentials, "from_service_account_file", credentials
+    )
+
+    with pytest.raises(ConfigurationError, match=f"{name} must be unset"):
+        GcsArchive(
+            "gs://bucket/archive", credentials_file=tmp_path / "credentials.json"
+        )
+    sdk_client.assert_not_called()
+    credentials.assert_not_called()
+
+    client = MagicMock(spec=GcsClient)
+    archive = GcsArchive("gs://bucket/archive", client=cast(GcsClient, client))
+    assert archive.client is client
+    client.bucket.assert_called_once_with("bucket")
+
+
+def test_gcs_default_client_retains_production_https_and_certificate_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspect the real SDK defaults with credentials that make no network calls."""
+    import google.auth
+    from google.auth.credentials import AnonymousCredentials
+    from google.cloud import storage
+
+    for variable in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(
+        google.auth, "default", MagicMock(return_value=(AnonymousCredentials(), "test"))
+    )
+
+    archive = GcsArchive("gs://bucket/archive", project="usagebassoon-test")
+    client = cast(storage.Client, archive.client)
+    try:
+        assert client._connection is not None
+        assert client._connection.API_BASE_URL == "https://storage.googleapis.com"
+        assert client._http.verify is True
+    finally:
+        client.close()
 
 
 def test_gcs_archive_uses_configured_request_timeout() -> None:

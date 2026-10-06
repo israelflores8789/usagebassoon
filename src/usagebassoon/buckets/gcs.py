@@ -169,6 +169,8 @@ class GcsSnapshotBucket:
 
         Raises:
             RuntimeError: If the optional GCS dependency is unavailable.
+            ConfigurationError: If ambient endpoint overrides are set without
+                an explicitly injected client.
         """
         self.uri = uri.rstrip("/")
         self.bucket_name, self.prefix = parse_gcs_uri(self.uri)
@@ -179,6 +181,9 @@ class GcsSnapshotBucket:
         self.timeout_seconds = timeout_seconds
         with operation(timeout_seconds):
             if client is None:
+                from usagebassoon.config import validate_gcs_environment
+
+                validate_gcs_environment()
                 try:
                     from google.cloud import storage
                 except ImportError as error:

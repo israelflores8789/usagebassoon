@@ -749,12 +749,28 @@ def _storage_config(
     return None, None, bigquery
 
 
+def validate_gcs_environment() -> None:
+    """Reject ambient endpoint overrides before GCS authentication or requests.
+
+    Raises:
+        ConfigurationError: If an emulator or custom storage endpoint is set.
+    """
+    for name in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        if name in os.environ:
+            raise ConfigurationError(
+                f"{name} must be unset when using GCS snapshots; "
+                "emulator and custom endpoints are not supported"
+            )
+
+
 def _gcs_config(value: object | None) -> GcsConfig | None:
     """Parse optional Google Cloud Storage snapshot settings."""
     if value is None:
         return None
     table = _table(value, "snapshots.gcs", _GCS_CONFIG_KEYS)
     enable = _boolean(table.get("enable", False), "snapshots.gcs.enable")
+    if enable:
+        validate_gcs_environment()
     uri = _string(table.get("uri"), "snapshots.gcs.uri", required=enable)
     project = _string(table.get("project"), "snapshots.gcs.project", required=enable)
     credentials_file = _string(
