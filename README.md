@@ -54,14 +54,34 @@ Get started with `bassoon --help` or import the Python API with `import usagebas
 
 🚀 UsageBassoon requires Python 3.12 or newer and a working [`tokscale`](https://github.com/junhoyeo/tokscale) installation.
 
+For the `bassoon` CLI, we recommend `pipx`. It keeps UsageBassoon's dependencies in their own Python environment and makes `bassoon` available in your terminal without having to manually activate that environment.
+
 ```bash
 pipx install "usagebassoon"            # minimal install
 
-pipx install "usagebassoon[backend.bigquery]"  # use with BigQuery
+pipx install "usagebassoon[bigquery]"  # use with BigQuery
 pipx install "usagebassoon[gcs]"       # use with Google Cloud Storage
 pipx install "usagebassoon[polars]"    # use polars dataframes
 pipx install "usagebassoon[full]"      # full installation
+```
 
+Want to use `import usagebassoon` in your own Python code or notebook? Install it with `pip` in that project's virtual environment or notebook environment instead. The same optional extras work here too.
+
+```bash
+python -m pip install "usagebassoon"        # minimal install
+python -m pip install "usagebassoon[full]"  # full installation
+```
+
+You can also download the `.whl` file attached to a [GitHub Release](https://github.com/israelflores8789/usagebassoon/releases) and install it directly. Replace `<version>` below with the downloaded wheel's version and run the command from its directory.
+
+```bash
+pipx install "./usagebassoon-<version>-py3-none-any.whl"          # CLI installation
+python -m pip install "./usagebassoon-<version>-py3-none-any.whl" # Python library installation
+```
+
+If you're working from a repository checkout, run this from its root:
+
+```bash
 uv tool install ".[full]"              # install from a checkout
 ```
 
@@ -71,7 +91,7 @@ Then, initialize UsageBassoon.
 bassoon init
 ```
 
-This creates a configuration file at the [platform-specific default path](#configtoml) when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB storage backend by default. Init is safe to repeat. Ordinary commands require an initialized backend and perform a schema preflight. Newer or incompatible schemas fail with an explicit error.
+This creates a configuration file at the [platform-specific default path](#configtoml) when absent, generates a stable `source_id` that is unique to your environment, and initializes a local DuckDB storage backend by default. `init` is safe to repeat. Ordinary commands require an initialized backend and perform a schema preflight. Newer or incompatible schemas fail with an explicit error.
 
 > [!TIP]
 > Use `bassoon init` when setting up new environments with an existing `config.toml` as well, especially if using a remote backend. It's idempotent and performs important setup including creating the configured schema, setting `source_id`, and does *not* overwrite your existing configuration file.

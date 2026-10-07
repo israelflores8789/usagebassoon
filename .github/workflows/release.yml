@@ -25,6 +25,8 @@ jobs:
     name: Verify CI for tagged commit
     runs-on: ubuntu-26.04
     timeout-minutes: 5
+    # Require approval before any release job executes.
+    environment: release-approval
     steps:
     - name: Require a successful CI run for this commit
       env:
