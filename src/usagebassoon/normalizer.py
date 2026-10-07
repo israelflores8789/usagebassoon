@@ -126,7 +126,7 @@ def _price_version_rows(
     *,
     freshness_at: datetime,
 ) -> ColumnarData:
-    """Build point-in-time rates associated with each processed usage day."""
+    """Build rates associated with their actual UTC observation day."""
     records: list[dict[str, object]] = []
     for day in sorted(pricing_by_day):
         for model in sorted(pricing_by_day[day]):
@@ -146,8 +146,6 @@ def _price_version_rows(
                     ),
                     "price_cache_write_per_token": (
                         pricing.pricing.cache_write_input_token_cost
-                        if pricing.pricing.cache_write_input_token_cost is not None
-                        else 0.0
                     ),
                     "collected_at": freshness_at,
                 }

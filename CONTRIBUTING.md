@@ -74,8 +74,8 @@ usagebassoon/
 │   ├── backends/           # StorageBackend protocol + data warehouse adapters
 │   ├── buckets/            # SnapshotBucket protocol + object storage adapters
 │   ├── sql/                # Dialect-specific DDL, views, and BigQuery compaction script
-│   │   ├── duckdb/         # ddl.sql, views.sql (also serves MotherDuck)
-│   │   └── bigquery/       # ddl.sql, views.sql, compaction.sql
+│   │   ├── duckdb/         # ddl.sql, views.sql, queries.sql (also serves MotherDuck)
+│   │   └── bigquery/       # ddl.sql, views.sql, queries.sql, compaction.sql
 │   ├── collector.py        # tokscale subprocess management
 │   ├── orchestrator.py     # Top-level data shuttler
 │   ├── ingest.py           # Contract validation and parsing coordinator
@@ -110,6 +110,8 @@ usagebassoon/
 
 Keep changes within these boundaries. New collection behavior should preserve the separation between acquisition, ingest validation/parsing, normalization, persistence, and archival. New persistence behavior should use the `StorageBackend` abstraction and canonical Arrow tables. New snapshot storage providers should implement `SnapshotBucket`. CLI commands should consume dialect-specific views and *never* embed non-portable SQL.
 
+Substantial read queries belong in each dialect's `queries.sql`, separated by standalone `-- name: <identifier>` markers and loaded with `schema_assets.query_sql(backend.dialect, name)`. Report helpers supply only trusted `{where}`, `{ordering}`, and `{limit}` fragments; filter values remain bound parameters. Apply filters before aggregation and calculate ratios from the filtered totals. Views define canonical data and shared metric semantics; query templates consume those views and are not installed schema objects or part of the schema hash. Keep query names, supported fragments, and results paired across dialects with the SQL parity and native live tests.
+
 ## Canonical data flow
 
 Presently, four **canonical `tokscale` commands** supply the collection pipeline:
@@ -133,7 +135,7 @@ Presently, four **canonical `tokscale` commands** supply the collection pipeline
 - constructs `IngestEvidence` from those acquisition outcomes, and
 - returns a validated `CollectionBundle`.
 
-Required `graph` and `models` payloads must be valid for collection to proceed. Token usage is prioritized, so `report` and `pricing` failures are conditionally tolerated when doing so preserves otherwise valid token facts.
+The required `graph` payload must be valid for collection to proceed. The required `model` payload is validated independently by day, retaining the successfully collected days, and publishing one batch with explicit incomplete statuses for failed or unsafe days. Later collections retry unfinished `models` targets, even if absent from subsequent `graph` payloads. `report` and `pricing` failures are conditionally tolerated to preserve valid token facts.
 
 ```mermaid
 flowchart TD

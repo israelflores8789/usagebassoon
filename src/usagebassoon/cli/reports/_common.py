@@ -185,7 +185,7 @@ def report_where(
     since: date | None = None,
     until: date | None = None,
     alias: str = "facts",
-    date_column: Literal["day", "last_active", "created_at"] = "day",
+    date_column: Literal["day", "last_active", "created_at", "activity_day"] = "day",
 ) -> tuple[str, dict[str, str]]:
     """Build dialect-neutral report predicates and bound string parameters.
 
@@ -276,11 +276,11 @@ def load_daily_usage(
         "SUM(facts.perf_duration_ms) AS perf_duration_ms, "
         "COUNT(facts.perf_duration_ms) AS measured_fact_count, "
         "COUNT(*) AS total_fact_count, "
-        "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
-        "THEN 'calculated' ELSE 'tokscale' END AS cost_basis, "
+        "CASE WHEN COUNT(DISTINCT facts.cost_basis) = 1 "
+        "THEN MAX(facts.cost_basis) ELSE 'mixed' END AS cost_basis, "
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
         "THEN SUM(facts.cost_usd) "
-        "ELSE SUM(facts.tokscale_cost_usd) END AS cost_usd "
+        "ELSE NULL END AS cost_usd "
         "FROM report_daily_usage AS facts"
         f"{where} "
         "GROUP BY facts.day "
@@ -315,7 +315,7 @@ def load_session_usage(
     Returns:
         Aggregated session report records.
     """
-    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "last_active"
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "activity_day"
     where, parameters = report_where(
         filters, since=since, until=until, date_column=timestamp
     )
@@ -333,8 +333,11 @@ def load_session_usage(
         "facts.perf_duration_ms AS perf_duration_ms, "
         "facts.perf_timed_duration_ms AS perf_timed_duration_ms, "
         "facts.perf_timed_tokens AS perf_timed_tokens, "
-        "COALESCE(facts.cost_usd, facts.tokscale_cost_usd) AS cost_usd, "
+        "facts.cost_usd AS cost_usd, "
         "facts.last_active AS last_active, "
+        "facts.activity_day AS activity_day, "
+        "facts.last_usage_day AS last_usage_day, "
+        "facts.last_active_stale AS last_active_stale, "
         "facts.created_at AS created_at "
         "FROM report_session_models AS facts"
         f"{where} "
@@ -354,14 +357,23 @@ def load_session_usage(
         "SUM(facts.perf_timed_tokens) AS perf_timed_tokens, "
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
         "THEN SUM(facts.cost_usd) "
-        "ELSE SUM(facts.tokscale_cost_usd) END AS cost_usd, "
+        "ELSE NULL END AS cost_usd, "
         "MAX(facts.last_active) AS last_active, "
+        "MAX(facts.activity_day) AS activity_day, "
+        "MAX(facts.last_usage_day) AS last_usage_day, "
+        "MAX(CASE WHEN facts.last_active_stale THEN 1 ELSE 0 END) "
+        "AS last_active_stale, "
         "MAX(facts.created_at) AS created_at "
         "FROM report_session_models AS facts"
         f"{where} "
         "GROUP BY facts.source_id, facts.client, facts.session_id "
     )
     select = model_select if by_model else session_select
+    ordering = (
+        "activity_day DESC NULLS LAST"
+        if sort == SessionSort.LAST_ACTIVE
+        else f"{sort.column} DESC NULLS LAST"
+    )
     sql = (
         "SELECT usage.*, "
         "CASE WHEN usage.perf_timed_tokens > 0 "
@@ -372,12 +384,15 @@ def load_session_usage(
         "END AS cost_per_million "
         "FROM (SELECT facts.source_id, facts.client, facts.session_id, "
         f"{select}) AS usage "
-        f"ORDER BY {sort.column} DESC NULLS LAST, "
+        f"ORDER BY {ordering}, "
         "last_active DESC NULLS LAST, source_id, client, session_id, model"
         f"{limit_sql}"
     )
     result = backend.query(sql, parameters)
-    return [dict(record) for record in result.to_pylist()]
+    records = [dict(record) for record in result.to_pylist()]
+    for record in records:
+        record["last_active_stale"] = bool(record["last_active_stale"])
+    return records
 
 
 def load_model_usage(
@@ -406,7 +421,7 @@ def load_model_usage(
         "AND facts.perf_timed_tokens > 0 "
         "THEN facts.perf_timed_tokens END) AS perf_timed_tokens, "
         "CASE WHEN COUNT(facts.cost_usd) = COUNT(*) "
-        "THEN SUM(facts.cost_usd) ELSE SUM(facts.tokscale_cost_usd) "
+        "THEN SUM(facts.cost_usd) ELSE NULL "
         "END AS cost_usd "
         "FROM report_models AS facts"
         f"{where} "
@@ -527,14 +542,18 @@ def sample_session_usage(
         _session_record(source_id, client, session_id, facts)
         for (source_id, client, session_id, _), facts in grouped.items()
     ]
-    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "last_active"
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "activity_day"
     if since is not None or until is not None:
         bounded: list[ReportRecord] = []
         for record in records:
             value = record[timestamp]
             if value is None:
                 continue
-            day = _as_datetime(value).date()
+            day = (
+                _as_datetime(value).date()
+                if timestamp == "created_at"
+                else _as_date(value)
+            )
             if (since is None or day >= since) and (until is None or day <= until):
                 bounded.append(record)
         records = bounded
@@ -542,7 +561,11 @@ def sample_session_usage(
     def sort_key(record: ReportRecord) -> tuple[float, float, str, str, str, str]:
         """Match descending SQL metrics and ascending identity tie-breakers."""
         return (
-            -_session_sort_value(record, sort),
+            (
+                -float(_as_date(record["activity_day"]).toordinal())
+                if sort == SessionSort.LAST_ACTIVE
+                else -_session_sort_value(record, sort)
+            ),
             -_session_sort_value(record, SessionSort.LAST_ACTIVE),
             str(record["source_id"]),
             str(record["client"]),
@@ -848,6 +871,8 @@ def _session_record(
 ) -> ReportRecord:
     """Aggregate sample facts into one session or session/model report record."""
     creation_times = [fact.created_at for fact in facts if fact.created_at is not None]
+    last_active = max(fact.last_active for fact in facts)
+    last_usage_day = max(fact.day for fact in facts)
     record = _usage_record(
         {
             "source_id": source_id,
@@ -855,7 +880,10 @@ def _session_record(
             "session_id": session_id,
             "model": ", ".join(sorted({fact.model for fact in facts})),
             "created_at": min(creation_times) if creation_times else None,
-            "last_active": max(fact.last_active for fact in facts),
+            "last_active": last_active,
+            "last_usage_day": last_usage_day,
+            "activity_day": max(last_usage_day, last_active.date()),
+            "last_active_stale": last_usage_day > last_active.date(),
         },
         facts,
     )

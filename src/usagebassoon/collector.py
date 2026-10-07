@@ -15,7 +15,7 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 from usagebassoon.config import TOKSCALE_CLEANUP_TIMEOUT_SECONDS, UsageBassoonConfig
@@ -349,25 +349,33 @@ def _fetch_daily_models(
     config: UsageBassoonConfig,
     prefix: Sequence[str],
     days: Sequence[date],
+    *,
+    failures: dict[date, str] | None = None,
 ) -> dict[date, JsonObject]:
-    """Fetch every required daily models payload or raise on the first failure."""
+    """Fetch daily models, retaining successful days when failures are tracked."""
     payloads: dict[date, JsonObject] = {}
     for day in days:
-        payloads[day] = _object(
-            _json_command(
-                config,
-                prefix,
-                "models",
-                "--json",
-                "--group-by",
-                "client,session,model",
-                "--since",
-                day.isoformat(),
-                "--until",
-                day.isoformat(),
-            ),
-            f"models --since {day.isoformat()} --until {day.isoformat()}",
-        )
+        try:
+            payloads[day] = _object(
+                _json_command(
+                    config,
+                    prefix,
+                    "models",
+                    "--json",
+                    "--group-by",
+                    "client,session,model",
+                    "--since",
+                    day.isoformat(),
+                    "--until",
+                    day.isoformat(),
+                ),
+                f"models --since {day.isoformat()} --until {day.isoformat()}",
+            )
+        except (OSError, RuntimeError, ValueError):
+            if failures is None:
+                raise
+            failures[day] = "fetch"
+            _LOG.exception("daily models collection failed for %s", day)
     return payloads
 
 
@@ -376,16 +384,23 @@ def _fetch_pricing(
     prefix: Sequence[str],
     models_by_day: dict[date, set[str]],
     logger: logging.Logger,
+    *,
+    existing: Mapping[date, set[str]] | None = None,
 ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
     """Fetch optional model prices while retaining successful per-model results."""
     pricing_by_day: dict[date, dict[str, JsonObject]] = {}
     failures: dict[date, frozenset[str]] = {}
-    for day, models in sorted(models_by_day.items()):
-        prices: dict[str, JsonObject] = {}
-        failed_models: set[str] = set()
+    attempted: set[tuple[date, str]] = set()
+    for _day, models in sorted(models_by_day.items()):
         for model in sorted(models):
+            day = datetime.now(UTC).date()
+            if (day, model) in attempted or (
+                existing is not None and model in existing.get(day, set())
+            ):
+                continue
+            attempted.add((day, model))
             try:
-                prices[model] = _object(
+                price = _object(
                     _json_command(
                         config,
                         prefix,
@@ -396,13 +411,14 @@ def _fetch_pricing(
                     f"pricing {model}",
                 )
             except Exception:
-                failed_models.add(model)
+                failures[day] = failures.get(day, frozenset()) | {model}
                 logger.exception(
                     "pricing collection failed for %s on %s", day.isoformat(), model
                 )
-        pricing_by_day[day] = prices
-        if failed_models:
-            failures[day] = frozenset(failed_models)
+            else:
+                observed_day = datetime.now(UTC).date()
+                pricing_by_day.setdefault(observed_day, {})[model] = price
+                attempted.add((observed_day, model))
     return pricing_by_day, failures
 
 
@@ -412,12 +428,21 @@ def _fetch_reports(
     days: Sequence[date],
     *,
     logger: logging.Logger | None = None,
+    all_history: bool = False,
 ) -> tuple[dict[date, JsonArray], frozenset[date]]:
-    """Fetch optional daily report payloads while preserving valid empty arrays."""
+    """Discover metadata once or fetch grouped creation days with timezone margins."""
     reports: dict[date, JsonArray] = {}
     failures: set[date] = set()
     active_logger = logger or _LOG
-    for day in days:
+    groups: list[list[date]] = []
+    for day in (date.min,) if all_history else sorted(set(days)):
+        if groups and day.toordinal() <= groups[-1][-1].toordinal() + 1:
+            groups[-1].append(day)
+        else:
+            groups.append([day])
+    for group in groups:
+        start = group[0] - timedelta(days=1) if group[0] > date.min else date.min
+        end = group[-1] + timedelta(days=1) if group[-1] < date.max else date.max
         try:
             report = _array(
                 _json_command(
@@ -426,16 +451,19 @@ def _fetch_reports(
                     "report",
                     "--json",
                     "--no-summarize",
-                    "--since",
-                    day.isoformat(),
-                    "--until",
-                    day.isoformat(),
+                    *(
+                        ()
+                        if all_history
+                        else ("--since", start.isoformat(), "--until", end.isoformat())
+                    ),
                 ),
-                f"report --since {day.isoformat()} --until {day.isoformat()}",
+                "report" if all_history else f"report --since {start} --until {end}",
             )
         except Exception:
-            failures.add(day)
-            active_logger.exception("session report collection failed for %s", day)
+            failures.update(group)
+            active_logger.exception(
+                "session report collection failed for %s through %s", start, end
+            )
         else:
-            reports[day] = report
+            reports.update({day: report for day in group})
     return reports, frozenset(failures)

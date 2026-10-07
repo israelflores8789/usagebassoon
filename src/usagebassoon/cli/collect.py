@@ -96,6 +96,12 @@ def _run_collection(
         typer.echo(f"Collection failed: {error}", err=True)
         raise typer.Exit(code=1) from error
     except (ConfigurationError, OSError, RuntimeError, ValueError) as error:
+        if isinstance(error, (OSError, RuntimeError)):
+            typer.echo(
+                "Warning: collection did not complete. Resolve the reported failure "
+                "and run bassoon collect again to retry missing data.",
+                err=True,
+            )
         hint = (
             "--since/--until"
             if refresh and isinstance(error, ValueError)
@@ -116,3 +122,10 @@ def _run_collection(
             f"Collected run {run_id}: {summary.inserted} inserted, "
             f"{summary.updated} updated."
         )
+        if summary.incomplete_targets:
+            typer.echo(
+                "Warning: collection is incomplete; failed targets were recorded "
+                "for retry. Run bassoon collect again to retry missing data. "
+                "See bassoon doctor and the operational log for details.",
+                err=True,
+            )

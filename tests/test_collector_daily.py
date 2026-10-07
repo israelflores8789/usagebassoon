@@ -33,7 +33,12 @@ from usagebassoon.collection_lock import collection_lock
 from usagebassoon.collector import RawCollection
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
-from usagebassoon.ingest import CollectionBundle, IngestStatus, IngestTarget
+from usagebassoon.ingest import (
+    CollectionBundle,
+    IngestStatus,
+    IngestTarget,
+    ReportInventory,
+)
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 from usagebassoon.normalizer import NormalizedBundle
@@ -369,6 +374,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     graph_raw: JsonObject,
     report_raws: dict[date, JsonArray],
     daily_raws: dict[date, JsonObject],
+    collection_bundle: CollectionBundle,
 ) -> None:
     """Use graph dates, skip completed history, and refresh the current day."""
     days = tuple(sorted(daily_raws))
@@ -386,6 +392,8 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         """Supply graph and report payloads while fetch helpers handle daily calls."""
         if arguments == ("graph",):
             return graph_raw
+        if arguments == ("report", "--json", "--no-summarize"):
+            return [row for rows in report_raws.values() for row in rows]
         if (
             len(arguments) == 7
             and arguments[:4] == ("report", "--json", "--no-summarize", "--since")
@@ -399,6 +407,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _configuration: UsageBassoonConfig,
         _prefix: object,
         selected_days: tuple[date, ...],
+        **_kwargs: object,
     ) -> dict[date, JsonObject]:
         """Return all selected mandatory daily facts."""
         requested_models.append(selected_days)
@@ -409,15 +418,16 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _prefix: object,
         models_by_day: dict[date, set[str]],
         _logger: logging.Logger,
+        **_kwargs: object,
     ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
         """Record model-day pricing requests and complete the successful targets."""
         requested_prices.append(models_by_day)
         return ({day: {} for day in models_by_day}, {})
 
-    def build(raw: RawCollection, **_kwargs: object) -> object:
+    def build(raw: RawCollection, **_kwargs: object) -> CollectionBundle:
         """Capture the raw bundle before normalization and persistence."""
         captured.append(raw)
-        return object()
+        return replace(collection_bundle, ingest_status=())
 
     def prefix(_configuration: UsageBassoonConfig) -> list[str]:
         """Return a deterministic tokscale executable for this unit test."""
@@ -431,6 +441,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         dict[date, set[str]],
         frozenset[tuple[str, str]],
         tuple[SchemaDriftState, ...],
+        ReportInventory,
     ]:
         """Return one completed historical day and one refreshable current day."""
         return (
@@ -452,6 +463,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
             {},
             frozenset(),
             (),
+            ReportInventory(),
         )
 
     def normalized(_bundle: CollectionBundle) -> NormalizedBundle:
@@ -462,6 +474,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         _configuration: UsageBassoonConfig,
         _bundle: NormalizedBundle,
         _logger: logging.Logger,
+        **_kwargs: object,
     ) -> PersistSummary:
         """Return the persistence outcome used for collection assertions."""
         return PersistSummary(0, 0, {})
@@ -482,18 +495,18 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     expected_successes = set(days) - {completed_day}
     assert summary == PersistSummary(0, 0, {})
     assert requested_models == [tuple(day for day in days if day != completed_day)]
-    assert set(requested_prices[0]) == expected_successes
+    assert set(requested_prices[0]) == {current_day}
     assert captured[0].graph is graph_raw
     assert set(captured[0].daily_models) == expected_successes
-    assert set(captured[0].report_by_day) == set(report_raws)
+    assert set(captured[0].report_by_day) == {date.min}
 
 
-def test_daily_models_failure_aborts_collection(
+def test_daily_models_failure_records_incomplete_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     graph_raw: JsonObject,
 ) -> None:
-    """Treat a required daily models failure as a failed collection run."""
+    """Persist failed daily targets so subsequent collections can retry them."""
     configuration = _config(tmp_path / "config.toml")
     assert configuration.local_database is not None
     backend = DuckDBBackend(configuration.local_database)
@@ -516,17 +529,16 @@ def test_daily_models_failure_aborts_collection(
     monkeypatch.setattr(collector, "_json_command", command)
     monkeypatch.setattr(subprocess_collector, "_json_command", command)
 
-    with pytest.raises(OSError, match="tokscale executable unavailable"):
-        collector.collect(configuration)
-    assert len(calls) == 2
+    _, summary = collector.collect(configuration)
+    assert summary.incomplete_targets
     assert calls[0] == ("graph",)
     assert calls[1][0] == "models"
     backend = DuckDBBackend(configuration.local_database)
     try:
         rows = backend.query("SELECT * FROM collection_runs").to_pylist()
         assert len(rows) == 1
-        assert rows[0]["status"] == "failed"
-        assert rows[0]["failure_code"] == "OSError"
+        assert rows[0]["status"] == "partial"
+        assert rows[0]["failure_code"] is None
         assert rows[0]["source_id"] == configuration.source_id
         assert backend.query("SELECT * FROM daily_stats").num_rows == 0
     finally:
@@ -664,6 +676,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         _config: UsageBassoonConfig,
         _prefix: object,
         days: tuple[date, ...],
+        **_kwargs: object,
     ) -> dict[date, JsonObject]:
         """Expose changed session facts, or fail before publishing a refresh."""
         requests.append(days)
@@ -691,6 +704,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         _prefix: object,
         requests: dict[date, set[str]],
         _logger: logging.Logger,
+        **_kwargs: object,
     ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
         """Fill only requested model-price gaps."""
         return (
@@ -713,6 +727,10 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         **_kwargs: object,
     ) -> tuple[dict[date, JsonArray], frozenset[date]]:
         """Return the selected source's session metadata."""
+        if _kwargs.get("all_history"):
+            return {
+                date.min: [row for rows in report_raws.values() for row in rows]
+            }, frozenset()
         return {
             requested: report_raws.get(requested, []) for requested in days
         }, frozenset()
@@ -823,6 +841,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         assert (
             backend.query(
                 f"SELECT * FROM current_price_versions WHERE source_id = '{SOURCE_ID}' "
+                f"AND day <= DATE '{(day + timedelta(days=1)).isoformat()}' "
                 "ORDER BY day, model"
             ).to_pylist()
             == historical_prices
@@ -855,3 +874,325 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         assert requests[-1][-1] == day
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("architecture", ["upsert", "append"])
+@pytest.mark.parametrize("fault", ["fetch", "contract", "parse", "duplicate"])
+def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
+    architecture: str,
+    fault: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raw: JsonObject,
+) -> None:
+    """Publish one partial batch and recover a failed day absent from the next graph."""
+    days = tuple(date(2025, 11, 1) + timedelta(days=i) for i in range(180))
+    failed_day = days[119]
+    graph = deepcopy(graph_raw)
+    template = cast(JsonObject, cast(JsonArray, graph["contributions"])[0])
+    graph["contributions"] = [
+        {**deepcopy(template), "date": day.isoformat()} for day in days
+    ]
+    daily = daily_raws[max(daily_raws)]
+    calls: dict[str, list[tuple[str, ...]]] = {}
+    fail = True
+    backend = (
+        DuckDBBackend(":memory:")
+        if architecture == "upsert"
+        else BigQueryReplayBackend()
+    )
+    if isinstance(backend, DuckDBBackend):
+        backend.apply_ddl()
+    else:
+        lock = Lock()
+        original_append = backend.append
+
+        def append(table: str, data: pa.Table) -> None:
+            """Serialize the local SQL replay engine's concurrent table writers."""
+            with lock:
+                original_append(table, data)
+
+        monkeypatch.setattr(backend, "append", append)
+
+    def command(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Simulate supported upstream output and one independently failing day."""
+        calls.setdefault(arguments[0], []).append(arguments)
+        if arguments == ("graph",):
+            return deepcopy(graph)
+        if arguments[0] == "report":
+            assert arguments == ("report", "--json", "--no-summarize")
+            return [deepcopy(row) for rows in report_raws.values() for row in rows]
+        if arguments[0] == "pricing":
+            return {**pricing_raw, "modelId": arguments[1]}
+        if arguments[0] == "models":
+            requested = date.fromisoformat(arguments[5])
+            result = deepcopy(daily)
+            if fail and requested == failed_day:
+                if fault == "fetch":
+                    raise RuntimeError("transient daily acquisition failure")
+                if fault == "contract":
+                    del result["entries"]
+                elif fault == "parse":
+                    cast(JsonObject, cast(JsonArray, result["entries"])[0])[
+                        "input"
+                    ] = -1
+                elif fault == "duplicate":
+                    cast(JsonArray, result["entries"]).append(
+                        deepcopy(cast(JsonArray, result["entries"])[0])
+                    )
+            return result
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+
+    def open_backend(_configuration: UsageBassoonConfig) -> StorageBackend:
+        """Reuse the isolated database through real planning and publication."""
+        return backend
+
+    def close_backend(*_args: object, **_kwargs: object) -> None:
+        """Keep the test engine alive between collection attempts."""
+
+    monkeypatch.setattr(persistence, "open_backend", open_backend)
+    monkeypatch.setattr(persistence, "close_backend", close_backend)
+    try:
+        _, summary = collector.collect(_config(tmp_path / "config.toml"))
+        assert any(target.day == failed_day for target in summary.incomplete_targets)
+        assert backend.query(
+            "SELECT count(DISTINCT day) AS days FROM current_daily_stats"
+        ).to_pylist() == [{"days": 179}]
+        assert len(calls["models"]) == 180
+        assert len(calls["pricing"]) == len(
+            {
+                cast(str, row["model"])
+                for row in cast(JsonArray, daily["entries"])
+                if isinstance(row, dict)
+            }
+        )
+        assert len(calls["report"]) == 1
+        fail = False
+        empty_contributions: JsonArray = []
+        graph["contributions"] = empty_contributions
+        calls.clear()
+        collector.collect(_config(tmp_path / "config.toml"))
+        assert [request[5] for request in calls["models"]] == [failed_day.isoformat()]
+        assert not calls.get("report")
+        assert not calls.get("pricing")
+        assert backend.query(
+            "SELECT count(DISTINCT day) AS days FROM current_daily_stats"
+        ).to_pylist() == [{"days": 180}]
+        assert backend.query(
+            "SELECT count(*) AS rows FROM collection_runs"
+        ).to_pylist() == [{"rows": 2}]
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_pricing_deduplicates_historical_requests_and_uses_observation_day(
+    fails: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One model lookup covers repeated historical days, including failed lookups."""
+    requests: list[tuple[str, ...]] = []
+
+    def command(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Record one current-rate request independently of its caller's usage day."""
+        requests.append(arguments)
+        if fails:
+            raise RuntimeError("pricing unavailable")
+        return {"modelId": arguments[1]}
+
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "datetime", _FixedDatetime)
+    prices, failures = subprocess_collector._fetch_pricing(
+        _config(tmp_path / "config.toml"),
+        ["tokscale"],
+        {date(2025, 1, 1): {"model"}, date(2025, 1, 2): {"model"}},
+        logging.getLogger("usagebassoon"),
+    )
+    assert requests == [("pricing", "model", "--json")]
+    assert set(failures if fails else prices) == {date(2026, 9, 10)}
+    requests.clear()
+    subprocess_collector._fetch_pricing(
+        _config(tmp_path / "config.toml"),
+        ["tokscale"],
+        {date(2025, 1, 1): {"model"}},
+        logging.getLogger("usagebassoon"),
+        existing={date(2026, 9, 10): {"model"}},
+    )
+    assert not requests
+
+
+def test_empty_source_records_report_discovery_without_repeating_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+) -> None:
+    """An empty sessions table is not mistaken for a cold source after discovery."""
+    graph = deepcopy(graph_raw)
+    contributions: JsonArray = []
+    graph["contributions"] = contributions
+    configuration = _config(tmp_path / "config.toml")
+    assert configuration.local_database is not None
+    backend = DuckDBBackend(configuration.local_database)
+    backend.apply_ddl()
+    backend.close()
+    reports: list[tuple[str, ...]] = []
+
+    def command(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Allow a graph scan and one explicit unbounded report discovery."""
+        if arguments == ("graph",):
+            return graph
+        assert arguments == ("report", "--json", "--no-summarize")
+        reports.append(arguments)
+        rows: JsonArray = []
+        return rows
+
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+    collector.collect(configuration)
+    collector.collect(configuration)
+    assert len(reports) == 1
+
+
+def test_report_refresh_groups_creation_days_and_allows_timezone_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nearby creation days share one bounded request, rather than a history scan."""
+    requests: list[tuple[str, ...]] = []
+    first = date(2026, 3, 1)
+    second = date(2026, 3, 2)
+    distant = date(2026, 9, 1)
+
+    def command(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Return valid empty metadata for each grouped creation-date request."""
+        requests.append(arguments)
+        rows: JsonArray = []
+        return rows
+
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+    reports, failures = subprocess_collector._fetch_reports(
+        _config(tmp_path / "config.toml"),
+        ["tokscale"],
+        [second, first, distant, first],
+    )
+    assert not failures
+    assert set(reports) == {first, second, distant}
+    assert requests == [
+        (
+            "report",
+            "--json",
+            "--no-summarize",
+            "--since",
+            "2026-02-28",
+            "--until",
+            "2026-03-03",
+        ),
+        (
+            "report",
+            "--json",
+            "--no-summarize",
+            "--since",
+            "2026-08-31",
+            "--until",
+            "2026-09-02",
+        ),
+    ]
+
+
+def _assert_live_backfill_and_warm_collection(
+    backend: StorageBackend,
+    configuration: UsageBassoonConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raw: JsonObject,
+) -> None:
+    """Exercise real warehouse planning/publication with simulated upstream output."""
+    calls: dict[str, int] = {}
+
+    def command(
+        _configuration: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **_kwargs: object,
+    ) -> JsonValue:
+        """Expose golden upstream output without reading real user session data."""
+        calls[arguments[0]] = calls.get(arguments[0], 0) + 1
+        if arguments == ("graph",):
+            return graph_raw
+        if arguments[0] == "models":
+            return daily_raws[date.fromisoformat(arguments[5])]
+        if arguments[0] == "pricing":
+            return {**pricing_raw, "modelId": arguments[1]}
+        assert arguments == ("report", "--json", "--no-summarize")
+        return [row for rows in report_raws.values() for row in rows]
+
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+    _, summary = collector.collect(configuration)
+    assert not summary.incomplete_targets
+    assert calls["models"] == len(daily_raws)
+    assert calls["report"] == 1
+    assert calls["pricing"] == len(
+        {
+            cast(str, row["model"])
+            for payload in daily_raws.values()
+            for row in cast(JsonArray, payload["entries"])
+            if isinstance(row, dict)
+        }
+    )
+    parameters = {"source_id": configuration.source_id}
+    assert backend.query(
+        "SELECT count(*) AS row_count FROM current_daily_stats "
+        "WHERE source_id = :source_id",
+        parameters,
+    ).to_pylist() == [
+        {
+            "row_count": sum(
+                len(cast(JsonArray, payload["entries"]))
+                for payload in daily_raws.values()
+            )
+        }
+    ]
+    assert backend.query(
+        "SELECT day, status FROM collection_status WHERE source_id = :source_id "
+        "AND domain = 'report_inventory'",
+        parameters,
+    ).to_pylist() == [{"day": date.min, "status": "complete"}]
+    rates = backend.query(
+        "SELECT DISTINCT day FROM current_price_versions WHERE source_id = :source_id",
+        parameters,
+    ).to_pylist()
+    assert rates == [{"day": datetime.now(UTC).date()}]
+    calls.clear()
+    _, summary = collector.collect(configuration)
+    assert not summary.incomplete_targets
+    assert calls == {"graph": 1}

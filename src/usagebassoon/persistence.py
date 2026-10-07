@@ -22,7 +22,7 @@ from usagebassoon.backends.factory import open_backend
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.deadlines import OperationTimeout, operation
 from usagebassoon.drift import SchemaDriftState
-from usagebassoon.ingest import IngestStatus, IngestTarget
+from usagebassoon.ingest import IngestStatus, IngestTarget, ReportInventory
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
 from usagebassoon.reconcile import ReconciliationIdentity
@@ -52,6 +52,7 @@ class PersistSummary:
     inserted: int
     updated: int
     per_table: dict[str, UpsertResult]
+    incomplete_targets: tuple[IngestStatus, ...] = ()
 
 
 def _source_literal(source_id: str) -> str:
@@ -67,6 +68,7 @@ def load_ingest_status(
     dict[date, set[str]],
     frozenset[ReconciliationIdentity],
     tuple[SchemaDriftState, ...],
+    ReportInventory,
 ]:
     """Load retry status, persisted coverage, and unresolved diagnostics."""
     backend = open_backend(config)
@@ -166,12 +168,28 @@ def load_ingest_status(
                     observation_count=observation_count,
                 )
             )
+        inventory = ReportInventory()
+        missing: set[tuple[str, str]] = set()
+        for row in planning:
+            if row["record_kind"] not in {"sessions", "missing_sessions"}:
+                continue
+            client, session = row["client"], row["session_id"]
+            created = row["created_at"]
+            if not isinstance(client, str) or not isinstance(session, str):
+                raise RuntimeError("session planning contains an invalid identity")
+            if row["record_kind"] == "missing_sessions":
+                missing.add((client, session))
+            else:
+                if created is not None and not isinstance(created, datetime):
+                    raise RuntimeError("session planning contains an invalid timestamp")
+                inventory.sessions[(client, session)] = created
         return (
             statuses,
             models_by_day,
             prices_by_day,
             frozenset(issue_identities),
             tuple(schema_drift),
+            ReportInventory(inventory.sessions, frozenset(missing)),
         )
     finally:
         close_backend(backend, context="loading ingest status", logger=_LOG)

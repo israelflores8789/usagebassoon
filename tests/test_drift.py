@@ -186,7 +186,9 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
         local_database=database,
     )
 
-    statuses, models, prices, reconciliation, schema_drift = load_ingest_status(config)
+    statuses, models, prices, reconciliation, schema_drift, _inventory = (
+        load_ingest_status(config)
+    )
 
     assert (statuses, models, prices, reconciliation) == ({}, {}, {}, frozenset())
     assert schema_drift == (

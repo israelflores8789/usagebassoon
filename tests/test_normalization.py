@@ -63,6 +63,23 @@ def test_normalize_preserves_canonical_nullable_types(
         for field in table.schema
     )
     assert set(normalized.tables["price_versions"].column("model").to_pylist())
+    missing_write_rates = {
+        day: {
+            model: price.model_copy(
+                update={
+                    "pricing": price.pricing.model_copy(
+                        update={"cache_write_input_token_cost": None}
+                    )
+                }
+            )
+            for model, price in prices.items()
+        }
+        for day, prices in collection_bundle.pricing_by_day.items()
+    }
+    prices = normalize(
+        replace(collection_bundle, pricing_by_day=missing_write_rates)
+    ).tables["price_versions"]
+    assert prices.column("price_cache_write_per_token").null_count == prices.num_rows
 
 
 def test_current_state_freshness_uses_collection_start(

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,15 @@ _LOG = logging.getLogger(LOGGER_NAME)
 
 
 type IngestTarget = tuple[date, str]
+type SessionIdentity = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ReportInventory:
+    """Persisted source-scoped session metadata and unresolved discovery targets."""
+
+    sessions: dict[SessionIdentity, datetime | None] = field(default_factory=dict)
+    missing: frozenset[SessionIdentity] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +97,7 @@ class ModelsPlan:
     daily_models: dict[date, DailyModelsPayload]
     models_by_day: dict[date, frozenset[str]]
     contract_drift: tuple[ContractDrift, ...]
+    failures: Mapping[date, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +114,9 @@ class IngestEvidence:
     prior_statuses: Mapping[IngestTarget, IngestStatus]
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset()
     prior_schema_drift: tuple[SchemaDriftState, ...] = ()
+    models_failures: Mapping[date, str] = field(default_factory=dict)
+    report_inventory: bool = False
+    expected_sessions: frozenset[SessionIdentity] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,8 +166,34 @@ def plan_models(
     payloads: Mapping[date, JsonObject],
     *,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
+    failures: dict[date, str] | None = None,
 ) -> ModelsPlan:
     """Validate and parse daily models before pricing planning consumes them."""
+    if failures is not None:
+        parsed: dict[date, DailyModelsPayload] = {}
+        events: list[ContractDrift] = []
+        for day, payload in payloads.items():
+            try:
+                plan = plan_models({day: payload}, contracts=contracts)
+            except ContractValidationError as error:
+                failures[day] = "contract"
+                events.extend(error.validation.events)
+                _LOG.exception("daily models contract validation failed for %s", day)
+            except ValueError:
+                failures[day] = "parse"
+                _LOG.exception("daily models parsing failed for %s", day)
+            else:
+                parsed.update(plan.daily_models)
+                events.extend(plan.contract_drift)
+        return ModelsPlan(
+            parsed,
+            {
+                day: frozenset(row.stats.model for row in value.entries)
+                for day, value in parsed.items()
+            },
+            tuple(events),
+            dict(failures),
+        )
     validation = validate_payloads(
         {"models": tuple(payloads.values())},
         contracts=contracts,
@@ -187,6 +226,9 @@ def build_ingest_evidence(
     prior_statuses: Mapping[IngestTarget, IngestStatus],
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset(),
     prior_schema_drift: tuple[SchemaDriftState, ...] = (),
+    report_days: frozenset[date] | None = None,
+    report_inventory: bool = False,
+    expected_sessions: frozenset[SessionIdentity] = frozenset(),
 ) -> IngestEvidence:
     """Construct ingest evidence from validated plans and acquisition outcomes."""
     expected_models = {
@@ -198,7 +240,9 @@ def build_ingest_evidence(
     return IngestEvidence(
         graph_plan=graph_plan,
         models_plan=models_plan,
-        report_days=frozenset(graph_plan.candidate_days),
+        report_days=(
+            frozenset(graph_plan.candidate_days) if report_days is None else report_days
+        ),
         report_fetch_failures=report_fetch_failures,
         pricing_expected_models=expected_models,
         pricing_existing_models={
@@ -208,6 +252,9 @@ def build_ingest_evidence(
         prior_statuses=prior_statuses,
         prior_reconciliation_issues=prior_reconciliation_issues,
         prior_schema_drift=prior_schema_drift,
+        models_failures=models_plan.failures,
+        report_inventory=report_inventory,
+        expected_sessions=expected_sessions,
     )
 
 
@@ -336,9 +383,14 @@ def build_collection_bundle(
             )
         else:
             valid_reports[day] = payload
-    combined_reports: JsonArray = [
-        row for day in sorted(valid_reports) for row in valid_reports[day]
-    ]
+    combined_reports: JsonArray = []
+    seen_reports: set[int] = set()
+    for day in sorted(valid_reports):
+        payload = valid_reports[day]
+        # A grouped request certifies several days but its rows are parsed once.
+        if id(payload) not in seen_reports:
+            combined_reports.extend(payload)
+            seen_reports.add(id(payload))
     try:
         report_rows = parse_report(combined_reports)
     except ValueError:
@@ -402,6 +454,19 @@ def build_collection_bundle(
         )
         for day in sorted(daily_models)
     ]
+    statuses.extend(
+        _status(
+            evidence.prior_statuses,
+            day=day,
+            domain="models",
+            status="failed",
+            expected_count=1,
+            succeeded_count=0,
+            run_id=run_id,
+            failure_code=failure,
+        )
+        for day, failure in sorted(evidence.models_failures.items())
+    )
     current_models_status = {status.day: status for status in statuses}
     pending_prior_days = {
         day
@@ -410,7 +475,7 @@ def build_collection_bundle(
         and prior.failure_code == "reconciliation"
         and current_models_status.get(day, prior).status != "complete"
     }
-    if daily_models and not pending_prior_days:
+    if daily_models and not pending_prior_days and not evidence.models_failures:
         active = {(issue.check, issue.key) for issue in reconciliation.issues}
         resolved = tuple(
             sorted(
@@ -424,7 +489,7 @@ def build_collection_bundle(
         _status(
             evidence.prior_statuses,
             day=day,
-            domain="report",
+            domain="report_inventory" if evidence.report_inventory else "report",
             status="failed" if day in report_failures else "complete",
             expected_count=1,
             succeeded_count=0 if day in report_failures else 1,
@@ -433,6 +498,21 @@ def build_collection_bundle(
         )
         for day in sorted(evidence.report_days)
     )
+    if evidence.expected_sessions:
+        found = {(row.client, row.session_id) for row in report_rows}
+        missing = evidence.expected_sessions - found
+        statuses.append(
+            _status(
+                evidence.prior_statuses,
+                day=started_at.date(),
+                domain="session_metadata",
+                status="partial" if missing else "complete",
+                expected_count=len(evidence.expected_sessions),
+                succeeded_count=len(evidence.expected_sessions & found),
+                run_id=run_id,
+                failure_code="missing_sessions" if missing else None,
+            )
+        )
     for day in sorted(evidence.pricing_expected_models):
         expected_models = evidence.pricing_expected_models[day]
         covered_models = set(evidence.pricing_existing_models.get(day, frozenset()))
@@ -463,7 +543,7 @@ def build_collection_bundle(
             )
         )
     complete_domains = {"graph"}
-    if daily_models:
+    if daily_models and not evidence.models_failures:
         complete_domains.add("models")
     if (
         evidence.report_days

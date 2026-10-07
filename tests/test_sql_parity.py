@@ -3,8 +3,9 @@
 
 """test_sql_parity.py — Shared logical contracts with native ingestion layouts."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from importlib import resources
+from uuid import uuid4
 
 import pyarrow as pa
 import pytest
@@ -321,6 +322,256 @@ def test_source_audit_view_deduplicates_runs_and_preserves_coherent_host_evidenc
         assert normalized_records(
             pa.Table.from_pylist(audit_sources(local))
         ) == normalized_records(left)
+    finally:
+        local.close()
+        remote.close()
+
+
+def test_price_resolution_preserves_observation_dates_and_per_fact_fallbacks(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Exact, preceding, later, zero and reported costs agree across dialects."""
+    normalized = normalize(collection_bundle)
+    fact_template = normalized.tables["daily_stats"].to_pylist()[0]
+    price_template = normalized.tables["price_versions"].to_pylist()[0]
+    stamp = datetime(2026, 10, 7, tzinfo=UTC)
+    cases = [
+        (
+            "old",
+            date(2026, 1, 7),
+            "model",
+            0,
+            0,
+            10.0,
+            "historical_estimate",
+            date(2026, 1, 8),
+        ),
+        (
+            "carry",
+            date(2026, 1, 9),
+            "model",
+            0,
+            0,
+            10.0,
+            "carried_forward",
+            date(2026, 1, 8),
+        ),
+        (
+            "exact",
+            date(2026, 1, 10),
+            "model",
+            0,
+            0,
+            20.0,
+            "observed",
+            date(2026, 1, 10),
+        ),
+        (
+            "incomplete",
+            date(2026, 1, 10),
+            "model",
+            1,
+            0,
+            11.0,
+            "carried_forward",
+            date(2026, 1, 8),
+        ),
+        ("reported", date(2026, 1, 10), "missing", 0, 0, 7.0, "tokscale", None),
+        ("free", date(2026, 1, 10), "free", 0, 0, 0.0, "observed", date(2026, 1, 10)),
+        ("cache", date(2026, 1, 10), "cache", 0, 5, 7.0, "tokscale", None),
+        ("unknown", date(2026, 1, 10), "missing", 0, 0, None, "unknown", None),
+    ]
+    facts = [
+        {
+            **fact_template,
+            "event_id": str(uuid4()),
+            "session_id": session,
+            "day": day,
+            "model": model,
+            "input_tokens": 10,
+            "output_tokens": output,
+            "cache_read": cache,
+            "cache_write": 0,
+            "reasoning": 0,
+            "total_tokens": 10 + output + cache,
+            "tokscale_cost_usd": None if session == "unknown" else 7.0,
+            "collected_at": stamp,
+        }
+        for session, day, model, output, cache, *_expected in cases
+    ]
+    prices = [
+        {
+            **price_template,
+            "event_id": str(uuid4()),
+            "day": day,
+            "model": model,
+            "price_input_per_token": rate,
+            "price_output_per_token": output,
+            "price_cache_read_per_token": None,
+            "price_cache_write_per_token": 0.0,
+            "collected_at": stamp,
+        }
+        for day, model, rate, output in [
+            (date(2026, 1, 8), "model", 1.0, 1.0),
+            (date(2026, 1, 10), "model", 2.0, None),
+            (date(2026, 1, 12), "model", 3.0, 3.0),
+            (date(2026, 1, 10), "free", 0.0, 0.0),
+            (date(2026, 1, 10), "cache", 1.0, 1.0),
+        ]
+    ]
+    prices.append(
+        {
+            **prices[0],
+            "event_id": str(uuid4()),
+            "source_id": "other-source",
+            "model": "missing",
+            "price_input_per_token": 100.0,
+        }
+    )
+    local, remote = DuckDBBackend(":memory:"), BigQueryReplayBackend()
+    try:
+        local.apply_ddl()
+        for backend in (local, remote):
+            backend.append(
+                "daily_stats",
+                pa.Table.from_pylist(
+                    facts, schema=CANONICAL_TABLE_SCHEMAS["daily_stats"]
+                ),
+            )
+            backend.append(
+                "price_versions",
+                pa.Table.from_pylist(
+                    prices, schema=CANONICAL_TABLE_SCHEMAS["price_versions"]
+                ),
+            )
+            rows = {
+                row["session_id"]: row
+                for row in backend.query("SELECT * FROM daily_cost").to_pylist()
+            }
+            for (
+                session,
+                _day,
+                _model,
+                _output,
+                _cache,
+                expected,
+                basis,
+                price_day,
+            ) in cases:
+                assert rows[session]["cost_usd"] == expected
+                assert rows[session]["cost_basis"] == basis
+                assert rows[session]["price_day"] == price_day
+            # Aggregation must retain calculated rows when another row needs fallback.
+            assert (
+                sum(
+                    row["cost_usd"]
+                    for row in rows.values()
+                    if row["cost_usd"] is not None
+                )
+                == 65.0
+            )
+            unknown = load_session_usage(backend, ReportFilters(), by_model=True)
+            assert (
+                next(
+                    row["cost_usd"] for row in unknown if row["session_id"] == "unknown"
+                )
+                is None
+            )
+            assert backend.query("SELECT cost_usd FROM report_summary").to_pylist() == [
+                {"cost_usd": None}
+            ]
+            assert backend.query(
+                "SELECT * FROM current_price_versions"
+            ).num_rows == len(prices)
+        for view in ("daily_cost", "report_daily_usage", "session_model_stats"):
+            left, right = (
+                local.query(f"SELECT * FROM {view}"),
+                remote.query(f"SELECT * FROM {view}"),
+            )
+            assert left.column_names == right.column_names
+            assert normalized_records(left) == normalized_records(right)
+    finally:
+        local.close()
+        remote.close()
+
+
+@pytest.mark.parametrize("by_model", [False, True])
+def test_stale_activity_uses_usage_day_then_reported_timestamp_for_ties(
+    by_model: bool,
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Backfill observation times cannot make old usage appear newly active."""
+    normalized = normalize(collection_bundle)
+    fact = normalized.tables["daily_stats"].to_pylist()[0]
+    session = normalized.tables["sessions"].to_pylist()[0]
+    usage_day = date(2026, 3, 1)
+    stamps = {
+        "stale-old": datetime(2026, 1, 1, tzinfo=UTC),
+        "stale-new": datetime(2026, 2, 1, tzinfo=UTC),
+        "same-day": datetime(2026, 3, 1, 12, tzinfo=UTC),
+        "later-report": datetime(2026, 3, 2, tzinfo=UTC),
+    }
+    observed = datetime(2026, 10, 7, tzinfo=UTC)
+    local, remote = DuckDBBackend(":memory:"), BigQueryReplayBackend()
+    try:
+        local.apply_ddl()
+        for backend in (local, remote):
+            backend.append(
+                "daily_stats",
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **fact,
+                            "event_id": str(uuid4()),
+                            "session_id": key,
+                            "day": usage_day,
+                            "collected_at": observed,
+                        }
+                        for key in stamps
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
+                ),
+            )
+            backend.append(
+                "sessions",
+                pa.Table.from_pylist(
+                    [
+                        {
+                            **session,
+                            "event_id": str(uuid4()),
+                            "session_id": key,
+                            "last_active": value,
+                            "collected_at": observed,
+                            "last_seen_at": observed,
+                        }
+                        for key, value in stamps.items()
+                    ],
+                    schema=CANONICAL_TABLE_SCHEMAS["sessions"],
+                ),
+            )
+            records = load_session_usage(backend, ReportFilters(), by_model=by_model)
+            assert [row["session_id"] for row in records] == [
+                "later-report",
+                "same-day",
+                "stale-new",
+                "stale-old",
+            ]
+            assert records[-1]["activity_day"] == usage_day
+            assert records[-1]["last_active"] == stamps["stale-old"]
+            assert records[-1]["last_active_stale"]
+            assert not records[1]["last_active_stale"]
+            assert (
+                len(
+                    load_session_usage(
+                        backend,
+                        ReportFilters(),
+                        by_model=by_model,
+                        since=usage_day,
+                        until=usage_day,
+                    )
+                )
+                == 3
+            )
     finally:
         local.close()
         remote.close()

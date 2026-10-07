@@ -17,6 +17,7 @@ from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
 from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import UsageBassoonConfig
+from usagebassoon.ingest import IngestStatus
 from usagebassoon.persistence import PersistSummary
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
@@ -52,6 +53,35 @@ def test_collect_reports_the_delegated_persistence_summary(
         plain_cli_output(result.output)
         == "Collected run run-123: 4 inserted, 2 updated.\n"
     )
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_manual_collection_warns_after_persisting_partial_data(
+    refresh: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both manual entry points explain partial publication and the retry action."""
+    config = tmp_path / "config.toml"
+    _write_config(config, tmp_path / "usagebassoon.duckdb")
+    target = IngestStatus(
+        date(2025, 1, 1), "models", "failed", 1, 0, "partial-run", "fetch"
+    )
+
+    def collect_run(
+        _configuration: UsageBassoonConfig,
+        **_kwargs: object,
+    ) -> tuple[str, PersistSummary]:
+        """Return successful publication containing an unfinished acquisition target."""
+        return "partial-run", PersistSummary(4, 0, {}, (target,))
+
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
+    args = ["collect", *(["refresh"] if refresh else []), "--config", str(config)]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0
+    assert "4 inserted" in plain_cli_output(result.stdout)
+    assert "Warning: collection is incomplete" in plain_cli_output(result.stderr)
+    assert "Run bassoon collect again" in plain_cli_output(result.stderr)
 
 
 @pytest.mark.parametrize(

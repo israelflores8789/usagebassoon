@@ -51,6 +51,7 @@ from typer.testing import CliRunner
 from tests._cli import plain_cli_output
 from tests._snapshot_fakes import seed_recovery_data
 from tests._sql_parity import normalized_records, seed_synthetic_data, view_names
+from tests.test_collector_daily import _assert_live_backfill_and_warm_collection
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.bigquery import BigQueryBackend
 from usagebassoon.backends.bigquery_compaction import (
@@ -70,6 +71,7 @@ from usagebassoon.curation import (
     set_note,
 )
 from usagebassoon.ingest import CollectionBundle
+from usagebassoon.json_types import JsonArray, JsonObject
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle, normalize
 from usagebassoon.persistence import persist_run
 from usagebassoon.storage_model import DEBUG_TABLES, SNAPSHOT_TABLES, STATE_KEYS
@@ -1247,3 +1249,30 @@ def test_live_source_audit_aggregates_history_with_one_summary_per_source(
         assert all(rows[source]["last_activity"] is not None for source in sources)
     finally:
         remote.close()
+
+
+def test_live_cold_collection_and_warm_planning(
+    live_settings: LiveSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raw: JsonObject,
+) -> None:
+    """Persist collector discovery and observed prices, then skip completed history."""
+    configuration = replace(
+        ConfigurationManager(live_settings.config_path).load(), source_id=str(uuid4())
+    )
+    backend = _backend(live_settings)
+    try:
+        _assert_live_backfill_and_warm_collection(
+            backend,
+            configuration,
+            monkeypatch,
+            graph_raw,
+            daily_raws,
+            report_raws,
+            pricing_raw,
+        )
+    finally:
+        backend.close()

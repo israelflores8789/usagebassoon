@@ -234,7 +234,11 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **tokscale derived metrics:** We invoke `tokscale` as a subprocess and treat its stdout as the only source of truth for token usage statistics. A future major version may make token statistics collection native.
 
-- **Daily tokscale pricing:** `price_versions` stores the tokscale rates observed for each model with activity on a processed day. `daily_cost` calculates `cost_usd` from those rates and daily token components; `tokscale_cost_usd` remains diagnostic. Historical price drift before collection is the downstream user's responsibility.
+- **Daily tokscale pricing:** `price_versions.day` records the UTC observation date, never a backfilled usage date. Fetch each needed model at most once per observation day after a successful persisted observation. `daily_cost` selects usable source/model rates from the usage date, the latest earlier observation, or the earliest later observation for historical estimates, then falls back to that fact's tokscale-reported cost. Expose `price_day` and `cost_basis`; never switch an entire aggregate to reported costs because one fact lacks rates. Historical price backfilling is outside v1.
+
+- **Collection acquisition and recovery:** Acquire days sequentially and publish one normalized batch. A failed or invalid models day does not discard successful days; persist failed/partial targets and include unfinished models targets in later planning even when absent from the graph. Manual collection and refresh warn when publication contains incomplete acquisition. Cold report discovery is source-scoped and recorded in the ledger; fetch all report history once, then discover missing sessions or explicitly refresh known creation days without rescanning every usage day.
+
+- **Session activity evidence:** Preserve tokscale's `last_active`. Derive `last_usage_day` from canonical daily facts, never from `collected_at` or `last_seen_at`. A later usage day makes the reported timestamp stale; display date precision, sort by effective activity day, and use the original `last_active DESC` plus session identity to break ties. Trust same-day or later reported timestamps without claiming they are always fresh.
 
 - **No at-rest obfuscation of stored data:** Persist full-fidelity data. `bassoon export` obfuscates sensitive fields by default; `--raw` exports original values in any supported format. See Privacy and sharing policy for command-specific behavior.
 

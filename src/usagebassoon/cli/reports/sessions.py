@@ -59,6 +59,9 @@ _EXPORT_COLUMNS = (
     "cost_per_million",
     "created_at",
     "last_active",
+    "last_usage_day",
+    "activity_day",
+    "last_active_stale",
 )
 
 
@@ -209,8 +212,12 @@ def sessions(
             "Cost/1M": format_cost_per_million(
                 record["cost_usd"], record["total_tokens"]
             ),
-            timestamp_column: format_timestamp(
-                record[timestamp_key], compact=output_width is not None
+            timestamp_column: (
+                str(record["activity_day"])
+                if not created and record.get("last_active_stale")
+                else format_timestamp(
+                    record[timestamp_key], compact=output_width is not None
+                )
             ),
         }
         if with_duration:

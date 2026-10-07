@@ -29,7 +29,7 @@ import signal
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import cast, override
@@ -54,6 +54,7 @@ from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_REPORT_ROWS,
 )
+from tests.test_collector_daily import _assert_live_backfill_and_warm_collection
 from usagebassoon.api import connect, query_arrow
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import (
@@ -75,6 +76,7 @@ from usagebassoon.curation import NoteAssignment, TagAssignment, add_tag, set_no
 from usagebassoon.deadlines import OperationTimeout
 from usagebassoon.diagnostics import run_doctor
 from usagebassoon.ingest import CollectionBundle
+from usagebassoon.json_types import JsonArray, JsonObject
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 from usagebassoon.snapshot.restore import restore_operation_id
@@ -1077,3 +1079,30 @@ def test_live_portable_snapshots_and_atomic_restore(
     finally:
         remote.close()
         local.close()
+
+
+def test_live_cold_collection_and_warm_planning(
+    live_settings: LiveSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raw: JsonObject,
+) -> None:
+    """Persist collector discovery and observed prices, then skip completed history."""
+    configuration = replace(
+        ConfigurationManager(live_settings.config_path).load(), source_id=str(uuid4())
+    )
+    backend = _backend()
+    try:
+        _assert_live_backfill_and_warm_collection(
+            backend,
+            configuration,
+            monkeypatch,
+            graph_raw,
+            daily_raws,
+            report_raws,
+            pricing_raw,
+        )
+    finally:
+        backend.close()

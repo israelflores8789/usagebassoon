@@ -146,33 +146,44 @@ WHERE domain <> 'collection'
 -- SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 -- SPDX-License-Identifier: AGPL-3.0-only
 
--- Reasoning tokens use the output rate, as tokscale's pricing semantics do.
+-- Use observed rates without inventing historical observations; retain cost provenance.
 CREATE OR REPLACE VIEW daily_cost AS
+WITH ranked AS (
+    SELECT daily_stats.*, rates.day AS price_day,
+        rates.price_input_per_token, rates.price_output_per_token,
+        rates.price_cache_read_per_token, rates.price_cache_write_per_token,
+        ROW_NUMBER() OVER (
+            PARTITION BY daily_stats.source_id, daily_stats.day, daily_stats.client, daily_stats.session_id, daily_stats.model
+            ORDER BY CASE WHEN rates.day <= daily_stats.day THEN 0 ELSE 1 END,
+                CASE WHEN rates.day <= daily_stats.day THEN rates.day END DESC,
+                CASE WHEN rates.day > daily_stats.day THEN rates.day END ASC
+        ) AS price_rank
+    FROM current_daily_stats AS daily_stats
+    LEFT JOIN current_price_versions AS rates
+        ON rates.source_id = daily_stats.source_id AND rates.model = daily_stats.model
+        AND (daily_stats.input_tokens = 0 OR rates.price_input_per_token IS NOT NULL)
+    AND ((daily_stats.output_tokens = 0 AND daily_stats.reasoning = 0) OR rates.price_output_per_token IS NOT NULL)
+    AND (daily_stats.cache_read = 0 OR rates.price_cache_read_per_token IS NOT NULL)
+    AND (daily_stats.cache_write = 0 OR rates.price_cache_write_per_token IS NOT NULL)
+)
 SELECT
-    daily_stats.*,
-    CASE
-        WHEN daily_stats.perf_timed_tokens > 0
-            AND daily_stats.perf_duration_ms IS NOT NULL
-        THEN 1000.0 * daily_stats.perf_duration_ms / daily_stats.perf_timed_tokens
-    END AS ms_per_1k_tokens,
-    CASE
-        WHEN (daily_stats.input_tokens <> 0 AND price_versions.price_input_per_token IS NULL)
-            OR ((daily_stats.output_tokens <> 0 OR daily_stats.reasoning <> 0)
-                AND price_versions.price_output_per_token IS NULL)
-            OR (daily_stats.cache_read <> 0 AND price_versions.price_cache_read_per_token IS NULL)
-            OR (daily_stats.cache_write <> 0 AND price_versions.price_cache_write_per_token IS NULL)
-        THEN NULL
-        ELSE COALESCE(daily_stats.input_tokens, 0) * COALESCE(price_versions.price_input_per_token, 0)
-            + (COALESCE(daily_stats.output_tokens, 0) + COALESCE(daily_stats.reasoning, 0))
-                * COALESCE(price_versions.price_output_per_token, 0)
-            + COALESCE(daily_stats.cache_read, 0) * COALESCE(price_versions.price_cache_read_per_token, 0)
-            + COALESCE(daily_stats.cache_write, 0) * COALESCE(price_versions.price_cache_write_per_token, 0)
-    END AS cost_usd
-FROM current_daily_stats AS daily_stats
-LEFT JOIN current_price_versions AS price_versions
-    ON price_versions.source_id = daily_stats.source_id
-    AND price_versions.day = daily_stats.day
-    AND price_versions.model = daily_stats.model;
+    ranked.event_id, ranked.source_id, ranked.day, ranked.client, ranked.session_id, ranked.model, ranked.provider, ranked.input_tokens, ranked.output_tokens, ranked.cache_read, ranked.cache_write, ranked.reasoning, ranked.total_tokens, ranked.message_count, ranked.tokscale_cost_usd, ranked.perf_duration_ms, ranked.perf_timed_tokens, ranked.perf_sample_count, ranked.perf_token_coverage, ranked.tokscale_ms_per_1k_tokens, ranked.collected_at,
+    CASE WHEN perf_timed_tokens > 0 AND perf_duration_ms IS NOT NULL
+        THEN 1000.0 * perf_duration_ms / perf_timed_tokens END AS ms_per_1k_tokens,
+    price_day,
+    CASE WHEN price_day = day THEN 'observed'
+         WHEN price_day < day THEN 'carried_forward'
+         WHEN price_day > day THEN 'historical_estimate'
+         WHEN total_tokens = 0 THEN 'zero_usage'
+         WHEN tokscale_cost_usd IS NOT NULL THEN 'tokscale'
+         ELSE 'unknown' END AS cost_basis,
+    CASE WHEN price_day IS NOT NULL OR total_tokens = 0 THEN
+        COALESCE(input_tokens, 0) * COALESCE(price_input_per_token, 0)
+        + (COALESCE(output_tokens, 0) + COALESCE(reasoning, 0)) * COALESCE(price_output_per_token, 0)
+        + COALESCE(cache_read, 0) * COALESCE(price_cache_read_per_token, 0)
+        + COALESCE(cache_write, 0) * COALESCE(price_cache_write_per_token, 0)
+    ELSE tokscale_cost_usd END AS cost_usd
+FROM ranked WHERE price_rank = 1;
 
 -- Familiar all-time session and model totals are calculated from daily facts.
 CREATE OR REPLACE VIEW session_model_stats AS
@@ -238,7 +249,9 @@ SELECT
     daily_cost.tokscale_ms_per_1k_tokens,
     daily_cost.ms_per_1k_tokens,
     daily_cost.cost_usd,
-    daily_cost.tokscale_cost_usd
+    daily_cost.tokscale_cost_usd,
+    daily_cost.price_day,
+    daily_cost.cost_basis
 FROM daily_cost AS daily_cost
 LEFT JOIN current_sessions AS sessions
     ON sessions.source_id = daily_cost.source_id
@@ -272,19 +285,30 @@ SELECT
     session_model_stats.perf_sample_count,
     session_model_stats.ms_per_1k_tokens,
     session_model_stats.cost_usd,
-    session_model_stats.tokscale_cost_usd
+    session_model_stats.tokscale_cost_usd,
+    activity.last_usage_day,
+    CASE WHEN sessions.last_active IS NULL OR activity.last_usage_day > CAST(sessions.last_active AS DATE)
+        THEN activity.last_usage_day ELSE CAST(sessions.last_active AS DATE) END AS activity_day,
+    CASE WHEN activity.last_usage_day IS NOT NULL AND (sessions.last_active IS NULL OR activity.last_usage_day > CAST(sessions.last_active AS DATE))
+        THEN TRUE ELSE FALSE END AS last_active_stale
 FROM session_model_stats AS session_model_stats
 LEFT JOIN current_sessions AS sessions
     ON sessions.source_id = session_model_stats.source_id
     AND sessions.client = session_model_stats.client
-    AND sessions.session_id = session_model_stats.session_id;
+    AND sessions.session_id = session_model_stats.session_id
+LEFT JOIN (
+    SELECT source_id, client, session_id, MAX(day) AS last_usage_day
+    FROM current_daily_stats GROUP BY source_id, client, session_id
+) AS activity ON activity.source_id = session_model_stats.source_id
+    AND activity.client = session_model_stats.client
+    AND activity.session_id = session_model_stats.session_id;
 
 -- Retained public relations for the query API and doctor checks. The terminal
 -- summary command now uses report_session_models directly.
 CREATE OR REPLACE VIEW report_summary AS
 SELECT
     COUNT(*) AS sessions,
-    COALESCE(SUM(cost_usd), 0) AS cost_usd
+    CASE WHEN COUNT(cost_usd) = COUNT(*) THEN COALESCE(SUM(cost_usd), 0) END AS cost_usd
 FROM (
     SELECT
         source_id,
@@ -299,7 +323,7 @@ CREATE OR REPLACE VIEW report_summary_models AS
 SELECT
     model,
     COALESCE(SUM(total_tokens), 0) AS total_tokens,
-    COALESCE(SUM(cost_usd), 0) AS cost_usd
+    CASE WHEN COUNT(cost_usd) = COUNT(*) THEN COALESCE(SUM(cost_usd), 0) END AS cost_usd
 FROM report_session_models
 GROUP BY model
 ORDER BY cost_usd DESC, model;
@@ -326,7 +350,9 @@ SELECT
     tokscale_ms_per_1k_tokens,
     ms_per_1k_tokens,
     cost_usd,
-    tokscale_cost_usd
+    tokscale_cost_usd,
+    price_day,
+    cost_basis
 FROM report_daily_usage;
 
 CREATE OR REPLACE VIEW session_tags AS
@@ -374,17 +400,26 @@ FROM current_notes AS notes;
 
 -- Planning and resolution share one snapshot and one query job.
 CREATE OR REPLACE VIEW collection_preflight AS
-SELECT DISTINCT 'status' AS record_kind, source_id, day, domain, status, expected_count, succeeded_count, run_id, failure_code, CAST(NULL AS TEXT) AS model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count
+SELECT DISTINCT 'status' AS record_kind, source_id, day, domain, status, expected_count, succeeded_count, run_id, failure_code, CAST(NULL AS TEXT) AS model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count, CAST(NULL AS VARCHAR) AS client, CAST(NULL AS VARCHAR) AS session_id
 FROM collection_status
 UNION ALL
-SELECT DISTINCT 'models' AS record_kind, source_id, day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count
+SELECT DISTINCT 'models' AS record_kind, source_id, day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count, CAST(NULL AS VARCHAR) AS client, CAST(NULL AS VARCHAR) AS session_id
 FROM current_daily_stats
 UNION ALL
-SELECT DISTINCT 'prices' AS record_kind, source_id, day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count
+SELECT DISTINCT 'prices' AS record_kind, source_id, day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count, CAST(NULL AS VARCHAR) AS client, CAST(NULL AS VARCHAR) AS session_id
 FROM current_price_versions
 UNION ALL
-SELECT DISTINCT 'issues' AS record_kind, source_id, CAST(NULL AS DATE) AS day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, CAST(NULL AS TEXT) AS model, check_name, issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count
+SELECT DISTINCT 'issues' AS record_kind, source_id, CAST(NULL AS DATE) AS day, CAST(NULL AS TEXT) AS domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, CAST(NULL AS TEXT) AS model, check_name, issue_key, CAST(NULL AS TEXT) AS tokscale_ver, CAST(NULL AS TEXT) AS drift_key, CAST(NULL AS TEXT) AS drift_kind, CAST(NULL AS TEXT) AS path, CAST(NULL AS TEXT) AS detail, CAST(NULL AS TEXT) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count, CAST(NULL AS VARCHAR) AS client, CAST(NULL AS VARCHAR) AS session_id
 FROM current_reconciliation_issues WHERE resolved = FALSE
 UNION ALL
-SELECT DISTINCT 'drift' AS record_kind, source_id, CAST(NULL AS DATE) AS day, domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, CAST(NULL AS TEXT) AS model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, created_at, observation_count
-FROM current_schema_drift_events WHERE resolved = FALSE;
+SELECT DISTINCT 'drift' AS record_kind, source_id, CAST(NULL AS DATE) AS day, domain, CAST(NULL AS TEXT) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS TEXT) AS run_id, CAST(NULL AS TEXT) AS failure_code, CAST(NULL AS TEXT) AS model, CAST(NULL AS TEXT) AS check_name, CAST(NULL AS TEXT) AS issue_key, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, created_at, observation_count, CAST(NULL AS VARCHAR) AS client, CAST(NULL AS VARCHAR) AS session_id
+FROM current_schema_drift_events WHERE resolved = FALSE
+UNION ALL
+SELECT DISTINCT 'sessions' AS record_kind, records.source_id, CAST(NULL AS DATE) AS day, CAST(NULL AS VARCHAR) AS domain, CAST(NULL AS VARCHAR) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS VARCHAR) AS run_id, CAST(NULL AS VARCHAR) AS failure_code, CAST(NULL AS VARCHAR) AS model, CAST(NULL AS VARCHAR) AS check_name, CAST(NULL AS VARCHAR) AS issue_key, CAST(NULL AS VARCHAR) AS tokscale_ver, CAST(NULL AS VARCHAR) AS drift_key, CAST(NULL AS VARCHAR) AS drift_kind, CAST(NULL AS VARCHAR) AS path, CAST(NULL AS VARCHAR) AS detail, CAST(NULL AS VARCHAR) AS contract_tokscale_ver, records.created_at, CAST(NULL AS BIGINT) AS observation_count, records.client, records.session_id
+FROM current_sessions AS records
+UNION ALL
+SELECT DISTINCT 'missing_sessions' AS record_kind, records.source_id, CAST(NULL AS DATE) AS day, CAST(NULL AS VARCHAR) AS domain, CAST(NULL AS VARCHAR) AS status, CAST(NULL AS BIGINT) AS expected_count, CAST(NULL AS BIGINT) AS succeeded_count, CAST(NULL AS VARCHAR) AS run_id, CAST(NULL AS VARCHAR) AS failure_code, CAST(NULL AS VARCHAR) AS model, CAST(NULL AS VARCHAR) AS check_name, CAST(NULL AS VARCHAR) AS issue_key, CAST(NULL AS VARCHAR) AS tokscale_ver, CAST(NULL AS VARCHAR) AS drift_key, CAST(NULL AS VARCHAR) AS drift_kind, CAST(NULL AS VARCHAR) AS path, CAST(NULL AS VARCHAR) AS detail, CAST(NULL AS VARCHAR) AS contract_tokscale_ver, CAST(NULL AS TIMESTAMPTZ) AS created_at, CAST(NULL AS BIGINT) AS observation_count, records.client, records.session_id
+FROM current_daily_stats AS records
+WHERE NOT EXISTS (SELECT 1 FROM current_sessions AS known
+    WHERE known.source_id = records.source_id AND known.client = records.client
+      AND known.session_id = records.session_id);

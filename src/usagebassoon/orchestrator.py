@@ -58,6 +58,7 @@ def _collect_locked(
         persisted_prices,
         prior_reconciliation_issues,
         prior_schema_drift,
+        report_inventory,
     ) = load_ingest_status(config)
     try:
         prefix = _prefix(config)
@@ -81,7 +82,7 @@ def _collect_locked(
                 | {
                     day
                     for (day, domain), status in statuses.items()
-                    if domain == _MODELS_DOMAIN and status.status == "provisional"
+                    if domain == _MODELS_DOMAIN and status.status != "complete"
                 }
                 | {
                     day
@@ -116,36 +117,82 @@ def _collect_locked(
             or day >= today - timedelta(days=_HISTORICAL_OVERLAP_DAYS)
             or (day, _MODELS_DOMAIN) not in completed
         )
-        requested_price_days = tuple(
-            day
-            for day in candidate_days
-            if day == today
-            or day in daily_days
-            or (day, _PRICING_DOMAIN) not in completed
+        models_failures: dict[date, str] = {}
+        daily_models = _fetch_daily_models(
+            config, prefix, daily_days, failures=models_failures
         )
-        daily_models = _fetch_daily_models(config, prefix, daily_days)
-        models_plan = plan_models(daily_models)
-        pricing_expected_models: dict[date, frozenset[str]] = {}
-        pricing_requests: dict[date, set[str]] = {}
-        for day in requested_price_days:
-            if day in models_plan.models_by_day:
-                models = set(models_plan.models_by_day[day])
-            elif (day, _MODELS_DOMAIN) in completed:
-                models = persisted_models.get(day, set())
-            else:
-                raise RuntimeError(
-                    f"pricing for {day.isoformat()} has no completed models status"
-                )
-            pricing_expected_models[day] = frozenset(models)
-            pricing_requests[day] = (
-                models if day == today else models - persisted_prices.get(day, set())
-            )
+        models_plan = plan_models(daily_models, failures=models_failures)
+        active_models = {
+            model for models in models_plan.models_by_day.values() for model in models
+        }
+        known_prices = {
+            model for models in persisted_prices.values() for model in models
+        }
+        unpriced_models = {
+            model for models in persisted_models.values() for model in models
+        } - known_prices
+        observation_day = datetime.now(UTC).date()
+        needed_models = active_models | unpriced_models
+        pricing_requests = {
+            observation_day: needed_models
+            - persisted_prices.get(observation_day, set())
+        }
         pricing_by_day, pricing_failures = _fetch_pricing(
-            config, prefix, pricing_requests, logger
+            config, prefix, pricing_requests, logger, existing=persisted_prices
+        )
+        active_sessions = {
+            (row.stats.client, row.stats.session_id)
+            for payload in models_plan.daily_models.values()
+            for row in payload.entries
+        }
+        missing_sessions = (
+            active_sessions - report_inventory.sessions.keys()
+        ) | report_inventory.missing
+        discovered = any(
+            domain == "report_inventory" and status.status == "complete"
+            for (_day, domain), status in statuses.items()
+        )
+        unknown_creation = (
+            {
+                identity
+                for identity in active_sessions
+                if identity in report_inventory.sessions
+                and report_inventory.sessions[identity] is None
+            }
+            if refresh_range is not None
+            else set()
+        )
+        full_report = not discovered or bool(missing_sessions | unknown_creation)
+        report_days = tuple(
+            sorted(
+                {
+                    created.date()
+                    for identity, created in report_inventory.sessions.items()
+                    if refresh_range is not None
+                    and identity in active_sessions
+                    and created is not None
+                }
+                | {
+                    day
+                    for (day, domain), status in statuses.items()
+                    if domain == "report" and status.status != "complete"
+                }
+            )
         )
         report_by_day, report_fetch_failures = _fetch_reports(
-            config, prefix, candidate_days, logger=logger
+            config, prefix, report_days, logger=logger, all_history=full_report
         )
+        expected_prices = {
+            day: frozenset(set(prices) | set(pricing_failures.get(day, ())))
+            for day, prices in pricing_by_day.items()
+        }
+        for day, failed_models in pricing_failures.items():
+            expected_prices[day] = expected_prices.get(day, frozenset()) | failed_models
+        already_observed = needed_models & persisted_prices.get(observation_day, set())
+        if already_observed:
+            expected_prices[observation_day] = (
+                expected_prices.get(observation_day, frozenset()) | already_observed
+            )
         raw = RawCollection(
             graph=graph_raw,
             daily_models=daily_models,
@@ -155,7 +202,7 @@ def _collect_locked(
         evidence = build_ingest_evidence(
             graph_plan=graph_plan,
             models_plan=models_plan,
-            pricing_days=frozenset(requested_price_days),
+            pricing_days=frozenset(expected_prices),
             persisted_models=persisted_models,
             persisted_prices=persisted_prices,
             report_fetch_failures=report_fetch_failures,
@@ -163,7 +210,21 @@ def _collect_locked(
             prior_statuses=statuses,
             prior_reconciliation_issues=prior_reconciliation_issues,
             prior_schema_drift=prior_schema_drift,
+            report_days=frozenset({date.min} if full_report else report_days),
+            report_inventory=full_report,
+            expected_sessions=frozenset(
+                missing_sessions
+                | unknown_creation
+                | {
+                    identity
+                    for identity, created in report_inventory.sessions.items()
+                    if created is not None
+                    and created.date() in report_days
+                    and identity in active_sessions
+                }
+            ),
         )
+        evidence = replace(evidence, pricing_expected_models=expected_prices)
         bundle = build_collection_bundle(
             raw,
             evidence=evidence,
@@ -187,7 +248,19 @@ def _collect_locked(
         except Exception:
             logger.exception("could not publish failed collection %s", run_id)
         raise
-    return persist_with_retries(config, normalize(bundle), logger)
+    summary = persist_with_retries(config, normalize(bundle), logger)
+    incomplete = tuple(
+        status
+        for status in bundle.ingest_status
+        if status.status not in {"complete", "provisional"}
+    )
+    if incomplete:
+        logger.warning(
+            "collection run %s persisted with %s incomplete targets",
+            run_id,
+            len(incomplete),
+        )
+    return replace(summary, incomplete_targets=incomplete)
 
 
 def collect(

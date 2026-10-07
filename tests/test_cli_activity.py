@@ -235,7 +235,7 @@ def test_filtered_backend_duration_and_cost(tmp_path: Path) -> None:
     assert result[0]["total_tokens"] == 185
     assert result[0]["perf_duration_ms"] == 3000
     assert result[0]["total_fact_count"] == 1
-    assert result[0]["cost_basis"] == "calculated"
+    assert result[0]["cost_basis"] == "observed"
     backend.close()
     runner = CliRunner()
     base = [
@@ -292,7 +292,7 @@ def test_daily_activity_query_matches_bigquery_replays() -> None:
         assert left[0]["perf_duration_ms"] == 144
         assert left[0]["total_tokens"] == 25
         assert left[0]["total_fact_count"] == 3
-        assert left[0]["cost_basis"] == "tokscale"
+        assert left[0]["cost_basis"] == "mixed"
     finally:
         local.close()
         remote.close()

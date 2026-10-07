@@ -104,6 +104,8 @@ bassoon report summary   # see the results!
 bassoon doctor           # troubleshooting
 ```
 
+Your first `bassoon collect` includes all usage dates reported by tokscale.
+
 Run `bassoon --help` or `bassoon <command> --help` for the complete command reference.
 
 ### Don't forget Tokscale!
@@ -139,6 +141,8 @@ All report commands support combined `--client`, `--model`, `--workspace`, `--ta
 All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
+
+UsageBassoon observes each given model's current prices once per UTC day from Tokscale's LiteLLM pricing data and prefers rates from the usage date, the latest earlier observation, then the earliest later observation for older backfills. Costs estimates are best effor calculations, and UsageBassoon honors custom pricing configurations reported through Tokscale.
 
 > [!IMPORTANT]
 > Reports are raw by default. Use `--sanitize` before sharing or using `--save <path>` to write a text artifact.
