@@ -33,6 +33,7 @@ from google.api_core.exceptions import (
 )
 from google.auth.credentials import AnonymousCredentials
 from google.auth.crypt import Signer
+from google.auth.transport.requests import AuthorizedSession
 from google.cloud import bigquery, bigquery_datatransfer
 from google.cloud.bigquery.table import TableListItem
 from google.cloud.bigquery_storage_v1 import types as bigquery_storage_types
@@ -65,6 +66,39 @@ from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle, n
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 from usagebassoon.storage_model import note_id_for_session
+
+
+def test_service_account_file_scopes_the_bigquery_http_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use scoped credentials in both the SDK and its supplied HTTP session."""
+    credentials = Credentials(
+        signer=cast(Signer, MagicMock(spec=Signer)),
+        service_account_email="collector@example.iam.gserviceaccount.com",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+
+    def load(_filename: str, *, scopes: list[str] | None = None) -> Credentials:
+        """Model the SDK's scope-preserving credential file loader offline."""
+        return credentials.with_scopes(scopes)
+
+    monkeypatch.setattr(Credentials, "from_service_account_file", load)
+    backend = BigQueryBackend(
+        "usagebassoon-test",
+        "usagebassoon_it",
+        credentials_file=tmp_path / "credentials.json",
+    )
+    try:
+        session = backend.client._http
+        assert isinstance(session, AuthorizedSession)
+        assert not session.credentials.requires_scopes
+        assert session.credentials.scopes == [
+            "https://www.googleapis.com/auth/cloud-platform"
+        ]
+        assert session.credentials is backend._credentials
+        assert session.credentials is backend.client._credentials
+    finally:
+        backend.close()
 
 
 def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(

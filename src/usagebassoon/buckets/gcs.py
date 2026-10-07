@@ -284,16 +284,17 @@ class GcsSnapshotBucket:
                 if credentials_file is not None:
                     try:
                         from google.auth.exceptions import GoogleAuthError
-                        from google.oauth2 import service_account
+                        from google.oauth2.service_account import Credentials
                     except ImportError as error:
                         raise RuntimeError(
                             "GCS snapshots require the usagebassoon[gcs] extra"
                         ) from error
                     try:
-                        resolved_credentials = (
-                            service_account.Credentials.from_service_account_file(
-                                str(credentials_file)
-                            )
+                        resolved_credentials = Credentials.from_service_account_file(
+                            str(credentials_file),
+                            scopes=[
+                                "https://www.googleapis.com/auth/devstorage.full_control"
+                            ],
                         )
                     except (GoogleAuthError, OSError, ValueError) as error:
                         raise RuntimeError(

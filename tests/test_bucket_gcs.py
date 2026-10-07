@@ -36,6 +36,44 @@ from usagebassoon.config import ConfigurationError
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
 
+def test_service_account_file_scopes_the_gcs_http_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scope file credentials before constructing the supplied HTTP session."""
+    from google.auth.crypt import Signer
+    from google.auth.transport.requests import AuthorizedSession
+    from google.cloud import storage
+    from google.oauth2.service_account import Credentials
+
+    credentials = Credentials(
+        signer=cast(Signer, MagicMock(spec=Signer)),
+        service_account_email="collector@example.iam.gserviceaccount.com",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+
+    def load(_filename: str, *, scopes: list[str] | None = None) -> Credentials:
+        """Model credential-file scope handling without reading a private key."""
+        return credentials.with_scopes(scopes)
+
+    for name in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(Credentials, "from_service_account_file", load)
+    archive = GcsArchive(
+        "gs://bucket/archive",
+        project="usagebassoon-test",
+        credentials_file=tmp_path / "credentials.json",
+    )
+    client = cast(storage.Client, archive.client)
+    session = client._http
+    assert isinstance(session, AuthorizedSession)
+    assert not session.credentials.requires_scopes
+    assert session.credentials.scopes == [
+        "https://www.googleapis.com/auth/devstorage.full_control"
+    ]
+    assert session.credentials is client._credentials
+    session.close()
+
+
 @pytest.fixture
 def gcs_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Advance pacing and backoff deterministically without real sleeps."""

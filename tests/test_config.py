@@ -315,6 +315,29 @@ def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) 
     assert ConfigurationManager(path).load().collection.schedule.interval == "30m"
 
 
+@pytest.mark.parametrize(
+    ("content", "separator"),
+    [
+        ('[backend]\nprovider = "duckdb"\n', "\n\n"),
+        ('  [backend]\nprovider = "duckdb"\n', "\n\n"),
+        ('\n[backend]\nprovider = "duckdb"\n', "\n"),
+        ('spinner = "pong"\n[backend]\nprovider = "duckdb"\n', "\n"),
+    ],
+)
+def test_initial_source_id_preserves_content_and_section_spacing(
+    tmp_path: Path, content: str, separator: str
+) -> None:
+    """Separate an initial section without duplicating an existing blank line."""
+    path = tmp_path / "config.toml"
+    path.write_text(content)
+    assert not config_module.write_initial_config(path)
+    configuration = ConfigurationManager(path).load()
+    expected = f'source_id = "{configuration.source_id}"{separator}{content}'
+    assert path.read_text() == expected
+    assert not config_module.write_initial_config(path)
+    assert path.read_text() == expected
+
+
 def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
     """Reject an unparsable source namespace before opening a backend."""
     path = tmp_path / "config.toml"

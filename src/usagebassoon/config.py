@@ -148,7 +148,8 @@ def write_initial_config(path: Path) -> bool:
                 if not isinstance(value, str) or _UUID_PATTERN.fullmatch(value) is None:
                     raise ConfigurationError("source_id must be a UUID")
                 return False
-            _atomic_replace(path, f'source_id = "{uuid4()}"\n' + content)
+            separator = "\n\n" if content.lstrip(" \t").startswith("[") else "\n"
+            _atomic_replace(path, f'source_id = "{uuid4()}"{separator}' + content)
             sync_directory(path.parent)
             return False
         content = (
