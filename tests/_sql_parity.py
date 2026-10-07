@@ -18,6 +18,13 @@ from sqlglot import exp
 
 from tests._observations import observations
 from usagebassoon.backends.base import StorageBackend
+from usagebassoon.cli.reports._common import (
+    ReportFilters,
+    SessionSort,
+    load_daily_usage,
+    load_model_usage,
+    load_session_usage,
+)
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.schema_assets import PARITY_SCHEMA_ASSETS
 
@@ -349,6 +356,67 @@ def _normalize_value(value: object) -> object:
     if isinstance(value, dict):
         return {key: _normalize_value(item) for key, item in value.items()}
     return cast(str | int | bool | None, value)
+
+
+def assert_report_results_match(
+    left: StorageBackend, right: StorageBackend, *, exhaustive: bool = False
+) -> None:
+    """Compare packaged queries, bound filters, grouping, and ordered output.
+
+    Both backends must contain ``seed_synthetic_data`` rows. Live tests exercise
+    every query shape; hermetic replay additionally covers every session sort.
+    """
+    filters = (
+        ReportFilters(),
+        ReportFilters(
+            source=_SOURCE_ID,
+            client="codex",
+            model="model-alpha",
+            workspace="alpha",
+            tag="workspace-tag",
+        ),
+    )
+    for selection in filters:
+        for name, loader in (("daily", load_daily_usage), ("models", load_model_usage)):
+            records = [
+                loader(
+                    backend, selection, since=date(2026, 9, 20), until=date(2026, 9, 20)
+                )
+                for backend in (left, right)
+            ]
+            assert _normalize_value(records[0]) == _normalize_value(records[1]), name
+            if name == "daily":
+                assert len(records[0]) == 1
+                assert records[0][0]["total_tokens"] == (
+                    25 if selection.model is None else 15
+                )
+                assert _normalize_value(records[0][0]["cost_usd"]) == (
+                    3.7 if selection.model is None else 1.5
+                )
+        sorts = tuple(SessionSort) if exhaustive else (SessionSort.LAST_ACTIVE,)
+        for by_model in (False, True):
+            for sort in sorts:
+                records = [
+                    load_session_usage(
+                        backend,
+                        selection,
+                        by_model=by_model,
+                        sort=sort,
+                        limit=2,
+                        since=date(2026, 9, 21),
+                        until=date(2026, 9, 21),
+                    )
+                    for backend in (left, right)
+                ]
+                assert _normalize_value(records[0]) == _normalize_value(records[1]), (
+                    by_model,
+                    sort,
+                    selection,
+                )
+                assert len(records[0]) == (2 if selection.model is None else 1)
+    malicious = ReportFilters(model="model-alpha' OR 1=1 --")
+    for backend in (left, right):
+        assert load_model_usage(backend, malicious) == []
 
 
 def _assert_records_match(

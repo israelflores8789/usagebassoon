@@ -24,8 +24,8 @@ usagebassoon/
 │   ├── backends/             # StorageBackend contracts, factory, and database adapters
 │   ├── buckets/              # SnapshotBucket abstractions, factory, and object adapters
 │   ├── sql/                  # Dialect-specific packaged SQL assets
-│   │   ├── duckdb/           # ddl.sql, views.sql (also serves MotherDuck)
-│   │   └── bigquery/         # ddl.sql, views.sql, compaction.sql
+│   │   ├── duckdb/           # ddl.sql, views.sql, queries.sql (also serves MotherDuck)
+│   │   └── bigquery/         # ddl.sql, views.sql, queries.sql, compaction.sql
 │   ├── api.py                # Public Python query and connection API
 │   ├── archiver.py           # Public snapshot orchestration
 │   ├── audit.py              # Backend and archived run/source evidence
@@ -312,6 +312,8 @@ The following are out-of-scope and/or antithetical to the design goals:
   6. Collection does not trigger archival. Independent snapshot jobs check scheduled/weekly obligations through `SnapshotArchiver` without waiting for collection or requiring tokscale.
 
 - **Backend SQL management:** Each backend installs native DDL and views under `sql/<dialect>/`; MotherDuck shares the DuckDB assets. CI checks structural parity with SQLGlot and behavior with synthetic replay and native backend tests.
+
+- **Packaged read queries:** Each dialect's `queries.sql` contains named queries separated by standalone `-- name: <identifier>` markers. `schema_assets.query_sql(backend.dialect, name)` selects the native template. CLI report helpers insert only trusted predicate, ordering, and limit fragments; values stay in separate query bindings. Apply runtime filters before aggregation, and calculate ratios from the filtered totals. Views retain canonical metric and activity semantics. Query templates are not installed objects and do not participate in schema hashes. Keep named-query inventories and behavior paired across dialects through structural, synthetic, and live tests.
 
 - **CI workflows:** `CI Local` (`.github/workflows/ci-local.yml`) runs on pull requests targeting `main` and manual dispatch. `CI` (`.github/workflows/ci.yml`) runs on pushes to `main` and `dev`, repeating local checks and adding protected BigQuery, MotherDuck, and GCS integration tests through the `ci-live` environment. `Release` (`.github/workflows/release.yml`) requires a successful `CI` push run on `main` for the exact tagged commit.
 

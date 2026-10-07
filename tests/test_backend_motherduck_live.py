@@ -44,6 +44,7 @@ from typer.testing import CliRunner
 from tests._cli import plain_cli_output
 from tests._observations import observations
 from tests._sql_parity import (
+    assert_report_results_match,
     assert_view_results_match,
     normalized_records,
     seed_synthetic_data,
@@ -336,6 +337,19 @@ def test_live_synthetic_views_match_duckdb() -> None:
         seed_synthetic_data(local)
         seed_synthetic_data(remote)
         assert_view_results_match(local, remote, right_label="MotherDuck")
+    finally:
+        local.close()
+        remote.close()
+
+
+def test_live_packaged_report_queries_match_duckdb() -> None:
+    """Execute every packaged report shape with filters on native MotherDuck."""
+    local, remote = DuckDBBackend(":memory:"), _backend()
+    try:
+        local.apply_ddl()
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        assert_report_results_match(local, remote)
     finally:
         local.close()
         remote.close()

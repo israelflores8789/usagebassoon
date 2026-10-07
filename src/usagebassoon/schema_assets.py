@@ -1,17 +1,68 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""schema_assets.py — Ordered packaged SQL assets for schema initialization."""
+"""schema_assets.py — Packaged schema assets and named native query templates."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from importlib import resources
 
 # Fresh installations use one baseline. Future upgrades register explicit steps.
 SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_ASSETS = ("ddl.sql", "views.sql")
 PARITY_SCHEMA_ASSETS = RUNTIME_SCHEMA_ASSETS
+QUERY_ASSET = "queries.sql"
+
+
+@cache
+def _query_templates(dialect: str) -> dict[str, str]:
+    """Index packaged queries separated by explicit ``-- name:`` markers."""
+    if dialect not in {"duckdb", "bigquery"}:
+        raise ValueError(f"unsupported SQL dialect: {dialect}")
+    sql = (
+        resources.files(f"usagebassoon.sql.{dialect}").joinpath(QUERY_ASSET).read_text()
+    )
+    queries: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in sql.splitlines():
+        if line.startswith("-- name:"):
+            name = line.removeprefix("-- name:").strip()
+            if not name.isascii() or not name.isidentifier():
+                raise ValueError(f"invalid packaged query name: {name!r}")
+            if name in queries:
+                raise ValueError(f"duplicate packaged query: {name}")
+            queries[name] = []
+            current = name
+        elif current is not None:
+            queries[current].append(line)
+    result = {name: "\n".join(lines).strip() for name, lines in queries.items()}
+    if not result or any(not sql for sql in result.values()):
+        raise ValueError("packaged queries must contain nonempty named SQL")
+    return result
+
+
+def query_sql(dialect: str, name: str) -> str:
+    """Read one named native query template from the dialect's queries.sql.
+
+    Callers insert only trusted SQL fragments and bind values separately. Query
+    templates are not installed schema objects or part of the schema hash.
+
+    Args:
+        dialect: SQL installation dialect; MotherDuck uses DuckDB.
+        name: Exact logical query name from a ``-- name:`` marker.
+
+    Returns:
+        Packaged SQL, including placeholders for controlled query construction.
+
+    Raises:
+        ValueError: If the dialect, query name, or packaged markers are invalid.
+    """
+    try:
+        return _query_templates(dialect)[name]
+    except KeyError as error:
+        raise ValueError(f"packaged query is not defined: {name}") from error
 
 
 def schema_hash(dialect: str) -> str:

@@ -50,7 +50,12 @@ from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
 from tests._snapshot_fakes import seed_recovery_data
-from tests._sql_parity import normalized_records, seed_synthetic_data, view_names
+from tests._sql_parity import (
+    assert_report_results_match,
+    normalized_records,
+    seed_synthetic_data,
+    view_names,
+)
 from tests.test_collector_daily import _assert_live_backfill_and_warm_collection
 from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.bigquery import BigQueryBackend
@@ -381,6 +386,20 @@ def managed_compaction_schedule(
 def _backend(settings: LiveSettings) -> BigQueryBackend:
     """Open a fresh BigQuery backend for one live assertion."""
     return BigQueryBackend(settings.project, _DATASET, location=settings.location)
+
+
+def test_live_packaged_report_queries_match_duckdb(live_settings: LiveSettings) -> None:
+    """Execute every packaged report shape with filters on native BigQuery."""
+    local, remote = DuckDBBackend(":memory:"), _backend(live_settings)
+    try:
+        local.apply_ddl()
+        seed_synthetic_data(local)
+        seed_synthetic_data(remote)
+        seed_synthetic_data(remote)
+        assert_report_results_match(local, remote)
+    finally:
+        local.close()
+        remote.close()
 
 
 @pytest.fixture(autouse=True)

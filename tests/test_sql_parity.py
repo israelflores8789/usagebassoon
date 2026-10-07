@@ -5,6 +5,8 @@
 
 from datetime import UTC, date, datetime, timedelta
 from importlib import resources
+from pathlib import Path
+from string import Formatter
 from uuid import uuid4
 
 import pyarrow as pa
@@ -14,6 +16,7 @@ from sqlglot import exp
 
 from tests._bigquery_replay import BigQueryReplayBackend
 from tests._sql_parity import (
+    assert_report_results_match,
     assert_view_results_match,
     normalized_records,
     seed_synthetic_data,
@@ -28,6 +31,7 @@ from usagebassoon.cli.reports._common import (
 )
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.schema_assets import QUERY_ASSET, _query_templates, query_sql
 from usagebassoon.storage_model import DEBUG_TABLES, EVENT_KEYS, STATE_KEYS
 
 pytestmark = pytest.mark.sql_parity
@@ -83,13 +87,78 @@ def test_logical_gold_and_event_schemas_match() -> None:
 def test_packaged_asset_inventory_and_native_parsing() -> None:
     for dialect in ("duckdb", "bigquery"):
         package = resources.files(f"usagebassoon.sql.{dialect}")
-        expected = {"ddl.sql", "views.sql"} | (
+        expected = {"ddl.sql", "views.sql", QUERY_ASSET} | (
             {"compaction.sql"} if dialect == "bigquery" else set()
         )
         actual = {item.name for item in package.iterdir() if item.name.endswith(".sql")}
         assert actual == expected
         for filename in actual:
-            assert sqlglot.parse(package.joinpath(filename).read_text(), read=dialect)
+            if filename != QUERY_ASSET:
+                assert sqlglot.parse(
+                    package.joinpath(filename).read_text(), read=dialect
+                )
+
+
+def test_named_query_inventory_and_native_asts_match() -> None:
+    """Keep named queries paired, read-only, and limited to controlled fragments."""
+    names = set(_query_templates("duckdb"))
+    assert names == set(_query_templates("bigquery"))
+    assert names == {
+        "report_daily",
+        "report_models",
+        "report_sessions",
+        "report_session_models",
+    }
+    for name in names:
+        asts = []
+        for dialect in ("duckdb", "bigquery"):
+            template = query_sql(dialect, name)
+            fields = {
+                field
+                for _, field, _, _ in Formatter().parse(template)
+                if field is not None
+            }
+            assert fields <= {"where", "ordering", "limit"}
+            sql = template.format(
+                where="WHERE facts.model = :model",
+                ordering="activity_day DESC NULLS LAST",
+                limit="LIMIT 2",
+            )
+            parsed = sqlglot.parse(sql, read=dialect)
+            assert len(parsed) == 1 and isinstance(parsed[0], exp.Select)
+            statement = parsed[0]
+            for ordered in statement.find_all(exp.Ordered):
+                ordered.set("nulls_first", None)
+            asts.append(statement.sql(dialect="duckdb", comments=False))
+        assert asts[0] == asts[1], name
+    with pytest.raises(ValueError, match="unsupported SQL dialect"):
+        query_sql("unsupported", "report_daily")
+    with pytest.raises(ValueError, match="not defined"):
+        query_sql("duckdb", "../ddl")
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        ("-- no named queries", "nonempty named SQL"),
+        ("-- name: empty\n", "nonempty named SQL"),
+        ("-- name: ../invalid\nSELECT 1;", "invalid packaged query name"),
+        ("-- name: duplicate\nSELECT 1;\n-- name: duplicate\nSELECT 2;", "duplicate"),
+    ],
+)
+def test_named_query_lookup_rejects_malformed_assets(
+    sql: str, message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject malformed markers rather than silently choosing an ambiguous query."""
+    (tmp_path / QUERY_ASSET).write_text(sql)
+
+    def package(_name: str) -> Path:
+        return tmp_path
+
+    _query_templates.cache_clear()
+    monkeypatch.setattr("usagebassoon.schema_assets.resources.files", package)
+    with pytest.raises(ValueError, match=message):
+        query_sql("duckdb", "duplicate")
 
 
 def test_report_view_asts_remain_equivalent() -> None:
@@ -126,6 +195,7 @@ def test_synthetic_raw_and_gold_replay_matches_shared_views() -> None:
             > local.query("SELECT * FROM daily_stats").num_rows
         )
         assert_view_results_match(local, remote, view_names())
+        assert_report_results_match(local, remote, exhaustive=True)
     finally:
         local.close()
         remote.close()
