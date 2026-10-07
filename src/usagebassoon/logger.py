@@ -143,6 +143,14 @@ def _log_directory(config: LoggingConfig) -> Path:
     return Path(override).expanduser() if override else config.directory.expanduser()
 
 
+_SETTINGS: LoggingConfig | None = None
+
+
+def current_settings() -> LoggingConfig | None:
+    """Return the active logging policy for an owned child process."""
+    return _SETTINGS
+
+
 def configure(config: LoggingConfig | UsageBassoonConfig) -> logging.Logger:
     """Configure the UsageBassoon rotating operational log.
 
@@ -152,12 +160,13 @@ def configure(config: LoggingConfig | UsageBassoonConfig) -> logging.Logger:
     Returns:
         The package logger configured for exception diagnostics.
     """
-    global _CREDENTIAL_ENVIRONMENT_NAMES, _KNOWN_CREDENTIALS
+    global _CREDENTIAL_ENVIRONMENT_NAMES, _KNOWN_CREDENTIALS, _SETTINGS
     if isinstance(config, UsageBassoonConfig):
         _CREDENTIAL_ENVIRONMENT_NAMES = tuple(
             dict.fromkeys((*_CREDENTIAL_ENVIRONMENT_NAMES, *config.tokscale_env))
         )
         config = config.logging
+    _SETTINGS = config
     # Reconfiguration must still protect credentials used by in-flight operations.
     _KNOWN_CREDENTIALS = tuple(
         dict.fromkeys(

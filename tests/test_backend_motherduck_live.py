@@ -26,12 +26,13 @@ import json
 import logging
 import os
 import signal
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from uuid import uuid4
 
 import duckdb
@@ -63,7 +64,11 @@ from usagebassoon.backends.base import (
     is_simple_identifier,
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
-from usagebassoon.backends.motherduck import MotherDuckBackend
+from usagebassoon.backends.motherduck import (
+    MotherDuckBackend,
+    _NativeMotherDuck,
+    _NativeResource,
+)
 from usagebassoon.cli.app import app
 from usagebassoon.config import ConfigurationManager, UsageBassoonConfig
 from usagebassoon.curation import NoteAssignment, TagAssignment, add_tag, set_note
@@ -72,6 +77,7 @@ from usagebassoon.diagnostics import run_doctor
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
+from usagebassoon.snapshot.restore import restore_operation_id
 from usagebassoon.storage_model import SNAPSHOT_TABLES, STATE_KEYS
 
 pytestmark = [pytest.mark.motherduck_live, pytest.mark.usefixtures("live_settings")]
@@ -128,23 +134,24 @@ def _reset_test_schema(backend: MotherDuckBackend) -> None:
     for name in reversed(view_names()):
         if not is_simple_identifier(name):
             pytest.fail(f"invalid packaged view name {name!r}")
-        backend.connection.execute(f'DROP VIEW IF EXISTS "{name}"')
+        backend.query(f'DROP VIEW IF EXISTS "{name}"')
     for statement in reversed(statements("duckdb", "ddl.sql")):
         if not isinstance(statement, exp.Create) or statement.kind != "TABLE":
             pytest.fail("DuckDB DDL must contain only CREATE TABLE statements")
         table = statement.this.this.name
         if not is_simple_identifier(table):
             pytest.fail(f"invalid packaged table name {table!r}")
-        backend.connection.execute(f'DROP TABLE IF EXISTS "{table}"')
+        backend.query(f'DROP TABLE IF EXISTS "{table}"')
     # This database is exclusively disposable: older prerelease table shapes
     # must not survive a reset and masquerade as unexpected recovery data.
-    for schema, table in backend.connection.execute(
+    for row in backend.query(
         "SELECT table_schema, table_name FROM information_schema.tables "
         "WHERE table_catalog = current_database() AND table_type = 'BASE TABLE'"
-    ).fetchall():
+    ).to_pylist():
+        schema, table = row["table_schema"], row["table_name"]
         quoted_schema = '"' + str(schema).replace('"', '""') + '"'
         quoted_table = '"' + str(table).replace('"', '""') + '"'
-        backend.connection.execute(f"DROP TABLE {quoted_schema}.{quoted_table}")
+        backend.query(f"DROP TABLE {quoted_schema}.{quoted_table}")
 
 
 @pytest.fixture(scope="module")
@@ -184,6 +191,83 @@ def live_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveSett
 def _backend() -> MotherDuckBackend:
     """Open a separate service-account connection to the test database."""
     return MotherDuckBackend(_DATABASE)
+
+
+class _RestoreFaultBackend(_NativeMotherDuck):
+    """Inject recovery failures on the native handle owned by the child."""
+
+    def __init__(self, failure: str, written: Path | None = None) -> None:
+        """Restrict the controlled connection to the dedicated live database."""
+        super().__init__(_DATABASE)
+        self.failure = failure
+        self.written = written
+        self.restored_tables = 0
+
+    @override
+    def upsert(
+        self,
+        table: str,
+        data: pa.Table,
+        natural_keys: Sequence[str],
+        change_fields: Sequence[str],
+    ) -> UpsertResult:
+        """Interrupt only after remote facts have entered the actual transaction."""
+        result = super().upsert(table, data, natural_keys, change_fields)
+        if (
+            self.failure == "timeout"
+            and self.written is not None
+            and not self.written.exists()
+        ):
+            self.written.write_text(table)
+            self.query(
+                "SELECT sum(x::DOUBLE * y::DOUBLE) "
+                "FROM range(1000000) a(x), range(1000000) b(y)"
+            )
+        return result
+
+    @override
+    def append(self, table: str, data: pa.Table) -> None:
+        """Fail only after a real remote table has entered the restore transaction."""
+        if self.failure == "late" and self.restored_tables:
+            raise RuntimeError("injected restore failure")
+        super().append(table, data)
+        self.restored_tables += 1
+        if self.failure == "late":
+            assert self.query(f'SELECT * FROM "{table}"').num_rows == data.num_rows
+            assert self.written is not None
+            self.written.write_text(table)
+
+    @override
+    def restore_snapshot(
+        self, files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
+    ) -> None:
+        """Lose commit acknowledgement or reject an unexpected replay."""
+        if self.failure == "forbidden":
+            raise AssertionError("a committed restore was replayed after reconnecting")
+        super().restore_snapshot(
+            files, operation_id=operation_id, snapshot_id=snapshot_id
+        )
+        if self.failure == "lost":
+            raise OSError("MotherDuck restore acknowledgement lost")
+
+
+def _fault_resource(failure: str, written: Path | None) -> _NativeResource:
+    """Allocate a real native fault target only in the resource-owning child."""
+    return _NativeResource(_RestoreFaultBackend(failure, written))
+
+
+def _install_live_fault(
+    monkeypatch: pytest.MonkeyPatch, failure: str, written: Path | None = None
+) -> None:
+    """Keep proxy and native interruption real while controlling a child operation."""
+
+    def factory(
+        database: str, _token: str, _timeout: float
+    ) -> Callable[[], _NativeResource]:
+        assert database == _DATABASE
+        return partial(_fault_resource, failure, written)
+
+    monkeypatch.setattr("usagebassoon.backends.motherduck._resource_factory", factory)
 
 
 def _normalized_bundle(
@@ -236,7 +320,7 @@ def empty_live_warehouse(live_settings: LiveSettings) -> None:
     try:
         with backend.transaction():
             for table in SNAPSHOT_TABLES:
-                backend.connection.execute(f'DELETE FROM "{table}"')
+                backend.query(f'DELETE FROM "{table}"')
     finally:
         backend.close()
 
@@ -493,48 +577,30 @@ def test_live_batch_rolls_back_after_late_failure(
 def test_live_native_deadline_rolls_back_and_replays_stable_batch(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Cancel a transaction after a remote upsert and replay on the native handle."""
+    """Interrupt a remote write and reuse the same child after a complete rollback."""
     bundle = _normalized_bundle(collection_bundle, str(uuid4()))
+    wrote = tmp_path / "remote-upsert"
+    _install_live_fault(monkeypatch, "timeout", wrote)
     backend = _backend()
-    connection = backend.connection
-    assert isinstance(connection, duckdb.DuckDBPyConnection)
-    original = backend.upsert
-    wrote_remote_facts = False
-
-    def delayed_upsert(
-        table: str,
-        data: pa.Table,
-        natural_keys: Sequence[str],
-        change_fields: Sequence[str],
-    ) -> UpsertResult:
-        nonlocal wrote_remote_facts
-        result = original(table, data, natural_keys, change_fields)
-        wrote_remote_facts = True
-        backend.query(
-            "SELECT sum(x::DOUBLE * y::DOUBLE) "
-            "FROM range(1000000) a(x), range(1000000) b(y)"
-        )
-        return result
-
+    process = backend._resource._process
     try:
         backend.timeout_seconds = 10.0
-        with monkeypatch.context() as patch:
-            patch.setattr(backend, "upsert", delayed_upsert)
-            with pytest.raises(OperationTimeout):
-                persist_run(backend, bundle)
-        assert wrote_remote_facts
+        with pytest.raises(OperationTimeout):
+            persist_run(backend, bundle)
+        assert wrote.exists()
+        assert backend._resource._process is process and process.poll() is None
         backend.timeout_seconds = 120.0
-        assert backend.connection is connection
         assert not backend.has_committed_run(bundle.run_id)
         assert backend.query("SELECT * FROM daily_stats").num_rows == 0
         assert backend.query("SELECT * FROM sessions").num_rows == 0
         persist_run(backend, bundle)
         assert backend.has_committed_run(bundle.run_id)
-        assert backend.query("SELECT * FROM current_daily_stats").num_rows == (
-            bundle.tables["daily_stats"].num_rows
+        assert (
+            backend.query("SELECT * FROM current_daily_stats").num_rows
+            == bundle.tables["daily_stats"].num_rows
         )
-        assert backend._watchdog is None
     finally:
         backend.close()
 
@@ -829,24 +895,13 @@ def test_live_configured_clients_and_curation_preserve_source_identity(
 
 
 def test_live_restore_receipt_survives_lost_reply_and_reconnection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Resolve a real committed restore and refuse replay through a new connection."""
     source = DuckDBBackend(":memory:")
+    _install_live_fault(monkeypatch, "lost")
     remote = _backend()
-    attempts: list[str] = []
-    original = remote.restore_snapshot
-
-    def lost_reply(
-        files: Mapping[str, Path], *, operation_id: str, snapshot_id: str
-    ) -> None:
-        original(files, operation_id=operation_id, snapshot_id=snapshot_id)
-        attempts.append(operation_id)
-        raise OSError("MotherDuck restore acknowledgement lost")
-
-    def forbidden_replay(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("a committed restore was replayed after reconnecting")
-
     try:
         source.apply_ddl()
         note = NoteAssignment(str(uuid4()), "codex", "receipt-session", "durable note")
@@ -856,14 +911,14 @@ def test_live_restore_receipt_survives_lost_reply_and_reconnection(
         uri = store.write(source, run_id="receipt", manual=True)
         assert uri is not None
         notices: list[str] = []
-        monkeypatch.setattr(remote, "restore_snapshot", lost_reply)
+        with store.reader.prepare(uri) as prepared:
+            receipt = restore_operation_id(prepared)
         assert store.restore(remote, uri, notice=notices.append)["notes"] == 1
         assert any("acknowledgement was interrupted" in notice for notice in notices)
-        assert len(attempts) == 1
         remote.close()
+        _install_live_fault(monkeypatch, "forbidden")
         remote = _backend()
-        monkeypatch.setattr(remote, "restore_snapshot", forbidden_replay)
-        assert remote.restore_committed(attempts[0])
+        assert remote.restore_committed(receipt)
         notices.clear()
         assert store.restore(remote, uri, notice=notices.append)["notes"] == 1
         assert any("already committed" in notice for notice in notices)
@@ -871,7 +926,7 @@ def test_live_restore_receipt_survives_lost_reply_and_reconnection(
         assert remote.query(
             "SELECT count(*) AS n FROM restore_receipts "
             "WHERE operation_id = :operation",
-            {"operation": attempts[0]},
+            {"operation": receipt},
         ).to_pylist() == [{"n": 1}]
     finally:
         remote.close()
@@ -986,22 +1041,18 @@ def test_live_portable_snapshots_and_atomic_restore(
         assert declined.exit_code != 0
         assert "Aborted" in plain_cli_output(declined.output)
         assert all(not records for records in rows(remote).values())
-        original_append = remote.append
-        written: list[str] = []
-
-        def fail_after_first_table(table: str, data: pa.Table) -> None:
-            """Inject a late failure after a real remote table has been restored."""
-            if written:
-                raise RuntimeError("injected restore failure")
-            original_append(table, data)
-            written.append(table)
-            assert remote.query(f'SELECT * FROM "{table}"').num_rows == data.num_rows
-
+        written = tmp_path / "restored-table"
+        remote.close()
         with monkeypatch.context() as failed_restore:
-            failed_restore.setattr(remote, "append", fail_after_first_table)
-            with pytest.raises(RuntimeError, match="injected restore failure"):
-                portable.restore(remote)
-        assert len(written) == 1
+            _install_live_fault(failed_restore, "late", written)
+            failed = _backend()
+            try:
+                with pytest.raises(RuntimeError, match="injected restore failure"):
+                    portable.restore(failed)
+            finally:
+                failed.close()
+        remote = _backend()
+        assert written.read_text() in SNAPSHOT_TABLES
         assert all(not records for records in rows(remote).values())
         restored = runner.invoke(app, command, input="y\n")
         assert restored.exit_code == 0, (

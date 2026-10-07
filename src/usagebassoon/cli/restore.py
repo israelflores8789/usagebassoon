@@ -16,7 +16,10 @@ from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
 from usagebassoon.cli.snapshot import confirm_location, notice
 from usagebassoon.cli.spinner import spinner
-from usagebassoon.snapshot.restore import restore_operation_id, restore_prepared
+from usagebassoon.snapshot.restore import (
+    restore_operation_id,
+    restore_prepared,
+)
 
 
 def restore(

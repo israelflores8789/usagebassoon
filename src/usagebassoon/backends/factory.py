@@ -8,7 +8,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
-from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.backends.base import (
+    StorageBackend,
+    close_backend,
+)
 from usagebassoon.deadlines import cleanup_budget, operation
 
 if TYPE_CHECKING:

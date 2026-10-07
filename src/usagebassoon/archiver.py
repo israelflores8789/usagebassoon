@@ -11,6 +11,7 @@ import tomllib
 from base64 import b64encode
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
@@ -61,6 +62,54 @@ _LOG = logging.getLogger("usagebassoon")
 def _now() -> datetime:
     """Return the current UTC instant."""
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotCapture:
+    """Disk-backed capture metadata; no native readers leave the operation."""
+
+    captured_at: str
+    specifications: dict[str, object]
+    files: dict[str, Path]
+    provenance: dict[str, object]
+
+
+def _capture_snapshot(backend: StorageBackend, directory: Path) -> _SnapshotCapture:
+    """Serialize one pinned backend stream into archiver-owned Parquet files."""
+    specifications: dict[str, object] = {}
+    files: dict[str, Path] = {}
+    with backend.stream_snapshot(SNAPSHOT_TABLES) as stream:
+        captured_at = stream.captured_at.isoformat()
+        for table in SNAPSHOT_TABLES:
+            remaining_seconds()
+            schema = CANONICAL_TABLE_SCHEMAS[table]
+            path = directory / f"{table}.parquet"
+            rows = 0
+            with pq.ParquetWriter(path, schema) as writer:
+                for batch in stream.tables[table]:
+                    remaining_seconds()
+                    batch = batch.cast(schema)
+                    writer.write_batch(batch)
+                    rows += batch.num_rows
+            refs: list[dict[str, object]] = []
+            if rows:
+                files[table] = path
+                refs.append(
+                    {
+                        "name": path.name,
+                        "size": path.stat().st_size,
+                        "sha256": digest(path),
+                    }
+                )
+            specifications[table] = {
+                "status": "complete",
+                "rows": rows,
+                "schema_ipc": b64encode(schema.serialize().to_pybytes()).decode(),
+                "objects": refs,
+            }
+    return _SnapshotCapture(
+        captured_at, specifications, files, backend.snapshot_provenance()
+    )
 
 
 class SnapshotWriteError(RuntimeError):
@@ -325,39 +374,10 @@ class SnapshotArchiver:
                 with TemporaryDirectory(prefix="usagebassoon-snapshot-") as temporary:
                     try:
                         directory = Path(temporary)
-                        specifications: dict[str, object] = {}
-                        files: dict[str, Path] = {}
-                        with backend.stream_snapshot(SNAPSHOT_TABLES) as stream:
-                            captured_at = stream.captured_at.isoformat()
-                            for table in SNAPSHOT_TABLES:
-                                remaining_seconds()
-                                schema = CANONICAL_TABLE_SCHEMAS[table]
-                                path = directory / f"{table}.parquet"
-                                rows = 0
-                                with pq.ParquetWriter(path, schema) as writer:
-                                    for batch in stream.tables[table]:
-                                        remaining_seconds()
-                                        batch = batch.cast(schema)
-                                        writer.write_batch(batch)
-                                        rows += batch.num_rows
-                                refs: list[dict[str, object]] = []
-                                if rows:
-                                    files[table] = path
-                                    refs.append(
-                                        {
-                                            "name": path.name,
-                                            "size": path.stat().st_size,
-                                            "sha256": digest(path),
-                                        }
-                                    )
-                                specifications[table] = {
-                                    "status": "complete",
-                                    "rows": rows,
-                                    "schema_ipc": b64encode(
-                                        schema.serialize().to_pybytes()
-                                    ).decode(),
-                                    "objects": refs,
-                                }
+                        capture = _capture_snapshot(backend, directory)
+                        captured_at = capture.captured_at
+                        specifications = capture.specifications
+                        files = capture.files
                         roles = sorted(
                             {role for _, memberships in due for role in memberships}
                         )
@@ -366,7 +386,7 @@ class SnapshotArchiver:
                             "snapshot_format_version": FORMAT_VERSION,
                             "data_schema_version": DATA_SCHEMA_VERSION,
                             "usagebassoon_version": __version__,
-                            **backend.snapshot_provenance(),
+                            **capture.provenance,
                             "created_at": created.isoformat(),
                             "captured_at": captured_at,
                             "run_id": run_id,

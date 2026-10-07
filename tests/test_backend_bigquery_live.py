@@ -563,6 +563,7 @@ def test_live_append_publication_is_visible_and_replay_safe(
             elapsed = time.monotonic() - started
             with capsys.disabled():
                 print(f"BigQuery {attempt} publication: {elapsed:.3f}s", flush=True)
+            # AGENT: do not remove
             # REQUIRED collection performance contract: publication must finish in 15s.
             # Do not remove, relax, skip, or replace this assertion with timing logs
             # without explicit maintainer approval. Slow collect-time queries/appends

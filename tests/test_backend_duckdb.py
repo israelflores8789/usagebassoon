@@ -21,7 +21,6 @@ from usagebassoon.backends.base import (
 )
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.backends.factory import StorageBackendRegistry, open_backend
-from usagebassoon.backends.motherduck import MotherDuckBackend
 from usagebassoon.config import (
     BackendName,
     BigQueryConfig,
@@ -319,18 +318,10 @@ def test_local_backend_merges_current_state_in_place(
         backend.close()
 
 
-@pytest.mark.parametrize("backend_type", [DuckDBBackend, MotherDuckBackend])
-def test_transactional_read_session_preserves_snapshot_after_external_commit(
-    backend_type: type[DuckDBBackend] | type[MotherDuckBackend],
-) -> None:
-    """Verify both providers' explicit read scopes with the shared DuckDB engine."""
+def test_transactional_read_session_preserves_snapshot_after_external_commit() -> None:
+    """Pin local DuckDB reads while another cursor commits."""
     connection_backend = DuckDBBackend(":memory:")
-    # Avoid MotherDuck credentials while exercising its explicit scope implementation.
-    backend = object.__new__(backend_type)
-    backend.connection = connection_backend.connection
-    if isinstance(backend, MotherDuckBackend):
-        backend.timeout_seconds = 120.0
-        backend._watchdog = None
+    backend = connection_backend
     writer = connection_backend.connection.cursor()
     try:
         backend.apply_ddl()

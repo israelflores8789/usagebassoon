@@ -170,6 +170,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:
 
+- NEVER remove comments marked with the `AGENT: do not remove` preamble or their explanatory continuation lines.
 - NEVER modify the golden JSON fixtures in `tests/fixtures/`.
 - NEVER attempt to publish to PyPI or invoke any publishing command; consequently, NEVER use `just publish` or `just release`.
 - NEVER attempt to perform a release to GitHub or invoke any release command.

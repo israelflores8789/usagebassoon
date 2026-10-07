@@ -11,14 +11,25 @@ seconds. Snapshot capture and restore use separate, longer scopes.
 
 from __future__ import annotations
 
+import io
+import logging
+import os
+import pickle
+import subprocess
+import sys
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import wraps
+from dataclasses import dataclass
+from functools import partial, wraps
 from math import isfinite
-from threading import Lock
+from threading import Event, Lock, Thread, Timer
 from time import monotonic
-from typing import Protocol, cast, override
+from types import BuiltinMethodType, MethodType, MethodWrapperType, ModuleType
+from typing import TYPE_CHECKING, Protocol, cast, override
+
+if TYPE_CHECKING:
+    from usagebassoon.config import LoggingConfig
 
 CLEANUP_SECONDS = 15.0
 CONNECTION_SECONDS = 10.0
@@ -26,9 +37,363 @@ REQUEST_SECONDS = 30.0
 SNAPSHOT_SECONDS = 600.0
 RESTORE_SECONDS = 600.0
 
+_LOG = logging.getLogger("usagebassoon")
+
 
 class OperationTimeout(TimeoutError, RuntimeError):
     """Completion is uncertain after an operation exhausts its shared budget."""
+
+
+class ResourceUnavailable(OperationTimeout):
+    """A terminated or unsafe child resource and all its scopes are invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceStart[R]:
+    """Construct a resource privately; only its readiness crosses the pipe."""
+
+    construct: Callable[[], R]
+    interrupt: Callable[[R], None] | None
+    close: Callable[[R], None]
+    expires: float
+    logging: LoggingConfig | None
+    logging_disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceCall[R, A, T]:
+    """One explicit operation on the same child-owned resource."""
+
+    execute: Callable[[R, A], T] | None
+    argument: A
+    expires: float
+    cleanup: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceReply[T]:
+    """A completed request, including cancellation and resource validity."""
+
+    value: T | None = None
+    error: BaseException | None = None
+    expired: bool = False
+    invalid: bool = False
+
+
+class SupervisedResource[R]:
+    """Own a persistent child and exchange typed operations under shared deadlines.
+
+    Constructors and operations must be trusted importable callables. Blocking
+    pipe I/O runs on a daemon thread; the owner bounds that wait and kills and
+    reaps the child before returning an uncertain outcome. No resource handle
+    crosses the process boundary, and a killed resource is never reconnected.
+    """
+
+    def __init__(
+        self,
+        construct: Callable[[], R],
+        *,
+        interrupt: Callable[[R], None] | None,
+        close: Callable[[R], None],
+    ) -> None:
+        """Start and await readiness inside the caller's operation budget."""
+        from usagebassoon.logger import current_settings
+
+        deadline = current_deadline()
+        if deadline is None:
+            raise RuntimeError("supervised resources require an operation deadline")
+        self._lock = Lock()
+        self._closed = False
+        self._process: subprocess.Popen[bytes] = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from usagebassoon.deadlines import _resource_worker; "
+                "_resource_worker()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            bufsize=0,
+        )
+        assert isinstance(self._process.stdin, io.FileIO)
+        assert isinstance(self._process.stdout, io.FileIO)
+        self._writer = io.BufferedWriter(self._process.stdin)
+        self._reader = io.BufferedReader(self._process.stdout)
+        try:
+            self._exchange(
+                _ResourceStart(
+                    construct,
+                    interrupt,
+                    close,
+                    deadline.expires,
+                    current_settings(),
+                    _LOG.disabled,
+                ),
+                deadline,
+            )
+        except BaseException:
+            self._terminate(deadline)
+            raise
+
+    def call[A, T](self, execute: Callable[[R, A], T], argument: A) -> T:
+        """Execute an importable, unbound operation with the child resource first."""
+        candidate: object = execute
+        while isinstance(candidate, partial):
+            candidate = candidate.func
+        if isinstance(candidate, (MethodType, BuiltinMethodType, MethodWrapperType)):
+            owner = candidate.__self__
+            if owner is not None and not isinstance(owner, ModuleType):
+                raise TypeError(
+                    "child callables must be unbound; the child supplies the resource"
+                )
+        deadline = current_deadline()
+        if deadline is None:
+            raise RuntimeError("supervised calls require an operation deadline")
+        deadline.remaining()
+        if self._closed:
+            raise ResourceUnavailable(
+                "child resource is closed; completion may be uncertain"
+            )
+        request = _ResourceCall(
+            execute, argument, deadline.expires, deadline._cleanup is deadline
+        )
+        return cast(T, self._exchange(request, deadline))
+
+    def close(self) -> None:
+        """Destroy and reap the child within the caller's cleanup allowance."""
+        if self._closed:
+            return
+        deadline = current_deadline()
+        if deadline is None:
+            raise RuntimeError("supervised close requires a cleanup deadline")
+        try:
+            self._exchange(
+                _ResourceCall[R, None, None](None, None, deadline.expires, True),
+                deadline,
+            )
+            self._process.wait(timeout=deadline.remaining())
+        finally:
+            self._terminate(deadline)
+
+    def _exchange(self, request: object, deadline: Deadline) -> object:
+        """Bound both sending and receiving, including incomplete reply frames."""
+        cleanup_end = (
+            deadline.expires
+            if deadline._cleanup is deadline
+            else deadline.expires + CLEANUP_SECONDS
+        )
+        reserve = min(1.0, CLEANUP_SECONDS / 2)
+        wait_end = cleanup_end - reserve
+        if not self._lock.acquire(timeout=max(0.0, wait_end - monotonic())):
+            raise OperationTimeout(
+                "resource operation could not acquire its connection before deadline"
+            )
+        completed = Event()
+        replies: list[_ResourceReply[object]] = []
+        failures: list[BaseException] = []
+
+        def exchange() -> None:
+            """Use standard pickle frames on the private unbuffered pipes."""
+            try:
+                assert (
+                    self._process.stdin is not None and self._process.stdout is not None
+                )
+                pickle.dump(request, self._writer)
+                self._writer.flush()
+                replies.append(cast(_ResourceReply[object], pickle.load(self._reader)))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        try:
+            if self._closed:
+                raise ResourceUnavailable(
+                    "child resource is closed; completion may be uncertain"
+                )
+            thread = Thread(
+                target=exchange, daemon=True, name="usagebassoon-resource-io"
+            )
+            thread.start()
+            if not completed.wait(max(0.0, wait_end - monotonic())):
+                _LOG.warning("terminating stalled resource; completion is uncertain")
+                self._terminate(deadline)
+                thread.join(timeout=max(0.0, cleanup_end - monotonic()))
+                raise ResourceUnavailable(
+                    "resource did not stop within cleanup grace; "
+                    "completion may be uncertain"
+                )
+            if failures:
+                self._terminate(deadline)
+                raise ResourceUnavailable(
+                    "child exited or its reply was interrupted; "
+                    "completion may be uncertain"
+                ) from failures[0]
+            reply = replies[0]
+            if reply.invalid:
+                self._terminate(deadline)
+                raise ResourceUnavailable(
+                    "child cancellation did not finish; completion may be uncertain"
+                ) from reply.error
+            if reply.expired:
+                raise OperationTimeout(
+                    "resource operation deadline exceeded; completion may be uncertain"
+                ) from reply.error
+            if reply.error is not None:
+                raise reply.error
+            return reply.value
+        except (KeyboardInterrupt, SystemExit):
+            self._terminate(deadline)
+            raise
+        finally:
+            self._lock.release()
+
+    def _terminate(self, deadline: Deadline) -> None:
+        """Invalidate the resource and cap all kill, reap, and pipe cleanup waits."""
+        self._closed = True
+        cleanup = deadline.cleanup()
+        cap = (
+            deadline.expires
+            if deadline._cleanup is deadline
+            else deadline.expires + CLEANUP_SECONDS
+        )
+        cleanup.expires = min(cleanup.expires, cap)
+        try:
+            if self._process.poll() is None:
+                self._process.kill()
+            self._process.wait(
+                timeout=max(0.001, min(1.0, cleanup.expires - monotonic()))
+            )
+        except Exception:
+            _LOG.exception(
+                "could not reap supervised resource process %s", self._process.pid
+            )
+        finally:
+            if self._process.stdin is not None:
+                self._process.stdin.close()
+            if self._process.stdout is not None:
+                self._process.stdout.close()
+
+
+def _resource_worker() -> None:
+    """Keep a generic native resource and its operations on one owning thread."""
+    from usagebassoon.config import LoggingConfig
+    from usagebassoon.logger import configure
+
+    # Keep native stdout messages out of the private reply channel.
+    output = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
+    with open(os.devnull, "wb") as discarded:
+        os.dup2(discarded.fileno(), sys.stdout.fileno())
+    spec = cast(_ResourceStart[object], pickle.load(sys.stdin.buffer))
+    configure(spec.logging or LoggingConfig(disable=spec.logging_disabled))
+    resource: object | None = None
+    destroyed = False
+    ready = False
+
+    def respond(reply: _ResourceReply[object]) -> None:
+        """Deliver a complete frame, marking an undeliverable outcome uncertain."""
+        try:
+            data = pickle.dumps(reply)
+        except Exception:
+            _LOG.exception("could not serialize resource outcome")
+            data = pickle.dumps(
+                _ResourceReply[object](
+                    error=ResourceUnavailable(
+                        "resource outcome could not be delivered"
+                    ),
+                    invalid=True,
+                )
+            )
+        output.write(data)
+        output.flush()
+
+    try:
+        deadline = Deadline(max(0.001, spec.expires - monotonic()))
+        deadline.expires = spec.expires
+        token = _CURRENT.set(deadline)
+        try:
+            deadline.remaining()
+            resource = spec.construct()
+            ready = True
+            deadline.remaining()
+            respond(_ResourceReply())
+        except BaseException as error:
+            _LOG.exception("supervised resource startup failed")
+            respond(_ResourceReply(error=error))
+            return
+        finally:
+            _CURRENT.reset(token)
+        while True:
+            request = cast(
+                _ResourceCall[object, object, object], pickle.load(sys.stdin.buffer)
+            )
+            deadline = Deadline(max(0.001, request.expires - monotonic()))
+            deadline.expires = request.expires
+            if request.cleanup:
+                deadline._cleanup = deadline
+            token = _CURRENT.set(deadline)
+            expired = Event()
+
+            def interrupt(signal: Event = expired) -> None:
+                """Apply the adapter's cancellation mechanism at deadline expiry."""
+                signal.set()
+                if spec.interrupt is not None:
+                    try:
+                        spec.interrupt(resource)
+                    except Exception:
+                        _LOG.exception("could not interrupt supervised resource")
+
+            # Leave time to attempt native cancellation before forced cleanup.
+            interrupt_at = request.expires - (
+                min(5.0, CLEANUP_SECONDS / 2) if request.cleanup else 0.0
+            )
+            timer = Timer(max(0.0, interrupt_at - monotonic()), interrupt)
+            timer.daemon = True
+            timer.start()
+            reply = _ResourceReply[object]()
+            try:
+                deadline.remaining()
+                if request.execute is None:
+                    spec.close(resource)
+                    destroyed = True
+                else:
+                    reply = _ResourceReply(
+                        value=request.execute(resource, request.argument)
+                    )
+                deadline.remaining()
+            except BaseException as error:
+                _LOG.exception("supervised resource operation failed")
+                reply = _ResourceReply(
+                    error=error,
+                    expired=expired.is_set(),
+                    invalid=isinstance(error, ResourceUnavailable),
+                )
+            finally:
+                timer.cancel()
+                timer.join(
+                    timeout=max(
+                        0.0, min(1.0, request.expires + CLEANUP_SECONDS - monotonic())
+                    )
+                )
+                _CURRENT.reset(token)
+            if timer.is_alive():
+                reply = _ResourceReply(
+                    error=ResourceUnavailable("resource interruption is still running"),
+                    invalid=True,
+                )
+            respond(reply)
+            if destroyed or reply.invalid:
+                break
+    except EOFError:
+        pass
+    finally:
+        if ready and not destroyed:
+            try:
+                with cleanup_budget():
+                    spec.close(resource)
+            except Exception:
+                _LOG.exception("could not close supervised resource after failure")
+        output.close()
 
 
 class Deadline:

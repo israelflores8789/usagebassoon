@@ -8,6 +8,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
+from functools import partial
 from threading import Barrier
 
 import pytest
@@ -16,6 +17,7 @@ from usagebassoon import deadlines
 from usagebassoon.deadlines import (
     Deadline,
     OperationTimeout,
+    SupervisedResource,
     bounded,
     checked,
     cleanup_budget,
@@ -24,6 +26,33 @@ from usagebassoon.deadlines import (
     operation,
     remaining_seconds,
 )
+
+
+@pytest.mark.parametrize("kind", ["instance", "class", "partial", "builtin"])
+def test_supervised_call_rejects_bound_callable_before_ipc(kind: str) -> None:
+    """Reject captured instances before touching a child or operation deadline."""
+
+    class Handler:
+        def execute(self, resource: object, argument: object) -> object:
+            return resource, argument
+
+        @classmethod
+        def execute_class(cls, resource: object, argument: object) -> object:
+            return resource, argument
+
+    client: SupervisedResource[object] = object.__new__(SupervisedResource)
+    handler = Handler()
+    message = "child callables must be unbound; the child supplies the resource"
+    with pytest.raises(TypeError, match=message):
+        if kind == "instance":
+            client.call(handler.execute, None)
+        elif kind == "class":
+            client.call(Handler.execute_class, None)
+        elif kind == "partial":
+            client.call(partial(handler.execute), None)
+        else:
+            bytes_client: SupervisedResource[bytes] = object.__new__(SupervisedResource)
+            bytes_client.call(b"owner".replace, b"argument")
 
 
 @dataclass
