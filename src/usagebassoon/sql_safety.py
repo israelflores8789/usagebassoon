@@ -20,7 +20,6 @@ PUBLIC_RELATIONS = frozenset(
         "report_daily_usage",
         "report_session_models",
         "session_model_stats",
-        "session_model_stats_current",
         "session_notes",
         "session_tags",
         "tagged_sessions",

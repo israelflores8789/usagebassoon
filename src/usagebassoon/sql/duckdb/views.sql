@@ -92,7 +92,8 @@ SELECT * FROM current_reconciliation_issues
 WHERE resolved = FALSE AND collected_at >= CURRENT_TIMESTAMP - INTERVAL '90' DAY;
 
 CREATE OR REPLACE VIEW collection_runs AS
-SELECT * FROM current_collection_ledger WHERE domain = 'collection';
+SELECT event_id, run_id, day, domain, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status
+FROM current_collection_ledger WHERE domain = 'collection';
 
 -- One source summary combines all canonical domains and one latest metadata row.
 CREATE OR REPLACE VIEW audit_sources AS
@@ -222,9 +223,6 @@ SELECT
 FROM daily_cost AS daily_cost
 GROUP BY source_id, client, session_id, model
 ) AS totals;
-
-CREATE OR REPLACE VIEW session_model_stats_current AS
-SELECT * FROM session_model_stats;
 
 -- Report source views preserve filter dimensions; terminal commands aggregate
 -- them after applying source, client, model, workspace, and effective-tag filters.

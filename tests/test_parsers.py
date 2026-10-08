@@ -239,3 +239,12 @@ def test_pricing_shape(pricing_row: PricingRow) -> None:
     assert pricing_row.pricing.output_cost_per_token == 3.75e-06
     assert pricing_row.pricing.cache_read_input_token_cost == 7.5e-08
     assert pricing_row.pricing.cache_write_input_token_cost is None
+
+
+def test_pricing_cache_creation_is_retained(
+    pricing_rows: dict[str, PricingRow],
+) -> None:
+    """Preserve real GPT cache-creation prices under the canonical cache-write name."""
+    assert pricing_rows["gpt-6-sol"].pricing.cache_write_input_token_cost == 2.5e-6
+    assert pricing_rows["gpt-6-luna"].pricing.cache_write_input_token_cost == 1.25e-7
+    assert pricing_rows["gemini-3.8-flash"].pricing.cache_write_input_token_cost is None

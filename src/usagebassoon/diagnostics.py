@@ -38,7 +38,6 @@ REQUIRED_RELATIONS: tuple[str, ...] = (
     "reconciliation_issues",
     "tags",
     "notes",
-    "session_model_stats_current",
     "report_summary",
     "report_models",
 )

@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pyarrow as pa
@@ -23,6 +26,7 @@ from tests.conftest import (
     EXPECTED_TOTAL_OUTPUT,
     EXPECTED_TOTAL_REASONING,
 )
+from usagebassoon import system_metadata
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
@@ -164,6 +168,98 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         assert backend.query("SELECT status FROM collection_runs").to_pylist() == [
             {"status": "ok"}
         ]
+    finally:
+        backend.close()
+
+
+def test_linux_cpu_model_reads_the_native_description(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read the Linux CPU brand rather than its numeric processor index."""
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor : 0\nmodel name : Example CPU\n")
+
+    def cpuinfo_path(_name: str) -> Path:
+        return cpuinfo
+
+    monkeypatch.setattr(system_metadata, "Path", cpuinfo_path)
+    assert system_metadata._linux_cpu_model() == "Example CPU"
+
+
+@pytest.mark.parametrize(
+    ("system", "executable", "timeout"),
+    [("Darwin", "/usr/sbin/sysctl", 2), ("Windows", "powershell.exe", 5)],
+)
+def test_native_cpu_queries_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    system: str,
+    executable: str,
+    timeout: int,
+) -> None:
+    """Query macOS and Windows CPU descriptions with finite process deadlines."""
+
+    def query(
+        command: list[str], **options: object
+    ) -> subprocess.CompletedProcess[str]:
+        assert command[0] == executable
+        assert options["timeout"] == timeout
+        assert options["check"] is True
+        assert options["stdin"] == subprocess.DEVNULL
+        if system == "Darwin":
+            assert command[1:] == ["-n", "machdep.cpu.brand_string"]
+        else:
+            assert "Win32_Processor" in command[-1]
+            assert "-NoProfile" in command
+        return subprocess.CompletedProcess(command, 0, stdout=" Example CPU\n")
+
+    monkeypatch.setattr(system_metadata.subprocess, "run", query)
+    assert system_metadata._cpu_model(system) == "Example CPU"
+
+
+def test_cpu_probe_failure_preserves_metadata_and_direct_launch_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CPU query failure falls back independently and never copies the login shell."""
+
+    def fail() -> str | None:
+        raise PermissionError("CPU metadata unavailable")
+
+    monkeypatch.setattr(system_metadata.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(system_metadata, "_linux_cpu_model", fail)
+    monkeypatch.setattr(system_metadata.platform, "processor", lambda: "Fallback CPU")
+    monkeypatch.setattr(system_metadata.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(system_metadata, "_physical_memory_bytes", lambda: 1024)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    with caplog.at_level(logging.ERROR, logger="usagebassoon"):
+        metadata = system_metadata.capture_system_metadata()
+    assert metadata.cpu_model == "Fallback CPU"
+    assert metadata.os_name == "Linux"
+    assert metadata.cpu_count == 4 and metadata.memory_bytes == 1024
+    assert metadata.shell is None
+    assert any(record.exc_info for record in caplog.records)
+    assert "platform CPU model capture failed" in caplog.text
+
+
+def test_collection_run_view_omits_target_counts(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Run summaries omit mixed target counts while preflight retains their evidence."""
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(collection_bundle))
+        runs = backend.query("SELECT * FROM collection_runs")
+        assert {"expected_count", "succeeded_count"}.isdisjoint(runs.column_names)
+        statuses = backend.query(
+            "SELECT expected_count, succeeded_count FROM collection_status"
+        )
+        assert statuses.num_rows == len(collection_bundle.ingest_status)
+        assert all(
+            row["expected_count"] == row["succeeded_count"]
+            for row in statuses.to_pylist()
+        )
     finally:
         backend.close()
 

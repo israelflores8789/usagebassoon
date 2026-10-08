@@ -398,7 +398,7 @@ These are the `tokscale` commands used to generate ingest data. Each command is 
 The DuckDB/MotherDuck and BigQuery assets implement shared canonical, collection planning, diagnostic, and report views; BigQuery additionally exposes `compaction_backlog`:
 
 - `daily_cost` applies the observed source/day/model rates to daily token facts. It returns `NULL` cost when a nonzero token category has no matching rate; reasoning uses the output rate.
-- `session_model_stats` aggregates daily facts across time at source/client/session/model grain. Its cost is `NULL` unless every contributing daily fact has a known cost. `session_model_stats_current` is an alias with identical rows and no current-time filter.
+- `session_model_stats` aggregates daily facts across time at source/client/session/model grain. Its cost is `NULL` unless every contributing daily fact has a known cost.
 - `report_daily_usage` exposes daily facts with workspace metadata. `report_session_models` exposes session/model totals with workspace and last-active metadata. These are the filterable report inputs; CLI reporting applies source, client, model, workspace, and effective-tag filters before aggregating.
 - `report_summary` and `report_models` provide global session and model aggregates. They omit source/client/workspace dimensions, and their `SUM(cost_usd)` ignores `NULL` inputs, so totals may be partial when pricing is incomplete.
 - `session_tags` resolves global client, workspace, and session tags while preserving tag scope. `tagged_sessions` joins those effective tags to session metadata.

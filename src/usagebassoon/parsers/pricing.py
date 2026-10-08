@@ -49,7 +49,7 @@ class PricingRates(BaseModel):
         alias="cacheReadInputTokenCost",
     )
     cache_write_input_token_cost: NonNegativeFloat | None = Field(
-        default=None, alias="cacheWriteInputTokenCost"
+        default=None, alias="cacheCreationInputTokenCost"
     )
 
 

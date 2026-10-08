@@ -55,6 +55,7 @@ def initialized_config(tmp_path: Path) -> Path:
         "SELECT * FROM daily_cost LIMIT 0",
         "SELECT * FROM daily_cost LIMIT 1000001",
         "SELECT * FROM daily_cost LIMIT :limit",
+        "SELECT * FROM session_model_stats_current LIMIT 1",
     ],
 )
 @pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
