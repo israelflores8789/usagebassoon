@@ -63,7 +63,7 @@ usagebassoon/
 └── justfile                  # Development, test, and maintenance tasks
 ```
 
-Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-10-tokscale-4.15.1.graph.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
+Golden fixture filenames use `golden-<capture-date>-tokscale-<exact-version>.<payload-kind>.json`, for example `golden-2026-09-30-tokscale-4.18.0.graph.json`. The tokscale version is the exact referenced version, never `latest`; prerelease versions remain unchanged, such as `tokscale-4.16.0-rc.1`.
 
 ## Architecture
 
@@ -300,8 +300,8 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Daily facts:** `tokscale graph` supplies candidate dates only. For each candidate day, date-filtered `tokscale models` supplies `daily_stats` at `(source_id, day, client, session_id, model)`. Completed historical targets skip by default; the current day refreshes.
 
 - **Token calculation invariants:**
-  - "reasoning" tokens are a component of the total token count such that total_tokens = input + cache_read + cache_write + reasoning + output tokens (fixture-verified against tokscale 4.15.1).
-  - "reasoning" tokens are considered output tokens for pricing purposes (fixture-verified against tokscale 4.15.1).
+  - "reasoning" tokens are a component of the total token count such that total_tokens = input + cache_read + cache_write + reasoning + output tokens (fixture-verified against tokscale 4.18.0).
+  - "reasoning" tokens are considered output tokens for pricing purposes (fixture-verified against tokscale 4.18.0).
 
 - **Data ingest pipeline:** `bassoon collect`:
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
@@ -357,7 +357,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 ```
 $ bassoon collect
-⚠ schema drift detected (tokscale 4.15.2 vs contract 4.15.1):
+⚠ schema drift detected (tokscale 4.18.1 vs contract 4.18.0):
     models: unknown field 'entries[].performance.gpu_util'
     pricing: field 'resolution.priceConsensus' changed type (number → object)
   → collection <status>.

@@ -83,7 +83,7 @@ fallback-version = "0.1.0"
 packages = ["src/usagebassoon"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"tests/fixtures" = "usagebassoon/cli/reports/_fixtures"
+"tests/fixtures/tokscale-4.18.0" = "usagebassoon/cli/reports/_fixtures"
 
 [tool.ruff]
 target-version = "py312"

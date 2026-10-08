@@ -573,7 +573,11 @@ def test_stale_activity_uses_usage_day_then_reported_timestamp_for_ties(
     """Backfill observation times cannot make old usage appear newly active."""
     normalized = normalize(collection_bundle)
     fact = normalized.tables["daily_stats"].to_pylist()[0]
-    session = normalized.tables["sessions"].to_pylist()[0]
+    session = next(
+        row
+        for row in normalized.tables["sessions"].to_pylist()
+        if all(row[key] == fact[key] for key in ("source_id", "client", "session_id"))
+    )
     usage_day = date(2026, 3, 1)
     stamps = {
         "stale-old": datetime(2026, 1, 1, tzinfo=UTC),

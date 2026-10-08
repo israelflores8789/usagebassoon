@@ -112,14 +112,14 @@ Run `bassoon --help` or `bassoon <command> --help` for the complete command refe
 
 ```bash
 # UsageBassoon uses bun by default
-bunx tokscale@4.15.1 --version
+bunx tokscale@4.18.0 --version
 ```
 
 > [!IMPORTANT]
-> Version 4.15.1 is officially supported. Verify the exact version with `tokscale --version` and verify your installation against [`tokscale`'s](https://github.com/junhoyeo/tokscale/releases) official checksums.
+> Version 4.18.0 is officially supported. Verify the exact version with `tokscale --version` and verify your installation against [`tokscale`'s](https://github.com/junhoyeo/tokscale/releases) official checksums.
 
 > [!NOTE]
-> You can set `[tokscale].bin` in `config.toml` or the `TOKSCALE_BIN` environment variable to choose the command; the configuration value takes precedence. With neither set, UsageBassoon uses a local `tokscale` executable when available, otherwise `bunx tokscale@latest`. Pin the supported release with `bin = "bunx tokscale@4.15.1"`.
+> You can set `[tokscale].bin` in `config.toml` or the `TOKSCALE_BIN` environment variable to choose the command; the configuration value takes precedence. With neither set, UsageBassoon uses a local `tokscale` executable when available, otherwise `bunx tokscale@latest`. Pin the supported release with `bin = "bunx tokscale@4.18.0"`.
 
 ### Source identity
 

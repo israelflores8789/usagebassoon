@@ -1,0 +1,20 @@
+{
+  "modelId": "gemini-3.8-flash",
+  "matchedKey": "gemini-3.8-flash",
+  "source": "LiteLLM",
+  "resolution": {
+    "kind": "exact",
+    "candidateCount": 1,
+    "priceConsensus": true,
+    "exactModelIdentity": true,
+    "aliasApplied": false,
+    "normalized": false,
+    "stripped": false,
+    "submissionSafe": true
+  },
+  "pricing": {
+    "inputCostPerToken": 7.5e-07,
+    "outputCostPerToken": 3.75e-06,
+    "cacheReadInputTokenCost": 7.5e-08
+  }
+}

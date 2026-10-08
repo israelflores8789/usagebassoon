@@ -35,7 +35,7 @@ from usagebassoon.schema_assets import query_sql
 type ReportRecord = dict[str, object]
 
 SAMPLE_LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
-SAMPLE_LATEST_DAY = date(2026, 9, 10)
+SAMPLE_LATEST_DAY = date(2026, 9, 30)
 _MULTIPLICATION_SIGN = "\N{MULTIPLICATION SIGN}"
 CACHE_MULTIPLIER_HEADER = f"Cache {_MULTIPLICATION_SIGN}"
 
@@ -749,7 +749,7 @@ def _golden_fixture_root() -> Path | Traversable:
     packaged = files("usagebassoon.cli.reports").joinpath("_fixtures")
     if packaged.is_dir():
         return packaged
-    return Path(__file__).parents[4] / "tests" / "fixtures"
+    return Path(__file__).parents[4] / "tests" / "fixtures" / "tokscale-4.18.0"
 
 
 def _golden_daily_files(root: Path | Traversable) -> list[Path | Traversable]:

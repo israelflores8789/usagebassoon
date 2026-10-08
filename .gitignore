@@ -219,3 +219,6 @@ __marimo__/
 
 # Test output logs
 .test_logs/
+
+# Raw fixture captures and temporary working directories
+tmp/

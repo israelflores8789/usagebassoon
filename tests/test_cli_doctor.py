@@ -65,12 +65,12 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
                 {
                     "source_id": [SOURCE_ID],
                     "domain": ["models"],
-                    "tokscale_ver": ["4.15.1"],
+                    "tokscale_ver": ["4.18.0"],
                     "drift_key": ["unknown_field:entries[].extra"],
                     "drift_kind": ["unknown_field"],
                     "path": ["entries[].extra"],
                     "detail": ["unexpected field"],
-                    "contract_tokscale_ver": ["4.15.1"],
+                    "contract_tokscale_ver": ["4.18.0"],
                     "created_at": [observed],
                     "collected_at": [observed],
                     "run_id": ["run-1"],
@@ -84,7 +84,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
 
     def fake_preflight(_config: object) -> tuple[tuple[str, ...], str]:
         """Return a working Tokscale command for this drift test."""
-        return ("tokscale",), "4.15.1"
+        return ("tokscale",), "4.18.0"
 
     monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", fake_preflight)
     runner = CliRunner()
@@ -112,7 +112,7 @@ def test_doctor_reports_configured_tokscale_command_and_version(
     def fake_popen(command: list[str], **_kwargs: object) -> subprocess.Popen[bytes]:
         calls.append(command)
         return popen(
-            [sys.executable, "-c", "print('tokscale 4.15.1')"],
+            [sys.executable, "-c", "print('tokscale 4.18.0')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -133,7 +133,7 @@ def test_doctor_reports_configured_tokscale_command_and_version(
     assert calls == [["npx", "tokscale@latest", "--version"]]
     assert (
         plain_cli_output(result.output).index("OK usagebassoon: version")
-        < plain_cli_output(result.output).index("OK tokscale: version 4.15.1")
+        < plain_cli_output(result.output).index("OK tokscale: version 4.18.0")
         < plain_cli_output(result.output).index("OK configuration:")
     )
     assert "command: npx tokscale@latest" in plain_cli_output(result.output)

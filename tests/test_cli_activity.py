@@ -44,7 +44,7 @@ def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
     assert payload["bins"] == 7
     assert payload["scale"] == "linear"
     assert len(payload["days"]) == 120
-    assert payload["days"][-1]["day"] == "2026-09-10"
+    assert payload["days"][-1]["day"] == "2026-09-30"
     assert any(row["value"] > 0 for row in payload["days"])
     assert payload["days"][0]["intensity"] == 0
     destination = tmp_path / "activity.csv"
@@ -144,7 +144,7 @@ def test_calendar_leap_day_unknown_and_partial_time() -> None:
     [
         ["--json", "--csv"],
         ["--days", "2", "--since", "2026-09-01"],
-        ["--since", "2026-09-11"],
+        ["--since", "2026-10-01"],
         ["--source", "invalid"],
         ["--color", "purple"],
         ["--color", "#ff00ff"],

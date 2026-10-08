@@ -5,9 +5,17 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import cast
+
 import pyarrow as pa
 import pytest
 
+from tests._cli import plain_cli_output
+from usagebassoon.json_types import JsonObject
 from usagebassoon.privacy import (
     redact_credentials,
     sanitize_doctor_text,
@@ -103,3 +111,63 @@ def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() ->
     assert "<path>" in sanitized
     assert "PASSWORD=<redacted>" in sanitized
     assert "SERVICE_SECRET=<redacted>" in sanitized
+
+
+def test_fixture_sanitizer_preserves_batch_identity_and_fidelity(
+    tmp_path: Path,
+) -> None:
+    """Obfuscate related synthetic files consistently without altering their facts."""
+    script = Path(__file__).parent / "fixtures" / "sanitize_fixtures.py"
+    inputs, outputs = tmp_path / "raw", tmp_path / "sanitized"
+    inputs.mkdir()
+    records: list[JsonObject] = [
+        {
+            "session_id": "ses_example",
+            "workspace": "/customer-a/private",
+            "workspace_label": "private",
+            "title": "Sensitive narrative",
+            "description": None,
+            "task_category": "feature",
+            "complexity": "moderate",
+            "task_group": "Private Auth",
+            "input": 42,
+            "cost": 1.25,
+        },
+        {
+            "session_ids": ["ses_example"],
+            "workspace": "/customer-b/private",
+            "workspace_label": "private",
+            "task_group": "Private Auth",
+            "reference": "ses_example",
+        },
+    ]
+    for index, record in enumerate(records):
+        (inputs / f"{index}.json").write_text(json.dumps(record))
+    original = {path.name: path.read_bytes() for path in inputs.iterdir()}
+    command = [sys.executable, str(script), str(inputs), "--output-dir", str(outputs)]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, plain_cli_output(result.stderr)
+    sanitized = [
+        cast(JsonObject, json.loads((outputs / f"{index}.json").read_text()))
+        for index in range(2)
+    ]
+    first, second = sanitized
+    session = first["session_id"]
+    assert isinstance(session, str)
+    assert session.startswith("ses_") and len(session) == len("ses_example")
+    assert second["session_ids"] == [session] and second["reference"] == session
+    assert first["workspace"] == "/project-alpha"
+    assert second["workspace"] == "/project-beta"
+    assert first["workspace_label"] == "project-alpha"
+    assert second["workspace_label"] == "project-beta"
+    assert first["task_group"] == second["task_group"]
+    assert first["task_group"] != "Private Auth"
+    assert first["title"] == "<redacted>" and first["description"] is None
+    for key in ("task_category", "complexity", "input", "cost"):
+        assert first[key] == records[0][key]
+    assert {path.name: path.read_bytes() for path in inputs.iterdir()} == original
+    saved = {path.name: path.read_bytes() for path in outputs.iterdir()}
+    repeated = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert repeated.returncode == 2
+    assert "already exists" in plain_cli_output(repeated.stderr)
+    assert {path.name: path.read_bytes() for path in outputs.iterdir()} == saved

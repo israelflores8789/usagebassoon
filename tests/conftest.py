@@ -3,7 +3,7 @@
 
 """conftest.py — Shared fixtures for the usagebassoon test suite.
 
-Golden payloads were captured from tokscale 4.15.1 and sanitized at daily
+Golden payloads were captured from tokscale 4.18.0 and sanitized at daily
 collection granularity.
 """
 
@@ -25,25 +25,25 @@ from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, parse_report
 from usagebassoon.reconcile import ReconciliationResult, reconcile_all
 
-FIXTURES = Path(__file__).parent / "fixtures"
-
 # Explicit expectations are independent test oracles that catch semantic
 # regressions in parsing and normalization instead of merely rechecking the fixture.
 # If tests were based on the fixture alone, a parser could silently produce a bug
 # because the expected value would be compute from the same transformed fixture data.
-EXPECTED_REPORT_ROWS = 81
-EXPECTED_DAILY_ROWS = 23
-EXPECTED_DAYS = 18
-EXPECTED_DAILY_STATS_ROWS = 97
-EXPECTED_TOTAL_INPUT = 78_318_668
-EXPECTED_TOTAL_OUTPUT = 1_415_099
-EXPECTED_TOTAL_CACHE_READ = 496_893_790
+EXPECTED_REPORT_ROWS = 181
+EXPECTED_DAILY_ROWS = 57
+EXPECTED_DAYS = 35
+EXPECTED_DAILY_STATS_ROWS = 238
+EXPECTED_TOTAL_INPUT = 109_900_335
+EXPECTED_TOTAL_OUTPUT = 3_230_700
+EXPECTED_TOTAL_CACHE_READ = 1_225_022_558
 EXPECTED_TOTAL_CACHE_WRITE = 0
-EXPECTED_TOTAL_REASONING = 1_686_926
-EXPECTED_TOTAL_MESSAGES = 4_988
-EXPECTED_TOTAL_COST = 109.48238866000003
-EXPECTED_GOLDEN_DATE = "2026-09-10"
-EXPECTED_TOKSCALE_VERSION = "4.15.1"
+EXPECTED_TOTAL_REASONING = 4_389_637
+EXPECTED_TOTAL_MESSAGES = 11_656
+EXPECTED_TOTAL_COST = 255.2014217
+EXPECTED_GOLDEN_DATE = "2026-09-30"
+EXPECTED_PRICING_DATE = "2026-10-08"
+EXPECTED_TOKSCALE_VERSION = "4.18.0"
+FIXTURES = Path(__file__).parent / "fixtures" / f"tokscale-{EXPECTED_TOKSCALE_VERSION}"
 FIXTURE_PREFIX = f"golden-{EXPECTED_GOLDEN_DATE}-tokscale-{EXPECTED_TOKSCALE_VERSION}"
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -145,9 +145,9 @@ def _load_report(day: date) -> JsonArray:
 
 
 @pytest.fixture(scope="session")
-def report_raw(report_raws: dict[date, JsonArray]) -> JsonArray:
-    """Return all daily report rows as the collector's combined report input."""
-    return [row for payload in report_raws.values() for row in payload]
+def report_raw() -> JsonArray:
+    """Return the complete report captured within the configured usage-date range."""
+    return _load_array("report-full-history")
 
 
 @pytest.fixture(scope="session")
@@ -159,7 +159,36 @@ def graph_raw() -> JsonObject:
 @pytest.fixture(scope="session")
 def pricing_raw() -> JsonObject:
     """Return the raw pricing payload as decoded JSON."""
-    return _load_object("pricing")
+    return _load_pricing("gemini-3.8-flash")
+
+
+def _load_pricing(model: str) -> JsonObject:
+    """Load one observed model rate card without rewriting its identity."""
+    path = FIXTURES / (
+        f"golden-{EXPECTED_PRICING_DATE}-tokscale-"
+        f"{EXPECTED_TOKSCALE_VERSION}.pricing.{model}.json"
+    )
+    payload = cast(JsonValue, json.loads(path.read_text()))
+    if not isinstance(payload, dict):
+        raise TypeError(f"pricing fixture {model} must be a JSON object")
+    return cast(JsonObject, payload)
+
+
+@pytest.fixture(scope="session")
+def pricing_raws() -> dict[str, JsonObject]:
+    """Return the seven independent model rate cards captured in this batch."""
+    return {
+        model: _load_pricing(model)
+        for model in (
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        )
+    }
 
 
 @pytest.fixture(scope="session")
@@ -205,6 +234,12 @@ def pricing_row(pricing_raw: JsonObject) -> PricingRow:
 
 
 @pytest.fixture(scope="session")
+def pricing_rows(pricing_raws: dict[str, JsonObject]) -> dict[str, PricingRow]:
+    """Return parsed rate cards preserving each model's actual prices."""
+    return {model: parse_pricing(payload) for model, payload in pricing_raws.items()}
+
+
+@pytest.fixture(scope="session")
 def recon_result(daily_models: dict[date, DailyModelsPayload]) -> ReconciliationResult:
     """Run full reconciliation over the golden fixture set."""
     return reconcile_all(daily_models)
@@ -214,7 +249,7 @@ def recon_result(daily_models: dict[date, DailyModelsPayload]) -> Reconciliation
 def collection_bundle(
     report_rows: list[SessionRow],
     graph_payload: GraphPayload,
-    pricing_row: PricingRow,
+    pricing_rows: dict[str, PricingRow],
     daily_models: dict[date, DailyModelsPayload],
     recon_result: ReconciliationResult,
 ) -> CollectionBundle:
@@ -229,34 +264,27 @@ def collection_bundle(
         daily_models=daily_models,
         report_rows=report_rows,
         graph=graph_payload,
-        pricing_by_day={
-            day: {
-                row.stats.model: pricing_row.model_copy(
-                    update={"model_id": row.stats.model}
+        pricing_by_day={date.fromisoformat(EXPECTED_PRICING_DATE): pricing_rows},
+        ingest_status=(
+            *(
+                IngestStatus(
+                    day=day,
+                    domain="models",
+                    status="complete",
+                    expected_count=1,
+                    succeeded_count=1,
+                    run_id=run_id,
                 )
-                for row in payload.entries
-            }
-            for day, payload in daily_models.items()
-        },
-        ingest_status=tuple(
+                for day in daily_models
+            ),
             IngestStatus(
-                day=day,
-                domain=domain,
+                day=date.fromisoformat(EXPECTED_PRICING_DATE),
+                domain="pricing",
                 status="complete",
-                expected_count=(
-                    1
-                    if domain == "models"
-                    else len({row.stats.model for row in payload.entries})
-                ),
-                succeeded_count=(
-                    1
-                    if domain == "models"
-                    else len({row.stats.model for row in payload.entries})
-                ),
+                expected_count=len(pricing_rows),
+                succeeded_count=len(pricing_rows),
                 run_id=run_id,
-            )
-            for day, payload in daily_models.items()
-            for domain in ("models", "pricing")
+            ),
         ),
         reconciliation=recon_result,
     )

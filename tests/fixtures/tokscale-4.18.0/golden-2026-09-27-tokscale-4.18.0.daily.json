@@ -1,0 +1,54 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-27T23-37-33-69078e93-4bfc-3bc4-d94b-5d52c8da8e4d",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "input": 124193,
+      "output": 4436,
+      "cacheRead": 1038080,
+      "cacheWrite": 0,
+      "reasoning": 39401,
+      "messageCount": 17,
+      "cost": 0.0447186,
+      "performance": {
+        "msPer1KTokens": 725.0723400021557,
+        "totalDurationMs": 874517,
+        "timedTokens": 1206110,
+        "sampleCount": 17,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-26T23-19-27-9583ed8a-d7ce-5850-5d96-b8f0404795ed",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "input": 50148,
+      "output": 2008,
+      "cacheRead": 798720,
+      "cacheWrite": 0,
+      "reasoning": 9632,
+      "messageCount": 12,
+      "cost": 0.018822,
+      "performance": {
+        "msPer1KTokens": 606.1837891106184,
+        "totalDurationMs": 521626,
+        "timedTokens": 860508,
+        "sampleCount": 12,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 174341,
+  "totalOutput": 6444,
+  "totalCacheRead": 1836800,
+  "totalCacheWrite": 0,
+  "totalMessages": 29,
+  "totalCost": 0.0635406,
+  "processingTimeMs": 94
+}

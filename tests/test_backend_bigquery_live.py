@@ -534,7 +534,7 @@ def test_live_doctor_schedule_lifecycle(
 
     def preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
         """Keep the read/scheduler regression independent of local tokscale."""
-        return ("tokscale",), "4.15.1"
+        return ("tokscale",), "4.18.0"
 
     monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", preflight)
     runner = CliRunner()

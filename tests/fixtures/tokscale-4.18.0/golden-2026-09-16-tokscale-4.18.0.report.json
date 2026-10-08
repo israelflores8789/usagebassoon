@@ -1,0 +1,75 @@
+[
+  {
+    "session_id": "rollout-2026-09-16T04-54-30-17f8e9f5-dd86-763b-2d8a-4983cce0c896",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789534505040,
+    "last_active": 1789603294858,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 726119,
+    "total_output_tokens": 35533,
+    "total_cache_read": 15967488,
+    "total_cost": 3.758466400000002,
+    "models_used": [
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
+    ],
+    "message_count": 170,
+    "duration_minutes": 1146496,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-16T04-46-49-408aa5ee-d920-0ca5-c8a2-a374d97e99b4",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789534206897,
+    "last_active": 1789534391665,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 167684,
+    "total_output_tokens": 3376,
+    "total_cache_read": 583680,
+    "total_cost": 0.052426,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 14,
+    "duration_minutes": 3079,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-16T04-42-05-98fef050-ba1d-32fb-3555-5e98cac23bcf",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789533828761,
+    "last_active": 1789533831089,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 19758,
+    "total_output_tokens": 69,
+    "total_cache_read": 19200,
+    "total_cost": 0.0044412,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 2,
+    "duration_minutes": 38,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

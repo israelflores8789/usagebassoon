@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_parsers.py — Parser-level golden-file tests (tokscale 4.15.1 fixture set)."""
+"""test_parsers.py — Parser-level golden-file tests (tokscale 4.18.0 fixture set)."""
 
 from __future__ import annotations
 

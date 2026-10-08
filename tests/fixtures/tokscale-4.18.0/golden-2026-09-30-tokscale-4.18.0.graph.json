@@ -1,0 +1,1513 @@
+{
+  "meta": {
+    "generatedAt": "2026-10-08T06:36:57.348293527+00:00",
+    "version": "4.18.0",
+    "dateRange": {
+      "start": "2026-08-22",
+      "end": "2026-09-30"
+    }
+  },
+  "summary": {
+    "totalTokens": 1342543230,
+    "totalCost": 255.20142170000003,
+    "totalDays": 35,
+    "activeDays": 35,
+    "averagePerDay": 7.291469191428572,
+    "maxCostInSingleDay": 20.230581975000014,
+    "clients": [
+      "codex",
+      "opencode"
+    ],
+    "models": [
+      "gemini-3.7-flash",
+      "gemini-3.8-flash",
+      "gpt-5.6-luna",
+      "gpt-5.6-terra",
+      "gpt-6-luna",
+      "gpt-6-sol",
+      "gpt-6.1-sol"
+    ]
+  },
+  "years": [
+    {
+      "year": "2026",
+      "totalTokens": 1342543230,
+      "totalCost": 255.20142170000003,
+      "range": {
+        "start": "2026-08-22",
+        "end": "2026-09-30"
+      }
+    }
+  ],
+  "contributions": [
+    {
+      "date": "2026-08-22",
+      "totals": {
+        "tokens": 8710404,
+        "cost": 2.0069420999999994,
+        "messages": 87
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 1638845,
+        "output": 39218,
+        "cacheRead": 7004228,
+        "cacheWrite": 0,
+        "reasoning": 28113
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 1638845,
+            "output": 39218,
+            "cacheRead": 7004228,
+            "cacheWrite": 0,
+            "reasoning": 28113
+          },
+          "cost": 2.0069420999999994,
+          "messages": 87
+        }
+      ],
+      "activeTimeMs": 1961236
+    },
+    {
+      "date": "2026-08-23",
+      "totals": {
+        "tokens": 4038348,
+        "cost": 0.7544901000000002,
+        "messages": 24
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 576622,
+        "output": 11814,
+        "cacheRead": 3444748,
+        "cacheWrite": 0,
+        "reasoning": 5164
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 576622,
+            "output": 11814,
+            "cacheRead": 3444748,
+            "cacheWrite": 0,
+            "reasoning": 5164
+          },
+          "cost": 0.7544901000000002,
+          "messages": 24
+        }
+      ],
+      "activeTimeMs": 339391
+    },
+    {
+      "date": "2026-08-24",
+      "totals": {
+        "tokens": 114065,
+        "cost": 0.06602767500000001,
+        "messages": 5
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 56126,
+        "output": 3066,
+        "cacheRead": 52609,
+        "cacheWrite": 0,
+        "reasoning": 2264
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 56126,
+            "output": 3066,
+            "cacheRead": 52609,
+            "cacheWrite": 0,
+            "reasoning": 2264
+          },
+          "cost": 0.06602767500000001,
+          "messages": 5
+        }
+      ],
+      "activeTimeMs": 46464
+    },
+    {
+      "date": "2026-08-26",
+      "totals": {
+        "tokens": 9327466,
+        "cost": 2.2917584999999994,
+        "messages": 164
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 2051452,
+        "output": 16084,
+        "cacheRead": 7219560,
+        "cacheWrite": 0,
+        "reasoning": 40370
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 2051452,
+            "output": 16084,
+            "cacheRead": 7219560,
+            "cacheWrite": 0,
+            "reasoning": 40370
+          },
+          "cost": 2.2917584999999994,
+          "messages": 164
+        }
+      ],
+      "activeTimeMs": 1351341
+    },
+    {
+      "date": "2026-08-27",
+      "totals": {
+        "tokens": 5355028,
+        "cost": 1.4146841250000008,
+        "messages": 133
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 1259718,
+        "output": 15411,
+        "cacheRead": 4051025,
+        "cacheWrite": 0,
+        "reasoning": 28874
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 1259718,
+            "output": 15411,
+            "cacheRead": 4051025,
+            "cacheWrite": 0,
+            "reasoning": 28874
+          },
+          "cost": 1.4146841250000008,
+          "messages": 133
+        }
+      ],
+      "activeTimeMs": 1189578
+    },
+    {
+      "date": "2026-08-29",
+      "totals": {
+        "tokens": 41510560,
+        "cost": 8.691381374999995,
+        "messages": 377
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 7566136,
+        "output": 46717,
+        "cacheRead": 33816275,
+        "cacheWrite": 0,
+        "reasoning": 81432
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 7566136,
+            "output": 46717,
+            "cacheRead": 33816275,
+            "cacheWrite": 0,
+            "reasoning": 81432
+          },
+          "cost": 8.691381374999995,
+          "messages": 377
+        }
+      ],
+      "activeTimeMs": 4061493
+    },
+    {
+      "date": "2026-08-30",
+      "totals": {
+        "tokens": 35216580,
+        "cost": 7.333609875,
+        "messages": 352
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 5753838,
+        "output": 101217,
+        "cacheRead": 29242735,
+        "cacheWrite": 0,
+        "reasoning": 118790
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 5753838,
+            "output": 101217,
+            "cacheRead": 29242735,
+            "cacheWrite": 0,
+            "reasoning": 118790
+          },
+          "cost": 7.333609875,
+          "messages": 352
+        }
+      ],
+      "activeTimeMs": 3544118
+    },
+    {
+      "date": "2026-08-31",
+      "totals": {
+        "tokens": 16519472,
+        "cost": 3.7569314999999976,
+        "messages": 218
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 3195547,
+        "output": 56111,
+        "cacheRead": 13225700,
+        "cacheWrite": 0,
+        "reasoning": 42114
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 3195547,
+            "output": 56111,
+            "cacheRead": 13225700,
+            "cacheWrite": 0,
+            "reasoning": 42114
+          },
+          "cost": 3.7569314999999976,
+          "messages": 218
+        }
+      ],
+      "activeTimeMs": 3184073
+    },
+    {
+      "date": "2026-09-01",
+      "totals": {
+        "tokens": 15831924,
+        "cost": 3.1345000499999984,
+        "messages": 183
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 2665484,
+        "output": 19337,
+        "cacheRead": 13126194,
+        "cacheWrite": 0,
+        "reasoning": 20909
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 2665484,
+            "output": 19337,
+            "cacheRead": 13126194,
+            "cacheWrite": 0,
+            "reasoning": 20909
+          },
+          "cost": 3.1345000499999984,
+          "messages": 183
+        }
+      ],
+      "activeTimeMs": 2419582
+    },
+    {
+      "date": "2026-09-02",
+      "totals": {
+        "tokens": 7935413,
+        "cost": 1.6856506500000001,
+        "messages": 143
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 1339645,
+        "output": 11259,
+        "cacheRead": 6545092,
+        "cacheWrite": 0,
+        "reasoning": 39417
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 1339645,
+            "output": 11259,
+            "cacheRead": 6545092,
+            "cacheWrite": 0,
+            "reasoning": 39417
+          },
+          "cost": 1.6856506500000001,
+          "messages": 143
+        }
+      ],
+      "activeTimeMs": 1231275
+    },
+    {
+      "date": "2026-09-03",
+      "totals": {
+        "tokens": 81507553,
+        "cost": 20.230581975000014,
+        "messages": 1093
+      },
+      "intensity": 4,
+      "tokenBreakdown": {
+        "input": 17124617,
+        "output": 337815,
+        "cacheRead": 63686773,
+        "cacheWrite": 0,
+        "reasoning": 358348
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 14749567,
+            "output": 309403,
+            "cacheRead": 50355286,
+            "cacheWrite": 0,
+            "reasoning": 281453
+          },
+          "cost": 17.054531700000002,
+          "messages": 957
+        },
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 2375050,
+            "output": 28412,
+            "cacheRead": 13331487,
+            "cacheWrite": 0,
+            "reasoning": 76895
+          },
+          "cost": 3.1760502750000006,
+          "messages": 136
+        }
+      ],
+      "activeTimeMs": 15890421
+    },
+    {
+      "date": "2026-09-04",
+      "totals": {
+        "tokens": 25773162,
+        "cost": 4.853806725000002,
+        "messages": 330
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 3092890,
+        "output": 105553,
+        "cacheRead": 22453573,
+        "cacheWrite": 0,
+        "reasoning": 121146
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 3092890,
+            "output": 105553,
+            "cacheRead": 22453573,
+            "cacheWrite": 0,
+            "reasoning": 121146
+          },
+          "cost": 4.853806725000002,
+          "messages": 330
+        }
+      ],
+      "activeTimeMs": 2805484
+    },
+    {
+      "date": "2026-09-05",
+      "totals": {
+        "tokens": 28635793,
+        "cost": 4.516456800000001,
+        "messages": 147
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 2734194,
+        "output": 61750,
+        "cacheRead": 25759234,
+        "cacheWrite": 0,
+        "reasoning": 80615
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 2734194,
+            "output": 61750,
+            "cacheRead": 25759234,
+            "cacheWrite": 0,
+            "reasoning": 80615
+          },
+          "cost": 4.516456800000001,
+          "messages": 147
+        }
+      ],
+      "activeTimeMs": 1525768
+    },
+    {
+      "date": "2026-09-06",
+      "totals": {
+        "tokens": 140870931,
+        "cost": 18.710195700000007,
+        "messages": 816
+      },
+      "intensity": 4,
+      "tokenBreakdown": {
+        "input": 9090838,
+        "output": 234758,
+        "cacheRead": 131233546,
+        "cacheWrite": 0,
+        "reasoning": 311789
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 9090838,
+            "output": 234758,
+            "cacheRead": 131233546,
+            "cacheWrite": 0,
+            "reasoning": 311789
+          },
+          "cost": 18.710195700000007,
+          "messages": 816
+        }
+      ],
+      "activeTimeMs": 7418780
+    },
+    {
+      "date": "2026-09-07",
+      "totals": {
+        "tokens": 108262133,
+        "cost": 19.27492897500001,
+        "messages": 471
+      },
+      "intensity": 4,
+      "tokenBreakdown": {
+        "input": 14315145,
+        "output": 201374,
+        "cacheRead": 93540853,
+        "cacheWrite": 0,
+        "reasoning": 204761
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 9691320,
+            "output": 126390,
+            "cacheRead": 61582537,
+            "cacheWrite": 0,
+            "reasoning": 62186
+          },
+          "cost": 12.594340275000002,
+          "messages": 255
+        },
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 4623825,
+            "output": 74984,
+            "cacheRead": 31958316,
+            "cacheWrite": 0,
+            "reasoning": 142575
+          },
+          "cost": 6.680588700000001,
+          "messages": 216
+        }
+      ],
+      "activeTimeMs": 7802527
+    },
+    {
+      "date": "2026-09-08",
+      "totals": {
+        "tokens": 34719597,
+        "cost": 6.987255375000003,
+        "messages": 285
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 5112098,
+        "output": 112117,
+        "cacheRead": 29353725,
+        "cacheWrite": 0,
+        "reasoning": 141657
+      },
+      "clients": [
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.8-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 3277556,
+            "output": 67391,
+            "cacheRead": 19549041,
+            "cacheWrite": 0,
+            "reasoning": 123755
+          },
+          "cost": 4.641142575000001,
+          "messages": 219
+        },
+        {
+          "client": "opencode",
+          "modelId": "gemini-3.7-flash",
+          "providerId": "google_vertex",
+          "tokens": {
+            "input": 1834542,
+            "output": 44726,
+            "cacheRead": 9804684,
+            "cacheWrite": 0,
+            "reasoning": 17902
+          },
+          "cost": 2.346112800000001,
+          "messages": 66
+        }
+      ],
+      "activeTimeMs": 2850602
+    },
+    {
+      "date": "2026-09-09",
+      "totals": {
+        "tokens": 7322488,
+        "cost": 2.6539325600000008,
+        "messages": 97
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 353933,
+        "output": 27509,
+        "cacheRead": 6896384,
+        "cacheWrite": 0,
+        "reasoning": 44662
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 84838,
+            "output": 3987,
+            "cacheRead": 446208,
+            "cacheWrite": 0,
+            "reasoning": 2146
+          },
+          "cost": 0.03325136,
+          "messages": 17
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 269095,
+            "output": 23522,
+            "cacheRead": 6450176,
+            "cacheWrite": 0,
+            "reasoning": 42516
+          },
+          "cost": 2.6206812000000004,
+          "messages": 80
+        }
+      ],
+      "activeTimeMs": 2967471
+    },
+    {
+      "date": "2026-09-10",
+      "totals": {
+        "tokens": 6663566,
+        "cost": 1.1192546,
+        "messages": 63
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 391540,
+        "output": 13989,
+        "cacheRead": 6241536,
+        "cacheWrite": 0,
+        "reasoning": 16501
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 167687,
+            "output": 7072,
+            "cacheRead": 2337536,
+            "cacheWrite": 0,
+            "reasoning": 7459
+          },
+          "cost": 0.9772532,
+          "messages": 29
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 223853,
+            "output": 6917,
+            "cacheRead": 3904000,
+            "cacheWrite": 0,
+            "reasoning": 9042
+          },
+          "cost": 0.1420014,
+          "messages": 34
+        }
+      ],
+      "activeTimeMs": 983098
+    },
+    {
+      "date": "2026-09-14",
+      "totals": {
+        "tokens": 25329918,
+        "cost": 6.046003119999997,
+        "messages": 278
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 1086555,
+        "output": 103861,
+        "cacheRead": 24082688,
+        "cacheWrite": 0,
+        "reasoning": 56814
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 650799,
+            "output": 59853,
+            "cacheRead": 16763392,
+            "cacheWrite": 0,
+            "reasoning": 29534
+          },
+          "cost": 5.726920399999998,
+          "messages": 154
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 435756,
+            "output": 44008,
+            "cacheRead": 7319296,
+            "cacheWrite": 0,
+            "reasoning": 27280
+          },
+          "cost": 0.31908272000000004,
+          "messages": 124
+        }
+      ],
+      "activeTimeMs": 4156646
+    },
+    {
+      "date": "2026-09-15",
+      "totals": {
+        "tokens": 29958061,
+        "cost": 7.37959476,
+        "messages": 363
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 1593550,
+        "output": 117817,
+        "cacheRead": 28185344,
+        "cacheWrite": 0,
+        "reasoning": 61350
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 986147,
+            "output": 73495,
+            "cacheRead": 18501376,
+            "cacheWrite": 0,
+            "reasoning": 35474
+          },
+          "cost": 6.9801972,
+          "messages": 197
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 607403,
+            "output": 44322,
+            "cacheRead": 9683968,
+            "cacheWrite": 0,
+            "reasoning": 25876
+          },
+          "cost": 0.3993975600000002,
+          "messages": 166
+        }
+      ],
+      "activeTimeMs": 5248623
+    },
+    {
+      "date": "2026-09-16",
+      "totals": {
+        "tokens": 27667271,
+        "cost": 7.0316458,
+        "messages": 254
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 1396379,
+        "output": 72156,
+        "cacheRead": 26138112,
+        "cacheWrite": 0,
+        "reasoning": 60624
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 770790,
+            "output": 54073,
+            "cacheRead": 20992512,
+            "cacheWrite": 0,
+            "reasoning": 29649
+          },
+          "cost": 6.744746399999999,
+          "messages": 180
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 625589,
+            "output": 18083,
+            "cacheRead": 5145600,
+            "cacheWrite": 0,
+            "reasoning": 30975
+          },
+          "cost": 0.2868994,
+          "messages": 74
+        }
+      ],
+      "activeTimeMs": 5516419
+    },
+    {
+      "date": "2026-09-17",
+      "totals": {
+        "tokens": 60099710,
+        "cost": 15.586292119999998,
+        "messages": 541
+      },
+      "intensity": 4,
+      "tokenBreakdown": {
+        "input": 2081488,
+        "output": 176878,
+        "cacheRead": 57617664,
+        "cacheWrite": 0,
+        "reasoning": 223680
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1330859,
+            "output": 138615,
+            "cacheRead": 49919488,
+            "cacheWrite": 0,
+            "reasoning": 61007
+          },
+          "cost": 15.041079599999998,
+          "messages": 420
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 750629,
+            "output": 38263,
+            "cacheRead": 7698176,
+            "cacheWrite": 0,
+            "reasoning": 162673
+          },
+          "cost": 0.54521252,
+          "messages": 121
+        }
+      ],
+      "activeTimeMs": 11541946
+    },
+    {
+      "date": "2026-09-18",
+      "totals": {
+        "tokens": 28883108,
+        "cost": 1.8034388799999999,
+        "messages": 280
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 1286657,
+        "output": 49018,
+        "cacheRead": 27433728,
+        "cacheWrite": 0,
+        "reasoning": 113705
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 164867,
+            "output": 4423,
+            "cacheRead": 2445824,
+            "cacheWrite": 0,
+            "reasoning": 1610
+          },
+          "cost": 0.8912947999999999,
+          "messages": 18
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1121790,
+            "output": 44595,
+            "cacheRead": 24987904,
+            "cacheWrite": 0,
+            "reasoning": 112095
+          },
+          "cost": 0.9121440799999996,
+          "messages": 262
+        }
+      ],
+      "activeTimeMs": 4935959
+    },
+    {
+      "date": "2026-09-19",
+      "totals": {
+        "tokens": 71791555,
+        "cost": 9.289764600000003,
+        "messages": 556
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 2686856,
+        "output": 173020,
+        "cacheRead": 68746240,
+        "cacheWrite": 0,
+        "reasoning": 185439
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 845061,
+            "output": 56640,
+            "cacheRead": 24870400,
+            "cacheWrite": 0,
+            "reasoning": 31280
+          },
+          "cost": 7.719241999999997,
+          "messages": 168
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1841795,
+            "output": 116380,
+            "cacheRead": 43875840,
+            "cacheWrite": 0,
+            "reasoning": 154159
+          },
+          "cost": 1.5705225999999999,
+          "messages": 388
+        }
+      ],
+      "activeTimeMs": 8307496
+    },
+    {
+      "date": "2026-09-20",
+      "totals": {
+        "tokens": 82443489,
+        "cost": 13.375264840000003,
+        "messages": 772
+      },
+      "intensity": 3,
+      "tokenBreakdown": {
+        "input": 3438064,
+        "output": 211237,
+        "cacheRead": 78492160,
+        "cacheWrite": 0,
+        "reasoning": 302028
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 2175411,
+            "output": 122131,
+            "cacheRead": 42290432,
+            "cacheWrite": 0,
+            "reasoning": 232541
+          },
+          "cost": 1.7064972400000016,
+          "messages": 445
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1262653,
+            "output": 89106,
+            "cacheRead": 36201728,
+            "cacheWrite": 0,
+            "reasoning": 69487
+          },
+          "cost": 11.6687676,
+          "messages": 327
+        }
+      ],
+      "activeTimeMs": 15334828
+    },
+    {
+      "date": "2026-09-21",
+      "totals": {
+        "tokens": 42045486,
+        "cost": 9.048109199999997,
+        "messages": 369
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 2417448,
+        "output": 102323,
+        "cacheRead": 39412224,
+        "cacheWrite": 0,
+        "reasoning": 113491
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1070250,
+            "output": 45031,
+            "cacheRead": 26398464,
+            "cacheWrite": 0,
+            "reasoning": 32675
+          },
+          "cost": 8.352664799999996,
+          "messages": 190
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1347198,
+            "output": 57292,
+            "cacheRead": 13013760,
+            "cacheWrite": 0,
+            "reasoning": 80816
+          },
+          "cost": 0.6954443999999997,
+          "messages": 179
+        }
+      ],
+      "activeTimeMs": 10172428
+    },
+    {
+      "date": "2026-09-22",
+      "totals": {
+        "tokens": 23269910,
+        "cost": 6.15083112,
+        "messages": 191
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 700508,
+        "output": 57307,
+        "cacheRead": 22475776,
+        "cacheWrite": 0,
+        "reasoning": 36319
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 155304,
+            "output": 7015,
+            "cacheRead": 1851136,
+            "cacheWrite": 0,
+            "reasoning": 16698
+          },
+          "cost": 0.09653911999999999,
+          "messages": 38
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-terra",
+          "providerId": "openai",
+          "tokens": {
+            "input": 545204,
+            "output": 50292,
+            "cacheRead": 20624640,
+            "cacheWrite": 0,
+            "reasoning": 19621
+          },
+          "cost": 6.054291999999999,
+          "messages": 153
+        }
+      ],
+      "activeTimeMs": 2261194
+    },
+    {
+      "date": "2026-09-23",
+      "totals": {
+        "tokens": 59081559,
+        "cost": 10.42078252000001,
+        "messages": 503
+      },
+      "intensity": 3,
+      "tokenBreakdown": {
+        "input": 1941346,
+        "output": 114545,
+        "cacheRead": 56820992,
+        "cacheWrite": 0,
+        "reasoning": 204676
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 780052,
+            "output": 36693,
+            "cacheRead": 16702464,
+            "cacheWrite": 0,
+            "reasoning": 127843
+          },
+          "cost": 0.3272978400000002,
+          "messages": 174
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-5.6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 276269,
+            "output": 16998,
+            "cacheRead": 4831744,
+            "cacheWrite": 0,
+            "reasoning": 32168
+          },
+          "cost": 0.21088787999999997,
+          "messages": 66
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 885025,
+            "output": 60854,
+            "cacheRead": 35286784,
+            "cacheWrite": 0,
+            "reasoning": 44665
+          },
+          "cost": 9.882596800000004,
+          "messages": 263
+        }
+      ],
+      "activeTimeMs": 8646169
+    },
+    {
+      "date": "2026-09-24",
+      "totals": {
+        "tokens": 80585957,
+        "cost": 12.782985839999986,
+        "messages": 753
+      },
+      "intensity": 3,
+      "tokenBreakdown": {
+        "input": 3181366,
+        "output": 169202,
+        "cacheRead": 76832256,
+        "cacheWrite": 0,
+        "reasoning": 403133
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1117195,
+            "output": 77563,
+            "cacheRead": 41724672,
+            "cacheWrite": 0,
+            "reasoning": 65595
+          },
+          "cost": 12.0109044,
+          "messages": 370
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 2064171,
+            "output": 91639,
+            "cacheRead": 35107584,
+            "cacheWrite": 0,
+            "reasoning": 337538
+          },
+          "cost": 0.7720814400000003,
+          "messages": 383
+        }
+      ],
+      "activeTimeMs": 14692207
+    },
+    {
+      "date": "2026-09-25",
+      "totals": {
+        "tokens": 51179244,
+        "cost": 12.830470899999993,
+        "messages": 516
+      },
+      "intensity": 3,
+      "tokenBreakdown": {
+        "input": 1626548,
+        "output": 84992,
+        "cacheRead": 49361408,
+        "cacheWrite": 0,
+        "reasoning": 106296
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 510562,
+            "output": 11296,
+            "cacheRead": 4533760,
+            "cacheWrite": 0,
+            "reasoning": 28315
+          },
+          "cost": 0.11619929999999999,
+          "messages": 76
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1115986,
+            "output": 73696,
+            "cacheRead": 44827648,
+            "cacheWrite": 0,
+            "reasoning": 77981
+          },
+          "cost": 12.714271599999993,
+          "messages": 440
+        }
+      ],
+      "activeTimeMs": 8954885
+    },
+    {
+      "date": "2026-09-26",
+      "totals": {
+        "tokens": 25446876,
+        "cost": 4.576805620000002,
+        "messages": 230
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 1783927,
+        "output": 71660,
+        "cacheRead": 23379712,
+        "cacheWrite": 0,
+        "reasoning": 211577
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 1024202,
+            "output": 47546,
+            "cacheRead": 13076992,
+            "cacheWrite": 0,
+            "reasoning": 170217
+          },
+          "cost": 0.34207161999999985,
+          "messages": 150
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 759725,
+            "output": 24114,
+            "cacheRead": 10302720,
+            "cacheWrite": 0,
+            "reasoning": 41360
+          },
+          "cost": 4.2347339999999996,
+          "messages": 80
+        }
+      ],
+      "activeTimeMs": 7776089
+    },
+    {
+      "date": "2026-09-27",
+      "totals": {
+        "tokens": 2066618,
+        "cost": 0.0635406,
+        "messages": 29
+      },
+      "intensity": 1,
+      "tokenBreakdown": {
+        "input": 174341,
+        "output": 6444,
+        "cacheRead": 1836800,
+        "cacheWrite": 0,
+        "reasoning": 49033
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 174341,
+            "output": 6444,
+            "cacheRead": 1836800,
+            "cacheWrite": 0,
+            "reasoning": 49033
+          },
+          "cost": 0.0635406,
+          "messages": 29
+        }
+      ],
+      "activeTimeMs": 1396143
+    },
+    {
+      "date": "2026-09-28",
+      "totals": {
+        "tokens": 35960152,
+        "cost": 8.261967460000003,
+        "messages": 282
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 1623645,
+        "output": 110494,
+        "cacheRead": 34028160,
+        "cacheWrite": 0,
+        "reasoning": 197853
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 918224,
+            "output": 85273,
+            "cacheRead": 23999104,
+            "cacheWrite": 0,
+            "reasoning": 51642
+          },
+          "cost": 8.005418800000001,
+          "messages": 179
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 705421,
+            "output": 25221,
+            "cacheRead": 10029056,
+            "cacheWrite": 0,
+            "reasoning": 146211
+          },
+          "cost": 0.2565486599999999,
+          "messages": 103
+        }
+      ],
+      "activeTimeMs": 13161225
+    },
+    {
+      "date": "2026-09-29",
+      "totals": {
+        "tokens": 46406247,
+        "cost": 14.620210059999998,
+        "messages": 263
+      },
+      "intensity": 3,
+      "tokenBreakdown": {
+        "input": 1166008,
+        "output": 71866,
+        "cacheRead": 44990720,
+        "cacheWrite": 0,
+        "reasoning": 177653
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 637250,
+            "output": 51748,
+            "cacheRead": 38011904,
+            "cacheWrite": 0,
+            "reasoning": 70034
+          },
+          "cost": 14.433677599999998,
+          "messages": 182
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 528758,
+            "output": 20118,
+            "cacheRead": 6978816,
+            "cacheWrite": 0,
+            "reasoning": 107619
+          },
+          "cost": 0.18653245999999998,
+          "messages": 81
+        }
+      ],
+      "activeTimeMs": 8566479
+    },
+    {
+      "date": "2026-09-30",
+      "totals": {
+        "tokens": 72013586,
+        "cost": 6.451325599999989,
+        "messages": 488
+      },
+      "intensity": 2,
+      "tokenBreakdown": {
+        "input": 3396981,
+        "output": 122781,
+        "cacheRead": 68294784,
+        "cacheWrite": 0,
+        "reasoning": 199040
+      },
+      "clients": [
+        {
+          "client": "codex",
+          "modelId": "gpt-6.1-sol",
+          "providerId": "openai",
+          "tokens": {
+            "input": 2738448,
+            "output": 85962,
+            "cacheRead": 50161024,
+            "cacheWrite": 0,
+            "reasoning": 91088
+          },
+          "cost": 6.131749199999995,
+          "messages": 317
+        },
+        {
+          "client": "codex",
+          "modelId": "gpt-6-luna",
+          "providerId": "openai",
+          "tokens": {
+            "input": 658533,
+            "output": 36819,
+            "cacheRead": 18133760,
+            "cacheWrite": 0,
+            "reasoning": 107952
+          },
+          "cost": 0.3195764000000001,
+          "messages": 171
+        }
+      ],
+      "activeTimeMs": 15266880
+    }
+  ],
+  "timeMetrics": {
+    "totalActiveTimeMs": 207536559,
+    "longestContinuousMs": 8704446,
+    "maxConcurrentSessions": 2,
+    "sessionCount": 618
+  }
+}

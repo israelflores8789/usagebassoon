@@ -1,0 +1,122 @@
+[
+  {
+    "session_id": "rollout-2026-09-14T23-44-51-80a1ca98-24e8-4fee-fa2d-e0251391f45f",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789430080699,
+    "last_active": 1789435635744,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 233693,
+    "total_output_tokens": 27671,
+    "total_cache_read": 6830592,
+    "total_cost": 0.23400844,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 76,
+    "duration_minutes": 92584,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-14T21-19-28-29a81aef-a3fe-bf7c-f7a1-fb0dca0e4fb0",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789420831696,
+    "last_active": 1789428695321,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 64075,
+    "total_output_tokens": 1728,
+    "total_cache_read": 258560,
+    "total_cost": 0.020446200000000005,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 16,
+    "duration_minutes": 131060,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-14T03-57-26-54303c19-fb31-85aa-8f3e-663e58175d34",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789358314080,
+    "last_active": 1789363843435,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 650799,
+    "total_output_tokens": 59853,
+    "total_cache_read": 16763392,
+    "total_cost": 5.726920399999998,
+    "models_used": [
+      "gpt-5.6-terra"
+    ],
+    "message_count": 154,
+    "duration_minutes": 92155,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-14T03-29-53-04d85961-2385-0054-c5e3-9db6026c9b42",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789356903954,
+    "last_active": 1789357597952,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 135611,
+    "total_output_tokens": 21094,
+    "total_cache_read": 3199488,
+    "total_cost": 0.13270875999999998,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 42,
+    "duration_minutes": 11566,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-14T01-01-21-233c0785-f21b-26b9-e01b-2daea918e7ec",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1789347744338,
+    "last_active": 1789352087700,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 189732,
+    "total_output_tokens": 20013,
+    "total_cache_read": 3584000,
+    "total_cost": 0.14931880000000003,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 56,
+    "duration_minutes": 72389,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

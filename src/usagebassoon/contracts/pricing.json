@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "payload_kind": "pricing",
-  "tokscale_version": "4.15.1",
+  "tokscale_version": "4.18.0",
   "entries": [
     {
       "path": "matchedKey",
@@ -23,6 +23,13 @@
         "object"
       ],
       "required": true
+    },
+    {
+      "path": "pricing.cacheCreationInputTokenCost",
+      "types": [
+        "float"
+      ],
+      "required": false
     },
     {
       "path": "pricing.cacheReadInputTokenCost",

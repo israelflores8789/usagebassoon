@@ -12,9 +12,15 @@ Input files are never modified. Directory inputs are searched recursively for
 JSON files, and outputs retain their relative paths under ``output/`` by default.
 ``--replace OLD=NEW`` applies a literal substring replacement to JSON string
 values before automatic session, workspace, and local-path sanitization. When
-OLD exactly matches a workspace path or label, NEW replaces every representation
-of that workspace. If OLD starts with ``/``, the replacement keeps that leading
-slash unless NEW already starts with one. Repeat the option for more replacements.
+OLD exactly matches a workspace path or an unambiguous label, NEW replaces every
+representation of that workspace. If OLD starts with ``/``, the replacement keeps
+that leading slash unless NEW already starts with one. Repeat the option for more
+replacements. Session IDs retain their original pseudonym scheme. Readable
+project labels are assigned consistently across the batch. Workspace paths
+remain distinct even when their labels match; record-local labels follow their
+workspace path. Narrative titles and descriptions are redacted; task categories,
+complexity classifications, and obfuscated task-group labels are retained.
+Existing output files are never overwritten.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import hashlib
 import json
 import re
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
@@ -32,15 +38,36 @@ type JsonValue = (
     bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 )
 
-SESSION_FIELDS = {"session", "sessionid"}
+SESSION_FIELDS = {"session", "sessionid", "sessions", "sessionids"}
 WORKSPACE_FIELDS = {
     "workspace",
+    "workspaces",
     "workspacelabel",
+    "workspacelabels",
     "workspacepath",
     "project",
+    "projects",
     "projectname",
+    "projectnames",
     "cwd",
     "workingdirectory",
+}
+SUMMARY_FIELDS = {"title", "description"}
+PUBLIC_FIELDS = {
+    "client",
+    "model",
+    "modelid",
+    "modelsused",
+    "provider",
+    "providerid",
+    "source",
+    "version",
+    "tokscaleversion",
+    "matchedkey",
+    "kind",
+    "groupby",
+    "taskcategory",
+    "complexity",
 }
 ROLLOUT_SESSION_ID = re.compile(
     r"^(rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"
@@ -48,9 +75,9 @@ ROLLOUT_SESSION_ID = re.compile(
     re.IGNORECASE,
 )
 LOCAL_PATH = re.compile(
-    r"(?<![\w])(?:~/[^\s\"'<>]+|"
-    r"[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s\"'<>]+|"
-    r"/(?:home|Users|root)/[^\s\"'<>]+)"
+    r"(?<![\w:/\\])(?:~/[^\s\"'<>`]+|"
+    r"[A-Za-z]:[\\/][^\s\"'<>`]+|"
+    r"\\\\[^\s\"'<>`]+|/[^\s\"'<>`]+)"
 )
 PROJECT_LABELS = (
     "alpha",
@@ -85,16 +112,18 @@ def _normalized_field_name(name: str) -> str:
     return "".join(character for character in name.casefold() if character.isalnum())
 
 
-def _walk(value: JsonValue) -> Iterator[tuple[str | None, JsonValue]]:
+def _walk(
+    value: JsonValue, key: str | None = None
+) -> Iterator[tuple[str | None, JsonValue]]:
     """Yield each JSON value together with its containing object key."""
     if isinstance(value, dict):
-        for key, child in value.items():
-            yield key, child
-            yield from _walk(child)
+        for child_key, child in value.items():
+            yield child_key, child
+            yield from _walk(child, child_key)
     elif isinstance(value, list):
         for child in value:
-            yield None, child
-            yield from _walk(child)
+            yield key, child
+            yield from _walk(child, key)
 
 
 def _collect_sensitive_values(
@@ -152,39 +181,109 @@ def _project_label(index: int) -> str:
 
 
 def _workspace_identity(value: str) -> str:
-    """Group a workspace path and its label by their final path component."""
+    """Normalize full workspace paths without merging POSIX path casing."""
     stripped = value.strip().rstrip("/\\")
-    basename = re.split(r"[/\\]", stripped)[-1]
-    return (basename or stripped).casefold()
+    if re.match(r"^[A-Za-z]:[\\/]", stripped) or stripped.startswith("\\\\"):
+        return stripped.replace("\\", "/").casefold()
+    return stripped or value.strip()
+
+
+def _is_workspace_path(value: str) -> bool:
+    """Return whether a workspace value contains path separators."""
+    return "/" in value or "\\" in value
+
+
+def _strings(value: JsonValue) -> Iterator[str]:
+    """Yield strings from one field, retaining array membership."""
+    if isinstance(value, str):
+        if value.strip():
+            yield value.strip()
+    elif isinstance(value, list):
+        for child in value:
+            yield from _strings(child)
+
+
+def _record_workspaces(record: dict[str, JsonValue]) -> set[str]:
+    """Collect workspace fields directly attached to one JSON record."""
+    return {
+        text
+        for key, value in record.items()
+        if _normalized_field_name(key) in WORKSPACE_FIELDS
+        for text in _strings(value)
+    }
+
+
+def _workspace_records(documents: list[JsonValue]) -> Iterator[dict[str, JsonValue]]:
+    """Yield records that can associate a workspace path with its labels."""
+    for document in documents:
+        if isinstance(document, dict):
+            yield document
+        for _key, value in _walk(document):
+            if isinstance(value, dict):
+                yield value
 
 
 def _workspace_replacements(
     workspace_values: set[str],
     extra_replacements: list[tuple[str, str]],
+    *,
+    documents: list[JsonValue] | None = None,
 ) -> dict[str, str]:
-    """Create shared project-name replacements, respecting explicit overrides."""
-    identities = sorted({_workspace_identity(value) for value in workspace_values})
+    """Link unambiguous labels to full paths and assign readable project names."""
+    aliases: dict[str, set[str]] = {}
+    for value in sorted(workspace_values):
+        if _is_workspace_path(value):
+            basename = re.split(r"[/\\]", value.rstrip("/\\"))[-1]
+            if basename:
+                aliases.setdefault(basename, set()).add(_workspace_identity(value))
+    for record in _workspace_records(documents or []):
+        values = _record_workspaces(record)
+        paths = {
+            _workspace_identity(value) for value in values if _is_workspace_path(value)
+        }
+        if len(paths) == 1:
+            for value in values:
+                if not _is_workspace_path(value):
+                    aliases.setdefault(value, set()).update(paths)
+    identities: dict[str, str] = {}
+    for value in workspace_values | aliases.keys():
+        targets = aliases.get(value, set())
+        identities[value] = (
+            next(iter(targets))
+            if not _is_workspace_path(value) and len(targets) == 1
+            else _workspace_identity(value)
+        )
     labels = {
-        identity: _project_label(index) for index, identity in enumerate(identities)
+        identity: _project_label(index)
+        for index, identity in enumerate(sorted(set(identities.values())))
     }
     for original, replacement in extra_replacements:
-        matching_identities = {
-            _workspace_identity(value)
-            for value in workspace_values
-            if original == value or original == _workspace_identity(value)
-        }
-        for identity in matching_identities:
-            labels[identity] = replacement
+        if original in identities:
+            if len(aliases.get(original, set())) > 1:
+                raise ValueError("workspace replacement matches an ambiguous label")
+            labels[identities[original]] = replacement
     replacements: dict[str, str] = {}
-    for value in workspace_values:
-        label = labels[_workspace_identity(value)]
+    for value, identity in sorted(identities.items()):
+        label = labels[identity]
         path_replacement = f"/{label.lstrip('/')}" if value.startswith("/") else label
         replacements[value] = path_replacement
-        basename = re.split(r"[/\\]", value.strip().rstrip("/\\"))[-1]
-        if basename:
-            replacements.setdefault(basename, label)
-        replacements.setdefault(value.replace("\\", "/"), path_replacement)
+        if "\\" in value:
+            replacements.setdefault(value.replace("\\", "/"), path_replacement)
     return replacements
+
+
+def _record_replacements(
+    record: dict[str, JsonValue], replacements: dict[str, str]
+) -> dict[str, str]:
+    """Use a record's path to disambiguate project labels shared by other paths."""
+    values = _record_workspaces(record)
+    paths = sorted(value for value in values if _is_workspace_path(value))
+    if len({_workspace_identity(value) for value in paths}) != 1:
+        return replacements
+    label = replacements[paths[0]].lstrip("/")
+    return replacements | {
+        value: label for value in values if not _is_workspace_path(value)
+    }
 
 
 def _parse_replacement(value: str) -> tuple[str, str]:
@@ -223,19 +322,10 @@ def _load_json(path: Path) -> JsonValue:
 
 
 def _local_path_substitute(match: re.Match[str]) -> str:
-    """Replace a home-directory path and retain punctuation after it."""
+    """Replace a local filesystem path and retain punctuation after it."""
     path = match.group(0)
     trimmed = path.rstrip(".,;:!?)]}")
     return f"<local-path>{path[len(trimmed) :]}"
-
-
-def _constant_replacement(replacement: str) -> Callable[[re.Match[str]], str]:
-    """Return a regex substitution callback for a literal replacement value."""
-
-    def substitute(_match: re.Match[str]) -> str:
-        return replacement
-
-    return substitute
 
 
 def _sanitize_text(
@@ -244,21 +334,44 @@ def _sanitize_text(
     workspace_replacements: dict[str, str],
     extra_replacements: list[tuple[str, str]],
 ) -> str:
-    """Replace known identifiers and redact common local home paths."""
+    """Replace known identifiers and redact local filesystem paths."""
     value = _apply_extra_replacements(value, extra_replacements)
     for original in sorted(session_ids, key=len, reverse=True):
         pseudonym = session_ids[original]
         value = value.replace(original, pseudonym)
-    for original in sorted(workspace_replacements, key=len, reverse=True):
-        if not original:
-            continue
-        pattern = re.compile(
-            rf"(?<![\w.-]){re.escape(original)}(?![\w.-])", re.IGNORECASE
-        )
-        value = pattern.sub(
-            _constant_replacement(workspace_replacements[original]), value
-        )
-    return LOCAL_PATH.sub(_local_path_substitute, value)
+    originals = sorted(
+        sorted(filter(None, workspace_replacements)), key=len, reverse=True
+    )
+    if originals:
+        alternatives = "|".join(re.escape(original) for original in originals)
+        pattern = re.compile(rf"(?<![\w.-])(?:{alternatives})(?![\w-])", re.IGNORECASE)
+        folded_replacements: dict[str, str] = {}
+        for original in originals:
+            folded_replacements.setdefault(
+                original.casefold(), workspace_replacements[original]
+            )
+
+        def substitute_workspace(match: re.Match[str]) -> str:
+            """Replace original names once, preserving generated project names."""
+            matched = match.group(0)
+            return workspace_replacements.get(
+                matched, folded_replacements[matched.casefold()]
+            )
+
+        value = pattern.sub(substitute_workspace, value)
+    protected_paths = {
+        replacement
+        for replacement in workspace_replacements.values()
+        if replacement.startswith("/")
+    }
+
+    def redact_path(match: re.Match[str]) -> str:
+        """Keep generated project paths while redacting other filesystem paths."""
+        if match.group(0).rstrip(".,;:!?)]}") in protected_paths:
+            return match.group(0)
+        return _local_path_substitute(match)
+
+    return LOCAL_PATH.sub(redact_path, value)
 
 
 def _apply_extra_replacements(
@@ -281,12 +394,17 @@ def _sanitize_value(
 ) -> JsonValue:
     """Sanitize strings recursively while preserving JSON structure and values."""
     if isinstance(value, dict):
+        record_replacements = _record_replacements(value, workspace_replacements)
         for child_key, child in value.items():
             value[child_key] = _sanitize_value(
                 child,
                 child_key,
                 session_ids,
-                workspace_replacements,
+                (
+                    record_replacements
+                    if _normalized_field_name(child_key) in WORKSPACE_FIELDS
+                    else workspace_replacements
+                ),
                 extra_replacements,
             )
         return value
@@ -298,11 +416,19 @@ def _sanitize_value(
         return value
     if isinstance(value, str):
         normalized_key = _normalized_field_name(key) if key is not None else ""
+        if normalized_key in SUMMARY_FIELDS:
+            return "<redacted>" if value else value
         if normalized_key in SESSION_FIELDS:
+            if not value:
+                return value
             replaced_value = _apply_extra_replacements(value, extra_replacements)
             if replaced_value != value:
                 return _sanitize_text(replaced_value, {}, workspace_replacements, [])
             return session_ids.get(value, _pseudonymize_session_id(value))
+        if normalized_key in WORKSPACE_FIELDS and value.strip():
+            return workspace_replacements[value.strip()]
+        if normalized_key in PUBLIC_FIELDS:
+            return _apply_extra_replacements(value, extra_replacements)
         return _sanitize_text(
             value, session_ids, workspace_replacements, extra_replacements
         )
@@ -339,7 +465,7 @@ def run(
         value: _pseudonymize_session_id(value) for value in sorted(original_session_ids)
     }
     workspace_replacements = _workspace_replacements(
-        workspace_values, extra_replacements
+        workspace_values, extra_replacements, documents=documents
     )
     output_paths = [
         _output_path(path, resolved_input, is_directory, resolved_output)
@@ -350,6 +476,11 @@ def run(
         for output_path, source in zip(output_paths, files, strict=True)
     ):
         raise ValueError("output path would overwrite an input fixture")
+    for destination in output_paths:
+        if not destination.resolve().is_relative_to(resolved_output):
+            raise ValueError("output path escapes the output directory")
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(f"output fixture already exists: {destination}")
 
     for source, document, destination in zip(
         files, documents, output_paths, strict=True
@@ -362,10 +493,8 @@ def run(
             extra_replacements,
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(sanitized, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        with destination.open("x", encoding="utf-8") as output:
+            output.write(json.dumps(sanitized, indent=2, ensure_ascii=False) + "\n")
         print(f"{source} -> {destination}")
     print(
         f"sanitized {len(files)} fixture(s); "

@@ -43,7 +43,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
                     {
                         "source_id": ["source"] * 3,
                         "domain": ["models", "pricing", "report"],
-                        "tokscale_ver": ["4.15.1", "4.15.2", "4.15.1"],
+                        "tokscale_ver": ["4.18.0", "4.18.1", "4.18.0"],
                         "drift_key": [
                             "unknown_field:future",
                             "type_change:resolution.price",
@@ -52,7 +52,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
                         "drift_kind": ["unknown_field", "type_change", "unknown_field"],
                         "path": ["future", "resolution.price", "extra"],
                         "detail": ["additive", "changed", "additive report"],
-                        "contract_tokscale_ver": ["4.15.1"] * 3,
+                        "contract_tokscale_ver": ["4.18.0"] * 3,
                         "created_at": [now] * 3,
                         "collected_at": [
                             now + timedelta(seconds=2),
@@ -88,12 +88,12 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                     {
                         "source_id": ["source"],
                         "domain": ["models"],
-                        "tokscale_ver": ["4.15.1"],
+                        "tokscale_ver": ["4.18.0"],
                         "drift_key": ["unknown_field:futureMetric"],
                         "drift_kind": ["unknown_field"],
                         "path": ["futureMetric"],
                         "detail": ["types int; tolerated"],
-                        "contract_tokscale_ver": ["4.15.1"],
+                        "contract_tokscale_ver": ["4.18.0"],
                         "created_at": [now],
                         "collected_at": [now],
                         "run_id": [run_id],
@@ -113,7 +113,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                         "started_at": [now],
                         "finished_at": [now],
                         "host": ["pytest"],
-                        "tokscale_ver": ["4.15.1"],
+                        "tokscale_ver": ["4.18.0"],
                         "status": ["schema_drift"],
                     }
                 )
@@ -162,12 +162,12 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
                     {
                         "source_id": [SOURCE_ID],
                         "domain": ["models"],
-                        "tokscale_ver": ["4.15.2"],
+                        "tokscale_ver": ["4.18.1"],
                         "drift_key": ["unknown_field:future"],
                         "drift_kind": ["unknown_field"],
                         "path": ["future"],
                         "detail": ["types int; tolerated"],
-                        "contract_tokscale_ver": ["4.15.1"],
+                        "contract_tokscale_ver": ["4.18.0"],
                         "created_at": [detected_at],
                         "collected_at": [detected_at],
                         "run_id": [detected_run_id],
@@ -194,12 +194,12 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
     assert schema_drift == (
         SchemaDriftState(
             domain="models",
-            tokscale_ver="4.15.2",
+            tokscale_ver="4.18.1",
             drift_key="unknown_field:future",
             drift_kind="unknown_field",
             path="future",
             detail="types int; tolerated",
-            contract_tokscale_ver="4.15.1",
+            contract_tokscale_ver="4.18.0",
             created_at=detected_at,
             observation_count=4,
         ),

@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added independent snapshot scheduler jobs, immutable-only emergency recovery, atomic fenced lifecycle transitions, immediate owned-stage retries, bounded source auditing, and separately reported scheduled/weekly backup health.
 - Added pipx-installable `bassoon` CLI token usage history collection, persistence, querying, reporting, and exporting.
 - Added the `usagebassoon` Python API for querying token usage history into `pandas` and `polars` (optional) dataframes and Arrow tables.
-- Added support for `tokscale` v4.15.1.
+- Added support for `tokscale` v4.18.0.
 - Added `tokscale` collection of daily per-session and per-model usage, session metadata, observed pricing, and collector-host metadata.
 - Added ephemeral append-only schema-drift observations and resolution events with replay-safe identities and deduplicated observation counts.
 - Added an Arrow-based `StorageBackend` protocol with dialect-specific schemas and views and backend-specific idempotent publication that preserves token usage history.

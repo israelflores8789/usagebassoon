@@ -50,11 +50,13 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 class _FixedDatetime:
     """Provide one candidate day as the current UTC day for collection tests."""
 
+    current: datetime = datetime(2026, 9, 10, tzinfo=UTC)
+
     @classmethod
     def now(cls, tz: object | None = None) -> datetime:
         """Return the selected current day as an aware UTC timestamp."""
-        del cls, tz
-        return datetime(2026, 9, 10, tzinfo=UTC)
+        del tz
+        return cls.current
 
 
 def _config(path: Path) -> UsageBassoonConfig:
@@ -379,6 +381,11 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     """Use graph dates, skip completed history, and refresh the current day."""
     days = tuple(sorted(daily_raws))
     completed_day, *_, current_day = days
+    monkeypatch.setattr(
+        _FixedDatetime,
+        "current",
+        datetime(current_day.year, current_day.month, current_day.day, tzinfo=UTC),
+    )
     captured: list[RawCollection] = []
     requested_models: list[tuple[date, ...]] = []
     requested_prices: list[dict[date, set[str]]] = []

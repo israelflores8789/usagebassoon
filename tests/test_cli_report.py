@@ -576,6 +576,8 @@ def test_session_values_and_model_counts_remain_whole_at_floor() -> None:
             "report",
             "sessions",
             "--test",
+            "--until",
+            "2026-09-10",
             "--width",
             "100",
             "--limit",
@@ -623,7 +625,16 @@ def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
     """Render graph currency labels with the same two-decimal precision as Cost."""
     result = CliRunner().invoke(
         app,
-        ["report", "graph", "--test", "--days", "3", "--sanitize"],
+        [
+            "report",
+            "graph",
+            "--test",
+            "--since",
+            "2026-09-08",
+            "--until",
+            "2026-09-10",
+            "--sanitize",
+        ],
     )
 
     assert result.exit_code == 0
@@ -646,10 +657,10 @@ def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     )
 
     assert result.exit_code == 0
-    assert "2026-09-10" in plain_cli_output(result.output)
-    assert "391.5K" in plain_cli_output(result.output)
-    assert "6.7M" in plain_cli_output(result.output)
-    assert "$1.12" in plain_cli_output(result.output)
+    assert "2026-09-30" in plain_cli_output(result.output)
+    assert "3.4M" in plain_cli_output(result.output)
+    assert "68.3M" in plain_cli_output(result.output)
+    assert "$6.45" in plain_cli_output(result.output)
 
 
 def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:
@@ -798,6 +809,8 @@ def test_session_optional_metric_layout(
         "report",
         "sessions",
         "--test",
+        "--until",
+        "2026-09-10",
         "--sanitize",
         "--limit",
         "8",

@@ -70,11 +70,15 @@ def test_shipped_contracts_accept_the_golden_payloads(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Assert checked-in contracts reproduce their sanitized source payloads."""
+    payloads = _payloads(
+        daily_raws, report_raw, graph_raw, pricing_raws["gemini-3.8-flash"]
+    )
+    payloads["pricing"] = tuple(pricing_raws.values())
     result = validate_payloads(
-        _payloads(daily_raws, report_raw, graph_raw, pricing_raw),
+        payloads,
     )
     assert result == type(result)(events=(), fatal=False)
 
@@ -235,7 +239,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
     assert isinstance(graph_meta, dict)
     original_version = graph_meta["version"]
     assert isinstance(original_version, str)
-    next_version = "4.15.2"
+    next_version = "4.18.1"
     next_meta = {**graph_meta, "version": next_version}
     next_graph = {**graph_raw, "meta": next_meta}
     bundles = tuple(
@@ -393,7 +397,7 @@ def test_clean_complete_domain_resolves_existing_event(
         assert isinstance(graph_meta, dict)
         versioned_graph = {
             **graph_raw,
-            "meta": {**graph_meta, "version": "4.15.2"},
+            "meta": {**graph_meta, "version": "4.18.1"},
         }
         versioned_evidence = IngestEvidence(
             graph_plan=plan_graph(versioned_graph),

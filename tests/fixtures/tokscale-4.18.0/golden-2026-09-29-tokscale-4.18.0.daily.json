@@ -1,0 +1,96 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-29T04-40-16-9300c2e8-0947-aa38-ee88-4dbb6841ebbb",
+      "model": "gpt-6-sol",
+      "provider": "openai",
+      "input": 637250,
+      "output": 51748,
+      "cacheRead": 38011904,
+      "cacheWrite": 0,
+      "reasoning": 70034,
+      "messageCount": 182,
+      "cost": 14.433677599999998,
+      "performance": {
+        "msPer1KTokens": 128.59743700796906,
+        "totalDurationMs": 4985843,
+        "timedTokens": 38770936,
+        "sampleCount": 182,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-29T21-09-03-345ba0bf-90f9-e9e9-a467-b0d58bb8e6d1",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "input": 321962,
+      "output": 9605,
+      "cacheRead": 2945536,
+      "cacheWrite": 0,
+      "reasoning": 51154,
+      "messageCount": 27,
+      "cost": 0.09203106,
+      "performance": {
+        "msPer1KTokens": 351.09758651450295,
+        "totalDurationMs": 1168543,
+        "timedTokens": 3328257,
+        "sampleCount": 27,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-29T23-08-37-6a3dcabc-6c2b-246e-c621-168c482b54e1",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "input": 117481,
+      "output": 5965,
+      "cacheRead": 2610688,
+      "cacheWrite": 0,
+      "reasoning": 19835,
+      "messageCount": 38,
+      "cost": 0.05075498,
+      "performance": {
+        "msPer1KTokens": 273.6149172339994,
+        "totalDurationMs": 753527,
+        "timedTokens": 2753969,
+        "sampleCount": 38,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "codex",
+      "mergedClients": null,
+      "sessionId": "rollout-2026-09-28T20-51-51-d30c0766-77c7-40e8-a350-bc6fb0181f7d",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "input": 89315,
+      "output": 4548,
+      "cacheRead": 1422592,
+      "cacheWrite": 0,
+      "reasoning": 36630,
+      "messageCount": 16,
+      "cost": 0.043746419999999994,
+      "performance": {
+        "msPer1KTokens": 777.1622287254078,
+        "totalDurationMs": 1206999,
+        "timedTokens": 1553085,
+        "sampleCount": 16,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 1166008,
+  "totalOutput": 71866,
+  "totalCacheRead": 44990720,
+  "totalCacheWrite": 0,
+  "totalMessages": 263,
+  "totalCost": 14.620210059999998,
+  "processingTimeMs": 93
+}

@@ -76,7 +76,7 @@ def test_tokscale_preflight_honors_configured_package_runner(
     def fake_popen(command: list[str], **_: object) -> subprocess.Popen[bytes]:
         calls.append(command)
         return popen(
-            [sys.executable, "-c", "print('tokscale 4.15.1')"],
+            [sys.executable, "-c", "print('tokscale 4.18.0')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -84,7 +84,7 @@ def test_tokscale_preflight_honors_configured_package_runner(
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
 
     assert resolve_tokscale_command(configuration) == ("npx", "tokscale@latest")
-    assert preflight_tokscale(configuration) == (("npx", "tokscale@latest"), "4.15.1")
+    assert preflight_tokscale(configuration) == (("npx", "tokscale@latest"), "4.18.0")
     assert calls == [["npx", "tokscale@latest", "--version"]]
 
 
