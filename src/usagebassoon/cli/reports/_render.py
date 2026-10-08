@@ -12,6 +12,7 @@ from typing import Literal
 import typer
 from rich import box
 from rich.table import Table
+from rich.text import Text
 
 from usagebassoon.cli._output import output_console, write_output
 
@@ -28,6 +29,18 @@ _RAW_REPORT_WARNING = (
     "Sharing this report? Re-run with --sanitize to obfuscate identifiers "
     "and free text."
 )
+
+
+def cost_estimate_note() -> Text:
+    """Build the cost disclaimer with a terminal hyperlink on the issue number."""
+    note = Text(COST_ESTIMATE_NOTE, style="yellow")
+    start = COST_ESTIMATE_NOTE.index("#1")
+    note.stylize(
+        "link https://github.com/israelflores8789/usagebassoon/issues/1",
+        start,
+        start + len("#1"),
+    )
+    return note
 
 
 def output_format(json_output: bool, csv_output: bool) -> OutputFormat:
@@ -129,7 +142,7 @@ def render_tables(
             console.print("No matching usage data.")
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
-    console.print(COST_ESTIMATE_NOTE, style="yellow")
+    console.print(cost_estimate_note())
     if save is not None:
         write_output(console.export_text(), save=save)
 
@@ -154,7 +167,7 @@ def render_graph(
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
     if show_cost_note:
-        console.print(COST_ESTIMATE_NOTE, style="yellow")
+        console.print(cost_estimate_note())
         text = text.rstrip() + "\n" + COST_ESTIMATE_NOTE + "\n"
     if save is not None:
         write_output(text, save=save)

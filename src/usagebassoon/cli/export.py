@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 import typer
+from rich.table import Table
 
 from usagebassoon.backends.base import close_backend
 from usagebassoon.backends.factory import open_backend
@@ -26,6 +27,27 @@ from usagebassoon.storage_model import EVENT_KEYS, STATE_KEYS
 ExportFormat = Literal["csv", "json", "parquet"]
 _CANONICAL_EXPORTS = frozenset(STATE_KEYS | EVENT_KEYS)
 _EXPORTABLE_RELATIONS = _CANONICAL_EXPORTS | PUBLIC_RELATIONS
+_RELATION_DESCRIPTIONS = {
+    "sessions": "Session metadata, timestamps, workspaces, and observed activity.",
+    "daily_stats": "Daily token usage per source, session, and model.",
+    "price_versions": "Model token prices observed on each collection date.",
+    "tags": "User tags assigned to workspaces, clients, or sessions.",
+    "notes": "User notes attached to source-specific sessions.",
+    "collection_ledger": "Collection outcomes, acquisition counts, and host metadata.",
+    "schema_drift_events": "Payload schema changes and their resolution state.",
+    "reconciliation_issues": "Token discrepancies and their resolution state.",
+    "daily_cost": "Daily token usage with costs and pricing provenance.",
+    "session_model_stats": "All-time token usage and costs per session and model.",
+    "report_daily_usage": "Daily usage and costs with workspace attribution.",
+    "report_session_models": "Session model totals with workspace and activity.",
+    "report_summary": "Overall session count and total usage cost.",
+    "report_summary_models": "Overall token usage and cost totals per model.",
+    "report_models": "Daily model usage facts with workspace and cost attribution.",
+    "session_tags": "Effective session tags inherited from all assignment scopes.",
+    "tagged_sessions": "Session metadata joined with effective tags.",
+    "session_notes": "Current session notes with identifiers and mutation timestamps.",
+    "noted_sessions": "Session metadata joined with user notes.",
+}
 
 
 def _json_default(value: object) -> str:
@@ -36,8 +58,13 @@ def _json_default(value: object) -> str:
 
 
 def export(
-    target: Annotated[str, typer.Argument(help="A supported table or view name.")],
-    output: Annotated[Path, typer.Argument(help="Destination file path.")],
+    target: Annotated[
+        str | None,
+        typer.Argument(help="A supported target; discover names with --list."),
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Argument(help="Destination file path.")
+    ] = None,
     format: Annotated[
         ExportFormat,
         typer.Option("--format", help="File format: csv, json, or parquet."),
@@ -61,9 +88,37 @@ def export(
         Path | None,
         typer.Option("--config", help="Use this configuration file."),
     ] = None,
+    list_kind: Annotated[
+        Literal["tables", "views"] | None,
+        typer.Option("--list", help="List supported export targets and descriptions."),
+    ] = None,
 ) -> None:
     """Export a relation, obfuscating share-sensitive fields by default."""
     del sanitize
+    if list_kind is not None:
+        if target is not None or output is not None:
+            raise typer.BadParameter(
+                "--list cannot be combined with target or output arguments",
+                param_hint="--list",
+            )
+        names = _CANONICAL_EXPORTS if list_kind == "tables" else PUBLIC_RELATIONS
+        table = Table(title=f"Exportable {list_kind}")
+        table.add_column("Target", no_wrap=True)
+        table.add_column("Description")
+        for name in sorted(names):
+            table.add_row(name, _RELATION_DESCRIPTIONS[name])
+        console = output_console()
+        console.print(table)
+        if list_kind == "tables":
+            console.print("Table targets export canonical current state.")
+        return
+    if target is None:
+        raise typer.BadParameter(
+            "target is required; use --list tables or --list views to discover targets",
+            param_hint="target",
+        )
+    if output is None:
+        raise typer.BadParameter("output is required", param_hint="output")
     if target not in _EXPORTABLE_RELATIONS:
         allowed = ", ".join(sorted(_EXPORTABLE_RELATIONS))
         raise typer.BadParameter(

@@ -110,7 +110,7 @@ def _graph_text(
         figure.plot_size(plot_width, 18)
         positions = list(range(len(values)))
         tick_positions = _tick_positions(len(labels), plot_width)
-        figure.draw(figure.bar(positions, values, marker="full"))
+        figure.draw(figure.bar(positions, values, marker="full", width=0.6))
         figure.ruler(0).lim(-0.5, len(values) - 0.5).ticks(
             tick_positions, [labels[position] for position in tick_positions]
         )

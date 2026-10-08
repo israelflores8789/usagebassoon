@@ -103,3 +103,48 @@ def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() ->
     assert "<path>" in sanitized
     assert "PASSWORD=<redacted>" in sanitized
     assert "SERVICE_SECRET=<redacted>" in sanitized
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected"),
+    [
+        (
+            "/home/alice/private/ub_dev.toml",
+            "/directory-alpha/directory-bravo/directory-charlie/ub_dev.toml",
+        ),
+        (
+            "/home/Alice Smith/ub_dev.toml",
+            "/directory-alpha/directory-bravo/ub_dev.toml",
+        ),
+        (
+            r"C:\Users\Alice Smith\ub_dev.toml",
+            r"C:\directory-alpha\directory-bravo\ub_dev.toml",
+        ),
+        (
+            r"\\private-server\private-share\Alice\ub_dev.toml",
+            r"\\directory-alpha\directory-bravo\directory-charlie\ub_dev.toml",
+        ),
+    ],
+)
+def test_doctor_obfuscates_config_directories(config_path: str, expected: str) -> None:
+    """Retain absolute path structure and filename without exposing directories."""
+    sanitized = sanitize_doctor_text(
+        f"path: {config_path}; failed to read {config_path}; PASSWORD=secret",
+        config_path=config_path,
+        database=None,
+    )
+    assert (
+        sanitized == f"path: {expected}; failed to read {expected}; PASSWORD=<redacted>"
+    )
+
+
+@pytest.mark.parametrize(
+    "database", ["usagebassoon_it", "/private/store.duckdb", r"C:\private\store.duckdb"]
+)
+def test_doctor_retains_named_targets_and_redacts_database_paths(database: str) -> None:
+    """Remote target names remain actionable while file locations stay private."""
+    sanitized = sanitize_doctor_text(
+        f"database={database}; TOKEN=secret", config_path=None, database=database
+    )
+    expected = "<path>" if "store.duckdb" in database else database
+    assert sanitized == f"database={expected}; TOKEN=<redacted>"

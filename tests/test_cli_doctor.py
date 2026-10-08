@@ -46,7 +46,10 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
 
     assert sanitized.exit_code == 1
     assert str(missing) not in plain_cli_output(sanitized.output)
-    assert "<config-path>" in plain_cli_output(sanitized.output)
+    output = plain_cli_output(sanitized.output)
+    assert "/directory-alpha/" in output
+    assert "/config.toml" in output
+    assert "<config-path>" not in output
     assert raw.exit_code == 1
     assert str(missing) in plain_cli_output(raw.output).replace("\n", "")
     assert "raw doctor output may contain" in plain_cli_output(raw.stderr)
@@ -321,3 +324,59 @@ def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
     assert any(
         "Weekly coverage gaps" in line and missing in line for line in report.details
     )
+
+
+def test_doctor_resolves_relative_config_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both raw and sanitized diagnostics use an absolute explicit config path."""
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    sanitized = runner.invoke(app, ["doctor", "--config", "ub_dev.toml"])
+    raw = runner.invoke(app, ["doctor", "--raw", "--config", "ub_dev.toml"])
+    assert sanitized.exit_code == raw.exit_code == 1
+    assert "/directory-alpha/" in plain_cli_output(sanitized.output)
+    assert "/ub_dev.toml" in plain_cli_output(sanitized.output)
+    assert str(tmp_path / "ub_dev.toml") in plain_cli_output(raw.output).replace(
+        "\n", ""
+    )
+
+
+@pytest.mark.parametrize("provider", ["bigquery", "motherduck"])
+def test_doctor_displays_remote_target_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Configured remote target names survive the default sharing sanitizer."""
+    config, backend = _configured_store(tmp_path)
+    config.write_text(
+        f'source_id = "{SOURCE_ID}"\nbackend.provider = "{provider}"\n'
+        + (
+            'backend.bigquery.project = "synthetic-project"\n'
+            'backend.bigquery.dataset = "usagebassoon_it"\n'
+            if provider == "bigquery"
+            else 'backend.motherduck.database = "usagebassoon_it"\n'
+        )
+    )
+
+    def fake_open(_configuration: object) -> DuckDBBackend:
+        """Use a local backend to avoid remote connections in a rendering test."""
+        return backend
+
+    def fake_preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Avoid subprocess acquisition in a configuration rendering test."""
+        return ("tokscale",), "4.18.0"
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.open_backend", fake_open)
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", fake_preflight)
+    try:
+        result = CliRunner().invoke(app, ["doctor", "--config", str(config)])
+        output = plain_cli_output(result.output)
+        assert result.exit_code == 0, output
+        assert f"backend={provider}, database=usagebassoon_it" in output
+        assert "<database>" not in output
+        assert "path:" in output
+        assert "/directory-alpha/" in output
+        assert "/config.toml" in output
+        assert str(config) not in output
+    finally:
+        backend.close()

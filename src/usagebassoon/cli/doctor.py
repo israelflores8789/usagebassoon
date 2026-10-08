@@ -123,7 +123,7 @@ def doctor(
     ] = False,
 ) -> None:
     """Check the configured backend, schema, drift, and ingest health."""
-    manager = ConfigurationManager(config)
+    manager = ConfigurationManager(ConfigurationManager(config).path.absolute())
     logger = _LOG
     opened = None
     config_error: str | None = None

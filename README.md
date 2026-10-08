@@ -484,6 +484,16 @@ The commands have deliberately different sharing behavior:
 
 `bassoon export` pseudonymizes fields such as session IDs, workspaces, tags, and host identifiers consistently within one output, and redacts notes, embedded filesystem paths, and common credential forms. System metadata remains raw in all cases. No command can infer the sensitivity of your downstream environment, so inspect sanitized output before sharing it.
 
+Discover supported export targets and their descriptions:
+
+```bash
+bassoon export --list tables
+bassoon export --list views
+bassoon export daily_cost usage.parquet
+```
+
+Table targets export canonical current state. Exports support Parquet (the default), CSV, and JSON through `--format`.
+
 ## Snapshots
 
 You can archive or perform routine backup of your token usage data with `bassoon snapshot` which creates whole-backend archives in Parquet format. Manually invoking `bassoon snapshot` bypasses scheduled snapshots, if configured, and pins it out of rotation (use `--no-pin` if you just want an ephemeral snapshot). See [#configtoml] for default path and settings.

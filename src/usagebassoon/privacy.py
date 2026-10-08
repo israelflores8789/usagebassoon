@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath, PureWindowsPath
 from urllib.parse import quote, quote_plus
 
 import pyarrow as pa
@@ -235,21 +236,39 @@ def sanitize_doctor_text(
     config_path: str | None,
     database: str | None,
 ) -> str:
-    """Redact configuration locations, credentials, and filesystem paths.
+    """Obfuscate configuration directories and redact credentials and other paths.
 
     Args:
         value: One doctor display string.
         config_path: Resolved configuration file path, when available.
-        database: Configured database or dataset, when available.
+        database: Configured database path or public database/dataset name.
 
     Returns:
         A display-safe variant of ``value``.
     """
-    sanitized = value
-    for private_value, replacement in (
-        (config_path, "<config-path>"),
-        (database, "<database>"),
-    ):
-        if private_value:
-            sanitized = sanitized.replace(private_value, replacement)
-    return _sanitize_text(sanitized, {})
+
+    def sanitize_part(part: str) -> str:
+        """Redact a diagnostic fragment while retaining named remote targets."""
+        if database and any(separator in database for separator in ("/", "\\")):
+            part = part.replace(database, "<path>")
+        return _sanitize_text(part, {})
+
+    if not config_path:
+        return sanitize_part(value)
+    path = (
+        PureWindowsPath(config_path)
+        if PureWindowsPath(config_path).is_absolute()
+        else PurePosixPath(config_path)
+    )
+    anchor = path.anchor
+    first_index = 1
+    if isinstance(path, PureWindowsPath) and path.drive.startswith("\\\\"):
+        anchor = "\\\\directory-alpha\\directory-bravo\\"
+        first_index = 3
+    directories = tuple(
+        _label("directory", index)
+        for index in range(first_index, first_index + len(path.parts) - 2)
+    )
+    obfuscated = str(type(path)(anchor, *directories, path.name))
+    obfuscated = redact_credentials(obfuscated)
+    return obfuscated.join(sanitize_part(part) for part in value.split(config_path))
