@@ -205,6 +205,75 @@ def test_synthetic_raw_and_gold_replay_matches_shared_views() -> None:
         remote.close()
 
 
+def test_compaction_deduplicates_usage_recollections_and_preserves_history(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Compact repeated corrections without losing gold-only or other-source keys."""
+    remote = BigQueryReplayBackend()
+    schema = CANONICAL_TABLE_SCHEMAS["daily_stats"]
+    seeds = normalize(collection_bundle).tables["daily_stats"].slice(0, 2).to_pylist()
+    original: dict[str, object] = seeds[0]
+    retained: dict[str, object] = seeds[1]
+    stamp = datetime(2026, 9, 10, tzinfo=UTC)
+    original["collected_at"] = retained["collected_at"] = stamp
+    isolated = dict(
+        original,
+        source_id="22222222-2222-4222-8222-222222222222",
+        event_id=str(uuid4()),
+    )
+    initial = pa.Table.from_pylist([original, retained, isolated], schema=schema)
+    try:
+        remote.append("daily_stats", initial)
+        remote.append("daily_stats", initial)
+        remote.compact()
+        remote.compact()
+        assert normalized_records(remote.query("SELECT * FROM daily_stats")) == (
+            normalized_records(initial)
+        )
+
+        # Simulate raw expiry: retained usage must survive in gold alone.
+        remote.engine.connection.execute("DELETE FROM raw_daily_stats")
+        increased = dict(
+            original,
+            event_id=str(uuid4()),
+            collected_at=stamp + timedelta(days=1),
+            input_tokens=int(seeds[0]["input_tokens"]) + 10,
+            total_tokens=int(seeds[0]["total_tokens"]) + 10,
+        )
+        data = pa.Table.from_pylist([increased], schema=schema)
+        remote.append("daily_stats", data)
+        remote.append("daily_stats", data)
+        remote.compact()
+
+        # A newer downward correction wins over the earlier larger count.
+        corrected = dict(
+            increased,
+            event_id=str(uuid4()),
+            collected_at=stamp + timedelta(days=2),
+            input_tokens=int(seeds[0]["input_tokens"]) + 5,
+            total_tokens=int(seeds[0]["total_tokens"]) + 5,
+        )
+        data = pa.Table.from_pylist([corrected], schema=schema)
+        remote.append("daily_stats", data)
+        remote.append("daily_stats", data)
+        expected = normalized_records(
+            pa.Table.from_pylist([corrected, retained, isolated], schema=schema)
+        )
+        assert (
+            normalized_records(remote.query("SELECT * FROM current_daily_stats"))
+            == expected
+        )
+        remote.compact()
+        remote.compact()
+        assert normalized_records(remote.query("SELECT * FROM daily_stats")) == expected
+        assert (
+            normalized_records(remote.query("SELECT * FROM current_daily_stats"))
+            == expected
+        )
+    finally:
+        remote.close()
+
+
 def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
     collection_bundle: CollectionBundle,
 ) -> None:

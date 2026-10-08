@@ -560,6 +560,81 @@ def test_daily_models_failure_records_incomplete_targets(
         backend.close()
 
 
+def test_overlap_always_includes_three_past_graph_usage_days(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_raw: JsonObject,
+) -> None:
+    """Keep graph discovery and retries while refreshing sparse completed dates."""
+    today = date(2026, 9, 10)
+    days = tuple(today - timedelta(days=offset) for offset in (90, 60, 40, 20, 10))
+    retry_day = today - timedelta(days=100)
+    persisted_only = today - timedelta(days=1)
+    graph = deepcopy(graph_raw)
+    template = cast(JsonObject, cast(JsonArray, graph["contributions"])[0])
+    graph["contributions"] = [
+        {**deepcopy(template), "date": day.isoformat()} for day in (*days, today)
+    ]
+    statuses = {
+        (day, "models"): IngestStatus(day, "models", "complete", 1, 1, "old")
+        for day in (*days[1:], today, persisted_only)
+    }
+    statuses[(retry_day, "models")] = IngestStatus(
+        retry_day, "models", "failed", 1, 0, "old"
+    )
+    requested: list[tuple[date, ...]] = []
+
+    def state(
+        _config: UsageBassoonConfig,
+    ) -> tuple[
+        dict[IngestTarget, IngestStatus],
+        dict[date, set[str]],
+        dict[date, set[str]],
+        frozenset[tuple[str, str]],
+        tuple[SchemaDriftState, ...],
+        ReportInventory,
+    ]:
+        """Expose completion and retry state independently of graph discovery."""
+        return (
+            statuses,
+            {persisted_only: {"model"}},
+            {},
+            frozenset(),
+            (),
+            ReportInventory(),
+        )
+
+    def command(*_args: object, **_kwargs: object) -> JsonValue:
+        """Return sparse graph usage without invoking tokscale."""
+        return graph
+
+    def models(
+        _config: UsageBassoonConfig,
+        _prefix: object,
+        selected_days: tuple[date, ...],
+        **_kwargs: object,
+    ) -> dict[date, JsonObject]:
+        """Capture planning and stop before acquisition and normalization."""
+        requested.append(selected_days)
+        raise RuntimeError("planning captured")
+
+    def persist(*_args: object, **_kwargs: object) -> PersistSummary:
+        """Avoid backend writes when recording the deliberate acquisition stop."""
+        return PersistSummary(0, 0, {})
+
+    monkeypatch.setattr(_FixedDatetime, "current", datetime(2026, 9, 10, tzinfo=UTC))
+    monkeypatch.setattr(collector, "datetime", _FixedDatetime)
+    monkeypatch.setattr(collector, "load_ingest_status", state)
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(collector, "_fetch_daily_models", models)
+    monkeypatch.setattr(collector, "persist_with_retries", persist)
+
+    with pytest.raises(RuntimeError, match="planning captured"):
+        collector.collect(_config(tmp_path / "config.toml"))
+
+    assert requested == [(retry_day, days[0], *days[-3:], today)]
+
+
 def test_report_failure_is_logged_and_does_not_abort_collection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -815,7 +890,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         assert requests[-1] == (day,)
         assert input_count() == original_input + 15
 
-        # Changes beyond the overlap require an explicit historical refresh.
+        # Idle calendar days do not age usage out of the historical overlap.
         stamp += timedelta(days=10)
         entries[0]["input"] = original_input + 30
         daily["totalInput"] += 15
@@ -824,8 +899,8 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         tokens = cast(JsonObject, client["tokens"])
         tokens["input"] = cast(int, tokens["input"]) + 20
         collector.collect(config)
-        assert requests[-1] == ()
-        assert input_count() == original_input + 15
+        assert requests[-1] == (day,)
+        assert input_count() == original_input + 30
 
         other = "22222222-2222-4222-8222-222222222222"
         collector.collect(replace(config, source_id=other))
@@ -836,7 +911,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         entries[0]["input"] = original_input + 35
         entries[1]["input"] = cast(int, entries[1]["input"]) - 5
         collector.collect(config)
-        assert requests[-1] == ()
+        assert requests[-1] == (day,)
         before_failure = facts()
         fail = True
         with pytest.raises(RuntimeError, match="models unavailable"):

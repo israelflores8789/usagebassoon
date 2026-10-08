@@ -78,6 +78,11 @@ def _collect_locked(
             target for target, status in statuses.items() if status.status == "complete"
         }
         today = started_at.date()
+        historical_overlap = set(
+            sorted(day for day in graph_plan.candidate_days if day < today)[
+                -_HISTORICAL_OVERLAP_DAYS:
+            ]
+        )
         candidate_days = tuple(
             sorted(
                 set(graph_plan.candidate_days)
@@ -85,11 +90,6 @@ def _collect_locked(
                     day
                     for (day, domain), status in statuses.items()
                     if domain == _MODELS_DOMAIN and status.status != "complete"
-                }
-                | {
-                    day
-                    for day in persisted_models
-                    if day >= today - timedelta(days=_HISTORICAL_OVERLAP_DAYS)
                 }
             )
         )
@@ -116,7 +116,8 @@ def _collect_locked(
             day
             for day in candidate_days
             if refresh_range is not None
-            or day >= today - timedelta(days=_HISTORICAL_OVERLAP_DAYS)
+            or day >= today
+            or day in historical_overlap
             or (day, _MODELS_DOMAIN) not in completed
         )
         models_failures: dict[date, str] = {}

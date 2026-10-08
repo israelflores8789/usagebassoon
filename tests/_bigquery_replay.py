@@ -24,7 +24,7 @@ from usagebassoon.backends.base import SnapshotRead, SnapshotStream
 from usagebassoon.backends.bigquery import BigQueryBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
-from usagebassoon.storage_model import DEBUG_TABLES
+from usagebassoon.storage_model import DEBUG_TABLES, STATE_KEYS
 
 
 def install_bigquery_replay(backend: DuckDBBackend) -> None:
@@ -70,7 +70,7 @@ class BigQueryReplayBackend(BigQueryBackend):
         self.engine.append(destination.rsplit(".", 1)[-1], data)
 
     def compact(self) -> None:
-        """Replay shipped curation winner SQL and replacements, retaining tombstones."""
+        """Replay shipped state winner SQL and replacements, retaining tombstones."""
         sql = (
             resources.files("usagebassoon.sql.bigquery")
             .joinpath("compaction.sql")
@@ -80,14 +80,16 @@ class BigQueryReplayBackend(BigQueryBackend):
             statement for statement in sqlglot.parse(sql, read="bigquery") if statement
         ]
         with self.engine.transaction():
-            for table in ("tags", "notes"):
+            for table in STATE_KEYS:
                 self.engine.connection.execute(
                     f"DROP TABLE IF EXISTS candidates_{table}"
                 )
                 self.engine.connection.execute(f"DROP TABLE IF EXISTS winners_{table}")
                 self.engine.connection.execute(
                     f"CREATE TEMP TABLE candidates_{table} AS "
-                    f"SELECT DISTINCT source_id FROM raw_{table}"
+                    f"SELECT DISTINCT source_id"
+                    f"{', day' if table in {'daily_stats', 'price_versions'} else ''} "
+                    f"FROM raw_{table}"
                 )
                 self.engine.connection.execute(f"DROP TABLE IF EXISTS keys_{table}")
                 for statement in parsed:
