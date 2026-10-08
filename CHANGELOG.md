@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-08
+
 ### Added
 
 - Added independent snapshot scheduler jobs, immutable-only emergency recovery, atomic fenced lifecycle transitions, immediate owned-stage retries, bounded source auditing, and separately reported scheduled/weekly backup health.
