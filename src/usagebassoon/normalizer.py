@@ -15,7 +15,7 @@ import pyarrow as pa
 from usagebassoon.drift import SchemaDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS
-from usagebassoon.system_metadata import capture_system_metadata
+from usagebassoon.system_metadata import InvokeMethod, capture_system_metadata
 
 if TYPE_CHECKING:
     from usagebassoon.ingest import CollectionBundle
@@ -191,7 +191,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             "memory_bytes": [
                 bundle.system_metadata.memory_bytes if bundle.system_metadata else None
             ],
-            "shell": [bundle.system_metadata.shell if bundle.system_metadata else None],
+            "invoke_method": [bundle.invoke_method.value],
             "tokscale_ver": [bundle.graph.meta.version],
             "status": [status],
             "day": [bundle.started_at.date()],
@@ -346,10 +346,12 @@ def failed_collection(
     finished_at: datetime,
     host: str,
     error: Exception,
+    invoke_method: InvokeMethod = InvokeMethod.PYTHON,
 ) -> NormalizedBundle:
     """Record a failed client acquisition without inventing token observations."""
     row = {
         **asdict(capture_system_metadata()),
+        "invoke_method": InvokeMethod(invoke_method).value,
         "event_id": str(uuid4()),
         "run_id": run_id,
         "source_id": source_id,

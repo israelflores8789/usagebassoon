@@ -101,6 +101,7 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
                     "status": ["ok", "partial"],
                     "host": ["old-host", "new-host"],
                     "cpu_count": [64, 2],
+                    "invoke_method": ["cli", "worker"],
                 }
             )
         ),
@@ -133,6 +134,7 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
         assert rows[0]["source_id"] == SOURCE_ID
         assert rows[0]["run_count"] == 2
         assert rows[0]["host"] == "new-host" and rows[0]["cpu_count"] == 2
+        assert rows[0]["invoke_method"] == "worker"
         assert rows[1]["source_id"] == other and rows[1]["last_activity"] is None
         store = SnapshotArchiver(str(tmp_path / "archive"))
         uri = store.write(backend, run_id="audit", manual=True, pin=True)
@@ -191,7 +193,7 @@ def test_source_identity_warning_uses_complete_matching_evidence_only(
     from usagebassoon.snapshot.reader import PreparedSnapshot
     from usagebassoon.system_metadata import SystemMetadata
 
-    metadata = SystemMetadata("Linux", "test", "x86_64", "test CPU", 4, 1024, "/bin/sh")
+    metadata = SystemMetadata("Linux", "test", "x86_64", "test CPU", 4, 1024)
     other = "22222222-2222-4222-8222-222222222222"
     row: dict[str, object] = {
         "source_id": other,

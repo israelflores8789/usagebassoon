@@ -197,7 +197,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("cpu_model", pa.string()),
             pa.field("cpu_count", pa.int64()),
             pa.field("memory_bytes", pa.int64()),
-            pa.field("shell", pa.string()),
+            pa.field("invoke_method", pa.string()),
             pa.field("tokscale_ver", pa.string()),
             pa.field("status", pa.string()),
         ]

@@ -36,6 +36,7 @@ from usagebassoon.persistence import (
     load_ingest_status,
     persist_with_retries,
 )
+from usagebassoon.system_metadata import InvokeMethod
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
@@ -50,6 +51,7 @@ def _collect_locked(
     started_at: datetime,
     logger: logging.Logger,
     refresh_range: tuple[date, date] | None = None,
+    invoke_method: InvokeMethod = InvokeMethod.PYTHON,
 ) -> PersistSummary:
     """Collect and persist while the local environment lock remains held."""
     (
@@ -233,6 +235,7 @@ def _collect_locked(
             started_at=started_at,
             finished_at=datetime.now(UTC),
             host=gethostname(),
+            invoke_method=invoke_method,
         )
     except Exception as error:
         failed = failed_collection(
@@ -242,6 +245,7 @@ def _collect_locked(
             finished_at=datetime.now(UTC),
             host=gethostname(),
             error=error,
+            invoke_method=invoke_method,
         )
         try:
             persist_with_retries(config, failed, logger)
@@ -269,6 +273,7 @@ def collect(
     refresh: bool = False,
     since: date | None = None,
     until: date | None = None,
+    invoke_method: InvokeMethod = InvokeMethod.PYTHON,
 ) -> tuple[str, PersistSummary]:
     """Collect usage, optionally refreshing an inclusive range for this source.
 
@@ -277,14 +282,17 @@ def collect(
         refresh: Bypass historical completion within the selected range.
         since: Refresh start; defaults to 29 days before the end.
         until: Refresh end; defaults to the collection's current UTC day.
+        invoke_method: Entry point that initiated collection; defaults to Python.
 
     Returns:
         Run identity and backend publication counts. Recollection preserves
         absent keys and existing historical prices, while filling price gaps.
 
     Raises:
-        ValueError: If bounds are reversed, future, or used without refresh.
+        ValueError: If bounds are reversed, future, used without refresh, or the
+            invocation method is unsupported.
     """
+    invoke_method = InvokeMethod(invoke_method)
     started_at = datetime.now(UTC)
     refresh_range = None
     if refresh:
@@ -305,7 +313,9 @@ def collect(
     run_id = str(uuid4())
     try:
         with collection_lock(config):
-            summary = _collect_locked(config, run_id, started_at, logger, refresh_range)
+            summary = _collect_locked(
+                config, run_id, started_at, logger, refresh_range, invoke_method
+            )
     except CollectionBusy:
         logger.info("collection skipped because source %s is busy", config.source_id)
         raise

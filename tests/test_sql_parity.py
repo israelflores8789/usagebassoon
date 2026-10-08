@@ -65,6 +65,10 @@ def _columns(table: exp.Create) -> dict[str, tuple[str, bool]]:
 
 def test_logical_gold_and_event_schemas_match() -> None:
     duckdb, bigquery = _tables("duckdb"), _tables("bigquery")
+    for dialect in (duckdb, bigquery):
+        ledger_columns = _columns(dialect["collection_ledger"])
+        assert "invoke_method" in ledger_columns
+        assert "shell" not in ledger_columns
     for table in STATE_KEYS | EVENT_KEYS:
         physical = "raw_" + table if table in DEBUG_TABLES else table
         assert _columns(duckdb[table]) == _columns(bigquery[physical]), table
@@ -387,8 +391,10 @@ def test_source_audit_view_deduplicates_runs_and_preserves_coherent_host_evidenc
         assert summaries[source]["run_count"] == 1
         assert summaries[source]["host"] == "one-host"
         assert summaries[source]["cpu_count"] == 2
+        assert summaries[source]["invoke_method"] == "python"
         assert summaries[other]["run_count"] == 0
         assert summaries[other]["host"] is None
+        assert summaries[other]["invoke_method"] is None
         assert normalized_records(
             pa.Table.from_pylist(audit_sources(local))
         ) == normalized_records(left)

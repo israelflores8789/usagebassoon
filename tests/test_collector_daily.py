@@ -43,6 +43,7 @@ from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 from usagebassoon.normalizer import NormalizedBundle
 from usagebassoon.persistence import PersistSummary
+from usagebassoon.system_metadata import InvokeMethod
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -370,8 +371,10 @@ def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     tmp_path: Path,
+    invoke_method: InvokeMethod | None,
     monkeypatch: pytest.MonkeyPatch,
     graph_raw: JsonObject,
     report_raws: dict[date, JsonArray],
@@ -431,9 +434,10 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         requested_prices.append(models_by_day)
         return ({day: {} for day in models_by_day}, {})
 
-    def build(raw: RawCollection, **_kwargs: object) -> CollectionBundle:
+    def build(raw: RawCollection, **kwargs: object) -> CollectionBundle:
         """Capture the raw bundle before normalization and persistence."""
         captured.append(raw)
+        assert kwargs["invoke_method"] is (invoke_method or InvokeMethod.PYTHON)
         return replace(collection_bundle, ingest_status=())
 
     def prefix(_configuration: UsageBassoonConfig) -> list[str]:
@@ -497,7 +501,11 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     monkeypatch.setattr(collector, "normalize", normalized)
     monkeypatch.setattr(collector, "persist_with_retries", persist)
 
-    _, summary = collector.collect(_config(tmp_path / "config.toml"))
+    configuration = _config(tmp_path / "config.toml")
+    if invoke_method is None:
+        _, summary = collector.collect(configuration)
+    else:
+        _, summary = collector.collect(configuration, invoke_method=invoke_method)
 
     expected_successes = set(days) - {completed_day}
     assert summary == PersistSummary(0, 0, {})
@@ -579,8 +587,10 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
+@pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     error_type: type[Exception],
+    invoke_method: InvokeMethod | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -599,7 +609,10 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     monkeypatch.setattr(collector, "_json_command", command)
 
     with pytest.raises(error_type, match="graph process failed"):
-        collector.collect(configuration)
+        if invoke_method is None:
+            collector.collect(configuration)
+        else:
+            collector.collect(configuration, invoke_method=invoke_method)
 
     backend = DuckDBBackend(configuration.local_database)
     try:
@@ -608,6 +621,8 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
         assert rows[0]["status"] == "failed"
         assert rows[0]["failure_code"] == error_type.__name__
         assert rows[0]["source_id"] == configuration.source_id
+        assert rows[0]["invoke_method"] == (invoke_method or InvokeMethod.PYTHON).value
+        assert "shell" not in rows[0]
         assert backend.query("SELECT * FROM daily_stats").num_rows == 0
     finally:
         backend.close()

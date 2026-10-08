@@ -30,6 +30,7 @@ from usagebassoon.scheduling import (
     run_worker,
     schedule_doctor_check,
 )
+from usagebassoon.system_metadata import InvokeMethod
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -61,6 +62,56 @@ def test_systemd_time_span_supports_arbitrary_valid_intervals() -> None:
     """Translate configured minute/hour intervals to systemd seconds."""
     assert _systemd_time_span("15m") == "900s"
     assert _systemd_time_span("2h") == "7200s"
+
+
+@pytest.mark.parametrize(
+    ("platform", "invoke_method"),
+    [("linux", InvokeMethod.SYSTEMD), ("darwin", InvokeMethod.LAUNCHD)],
+)
+def test_native_collection_artifacts_pass_invocation_method_to_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    invoke_method: InvokeMethod,
+) -> None:
+    """Generated native commands retain their scheduler identity at the CLI boundary."""
+    import plistlib
+
+    import usagebassoon.scheduling as scheduling
+
+    configuration = _configuration(tmp_path)
+    monkeypatch.setattr(scheduling, "_resolve_bassoon", lambda: "/opt/bin/bassoon")
+    command = scheduling._collect_command(configuration, platform)
+    assert command == (
+        "/opt/bin/bassoon",
+        "collect",
+        "--config",
+        str(configuration.path.resolve()),
+        "--invoke-method",
+        invoke_method.value,
+    )
+    if platform == "linux":
+        service = scheduling._systemd_service(command)
+        assert f"--invoke-method {invoke_method.value}" in service
+    else:
+        payload = plistlib.loads(
+            scheduling._launchd_plist_bytes(configuration, command)
+        )
+        assert payload["ProgramArguments"] == list(command)
+
+    def collect_run(
+        config: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
+        """Check the scheduler marker after parsing the generated command."""
+        assert config.path == configuration.path
+        assert invoke_method is expected
+        return "native-run", PersistSummary(0, 0, {})
+
+    expected = invoke_method
+    monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
+    result = CliRunner().invoke(app, list(command[1:]))
+    assert result.exit_code == 0, plain_cli_output(result.output)
+    assert "Collected run native-run" in plain_cli_output(result.output)
 
 
 def test_tokscale_preflight_honors_configured_package_runner(
@@ -160,7 +211,10 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
     """Make the container worker's interval behavior match native install."""
     configuration = _configuration(tmp_path)
 
-    def stop_worker(_config: UsageBassoonConfig) -> NoReturn:
+    def stop_worker(
+        _config: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> NoReturn:
+        assert invoke_method is InvokeMethod.WORKER
         raise KeyboardInterrupt
 
     def fake_preflight(_config: UsageBassoonConfig) -> tuple[str, ...]:
@@ -232,7 +286,10 @@ def test_worker_keeps_startup_configuration_until_restart(
                 self.set()
             return self.is_set()
 
-    def fake_collect(config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def fake_collect(
+        config: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
+        assert invoke_method is InvokeMethod.WORKER
         collected.append(config)
         if len(collected) > 1 and change != "none":
             assert "restart the worker" in caplog.text
@@ -438,7 +495,10 @@ def test_snapshot_worker_runs_while_collection_is_blocked(
         if blocked.wait(2):
             captured.set()
 
-    def collect(_config: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect(
+        _config: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
+        assert invoke_method is InvokeMethod.WORKER
         blocked.set()
         assert captured.wait(2), "blocked collection prevented independent backup"
         handler = signals[module.signal.SIGTERM]
@@ -656,7 +716,10 @@ def test_worker_continues_after_an_operational_cycle_failure(
         if len(attempts) == 1:
             raise failure
 
-    def collect(configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect(
+        configuration: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
+        assert invoke_method is InvokeMethod.WORKER
         cycle(configuration)
         return "successful-run", PersistSummary(1, 0, {})
 
@@ -739,7 +802,10 @@ def test_worker_failure_outputs_protect_active_credentials(
     def preflight(_config: UsageBassoonConfig) -> tuple[str, str]:
         return "tokscale", "test"
 
-    def collect(settings: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect(
+        settings: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
+        assert invoke_method is InvokeMethod.WORKER
         nonlocal attempts
         attempts += 1
         if attempts == 1:

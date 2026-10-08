@@ -32,7 +32,11 @@ from usagebassoon.reconcile import (
     ReconciliationResult,
     reconcile_all,
 )
-from usagebassoon.system_metadata import SystemMetadata, capture_system_metadata
+from usagebassoon.system_metadata import (
+    InvokeMethod,
+    SystemMetadata,
+    capture_system_metadata,
+)
 
 if TYPE_CHECKING:
     from usagebassoon.collector import RawCollection
@@ -139,6 +143,7 @@ class CollectionBundle:
     fetch_summary: dict[str, int] | None = None
     drift_fatal: bool = False
     system_metadata: SystemMetadata | None = None
+    invoke_method: InvokeMethod = InvokeMethod.PYTHON
 
 
 def plan_graph(
@@ -292,6 +297,7 @@ def build_collection_bundle(
     host: str | None,
     evidence: IngestEvidence | None = None,
     system_metadata: SystemMetadata | None = None,
+    invoke_method: InvokeMethod = InvokeMethod.PYTHON,
     contracts: Mapping[PayloadKind, PayloadContract] | None = None,
 ) -> CollectionBundle:
     """Validate raw payload contracts, then parse one collection bundle.
@@ -313,6 +319,7 @@ def build_collection_bundle(
         host: Hostname or container identifier when available.
         evidence: Validated acquisition outcomes for this ingest decision.
         system_metadata: Collector-host metadata, captured when omitted.
+        invoke_method: Entry point that initiated this collection cycle.
         contracts: Explicit contracts for tests or custom deployments.
 
     Returns:
@@ -599,4 +606,5 @@ def build_collection_bundle(
             + len(graph_plan.graph.contributions)
         },
         system_metadata=system_metadata or capture_system_metadata(),
+        invoke_method=InvokeMethod(invoke_method),
     )

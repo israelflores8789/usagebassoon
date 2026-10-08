@@ -268,7 +268,7 @@ CREATE TABLE collection_ledger (
     cpu_model STRING,
     cpu_count INT64,
     memory_bytes INT64,
-    shell STRING,
+    invoke_method STRING,
     tokscale_ver STRING,
     status STRING
 )

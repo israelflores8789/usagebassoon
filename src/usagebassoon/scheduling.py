@@ -39,6 +39,7 @@ from usagebassoon.diagnostics import DoctorCheck
 from usagebassoon.logger import configure as configure_logging
 from usagebassoon.logger import worker_diagnostic
 from usagebassoon.orchestrator import collect as collect_run
+from usagebassoon.system_metadata import InvokeMethod
 from usagebassoon.version import __version__
 
 _LOG = logging.getLogger("usagebassoon")
@@ -259,13 +260,17 @@ def _resolve_bassoon() -> str:
     )
 
 
-def _collect_command(config: UsageBassoonConfig) -> tuple[str, ...]:
+def _collect_command(config: UsageBassoonConfig, platform: str) -> tuple[str, ...]:
     """Build the absolute collection command for a native scheduler."""
     return (
         _resolve_bassoon(),
         "collect",
         "--config",
         str(config.path.expanduser().resolve()),
+        "--invoke-method",
+        InvokeMethod.SYSTEMD.value
+        if platform == "linux"
+        else InvokeMethod.LAUNCHD.value,
     )
 
 
@@ -465,7 +470,7 @@ def install_native_schedule(
 ) -> ScheduleStatus:
     """Preflight and install the native schedule for the current platform."""
     availability = _require_scheduler()
-    command = _collect_command(config)
+    command = _collect_command(config, availability.platform)
     if availability.platform == "linux":
         return _install_systemd(config, command, no_linger=no_linger)
     return _install_launchd(config, command)
@@ -574,7 +579,7 @@ def _install_launchd(
 def start_native_schedule(config: UsageBassoonConfig) -> ScheduleStatus:
     """Start an installed native schedule after preflight."""
     availability = _require_scheduler()
-    command = _collect_command(config)
+    command = _collect_command(config, availability.platform)
     if availability.platform == "linux":
         if not (_systemd_unit_dir() / SYSTEMD_TIMER_NAME).is_file():
             raise SchedulingError("schedule is not installed")
@@ -635,7 +640,7 @@ def native_schedule_status(config: UsageBassoonConfig) -> ScheduleStatus:
     availability = scheduler_availability()
     command: tuple[str, ...]
     try:
-        command = _collect_command(config)
+        command = _collect_command(config, availability.platform)
     except SchedulingError:
         _LOG.warning("could not resolve scheduled collection command", exc_info=True)
         command = ()
@@ -1028,7 +1033,9 @@ def run_worker(
                 worker_diagnostic(message)
                 change_reported = True
             try:
-                run_id, summary = collect_run(configuration)
+                run_id, summary = collect_run(
+                    configuration, invoke_method=InvokeMethod.WORKER
+                )
             except CollectionBusy as error:
                 logger.info("scheduled collection skipped: %s", error)
                 worker_diagnostic(f"scheduled collection skipped: {error}")

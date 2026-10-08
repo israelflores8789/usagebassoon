@@ -19,6 +19,7 @@ from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.ingest import IngestStatus
 from usagebassoon.persistence import PersistSummary
+from usagebassoon.system_metadata import InvokeMethod
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -39,9 +40,12 @@ def test_collect_reports_the_delegated_persistence_summary(
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usagebassoon.duckdb")
 
-    def collect_run(configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect_run(
+        configuration: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
         """Return a deterministic collector outcome for the CLI boundary."""
         assert configuration.path == config
+        assert invoke_method is InvokeMethod.CLI
         return "run-123", PersistSummary(inserted=4, updated=2, per_table={})
 
     monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
@@ -128,8 +132,11 @@ def test_collect_reports_local_collection_contention(
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usagebassoon.duckdb")
 
-    def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect_run(
+        _configuration: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
         """Simulate a local collection already holding the environment lock."""
+        assert invoke_method is InvokeMethod.CLI
         raise CollectionBusy("source is already collecting")
 
     monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
@@ -150,8 +157,11 @@ def test_collect_formats_unexpected_errors_without_a_traceback(
     config = tmp_path / "config.toml"
     _write_config(config, tmp_path / "usagebassoon.duckdb")
 
-    def collect_run(_configuration: UsageBassoonConfig) -> tuple[str, PersistSummary]:
+    def collect_run(
+        _configuration: UsageBassoonConfig, *, invoke_method: InvokeMethod
+    ) -> tuple[str, PersistSummary]:
         """Raise an unexpected exception from the delegated collector."""
+        assert invoke_method is InvokeMethod.CLI
         raise TypeError("unexpected collector failure")
 
     monkeypatch.setattr("usagebassoon.cli.collect.collect_run", collect_run)
@@ -201,6 +211,7 @@ def test_collect_refresh_delegates_source_and_date_bounds(
         refresh: bool,
         since: date | None,
         until: date | None,
+        invoke_method: InvokeMethod,
     ) -> tuple[str, PersistSummary]:
         """Record exactly one source-scoped refresh invocation."""
         nonlocal calls
@@ -208,6 +219,7 @@ def test_collect_refresh_delegates_source_and_date_bounds(
         assert configuration.source_id == SOURCE_ID
         assert configuration.path == config
         assert refresh
+        assert invoke_method is InvokeMethod.CLI
         assert (since, until) == expected
         return "refresh-run", PersistSummary(2, 1, {})
 

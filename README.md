@@ -473,7 +473,7 @@ The commands have deliberately different sharing behavior:
 
 | Command            | Default output                             | Sharing guidance                                             |
 |--------------------|--------------------------------------------|--------------------------------------------------------------|
-| `bassoon doctor`   | Sanitized diagnostic paths and credentials | Prefer this for issue reports, but *review* it: diagnostics may expose host metadata such as OS, OS version, architecture, CPU, memory, and shell. Add `--raw` only for private troubleshooting. |
+| `bassoon doctor`   | Sanitized diagnostic paths and credentials | Prefer this for issue reports, but *review* it: diagnostics may expose OS, OS version, architecture, CPU, memory, and collection invocation method. Add `--raw` only for private troubleshooting. |
 | `bassoon report`   | Raw personal report                        | Add `--sanitize` before sharing.                             |
 | `bassoon export`   | Obfuscated export; notes are redacted      | Safe defaults still require review. Add `--raw` only for an intentional private backup or data-management export. |
 | `bassoon query`    | Raw relation data                          | It always warns on stderr and may contain session IDs, workspaces, tags, notes, paths, and host metadata. Do not share it publicly. |

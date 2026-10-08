@@ -47,7 +47,7 @@ FROM (SELECT * FROM notes UNION ALL SELECT * FROM raw_notes) AS observations
 WHERE observation_rank = 1 AND op = 'upsert';
 
 CREATE OR REPLACE VIEW current_collection_ledger AS
-SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status
+SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status
 FROM (
 SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, run_id, day, domain ORDER BY collected_at DESC, finished_at DESC NULLS LAST, event_id DESC) AS observation_rank
 FROM (SELECT * FROM collection_ledger) AS observations
@@ -104,7 +104,7 @@ SELECT * FROM current_reconciliation_issues
 WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
 
 CREATE OR REPLACE VIEW collection_runs AS
-SELECT event_id, run_id, day, domain, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status
+SELECT event_id, run_id, day, domain, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status
 FROM current_collection_ledger WHERE domain = 'collection';
 
 -- One source summary combines all canonical domains and one latest metadata row.
@@ -141,13 +141,13 @@ SELECT sources.source_id, totals.first_activity, totals.last_activity,
     COALESCE(totals.run_count, 0) AS run_count,
     latest.status AS latest_outcome,
     latest.host, latest.os_name, latest.os_version, latest.architecture,
-    latest.cpu_model, latest.cpu_count, latest.memory_bytes, latest.shell
+    latest.cpu_model, latest.cpu_count, latest.memory_bytes, latest.invoke_method
 FROM sources
 LEFT JOIN totals ON sources.source_id = totals.source_id
 LEFT JOIN latest ON sources.source_id = latest.source_id;
 
 CREATE OR REPLACE VIEW collection_status AS
-SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, shell, tokscale_ver, status FROM (
+SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status FROM (
 SELECT current_collection_ledger.*, ROW_NUMBER() OVER (
     PARTITION BY source_id, day, domain
     ORDER BY collected_at DESC, finished_at DESC NULLS LAST, event_id DESC

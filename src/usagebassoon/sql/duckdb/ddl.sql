@@ -34,7 +34,7 @@ CREATE TABLE collection_ledger (
     cpu_model TEXT,
     cpu_count INTEGER,
     memory_bytes BIGINT,
-    shell TEXT,
+    invoke_method TEXT,
     tokscale_ver TEXT,
     status TEXT
 );

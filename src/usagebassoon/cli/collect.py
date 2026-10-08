@@ -17,6 +17,7 @@ from usagebassoon.collection_lock import CollectionBusy
 from usagebassoon.config import ConfigurationError, ConfigurationManager
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.orchestrator import collect as collect_run
+from usagebassoon.system_metadata import InvokeMethod
 
 _LOG = logging.getLogger(LOGGER_NAME)
 collect_app = typer.Typer(invoke_without_command=True)
@@ -29,11 +30,14 @@ def collect(
         Path | None,
         typer.Option("--config", help="Use this configuration file."),
     ] = None,
+    invoke_method: Annotated[
+        InvokeMethod, typer.Option("--invoke-method", hidden=True)
+    ] = InvokeMethod.CLI,
 ) -> None:
     """Collect daily tokscale observations and publish them to storage."""
     ctx.obj = config
     if ctx.invoked_subcommand is None:
-        _run_collection(config)
+        _run_collection(config, invoke_method=invoke_method)
 
 
 @collect_app.command()
@@ -82,15 +86,22 @@ def _run_collection(
     refresh: bool = False,
     since: date | None = None,
     until: date | None = None,
+    invoke_method: InvokeMethod = InvokeMethod.CLI,
 ) -> None:
     """Run ordinary collection or refresh with shared error and result rendering."""
     try:
         configuration = ConfigurationManager(config).load()
         with spinner(configuration):
             run_id, summary = (
-                collect_run(configuration, refresh=True, since=since, until=until)
+                collect_run(
+                    configuration,
+                    refresh=True,
+                    since=since,
+                    until=until,
+                    invoke_method=invoke_method,
+                )
                 if refresh
-                else collect_run(configuration)
+                else collect_run(configuration, invoke_method=invoke_method)
             )
     except CollectionBusy as error:
         typer.echo(f"Collection failed: {error}", err=True)

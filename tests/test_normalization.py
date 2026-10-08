@@ -31,7 +31,7 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
 from usagebassoon.persistence import persist_run
-from usagebassoon.system_metadata import SystemMetadata
+from usagebassoon.system_metadata import InvokeMethod, SystemMetadata
 
 
 def test_normalize_emits_daily_tables_and_collection_status(
@@ -217,11 +217,11 @@ def test_native_cpu_queries_are_bounded(
     assert system_metadata._cpu_model(system) == "Example CPU"
 
 
-def test_cpu_probe_failure_preserves_metadata_and_direct_launch_shell(
+def test_cpu_probe_failure_preserves_metadata(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A CPU query failure falls back independently and never copies the login shell."""
+    """A CPU query failure preserves the other available host attributes."""
 
     def fail() -> str | None:
         raise PermissionError("CPU metadata unavailable")
@@ -231,13 +231,11 @@ def test_cpu_probe_failure_preserves_metadata_and_direct_launch_shell(
     monkeypatch.setattr(system_metadata.platform, "processor", lambda: "Fallback CPU")
     monkeypatch.setattr(system_metadata.os, "cpu_count", lambda: 4)
     monkeypatch.setattr(system_metadata, "_physical_memory_bytes", lambda: 1024)
-    monkeypatch.setenv("SHELL", "/bin/zsh")
     with caplog.at_level(logging.ERROR, logger="usagebassoon"):
         metadata = system_metadata.capture_system_metadata()
     assert metadata.cpu_model == "Fallback CPU"
     assert metadata.os_name == "Linux"
     assert metadata.cpu_count == 4 and metadata.memory_bytes == 1024
-    assert metadata.shell is None
     assert any(record.exc_info for record in caplog.records)
     assert "platform CPU model capture failed" in caplog.text
 
@@ -520,10 +518,12 @@ def test_older_same_source_run_cannot_regress_daily_facts(
         backend.close()
 
 
+@pytest.mark.parametrize("invoke_method", list(InvokeMethod))
 def test_persist_run_records_collector_system_metadata(
     collection_bundle: CollectionBundle,
+    invoke_method: InvokeMethod,
 ) -> None:
-    """Record collector host metadata in the immutable run audit row."""
+    """Record host metadata and the explicit invocation in collection audit views."""
     metadata = SystemMetadata(
         os_name="Linux",
         os_version="6.16",
@@ -531,15 +531,23 @@ def test_persist_run_records_collector_system_metadata(
         cpu_model="Example CPU",
         cpu_count=16,
         memory_bytes=68_719_476_736,
-        shell="/bin/bash",
     )
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
-        normalized = normalize(replace(collection_bundle, system_metadata=metadata))
+        normalized = normalize(
+            replace(
+                collection_bundle,
+                system_metadata=metadata,
+                invoke_method=invoke_method,
+            )
+        )
+        ledger = normalized.tables["collection_ledger"]
+        assert set(ledger.column("invoke_method").to_pylist()) == {invoke_method.value}
+        assert "shell" not in ledger.column_names
         persist_run(backend, normalized)
         assert backend.query(
-            "SELECT os_name, architecture, cpu_count, memory_bytes, shell "
+            "SELECT os_name, architecture, cpu_count, memory_bytes, invoke_method "
             "FROM collection_runs"
         ).to_pylist() == [
             {
@@ -547,7 +555,7 @@ def test_persist_run_records_collector_system_metadata(
                 "architecture": "x86_64",
                 "cpu_count": 16,
                 "memory_bytes": 68_719_476_736,
-                "shell": "/bin/bash",
+                "invoke_method": invoke_method.value,
             }
         ]
     finally:

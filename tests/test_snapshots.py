@@ -407,6 +407,52 @@ def _backend() -> DuckDBBackend:
     return backend
 
 
+def test_snapshot_restore_preserves_collection_invocation_methods(
+    tmp_path: Path,
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Archive and restore every invocation value through the shared ledger schema."""
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from usagebassoon.audit import audit_runs
+    from usagebassoon.normalizer import normalize
+    from usagebassoon.system_metadata import InvokeMethod
+
+    source, target = _backend(), _backend()
+    try:
+        ledger = pa.concat_tables(
+            [
+                normalize(
+                    replace(
+                        collection_bundle,
+                        run_id=str(uuid4()),
+                        invoke_method=method,
+                    )
+                ).tables["collection_ledger"]
+                for method in InvokeMethod
+            ]
+        )
+        source.append("collection_ledger", ledger)
+        store = SnapshotStore(str(tmp_path / "archive"))
+        uri = store.write(source, run_id="invocations", manual=True)
+        assert uri is not None
+        with store.reader.prepare(uri) as prepared:
+            rows = audit_runs(prepared=prepared)
+            assert {row["invoke_method"] for row in rows} == {
+                method.value for method in InvokeMethod
+            }
+            assert all("shell" not in row for row in rows)
+        assert store.restore(target, uri)["collection_ledger"] == ledger.num_rows
+        query = "SELECT * FROM current_collection_ledger ORDER BY event_id"
+        restored = target.query(query)
+        assert "shell" not in restored.column_names
+        assert restored.to_pylist() == source.query(query).to_pylist()
+    finally:
+        source.close()
+        target.close()
+
+
 def test_registered_remote_providers_share_capture_and_complete_lifecycle(
     tmp_path: Path,
 ) -> None:

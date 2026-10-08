@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""system_metadata.py — Best-effort collector-host metadata capture."""
+"""system_metadata.py — Collection invocation metadata and best-effort host capture."""
 
 from __future__ import annotations
 
@@ -10,9 +10,20 @@ import os
 import platform
 import subprocess
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 _LOG = logging.getLogger("usagebassoon")
+
+
+class InvokeMethod(StrEnum):
+    """Explicit entry point that initiated a UsageBassoon collection cycle."""
+
+    CLI = "cli"
+    SYSTEMD = "systemd"
+    LAUNCHD = "launchd"
+    WORKER = "worker"
+    PYTHON = "python"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +37,6 @@ class SystemMetadata:
         cpu_model: Processor description when the platform exposes one.
         cpu_count: Number of logical CPUs when known.
         memory_bytes: Physical memory size when the platform exposes it.
-        shell: Shell used to launch tokscale; None for direct subprocess execution.
     """
 
     os_name: str | None
@@ -35,7 +45,6 @@ class SystemMetadata:
     cpu_model: str | None
     cpu_count: int | None
     memory_bytes: int | None
-    shell: str | None
 
 
 def _physical_memory_bytes() -> int | None:
@@ -143,7 +152,6 @@ def capture_system_metadata() -> SystemMetadata:
             cpu_model=_cpu_model(system),
             cpu_count=os.cpu_count(),
             memory_bytes=_physical_memory_bytes(),
-            shell=None,
         )
     except Exception:
         _LOG.exception("system metadata capture failed; omitting host metadata")
@@ -154,5 +162,4 @@ def capture_system_metadata() -> SystemMetadata:
             cpu_model=None,
             cpu_count=None,
             memory_bytes=None,
-            shell=None,
         )
