@@ -41,6 +41,7 @@ from usagebassoon.cli.reports._common import (
     sanitize_records,
 )
 from usagebassoon.cli.reports._render import (
+    COST_ESTIMATE_NOTE,
     DataFormat,
     output_format,
     write_output,
@@ -266,6 +267,8 @@ def _render(
         plain=plain,
         ansi_color=ansi_color,
     )
+    if any(record.get("metric") in {"cost", "cost-per-million"} for record in records):
+        console.print(COST_ESTIMATE_NOTE, style="yellow")
     if save is not None:
         write_output(console.export_text(), save=save)
 

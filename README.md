@@ -142,7 +142,10 @@ All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 
-UsageBassoon observes each given model's current prices once per UTC day from Tokscale's LiteLLM pricing data and prefers rates from the usage date, the latest earlier observation, then the earliest later observation for older backfills. Costs estimates are best effor calculations, and UsageBassoon honors custom pricing configurations reported through Tokscale.
+UsageBassoon observes each given model's current prices once per UTC day from Tokscale's pricing data, typically sourced from LiteLLM, and prefers rates from the usage date, the latest earlier observation, then the earliest later observation for older backfills. Cost estimates are best-effort calculations, and UsageBassoon honors custom pricing configurations reported through Tokscale.
+
+> [!NOTE]
+> **Cost estimates may be underestimated due to model context thresholds.** Tokscale 4.18.0's `pricing` JSON exposes only base rates, and its aggregated usage JSON does not expose request-level context information or token allocation across pricing tiers. UsageBassoon cannot independently reproduce context-threshold surcharges from those aggregates, so calculated costs can differ from Tokscale's reported costs. This limitation concerns *only* pricing; token counts remain preserved as supplied by Tokscale. Costs are estimates, not verified provider charges. We are monitoring Tokscale for metadata support; see [issue #1](https://github.com/israelflores8789/usagebassoon/issues/1).
 
 > [!IMPORTANT]
 > Reports are raw by default. Use `--sanitize` before sharing or using `--save <path>` to write a text artifact.

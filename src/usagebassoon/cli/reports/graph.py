@@ -245,4 +245,4 @@ def graph(
         parse_width(width),
         format_cost if metric == "cost" else format_tokens,
     )
-    render_graph(text, save=save, sanitize=sanitize)
+    render_graph(text, save=save, sanitize=sanitize, show_cost_note=metric == "cost")

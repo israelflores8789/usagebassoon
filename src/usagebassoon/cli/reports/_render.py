@@ -19,6 +19,11 @@ type ReportColumn = tuple[str, Literal["left", "right"]]
 type OutputFormat = Literal["text", "json", "csv"]
 type DataFormat = Literal["json", "csv"]
 
+COST_ESTIMATE_NOTE = (
+    "Note: Costs may be underestimated due to context thresholds depending on "
+    "the model. See issue #1."
+)
+
 _RAW_REPORT_WARNING = (
     "Sharing this report? Re-run with --sanitize to obfuscate identifiers "
     "and free text."
@@ -124,6 +129,7 @@ def render_tables(
             console.print("No matching usage data.")
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
+    console.print(COST_ESTIMATE_NOTE, style="yellow")
     if save is not None:
         write_output(console.export_text(), save=save)
 
@@ -133,11 +139,22 @@ def render_graph(
     *,
     save: Path | None,
     sanitize: bool,
+    show_cost_note: bool = False,
 ) -> None:
-    """Print one pre-rendered terminal graph and optionally save it as text."""
+    """Print one pre-rendered terminal graph and optionally save it as text.
+
+    Args:
+        text: Pre-rendered graph text.
+        save: Optional destination for the graph text.
+        sanitize: Whether identifiers have been intentionally obfuscated.
+        show_cost_note: Whether the graph displays calculated costs.
+    """
     console = output_console()
     console.print(text, end="")
     if save is None and not sanitize:
         console.print(_RAW_REPORT_WARNING, style="yellow")
+    if show_cost_note:
+        console.print(COST_ESTIMATE_NOTE, style="yellow")
+        text = text.rstrip() + "\n" + COST_ESTIMATE_NOTE + "\n"
     if save is not None:
         write_output(text, save=save)
