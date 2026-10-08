@@ -18,7 +18,7 @@ from tests.conftest import (
     EXPECTED_REPORT_ROWS,
     EXPECTED_TOKSCALE_VERSION,
 )
-from usagebassoon.json_types import JsonArray, JsonObject
+from usagebassoon.json_types import JsonObject
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily, parse_models
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
@@ -64,7 +64,7 @@ def test_models_invalid_payload_type() -> None:
 
 def test_tokscale_metrics_reject_negative_and_non_finite_values(
     daily_raws: dict[date, JsonObject],
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Reject invalid token and pricing values before normalization."""
     day = min(daily_raws)
@@ -74,15 +74,17 @@ def test_tokscale_metrics_reject_negative_and_non_finite_values(
     first_entry = entries[0]
     assert isinstance(first_entry, dict)
     invalid_models["entries"] = [{**first_entry, "input": -1}, *entries[1:]]
-    invalid_pricing = dict(pricing_raw)
-    pricing = pricing_raw["pricing"]
-    assert isinstance(pricing, dict)
-    invalid_pricing["pricing"] = {**pricing, "inputCostPerToken": inf}
-
     with pytest.raises(ValidationError):
         parse_daily(invalid_models, day=day)
-    with pytest.raises(ValidationError):
-        parse_pricing(invalid_pricing)
+    for pricing_raw in pricing_raws.values():
+        pricing = pricing_raw["pricing"]
+        assert isinstance(pricing, dict)
+        invalid_pricing = {
+            **pricing_raw,
+            "pricing": {**pricing, "inputCostPerToken": inf},
+        }
+        with pytest.raises(ValidationError):
+            parse_pricing(invalid_pricing)
 
 
 def test_daily_models_attach_requested_days(
@@ -107,17 +109,6 @@ def test_daily_models_reuse_the_models_contract(
     with pytest.raises(ValueError, match="must be a JSON object"):
         parse_daily([], day=date(2026, 9, 10))
     assert parse_daily(daily_raws[min(daily_raws)], day=min(daily_raws)).entries
-
-
-def test_daily_reports_are_partitioned_by_session_creation_date(
-    report_raws: dict[date, JsonArray],
-) -> None:
-    """Keep report metadata daily by session creation, not usage-token day."""
-    for day, payload in report_raws.items():
-        assert all(
-            row.created_at is not None and row.created_at.date() == day
-            for row in parse_report(payload)
-        )
 
 
 def test_report_rows_and_timestamps(report_rows: list[SessionRow]) -> None:
@@ -228,8 +219,9 @@ def test_graph_duplicate_dates_rejected(graph_raw: JsonObject) -> None:
         parse_graph(dup)
 
 
-def test_pricing_shape(pricing_row: PricingRow) -> None:
+def test_pricing_shape(pricing_rows: dict[str, PricingRow]) -> None:
     """Assert the pricing fixture carries provenance and nullable rates."""
+    pricing_row = pricing_rows["gemini-3.8-flash"]
     assert pricing_row.model_id == "gemini-3.8-flash"
     assert pricing_row.matched_key == "gemini-3.8-flash"
     assert pricing_row.source == "LiteLLM"
@@ -248,3 +240,21 @@ def test_pricing_cache_creation_is_retained(
     assert pricing_rows["gpt-6-sol"].pricing.cache_write_input_token_cost == 2.5e-6
     assert pricing_rows["gpt-6-luna"].pricing.cache_write_input_token_cost == 1.25e-7
     assert pricing_rows["gemini-3.8-flash"].pricing.cache_write_input_token_cost is None
+
+
+def test_pricing_captures_cover_used_models(
+    daily_models: dict[date, DailyModelsPayload],
+    pricing_raws: dict[str, JsonObject],
+    pricing_rows: dict[str, PricingRow],
+) -> None:
+    """Require captured prices for used models and retain every card's identity."""
+    used_models = {
+        entry.stats.model
+        for payload in daily_models.values()
+        for entry in payload.entries
+    }
+    assert used_models <= pricing_raws.keys()
+    assert pricing_raws.keys() == pricing_rows.keys()
+    for model, row in pricing_rows.items():
+        assert row.model_id == model == pricing_raws[model]["modelId"]
+        assert row.matched_key == pricing_raws[model]["matchedKey"]

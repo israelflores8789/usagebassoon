@@ -38,14 +38,14 @@ def _payloads(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> dict[str, tuple[JsonValue, ...]]:
     """Build the raw payload mapping expected by contract validation."""
     return {
         "models": tuple(daily_raws.values()),
         "report": (report_raw,),
         "graph": (graph_raw,),
-        "pricing": (pricing_raw,),
+        "pricing": tuple(pricing_raws.values()),
     }
 
 
@@ -55,14 +55,14 @@ def _raw_collection(
     daily_models: dict[date, JsonObject],
     report: JsonArray,
     graph: JsonObject,
-    pricing: JsonObject,
+    pricing: dict[str, JsonObject],
 ) -> RawCollection:
     """Build one complete raw collection fixture for contract tests."""
     return RawCollection(
         daily_models=daily_models,
         report_by_day={day: report},
         graph=graph,
-        pricing_by_day={day: {"gemini-3.8-flash": pricing}},
+        pricing_by_day={day: pricing},
     )
 
 
@@ -73,13 +73,8 @@ def test_shipped_contracts_accept_the_golden_payloads(
     pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Assert checked-in contracts reproduce their sanitized source payloads."""
-    payloads = _payloads(
-        daily_raws, report_raw, graph_raw, pricing_raws["gemini-3.8-flash"]
-    )
-    payloads["pricing"] = tuple(pricing_raws.values())
-    result = validate_payloads(
-        payloads,
-    )
+    payloads = _payloads(daily_raws, report_raw, graph_raw, pricing_raws)
+    result = validate_payloads(payloads)
     assert result == type(result)(events=(), fatal=False)
 
 
@@ -171,7 +166,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Assert additive raw fields are preserved as non-fatal drift events."""
     day = min(daily_raws)
@@ -183,7 +178,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
             daily_models={day: changed_models},
             report=report_raw,
             graph=graph_raw,
-            pricing=pricing_raw,
+            pricing=pricing_raws,
         ),
         run_id=str(uuid4()),
         source_id=SOURCE_ID,
@@ -229,7 +224,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Keep one event per identity and count observations within each version."""
     day = min(daily_raws)
@@ -249,7 +244,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
                 daily_models={day: changed_models},
                 report=report_raw,
                 graph=graph,
-                pricing=pricing_raw,
+                pricing=pricing_raws,
             ),
             run_id=str(uuid4()),
             source_id=SOURCE_ID,
@@ -340,7 +335,7 @@ def test_clean_complete_domain_resolves_existing_event(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Close a rechecked event while preserving its first detection metadata."""
     day = min(daily_raws)
@@ -351,7 +346,7 @@ def test_clean_complete_domain_resolves_existing_event(
             daily_models={day: {**daily_raws[day], "futureMetric": 1}},
             report=report_raw,
             graph=graph_raw,
-            pricing=pricing_raw,
+            pricing=pricing_raws,
         ),
         run_id=str(uuid4()),
         source_id=SOURCE_ID,
@@ -449,7 +444,7 @@ def test_required_missing_field_blocks_parsing(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Assert required contract loss raises before parser invocation."""
     day = min(daily_raws)
@@ -463,7 +458,7 @@ def test_required_missing_field_blocks_parsing(
                 daily_models={day: changed_models},
                 report=report_raw,
                 graph=graph_raw,
-                pricing=pricing_raw,
+                pricing=pricing_raws,
             ),
             run_id=str(uuid4()),
             source_id=SOURCE_ID,
@@ -504,7 +499,7 @@ def test_mixed_contract_types_are_explicit_not_silently_collapsed() -> None:
 def test_empty_report_is_a_successful_secondary_domain(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Accept an empty report response while recording completed coverage."""
     day = min(daily_raws)
@@ -517,7 +512,7 @@ def test_empty_report_is_a_successful_secondary_domain(
             daily_models={day: daily_raws[day]},
             report=[],
             graph=graph_raw,
-            pricing=pricing_raw,
+            pricing=pricing_raws,
         ),
         run_id=run_id,
         source_id=SOURCE_ID,
@@ -556,7 +551,7 @@ def test_secondary_contract_failures_do_not_block_required_collection(
                 daily_models={day: daily_raws[day]},
                 report=[{}],
                 graph=graph_raw,
-                pricing={},
+                pricing={"invalid-model": {}},
             ),
             run_id=run_id,
             source_id=SOURCE_ID,

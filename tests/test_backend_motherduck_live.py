@@ -1101,7 +1101,7 @@ def test_live_cold_collection_and_warm_planning(
     graph_raw: JsonObject,
     daily_raws: dict[date, JsonObject],
     report_raws: dict[date, JsonArray],
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Persist collector discovery and observed prices, then skip completed history."""
     configuration = replace(
@@ -1116,7 +1116,7 @@ def test_live_cold_collection_and_warm_planning(
             graph_raw,
             daily_raws,
             report_raws,
-            pricing_raw,
+            pricing_raws,
         )
     finally:
         backend.close()

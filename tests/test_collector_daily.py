@@ -624,7 +624,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
     graph_raw: JsonObject,
     daily_raws: dict[date, JsonObject],
     report_raws: dict[date, JsonArray],
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Recover midnight and late changes without duplicates or erasing history."""
     day = max(daily_raws)
@@ -716,7 +716,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         """Fill only requested model-price gaps."""
         return (
             {
-                date: {model: {**pricing_raw, "modelId": model} for model in models}
+                date: {model: pricing_raws[model] for model in models}
                 for date, models in requests.items()
             },
             {},
@@ -893,7 +893,7 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
     graph_raw: JsonObject,
     daily_raws: dict[date, JsonObject],
     report_raws: dict[date, JsonArray],
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Publish one partial batch and recover a failed day absent from the next graph."""
     days = tuple(date(2025, 11, 1) + timedelta(days=i) for i in range(180))
@@ -938,7 +938,7 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
             assert arguments == ("report", "--json", "--no-summarize")
             return [deepcopy(row) for rows in report_raws.values() for row in rows]
         if arguments[0] == "pricing":
-            return {**pricing_raw, "modelId": arguments[1]}
+            return pricing_raws[arguments[1]]
         if arguments[0] == "models":
             requested = date.fromisoformat(arguments[5])
             result = deepcopy(daily)
@@ -1140,7 +1140,7 @@ def _assert_live_backfill_and_warm_collection(
     graph_raw: JsonObject,
     daily_raws: dict[date, JsonObject],
     report_raws: dict[date, JsonArray],
-    pricing_raw: JsonObject,
+    pricing_raws: dict[str, JsonObject],
 ) -> None:
     """Exercise real warehouse planning/publication with simulated upstream output."""
     calls: dict[str, int] = {}
@@ -1158,7 +1158,7 @@ def _assert_live_backfill_and_warm_collection(
         if arguments[0] == "models":
             return daily_raws[date.fromisoformat(arguments[5])]
         if arguments[0] == "pricing":
-            return {**pricing_raw, "modelId": arguments[1]}
+            return pricing_raws[arguments[1]]
         assert arguments == ("report", "--json", "--no-summarize")
         return [row for rows in report_raws.values() for row in rows]
 

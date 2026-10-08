@@ -13,6 +13,7 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from urllib.parse import unquote
 from uuid import uuid4
 
 import pytest
@@ -156,39 +157,53 @@ def graph_raw() -> JsonObject:
     return _load_object("graph")
 
 
-@pytest.fixture(scope="session")
-def pricing_raw() -> JsonObject:
-    """Return the raw pricing payload as decoded JSON."""
-    return _load_pricing("gemini-3.8-flash")
+def _load_pricing(
+    directory: Path, *, observation_day: date, version: str
+) -> dict[str, JsonObject]:
+    """Load captured rate cards, checking their filename and payload identities.
 
+    Args:
+        directory: Directory containing the versioned golden captures.
+        observation_day: UTC date on which prices were observed.
+        version: Exact tokscale version used for the capture.
 
-def _load_pricing(model: str) -> JsonObject:
-    """Load one observed model rate card without rewriting its identity."""
-    path = FIXTURES / (
-        f"golden-{EXPECTED_PRICING_DATE}-tokscale-"
-        f"{EXPECTED_TOKSCALE_VERSION}.pricing.{model}.json"
-    )
-    payload = cast(JsonValue, json.loads(path.read_text()))
-    if not isinstance(payload, dict):
-        raise TypeError(f"pricing fixture {model} must be a JSON object")
-    return cast(JsonObject, payload)
+    Returns:
+        Raw rate cards keyed by their unmodified model IDs.
+
+    Raises:
+        TypeError: If a payload is not an object or lacks a nonempty model ID.
+        ValueError: If identities disagree, repeat, or no matching cards exist.
+    """
+    prefix = f"golden-{observation_day.isoformat()}-tokscale-{version}.pricing."
+    payloads: dict[str, JsonObject] = {}
+    for path in sorted(directory.iterdir()):
+        if not (path.name.startswith(prefix) and path.name.endswith(".json")):
+            continue
+        payload = cast(JsonValue, json.loads(path.read_text()))
+        if not isinstance(payload, dict):
+            raise TypeError(f"pricing fixture {path.name} must be a JSON object")
+        model = payload.get("modelId")
+        if not isinstance(model, str) or not model.strip():
+            raise TypeError(f"pricing fixture {path.name} must have a modelId")
+        filename_model = unquote(path.name[len(prefix) : -len(".json")])
+        if filename_model != model:
+            raise ValueError(f"pricing fixture {path.name} disagrees with modelId")
+        if model in payloads:
+            raise ValueError(f"duplicate pricing fixture for {model}")
+        payloads[model] = payload
+    if not payloads:
+        raise ValueError(f"no pricing fixtures for {observation_day} at {version}")
+    return payloads
 
 
 @pytest.fixture(scope="session")
 def pricing_raws() -> dict[str, JsonObject]:
-    """Return the seven independent model rate cards captured in this batch."""
-    return {
-        model: _load_pricing(model)
-        for model in (
-            "gemini-3.7-flash",
-            "gemini-3.8-flash",
-            "gpt-5.6-luna",
-            "gpt-5.6-terra",
-            "gpt-6-luna",
-            "gpt-6-sol",
-            "gpt-6.1-sol",
-        )
-    }
+    """Return all model rate cards from the configured pricing capture."""
+    return _load_pricing(
+        FIXTURES,
+        observation_day=date.fromisoformat(EXPECTED_PRICING_DATE),
+        version=EXPECTED_TOKSCALE_VERSION,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -225,12 +240,6 @@ def daily_raws(graph_payload: GraphPayload) -> dict[date, JsonObject]:
 def daily_models(daily_raws: dict[date, JsonObject]) -> dict[date, DailyModelsPayload]:
     """Return date-attached model statistics for graph candidate days."""
     return {day: parse_daily(payload, day=day) for day, payload in daily_raws.items()}
-
-
-@pytest.fixture(scope="session")
-def pricing_row(pricing_raw: JsonObject) -> PricingRow:
-    """Return the validated pricing row."""
-    return parse_pricing(pricing_raw)
 
 
 @pytest.fixture(scope="session")
