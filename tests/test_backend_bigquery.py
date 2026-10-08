@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, date, datetime, timedelta
@@ -201,12 +201,40 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
     from requests import Session
 
     release = Event()
+    request_seen = Event()
+    requests: list[str] = []
+    data = normalize(collection_bundle).tables["daily_stats"].slice(0, 1)
 
     class StalledHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            release.wait(2)
+            """Hold requests until timeout, then serve a healthy load submission."""
+            requests.append(self.path)
+            request_seen.set()
+            if not release.is_set():
+                release.wait(5)
+                return
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_response(200)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{server.server_port}/upload/recovery"
+            )
+            self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def do_PUT(self) -> None:
+            """Complete the recovered SDK client's resumable Parquet upload."""
+            requests.append(self.path)
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = (
+                b'{"jobReference":{"projectId":"usagebassoon-test",'
+                b'"jobId":"recovered","location":"US"},'
+                b'"configuration":{"load":{}},"status":{"state":"DONE"}}'
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
 
         @override
         def log_message(self, format: str, *args: object) -> None:
@@ -228,34 +256,45 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
         "usagebassoon-test",
         "usagebassoon_it",
         client=client,
-        timeout_seconds=0.15,
+        timeout_seconds=0.5,
     )
+    wait = MagicMock(wraps=backend._wait_for_job)
+    monkeypatch.setattr(backend, "_wait_for_job", wait)
     started = time.monotonic()
     try:
         with pytest.raises(OperationTimeout) as failure:
             if boundary == "submission":
                 backend.query("SELECT 1")
             elif boundary == "upload":
-                backend.append(
-                    "daily_stats", normalize(collection_bundle).tables["daily_stats"]
-                )
+                backend.append("daily_stats", data)
             else:
                 # Bound cancellation separately after job polling fails.
                 job = bigquery.QueryJob("stuck", "SELECT 1", client)
                 import usagebassoon.deadlines as deadlines
 
-                monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.15)
+                monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.5)
                 monkeypatch.setattr(
                     job, "result", MagicMock(side_effect=FutureTimeoutError)
                 )
                 backend._wait_for_job(job)
         assert time.monotonic() - started < 2
+        assert request_seen.is_set()
+        if boundary == "cancellation":
+            assert "/cancel" in requests[0]
+            wait.assert_called_once()
+        else:
+            assert ("/upload/" in requests[0]) == (boundary == "upload")
+            wait.assert_not_called()
         assert backend.is_retryable_error(failure.value)
         assert backend.is_retryable_error(OperationTimeout())
-        backend.client = cast(bigquery.Client, _BatchClient())
-        backend.append(
-            "daily_stats", normalize(collection_bundle).tables["daily_stats"]
-        )
+        assert current_deadline() is None
+        release.set()
+        backend.timeout_seconds = 2.0
+        wait.reset_mock()
+        backend.append("daily_stats", data)
+        wait.assert_called_once()
+        assert "/upload/" in requests[-1]
+        assert current_deadline() is None
     finally:
         release.set()
         client.close()
@@ -2145,6 +2184,54 @@ def test_doctor_snapshot_failure_never_falls_back_to_live_reads() -> None:
     assert report.status == "error"
     assert "snapshot unavailable" in report.errors[0].message
     backend.query.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["stages", "receipt", "cleanup"])
+@pytest.mark.parametrize(
+    ("seconds", "parent_seconds"), [(90.0, None), (10.0, None), (90.0, 10.0)]
+)
+def test_restore_inspection_respects_the_operation_deadline(
+    action: str,
+    seconds: float,
+    parent_seconds: float | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow healthy recovery beyond fifteen seconds within its real deadline."""
+    clock = [0.0]
+
+    def now() -> float:
+        """Advance the operation clock only when the simulated service responds."""
+        return clock[0]
+
+    def page(*_args: object, **_kwargs: object) -> MagicMock:
+        """Spend twenty seconds discovering an empty recovery destination."""
+        clock[0] = 20.0
+        return _job_page([])
+
+    monkeypatch.setattr("usagebassoon.deadlines.monotonic", now)
+    monkeypatch.setattr("usagebassoon.backends.bigquery.time.monotonic", now)
+    backend = _backend()
+    backend.timeout_seconds = seconds
+    client = MagicMock(spec=bigquery.Client)
+    backend.client = cast(bigquery.Client, client)
+    client.query.return_value.result.return_value = list[dict[str, object]]()
+    client.list_tables.side_effect = page
+    client.list_jobs.side_effect = page
+    actions: dict[str, Callable[[], object]] = {
+        "stages": backend.restore_stages,
+        "receipt": lambda: backend.restore_committed("missing"),
+        "cleanup": backend.cleanup_restore_stages,
+    }
+    expected: list[dict[str, object]] | bool | None = (
+        [] if action == "stages" else False if action == "receipt" else None
+    )
+    if seconds == 10.0 or parent_seconds == 10.0:
+        with pytest.raises(RuntimeError, match="deadline"), operation(parent_seconds):
+            actions[action]()
+    else:
+        with operation(parent_seconds):
+            assert actions[action]() == expected
+    assert current_deadline() is None
 
 
 def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(

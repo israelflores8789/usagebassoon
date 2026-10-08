@@ -405,11 +405,8 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
         daily_rows = cast(
             list[dict[str, object]], later.tables["daily_stats"].to_pylist()
         )
-        daily = next(
-            row
-            for row in daily_rows
-            if row["day"] == price["day"] and row["model"] == price["model"]
-        )
+        # Prices use their observation day, independent of historical usage days.
+        daily = next(row for row in daily_rows if row["model"] == price["model"])
         sessions = cast(list[dict[str, object]], later.tables["sessions"].to_pylist())
         session = next(
             row

@@ -1120,7 +1120,7 @@ class BigQueryBackend(AbstractStorageBackend):
     @bounded
     def restore_committed(self, operation_id: str) -> bool:
         """Resolve restore completion from the receipt committed with its rows."""
-        deadline = time.monotonic() + remaining_seconds(15.0)
+        deadline = time.monotonic() + remaining_seconds(None)
         remaining = self._recovery_budget(deadline)
         committed = self._restore_receipt(operation_id, remaining)
         if not committed and any(
@@ -1154,7 +1154,7 @@ class BigQueryBackend(AbstractStorageBackend):
             job_retry=None,
         )
         rows = job.result(
-            timeout=remaining(),
+            timeout=min(120.0, remaining()),
             retry=_request_retry(remaining),
             job_retry=None,
         )
@@ -1221,7 +1221,7 @@ class BigQueryBackend(AbstractStorageBackend):
     def restore_stages(self) -> list[dict[str, object]]:
         """Inspect only label-owned restore stages, including their expiry."""
         return self._restore_stage_records(
-            self._recovery_budget(time.monotonic() + remaining_seconds(15.0))
+            self._recovery_budget(time.monotonic() + remaining_seconds(None))
         )
 
     def _restore_stage_records(
@@ -1239,6 +1239,11 @@ class BigQueryBackend(AbstractStorageBackend):
             )
             page = next(iter(pager.pages))
             for item in page:
+                labels: dict[str, str] = item.labels
+                if labels.get("usagebassoon_kind") != "restore_stage" or not labels.get(
+                    "usagebassoon_restore"
+                ):
+                    continue
                 table = self.client.get_table(
                     item.reference,
                     retry=_request_retry(remaining),
@@ -1264,7 +1269,7 @@ class BigQueryBackend(AbstractStorageBackend):
     @bounded
     def cleanup_restore_stages(self) -> None:
         """Drain owned restore jobs and immediately discard disposable stages."""
-        deadline = time.monotonic() + remaining_seconds(15.0)
+        deadline = time.monotonic() + remaining_seconds(None)
         remaining = self._recovery_budget(deadline)
         self._drain_restore_jobs(remaining)
         stages = self._restore_stage_records(remaining)
@@ -1442,7 +1447,7 @@ class BigQueryBackend(AbstractStorageBackend):
                 if cleanup_allowed:
                     try:
                         remaining = self._recovery_budget(
-                            time.monotonic() + remaining_seconds(15.0)
+                            time.monotonic() + remaining_seconds(None)
                         )
                         self._drain_restore_jobs(remaining)
                         self._delete_stages(tuple(stages.values()), remaining=remaining)
