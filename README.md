@@ -558,7 +558,7 @@ UsageBassoon currently supports [MotherDuck](https://motherduck.com/docs/getting
 
 1. Install the BigQuery extra with `pipx install "usagebassoon[bigquery]"`, or include `bigquery` alongside your other required extras.
 2. In GCP, enable the BigQuery, BigQuery Storage, and BigQuery Data Transfer APIs. UsageBassoon does not enable services itself.
-3. Create an empty dataset in the location configured in `config.toml`.
+3. Either let `bassoon init` create the dataset in the location configured in `config.toml`, or create it yourself first. An existing dataset must be empty of tables and views before its first initialization.
 4. Configure a dedicated service account or your own identity through Application Default Credentials, or set `credentials_file` explicitly in your `config.toml`.
 5. Grant the permissions below, configure `[backend.bigquery]`, and run `bassoon init`.
 6. You can run `bassoon collect` and `bassoon doctor` to check access and compaction backlog.
@@ -572,6 +572,7 @@ Each permission notes where it is granted and which identity needs it. **Setup**
 
 - **BigQuery, project scope**
   - `bigquery.jobs.create`: run queries, loads, and schema statements. Setup, runtime, restore, and scheduled compaction.
+  - `bigquery.datasets.create`: create the configured dataset when it does not exist. Setup, when relying on `bassoon init` to create the dataset.
   - `bigquery.readsessions.create / getData / update`: permissions supplied by the Storage Read API role for Arrow result reads. Runtime reads and snapshot capture.
   - `bigquery.transfers.get / update`: create, update, and find compaction schedules. Setup.
   - `bigquery.jobs.listAll`: lets `bassoon doctor` inspect active transactions; required for `bassoon restore`. Doctor, runtime.
@@ -589,9 +590,10 @@ Each permission notes where it is granted and which identity needs it. **Setup**
 
 - `roles/bigquery.jobUser` (project-level): `bigquery.jobs.create`.
 - `roles/bigquery.readSessionUser` (project-level): the three `bigquery.readsessions.*` permissions listed above.
-- `roles/bigquery.dataEditor` (dataset-level): `bigquery.datasets.get` and every `bigquery.tables.*` permission listed above, including create, update, updateData, list, and delete.
+- `roles/bigquery.dataEditor` (dataset-level): `bigquery.datasets.get` and every `bigquery.tables.*` permission listed above, including create, update, updateData, list, and delete. (This role also includes `bigquery.datasets.create`, but dataset creation requires that permission at project-level.)
 - `roles/iam.serviceAccountUser` on the compaction schedule's specific service account: `iam.serviceAccounts.actAs`.
 - A custom project-level role containing:
+  - `bigquery.datasets.create` (optional): to allow UsageBassoon to initialize a dataset with `bassoon init`.
   - `bigquery.transfers.get / update`: for compaction schedule management. See [scheduled-query permissions](https://docs.cloud.google.com/bigquery/docs/scheduling-queries#required_permissions).
   - `bigquery.jobs.listAll`: for doctor's transaction check and restore. Can also use project-level `roles/bigquery.resourceViewer`.
 
