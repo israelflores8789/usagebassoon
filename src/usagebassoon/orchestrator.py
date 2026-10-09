@@ -20,6 +20,7 @@ from usagebassoon.collector import (
     _json_command,
     _object,
     _prefix,
+    tokscale_profile,
 )
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.ingest import (
@@ -63,181 +64,199 @@ def _collect_locked(
         report_inventory,
     ) = load_ingest_status(config)
     try:
-        prefix = _prefix(config)
-        graph_raw = _object(
-            _json_command(
+        with tokscale_profile(config) as environment:
+            prefix = _prefix(config)
+            graph_raw = _object(
+                _json_command(
+                    config,
+                    prefix,
+                    "graph",
+                    max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
+                    environment=environment,
+                ),
+                "graph",
+            )
+            graph_plan = plan_graph(graph_raw)
+            completed = {
+                target
+                for target, status in statuses.items()
+                if status.status == "complete"
+            }
+            today = started_at.date()
+            historical_overlap = set(
+                sorted(day for day in graph_plan.candidate_days if day < today)[
+                    -_HISTORICAL_OVERLAP_DAYS:
+                ]
+            )
+            candidate_days = tuple(
+                sorted(
+                    set(graph_plan.candidate_days)
+                    | {
+                        day
+                        for (day, domain), status in statuses.items()
+                        if domain == _MODELS_DOMAIN and status.status != "complete"
+                    }
+                )
+            )
+            if refresh_range is not None:
+                since, until = refresh_range
+                candidate_days = tuple(
+                    since + timedelta(days=offset)
+                    for offset in range((until - since).days + 1)
+                )
+                graph_plan = replace(
+                    graph_plan,
+                    graph=graph_plan.graph.model_copy(
+                        update={
+                            "contributions": [
+                                item
+                                for item in graph_plan.graph.contributions
+                                if since <= item.date <= until
+                            ]
+                        }
+                    ),
+                )
+            graph_plan = replace(graph_plan, candidate_days=candidate_days)
+            daily_days = tuple(
+                day
+                for day in candidate_days
+                if refresh_range is not None
+                or day >= today
+                or day in historical_overlap
+                or (day, _MODELS_DOMAIN) not in completed
+            )
+            models_failures: dict[date, str] = {}
+            daily_models = _fetch_daily_models(
                 config,
                 prefix,
-                "graph",
-                max_stdout_bytes=_GRAPH_MAX_STDOUT_BYTES,
-            ),
-            "graph",
-        )
-        graph_plan = plan_graph(graph_raw)
-        completed = {
-            target for target, status in statuses.items() if status.status == "complete"
-        }
-        today = started_at.date()
-        historical_overlap = set(
-            sorted(day for day in graph_plan.candidate_days if day < today)[
-                -_HISTORICAL_OVERLAP_DAYS:
-            ]
-        )
-        candidate_days = tuple(
-            sorted(
-                set(graph_plan.candidate_days)
-                | {
-                    day
-                    for (day, domain), status in statuses.items()
-                    if domain == _MODELS_DOMAIN and status.status != "complete"
-                }
+                daily_days,
+                failures=models_failures,
+                environment=environment,
             )
-        )
-        if refresh_range is not None:
-            since, until = refresh_range
-            candidate_days = tuple(
-                since + timedelta(days=offset)
-                for offset in range((until - since).days + 1)
+            models_plan = plan_models(daily_models, failures=models_failures)
+            active_models = {
+                model
+                for models in models_plan.models_by_day.values()
+                for model in models
+            }
+            known_prices = {
+                model for models in persisted_prices.values() for model in models
+            }
+            unpriced_models = {
+                model for models in persisted_models.values() for model in models
+            } - known_prices
+            observation_day = datetime.now(UTC).date()
+            needed_models = active_models | unpriced_models
+            pricing_requests = {
+                observation_day: needed_models
+                - persisted_prices.get(observation_day, set())
+            }
+            pricing_by_day, pricing_failures = _fetch_pricing(
+                config,
+                prefix,
+                pricing_requests,
+                logger,
+                existing=persisted_prices,
+                environment=environment,
             )
-            graph_plan = replace(
-                graph_plan,
-                graph=graph_plan.graph.model_copy(
-                    update={
-                        "contributions": [
-                            item
-                            for item in graph_plan.graph.contributions
-                            if since <= item.date <= until
-                        ]
-                    }
-                ),
+            active_sessions = {
+                (row.stats.client, row.stats.session_id)
+                for payload in models_plan.daily_models.values()
+                for row in payload.entries
+            }
+            missing_sessions = (
+                active_sessions - report_inventory.sessions.keys()
+            ) | report_inventory.missing
+            discovered = any(
+                domain == "report_inventory" and status.status == "complete"
+                for (_day, domain), status in statuses.items()
             )
-        graph_plan = replace(graph_plan, candidate_days=candidate_days)
-        daily_days = tuple(
-            day
-            for day in candidate_days
-            if refresh_range is not None
-            or day >= today
-            or day in historical_overlap
-            or (day, _MODELS_DOMAIN) not in completed
-        )
-        models_failures: dict[date, str] = {}
-        daily_models = _fetch_daily_models(
-            config, prefix, daily_days, failures=models_failures
-        )
-        models_plan = plan_models(daily_models, failures=models_failures)
-        active_models = {
-            model for models in models_plan.models_by_day.values() for model in models
-        }
-        known_prices = {
-            model for models in persisted_prices.values() for model in models
-        }
-        unpriced_models = {
-            model for models in persisted_models.values() for model in models
-        } - known_prices
-        observation_day = datetime.now(UTC).date()
-        needed_models = active_models | unpriced_models
-        pricing_requests = {
-            observation_day: needed_models
-            - persisted_prices.get(observation_day, set())
-        }
-        pricing_by_day, pricing_failures = _fetch_pricing(
-            config, prefix, pricing_requests, logger, existing=persisted_prices
-        )
-        active_sessions = {
-            (row.stats.client, row.stats.session_id)
-            for payload in models_plan.daily_models.values()
-            for row in payload.entries
-        }
-        missing_sessions = (
-            active_sessions - report_inventory.sessions.keys()
-        ) | report_inventory.missing
-        discovered = any(
-            domain == "report_inventory" and status.status == "complete"
-            for (_day, domain), status in statuses.items()
-        )
-        unknown_creation = (
-            {
+            unknown_creation = {
                 identity
                 for identity in active_sessions
                 if identity in report_inventory.sessions
                 and report_inventory.sessions[identity] is None
             }
-            if refresh_range is not None
-            else set()
-        )
-        full_report = not discovered or bool(missing_sessions | unknown_creation)
-        report_days = tuple(
-            sorted(
-                {
-                    created.date()
-                    for identity, created in report_inventory.sessions.items()
-                    if refresh_range is not None
-                    and identity in active_sessions
-                    and created is not None
-                }
-                | {
-                    day
-                    for (day, domain), status in statuses.items()
-                    if domain == "report" and status.status != "complete"
-                }
+            full_report = not discovered or bool(missing_sessions | unknown_creation)
+            report_days = tuple(
+                sorted(
+                    {
+                        created.date()
+                        for identity, created in report_inventory.sessions.items()
+                        if identity in active_sessions and created is not None
+                    }
+                    | {
+                        day
+                        for (day, domain), status in statuses.items()
+                        if domain == "report" and status.status != "complete"
+                    }
+                )
             )
-        )
-        report_by_day, report_fetch_failures = _fetch_reports(
-            config, prefix, report_days, logger=logger, all_history=full_report
-        )
-        expected_prices = {
-            day: frozenset(set(prices) | set(pricing_failures.get(day, ())))
-            for day, prices in pricing_by_day.items()
-        }
-        for day, failed_models in pricing_failures.items():
-            expected_prices[day] = expected_prices.get(day, frozenset()) | failed_models
-        already_observed = needed_models & persisted_prices.get(observation_day, set())
-        if already_observed:
-            expected_prices[observation_day] = (
-                expected_prices.get(observation_day, frozenset()) | already_observed
+            report_by_day, report_fetch_failures = _fetch_reports(
+                config,
+                prefix,
+                report_days,
+                logger=logger,
+                all_history=full_report,
+                environment=environment,
             )
-        raw = RawCollection(
-            graph=graph_raw,
-            daily_models=daily_models,
-            report_by_day=report_by_day,
-            pricing_by_day=pricing_by_day,
-        )
-        evidence = build_ingest_evidence(
-            graph_plan=graph_plan,
-            models_plan=models_plan,
-            pricing_days=frozenset(expected_prices),
-            persisted_models=persisted_models,
-            persisted_prices=persisted_prices,
-            report_fetch_failures=report_fetch_failures,
-            pricing_fetch_failures=pricing_failures,
-            prior_statuses=statuses,
-            prior_reconciliation_issues=prior_reconciliation_issues,
-            prior_schema_drift=prior_schema_drift,
-            report_days=frozenset({date.min} if full_report else report_days),
-            report_inventory=full_report,
-            expected_sessions=frozenset(
-                missing_sessions
-                | unknown_creation
-                | {
-                    identity
-                    for identity, created in report_inventory.sessions.items()
-                    if created is not None
-                    and created.date() in report_days
-                    and identity in active_sessions
-                }
-            ),
-        )
-        evidence = replace(evidence, pricing_expected_models=expected_prices)
-        bundle = build_collection_bundle(
-            raw,
-            evidence=evidence,
-            run_id=run_id,
-            source_id=config.source_id,
-            started_at=started_at,
-            finished_at=datetime.now(UTC),
-            host=gethostname(),
-            invoke_method=invoke_method,
-        )
+            expected_prices = {
+                day: frozenset(set(prices) | set(pricing_failures.get(day, ())))
+                for day, prices in pricing_by_day.items()
+            }
+            for day, failed_models in pricing_failures.items():
+                expected_prices[day] = (
+                    expected_prices.get(day, frozenset()) | failed_models
+                )
+            already_observed = needed_models & persisted_prices.get(
+                observation_day, set()
+            )
+            if already_observed:
+                expected_prices[observation_day] = (
+                    expected_prices.get(observation_day, frozenset()) | already_observed
+                )
+            raw = RawCollection(
+                graph=graph_raw,
+                daily_models=daily_models,
+                report_by_day=report_by_day,
+                pricing_by_day=pricing_by_day,
+            )
+            evidence = build_ingest_evidence(
+                graph_plan=graph_plan,
+                models_plan=models_plan,
+                pricing_days=frozenset(expected_prices),
+                persisted_models=persisted_models,
+                persisted_prices=persisted_prices,
+                report_fetch_failures=report_fetch_failures,
+                pricing_fetch_failures=pricing_failures,
+                prior_statuses=statuses,
+                prior_reconciliation_issues=prior_reconciliation_issues,
+                prior_schema_drift=prior_schema_drift,
+                report_days=frozenset({date.min} if full_report else report_days),
+                report_inventory=full_report,
+                expected_sessions=frozenset(
+                    missing_sessions
+                    | unknown_creation
+                    | {
+                        identity
+                        for identity, created in report_inventory.sessions.items()
+                        if created is not None
+                        and created.date() in report_days
+                        and identity in active_sessions
+                    }
+                ),
+            )
+            evidence = replace(evidence, pricing_expected_models=expected_prices)
+            bundle = build_collection_bundle(
+                raw,
+                evidence=evidence,
+                run_id=run_id,
+                source_id=config.source_id,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                host=gethostname(),
+                invoke_method=invoke_method,
+            )
     except Exception as error:
         failed = failed_collection(
             run_id=run_id,

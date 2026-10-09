@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -12,11 +13,18 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
+from pathlib import Path
 from typing import cast
+
+from platformdirs import user_config_path
 
 from usagebassoon.config import TOKSCALE_CLEANUP_TIMEOUT_SECONDS, UsageBassoonConfig
 from usagebassoon.display import sanitize_display
@@ -30,14 +38,17 @@ _COLLECTION_DEADLINE_MARGIN_SECONDS = 5.0
 _GRAPH_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 _CHILD_ENVIRONMENT_NAMES = frozenset(
     {
+        "APPDATA",
         "HOME",
         "LANG",
         "LANGUAGE",
         "PATH",
         "TMPDIR",
+        "TOKSCALE_CONFIG_DIR",
         "TOKSCALE_EXTRA_DIRS",
         "TOKSCALE_NATIVE_TIMEOUT_MS",
         "USER",
+        "USERPROFILE",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
     }
@@ -162,6 +173,124 @@ def _child_environment(config: UsageBassoonConfig) -> dict[str, str]:
     return {
         name: value for name in names if (value := os.environ.get(name)) is not None
     }
+
+
+def _tokscale_config_directory(environment: Mapping[str, str]) -> Path:
+    """Resolve the user's tokscale profile using tokscale's platform rules."""
+    if directory := environment.get("TOKSCALE_CONFIG_DIR"):
+        return Path(directory).absolute()
+    home = Path(environment.get("HOME") or Path.home())
+    if sys.platform == "darwin":
+        return home / ".config" / "tokscale"
+    if sys.platform == "win32":
+        return user_config_path("tokscale", appauthor=False, roaming=True)
+    return Path(environment.get("XDG_CONFIG_HOME") or home / ".config") / "tokscale"
+
+
+@contextmanager
+def _tokscale_temporary_directory(
+    *, prefix: str, directory: Path | None = None
+) -> Generator[Path, None, None]:
+    """Clean private staging directories without hiding acquisition failures."""
+    temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=directory)
+    failed = False
+    try:
+        yield Path(temporary.name)
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError:
+            _LOG.exception("could not clean up a temporary tokscale directory")
+            if not failed:
+                raise
+
+
+def _persistent_tokscale_cache(
+    config: UsageBassoonConfig, source: Path, environment: Mapping[str, str]
+) -> Path:
+    """Seed a private source/profile cache once, retaining compacted history."""
+    identity = "\0".join(
+        (config.source_id, str(source.resolve()), environment.get("HOME", ""))
+    )
+    root = config.path.absolute().parent / "tokscale"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = root / sha256(identity.encode()).hexdigest()
+    directory.mkdir(mode=0o700, exist_ok=True)
+    cache = directory / "cache"
+    if cache.is_dir():
+        return cache
+    # Publish a complete seed; concurrent collectors may adopt the first seed.
+    with _tokscale_temporary_directory(prefix=".seed-", directory=directory) as staging:
+        seed = staging / "cache"
+        if (source / "cache").is_dir():
+            shutil.copytree(source / "cache", seed)
+        else:
+            seed.mkdir(mode=0o700)
+        try:
+            seed.rename(cache)
+        except OSError as error:
+            if error.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not cache.is_dir():
+                raise
+    return cache
+
+
+def _link_tokscale_cache(profile: Path, cache: Path) -> None:
+    """Attach persistent caches without copying or removing their contents."""
+    link = profile / "cache"
+    if sys.platform == "win32":
+        # Directory junctions do not require Windows symlink privileges.
+        environment = dict(
+            os.environ,
+            USAGEBASSOON_CACHE_LINK=str(link),
+            USAGEBASSOON_CACHE_TARGET=str(cache),
+        )
+        result = subprocess.run(
+            'cmd /d /c mklink /J "%USAGEBASSOON_CACHE_LINK%" '
+            '"%USAGEBASSOON_CACHE_TARGET%"',
+            executable=os.environ.get("COMSPEC", "cmd.exe"),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=TOKSCALE_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError("could not attach the persistent tokscale cache")
+    else:
+        link.symlink_to(cache, target_is_directory=True)
+
+
+@contextmanager
+def tokscale_profile(
+    config: UsageBassoonConfig,
+) -> Generator[dict[str, str], None, None]:
+    """Copy configuration into a fresh wiki profile with persistent caches.
+
+    Args:
+        config: Source identity and configuration location for persistent state.
+
+    Yields:
+        Restricted child environment shared by this run's acquisition commands.
+
+    Raises:
+        OSError: If configuration, persistent state, or profile cleanup fails.
+        RuntimeError: If the persistent cache cannot be attached.
+    """
+    environment = _child_environment(config)
+    source = _tokscale_config_directory(environment)
+    with _tokscale_temporary_directory(prefix="usagebassoon-tokscale-") as profile:
+        for filename in ("settings.json", "custom-pricing.json"):
+            path = source / filename
+            if path.exists():
+                shutil.copyfile(path, profile / filename)
+        cache = _persistent_tokscale_cache(config, source, environment)
+        _link_tokscale_cache(profile, cache)
+        environment["TOKSCALE_CONFIG_DIR"] = str(profile)
+        yield environment
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -291,6 +420,7 @@ def _json_command(
     prefix: Sequence[str],
     *arguments: str,
     max_stdout_bytes: int | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> JsonValue:
     """Run one bounded tokscale JSON command and decode its standard output."""
     command = [*prefix, "--no-spinner", *arguments]
@@ -301,7 +431,9 @@ def _json_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_child_environment(config),
+            env=dict(environment)
+            if environment is not None
+            else _child_environment(config),
             shell=False,
             start_new_session=True,
         )
@@ -351,6 +483,7 @@ def _fetch_daily_models(
     days: Sequence[date],
     *,
     failures: dict[date, str] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[date, JsonObject]:
     """Fetch daily models, retaining successful days when failures are tracked."""
     payloads: dict[date, JsonObject] = {}
@@ -368,6 +501,7 @@ def _fetch_daily_models(
                     day.isoformat(),
                     "--until",
                     day.isoformat(),
+                    environment=environment,
                 ),
                 f"models --since {day.isoformat()} --until {day.isoformat()}",
             )
@@ -386,6 +520,7 @@ def _fetch_pricing(
     logger: logging.Logger,
     *,
     existing: Mapping[date, set[str]] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[dict[date, dict[str, JsonObject]], dict[date, frozenset[str]]]:
     """Fetch optional model prices while retaining successful per-model results."""
     pricing_by_day: dict[date, dict[str, JsonObject]] = {}
@@ -407,6 +542,7 @@ def _fetch_pricing(
                         "pricing",
                         model,
                         "--json",
+                        environment=environment,
                     ),
                     f"pricing {model}",
                 )
@@ -429,17 +565,14 @@ def _fetch_reports(
     *,
     logger: logging.Logger | None = None,
     all_history: bool = False,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[dict[date, JsonArray], frozenset[date]]:
-    """Discover metadata once or fetch grouped creation days with timezone margins."""
+    """Observe metadata once for a bounded creation-date range or all history."""
     reports: dict[date, JsonArray] = {}
     failures: set[date] = set()
     active_logger = logger or _LOG
-    groups: list[list[date]] = []
-    for day in (date.min,) if all_history else sorted(set(days)):
-        if groups and day.toordinal() <= groups[-1][-1].toordinal() + 1:
-            groups[-1].append(day)
-        else:
-            groups.append([day])
+    requested = [date.min] if all_history else sorted(set(days))
+    groups = [requested] if requested else []
     for group in groups:
         start = group[0] - timedelta(days=1) if group[0] > date.min else date.min
         end = group[-1] + timedelta(days=1) if group[-1] < date.max else date.max
@@ -456,6 +589,7 @@ def _fetch_reports(
                         if all_history
                         else ("--since", start.isoformat(), "--until", end.isoformat())
                     ),
+                    environment=environment,
                 ),
                 "report" if all_history else f"report --since {start} --until {end}",
             )

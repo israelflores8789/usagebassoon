@@ -9,8 +9,9 @@ import logging
 import os
 import signal
 import subprocess
+import tempfile
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -168,6 +169,80 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
     assert "MOTHERDUCK_TOKEN" not in child
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in child
     assert "AWS_ACCESS_KEY_ID" not in child
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail: bool,
+) -> None:
+    """Keep cached history and pricing across runs, cleaning profiles on failure."""
+    original = tmp_path / "user-profile"
+    (original / "cache").mkdir(parents=True)
+    settings = '{"scanner":{"bucketTimezone":"Etc/UTC"},"modelAliases":{}}'
+    pricing = '{"models":{"custom":{"input_cost_per_million_tokens":7}}}'
+    (original / "settings.json").write_text(settings)
+    (original / "custom-pricing.json").write_text(pricing)
+    (original / "wiki.db").write_text("stale wiki")
+    (original / "credentials.json").write_text("private")
+    (original / "cache" / "history").write_text("compacted turns")
+    monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(original))
+    configuration = _config(tmp_path / "config.toml")
+    script = (
+        "import json,os,pathlib; "
+        "p=pathlib.Path(os.environ['TOKSCALE_CONFIG_DIR']); "
+        "print(json.dumps({'settings':(p/'settings.json').read_text(), "
+        "'pricing':(p/'custom-pricing.json').read_text(), "
+        "'history':(p/'cache'/'history').read_text()})); "
+        "(p/'wiki.db').write_text('fresh wiki')"
+    )
+    cache_paths: list[Path] = []
+    profile_paths: list[Path] = []
+    cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def cleanup_failure(directory: tempfile.TemporaryDirectory[str]) -> None:
+        """Exercise a cleanup error without retaining temporary profile files."""
+        cleanup(directory)
+        raise OSError("cleanup failed")
+
+    for _ in range(2):
+        with (
+            (
+                pytest.raises(RuntimeError, match="acquisition failed")
+                if fail
+                else nullcontext()
+            ),
+            subprocess_collector.tokscale_profile(configuration) as environment,
+        ):
+            profile = Path(environment["TOKSCALE_CONFIG_DIR"])
+            profile_paths.append(profile)
+            assert not (profile / "wiki.db").exists()
+            assert not (profile / "credentials.json").exists()
+            cache = (profile / "cache").resolve()
+            cache_paths.append(cache)
+            assert subprocess_collector._json_command(
+                configuration,
+                [executable, "-c", script],
+                environment=environment,
+            ) == {
+                "settings": settings,
+                "pricing": pricing,
+                "history": "compacted turns" if len(cache_paths) == 1 else "retained",
+            }
+            assert (profile / "wiki.db").read_text() == "fresh wiki"
+            (cache / "history").write_text("retained")
+            if fail:
+                monkeypatch.setattr(
+                    tempfile.TemporaryDirectory, "cleanup", cleanup_failure
+                )
+                raise RuntimeError("acquisition failed")
+        assert not profile.exists()
+        assert cache.is_dir()
+    assert profile_paths[0] != profile_paths[1]
+    assert cache_paths[0] == cache_paths[1]
+    assert (original / "wiki.db").read_text() == "stale wiki"
+    assert (original / "cache" / "history").read_text() == "compacted turns"
 
 
 def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
@@ -1025,8 +1100,13 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
         if arguments == ("graph",):
             return deepcopy(graph)
         if arguments[0] == "report":
-            assert arguments == ("report", "--json", "--no-summarize")
-            return [deepcopy(row) for rows in report_raws.values() for row in rows]
+            assert arguments[:3] == ("report", "--json", "--no-summarize")
+            rows = [deepcopy(row) for rows in report_raws.values() for row in rows]
+            if not fail:
+                for row in rows:
+                    assert isinstance(row, dict)
+                    row["message_count"] = cast(int, row["message_count"]) + 1
+            return rows
         if arguments[0] == "pricing":
             return pricing_raws[arguments[1]]
         if arguments[0] == "models":
@@ -1081,7 +1161,27 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
         calls.clear()
         collector.collect(_config(tmp_path / "config.toml"))
         assert [request[5] for request in calls["models"]] == [failed_day.isoformat()]
-        assert not calls.get("report")
+        assert len(calls["report"]) == 1
+        assert calls["report"][0][3] == "--since"
+        active = cast(JsonObject, cast(JsonArray, daily["entries"])[0])
+        original = next(
+            row
+            for rows in report_raws.values()
+            for row in rows
+            if isinstance(row, dict)
+            and row["client"] == active["client"]
+            and row["session_id"] == active["sessionId"]
+        )
+        assert backend.query(
+            "SELECT message_count FROM current_sessions "
+            "WHERE source_id = :source_id AND client = :client "
+            "AND session_id = :session",
+            {
+                "source_id": SOURCE_ID,
+                "client": cast(str, active["client"]),
+                "session": cast(str, active["sessionId"]),
+            },
+        ).to_pylist() == [{"message_count": cast(int, original["message_count"]) + 1}]
         assert not calls.get("pricing")
         assert backend.query(
             "SELECT count(DISTINCT day) AS days FROM current_daily_stats"
@@ -1176,7 +1276,7 @@ def test_report_refresh_groups_creation_days_and_allows_timezone_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Nearby creation days share one bounded request, rather than a history scan."""
+    """All creation days share one fresh observation with timezone margins."""
     requests: list[tuple[str, ...]] = []
     first = date(2026, 3, 1)
     second = date(2026, 3, 2)
@@ -1208,15 +1308,6 @@ def test_report_refresh_groups_creation_days_and_allows_timezone_boundaries(
             "--no-summarize",
             "--since",
             "2026-02-28",
-            "--until",
-            "2026-03-03",
-        ),
-        (
-            "report",
-            "--json",
-            "--no-summarize",
-            "--since",
-            "2026-08-31",
             "--until",
             "2026-09-02",
         ),
@@ -1252,7 +1343,7 @@ def _assert_live_backfill_and_warm_collection(
             return daily_raws[day]
         if arguments[0] == "pricing":
             return pricing_raws[arguments[1]]
-        assert arguments == ("report", "--json", "--no-summarize")
+        assert arguments[:3] == ("report", "--json", "--no-summarize")
         return [row for rows in report_raws.values() for row in rows]
 
     monkeypatch.setattr(collector, "_json_command", command)
@@ -1302,5 +1393,5 @@ def _assert_live_backfill_and_warm_collection(
     _, summary = collector.collect(configuration)
     assert not summary.incomplete_targets
     # Completed older history stays skipped even across idle calendar gaps.
-    assert calls == {"graph": 1, "models": min(3, len(daily_raws))}
+    assert calls == {"graph": 1, "models": min(3, len(daily_raws)), "report": 1}
     assert requested_days == sorted(daily_raws)[-3:]
