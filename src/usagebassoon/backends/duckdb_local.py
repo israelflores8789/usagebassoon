@@ -358,8 +358,10 @@ class _DuckDBStorage(AbstractStorageBackend):
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if column == "first_seen_at":
-                value = f"COALESCE(target.{quoted_column}, {value})"
+            if table == "sessions" and column == "first_seen_at":
+                value = f"LEAST(target.{quoted_column}, {value})"
+            elif table == "sessions" and column == "last_seen_at":
+                value = f"GREATEST(target.{quoted_column}, {value})"
             assignments.append(f"{quoted_column} = {value}")
         source_values = ", ".join(f"source.{_identifier(column)}" for column in columns)
 

@@ -71,7 +71,7 @@ def _session_rows(
             "models_used": sorted(row.models_used),
             "session_label": make_session_label(row),
             "first_seen_at": at,
-            "last_seen_at": row.last_active or at,
+            "last_seen_at": at,
             "collected_at": freshness_at,
         }
         for row in rows

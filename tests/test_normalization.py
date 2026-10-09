@@ -96,6 +96,27 @@ def test_current_state_freshness_uses_collection_start(
         }
 
 
+@pytest.mark.parametrize("activity_offset_days", [-30, 0, 30, None])
+def test_session_visibility_uses_completion_independently_of_activity(
+    collection_bundle: CollectionBundle, activity_offset_days: int | None
+) -> None:
+    """Preserve reported activity while recording when metadata was observed."""
+    finished_at = collection_bundle.started_at + timedelta(minutes=10)
+    last_active = (
+        finished_at + timedelta(days=activity_offset_days)
+        if activity_offset_days is not None
+        else None
+    )
+    session = collection_bundle.report_rows[0].model_copy(
+        update={"last_active": last_active}
+    )
+    bundle = replace(collection_bundle, finished_at=finished_at, report_rows=[session])
+    row = normalize(bundle).tables["sessions"].to_pylist()[0]
+    assert row["first_seen_at"] == row["last_seen_at"] == finished_at
+    assert row["last_active"] == last_active
+    assert row["collected_at"] == bundle.started_at
+
+
 def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
     collection_bundle: CollectionBundle,
 ) -> None:

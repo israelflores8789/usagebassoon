@@ -3,6 +3,7 @@
 
 """test_sql_parity.py — Shared logical contracts with native ingestion layouts."""
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from importlib import resources
 from pathlib import Path
@@ -23,6 +24,7 @@ from tests._sql_parity import (
     statements,
     view_names,
 )
+from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.reports._common import (
     ReportFilters,
@@ -271,6 +273,81 @@ def test_compaction_deduplicates_usage_recollections_and_preserves_history(
             == expected
         )
     finally:
+        remote.close()
+
+
+@pytest.mark.parametrize("publication_order", [(0, 1, 2), (2, 1, 0), (1, 0, 2)])
+def test_session_visibility_survives_metadata_winners_compaction_and_raw_expiry(
+    collection_bundle: CollectionBundle,
+    publication_order: tuple[int, ...],
+    tmp_path: Path,
+) -> None:
+    """Keep completion extrema when overlapping collections change metadata."""
+    local = DuckDBBackend(":memory:")
+    remote = BigQueryReplayBackend()
+    stamp = collection_bundle.started_at
+    schema = CANONICAL_TABLE_SCHEMAS["sessions"]
+    rows = []
+    for start_minutes, finish_minutes in ((0, 20), (5, 10), (6, 12)):
+        session = collection_bundle.report_rows[0].model_copy(
+            update={
+                "last_active": stamp
+                - timedelta(days=30)
+                + timedelta(minutes=start_minutes)
+            }
+        )
+        bundle = replace(
+            collection_bundle,
+            run_id=str(uuid4()),
+            started_at=stamp + timedelta(minutes=start_minutes),
+            finished_at=stamp + timedelta(minutes=finish_minutes),
+            report_rows=[session],
+        )
+        rows.append(normalize(bundle).tables["sessions"].to_pylist()[0])
+    try:
+        local.apply_ddl()
+        for index in publication_order:
+            data = pa.Table.from_pylist([rows[index]], schema=schema)
+            for _ in range(2):
+                local.upsert("sessions", data, STATE_KEYS["sessions"], ())
+                remote.append("sessions", data)
+            expected = normalized_records(local.query("SELECT * FROM current_sessions"))
+            assert (
+                normalized_records(remote.query("SELECT * FROM current_sessions"))
+                == expected
+            )
+            remote.compact()
+            assert (
+                normalized_records(remote.query("SELECT * FROM sessions")) == expected
+            )
+            remote.engine.connection.execute("DELETE FROM raw_sessions")
+            assert (
+                normalized_records(remote.query("SELECT * FROM current_sessions"))
+                == expected
+            )
+        expected_row = {
+            **rows[2],
+            "first_seen_at": stamp + timedelta(minutes=10),
+            "last_seen_at": stamp + timedelta(minutes=20),
+        }
+        assert local.query("SELECT * FROM current_sessions").to_pylist() == [
+            expected_row
+        ]
+        for name, source in (("local", local), ("remote", remote)):
+            target = DuckDBBackend(":memory:")
+            try:
+                target.apply_ddl()
+                store = SnapshotArchiver(str(tmp_path / name))
+                uri = store.write(source, run_id=name, manual=True)
+                assert uri is not None
+                assert store.restore(target, uri)["sessions"] == 1
+                assert target.query("SELECT * FROM current_sessions").to_pylist() == [
+                    expected_row
+                ]
+            finally:
+                target.close()
+    finally:
+        local.close()
         remote.close()
 
 
