@@ -44,6 +44,7 @@ from uuid import uuid4
 import pyarrow as pa
 import pytest
 from google.api_core.exceptions import NotFound
+from google.api_core.retry import Retry
 from google.cloud import bigquery, bigquery_datatransfer
 from google.protobuf.field_mask_pb2 import FieldMask
 from typer.testing import CliRunner
@@ -86,6 +87,7 @@ pytestmark = pytest.mark.bigquery_live
 _DATASET = "usagebassoon_it"
 _LOCATION = "US"
 _LIVE_TEST_TIMEOUT_SECONDS = 600
+_COMPACTION_TIMEOUT_SECONDS = 300
 
 
 @contextmanager
@@ -99,17 +101,21 @@ def _phase(name: str) -> Generator[None, None, None]:
 
 
 def _compact(backend: BigQueryBackend) -> None:
-    """Run the packaged compaction transaction and report its wall time."""
+    """Bound scheduled compaction separately from ordinary backend queries."""
     sql = backend._qualify_view_sql(
         resources.files("usagebassoon.sql.bigquery")
         .joinpath("compaction.sql")
         .read_text()
     )
     with _phase("compaction"):
-        backend._wait_for_job(
-            backend.client.query(
-                sql, job_config=backend._query_config(), location=backend.location
-            )
+        # Multi-statement compaction can exceed the ordinary 120-second job wait.
+        backend.client.query_and_wait(
+            sql,
+            job_config=backend._query_config(),
+            location=backend.location,
+            api_timeout=30.0,
+            wait_timeout=_COMPACTION_TIMEOUT_SECONDS,
+            job_retry=Retry(predicate=lambda _error: False),
         )
 
 

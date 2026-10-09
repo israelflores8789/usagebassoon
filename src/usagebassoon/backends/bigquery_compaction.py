@@ -131,6 +131,10 @@ def pause_compaction(
     from google.protobuf.field_mask_pb2 import FieldMask
 
     deadline = time.monotonic() + timeout
+    retry_advice = (
+        "Keep writers stopped and retry restore after compaction finishes. "
+        "Estimated wait time: 2 minutes."
+    )
 
     def remaining() -> float:
         """Apply one operation budget to discovery, updates and polling."""
@@ -158,8 +162,7 @@ def pause_compaction(
             jobs = _active_compaction_jobs(backend, remaining)
             if jobs:
                 raise RuntimeError(
-                    f"Compaction is still running: {', '.join(jobs)}; "
-                    "keep writers stopped and retry after it finishes"
+                    f"Compaction is still running: {', '.join(jobs)}; " + retry_advice
                 )
             return
         config = matches[0]
@@ -199,12 +202,12 @@ def pause_compaction(
                 if jobs:
                     raise RuntimeError(
                         "Scheduled compaction is disabled but compaction jobs "
-                        f"remain active: {', '.join(jobs)}; wait and retry restore"
+                        f"remain active: {', '.join(jobs)}; " + retry_advice
                     )
                 return
             raise RuntimeError(
                 "scheduled compaction is disabled but a run remains active; "
-                "wait and retry restore"
+                + retry_advice
             )
 
 

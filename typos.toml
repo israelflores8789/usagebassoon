@@ -2,4 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [files]
-extend-exclude = ["tests/fixtures/golden-*.json"]
+extend-exclude = [
+    "tests/fixtures/tokscale-4.15.1/*.json",
+    "tests/fixtures/tokscale-4.18.0/*.json",
+]

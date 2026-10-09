@@ -1232,8 +1232,9 @@ def _assert_live_backfill_and_warm_collection(
     report_raws: dict[date, JsonArray],
     pricing_raws: dict[str, JsonObject],
 ) -> None:
-    """Exercise real warehouse planning/publication with simulated upstream output."""
+    """Persist cold history, then refresh only the warm historical overlap."""
     calls: dict[str, int] = {}
+    requested_days: list[date] = []
 
     def command(
         _configuration: UsageBassoonConfig,
@@ -1246,7 +1247,9 @@ def _assert_live_backfill_and_warm_collection(
         if arguments == ("graph",):
             return graph_raw
         if arguments[0] == "models":
-            return daily_raws[date.fromisoformat(arguments[5])]
+            day = date.fromisoformat(arguments[5])
+            requested_days.append(day)
+            return daily_raws[day]
         if arguments[0] == "pricing":
             return pricing_raws[arguments[1]]
         assert arguments == ("report", "--json", "--no-summarize")
@@ -1289,7 +1292,15 @@ def _assert_live_backfill_and_warm_collection(
         parameters,
     ).to_pylist()
     assert rates == [{"day": datetime.now(UTC).date()}]
+    assert backend.query(
+        "SELECT day, status FROM collection_status WHERE source_id = :source_id "
+        "AND domain = 'models' ORDER BY day",
+        parameters,
+    ).to_pylist() == [{"day": day, "status": "complete"} for day in sorted(daily_raws)]
     calls.clear()
+    requested_days.clear()
     _, summary = collector.collect(configuration)
     assert not summary.incomplete_targets
-    assert calls == {"graph": 1}
+    # Completed older history stays skipped even across idle calendar gaps.
+    assert calls == {"graph": 1, "models": min(3, len(daily_raws))}
+    assert requested_days == sorted(daily_raws)[-3:]
