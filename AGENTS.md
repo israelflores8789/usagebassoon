@@ -237,6 +237,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Daily tokscale pricing:** `price_versions.day` records the UTC observation date, never a backfilled usage date. Fetch each needed model at most once per observation day after a successful persisted observation. `daily_cost` selects usable source/model rates from the usage date, the latest earlier observation, or the earliest later observation for historical estimates, then falls back to that fact's tokscale-reported cost. Expose `price_day` and `cost_basis`; never switch an entire aggregate to reported costs because one fact lacks rates. Historical price backfilling is outside v1.
 
 - **Collection acquisition and recovery:** Acquire days sequentially and publish one normalized batch. A failed or invalid models day does not discard successful days; persist failed/partial targets and include unfinished models targets in later planning even when absent from the graph. Manual collection and refresh warn when publication contains incomplete acquisition. Cold report discovery is source-scoped and recorded in the ledger; fetch all report history once, then discover missing sessions or explicitly refresh known creation days without rescanning every usage day.
+- **Tokscale profile lifecycle:** Copy settings and custom pricing into a fresh per-run wiki profile; retain source/profile-scoped message and pricing caches, seed existing cached history once, and refresh active sessions by creation date with one report request. Never discard cached compacted turns or modify the user's tokscale profile.
 
 - **Session activity evidence:** Preserve tokscale's `last_active`. Derive `last_usage_day` from canonical daily facts, never from `collected_at` or `last_seen_at`. A later usage day makes the reported timestamp stale; display date precision, sort by effective activity day, and use the original `last_active DESC` plus session identity to break ties. Trust same-day or later reported timestamps without claiming they are always fresh.
 
@@ -379,8 +380,11 @@ $ bassoon collect
   ```
 
 - **Notable SQL semantics:**
-  - `last_active` is tokscale session metadata; `first_seen_at` and `last_seen_at` track UsageBassoon observations.
-  - `collected_at` orders observations; shared tie-break policies and natural keys are in `storage_model.py`.
+  - `first_seen_at`: Earliest recorded collection completion containing the session's report metadata, scoped to `(source_id, client, session_id)`.
+  - `last_seen_at`: Latest recorded collection completion containing that metadata, scoped to the same session key.
+  - `last_active`: Session activity timestamp supplied by tokscale's report payload, preserved separately from collector visibility.
+  - `collected_at`: Collection start time used to order observations and select current metadata; shared tie-break policies and natural keys are in `storage_model.py`.
+  - Each normalized session observation sets both seen timestamps to `bundle.finished_at`; canonical state preserves `MIN(first_seen_at)` and `MAX(last_seen_at)` independently of the metadata winner, including retries, out-of-order publication, compaction, and restore. Seeing metadata does not establish new session activity or complete daily-fact acquisition.
 
 - **General storage model:** Durable logical state comprises `sessions`, `daily_stats`, `price_versions`, `tags`, and `notes`. `collection_ledger` outcomes are permanent; physical replay appends are deduplicated in canonical views. Diagnostic streams have a 90-day visibility window, with physical pruning as described above. Append-and-compact progress uses per-arrival-bucket counts; BigQuery implements buckets with ingestion-day partitions. Schema and compaction metadata are excluded from snapshots.
 
