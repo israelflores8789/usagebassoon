@@ -51,7 +51,7 @@ def _collect_locked(
     run_id: str,
     started_at: datetime,
     logger: logging.Logger,
-    refresh_range: tuple[date, date] | None = None,
+    refresh_range: tuple[date | None, date] | None = None,
     invoke_method: InvokeMethod = InvokeMethod.PYTHON,
 ) -> PersistSummary:
     """Collect and persist while the local environment lock remains held."""
@@ -62,6 +62,7 @@ def _collect_locked(
         prior_reconciliation_issues,
         prior_schema_drift,
         report_inventory,
+        prior_daily,
     ) = load_ingest_status(config)
     try:
         with tokscale_profile(config) as environment:
@@ -100,6 +101,13 @@ def _collect_locked(
             )
             if refresh_range is not None:
                 since, until = refresh_range
+                if since is None:
+                    history = (
+                        set(graph_plan.candidate_days)
+                        | set(persisted_models)
+                        | {day for day, domain in statuses if domain == _MODELS_DOMAIN}
+                    )
+                    since = min((day for day in history if day <= until), default=until)
                 candidate_days = tuple(
                     since + timedelta(days=offset)
                     for offset in range((until - since).days + 1)
@@ -177,7 +185,11 @@ def _collect_locked(
                 if identity in report_inventory.sessions
                 and report_inventory.sessions[identity] is None
             }
-            full_report = not discovered or bool(missing_sessions | unknown_creation)
+            full_report = (
+                not discovered
+                or bool(missing_sessions | unknown_creation)
+                or (refresh_range is not None and refresh_range[0] is None)
+            )
             report_days = tuple(
                 sorted(
                     {
@@ -272,7 +284,9 @@ def _collect_locked(
         except Exception:
             logger.exception("could not publish failed collection %s", run_id)
         raise
-    summary = persist_with_retries(config, normalize(bundle), logger)
+    summary = persist_with_retries(
+        config, normalize(bundle), logger, prior_daily=prior_daily
+    )
     incomplete = tuple(
         status
         for status in bundle.ingest_status
@@ -300,7 +314,7 @@ def collect(
     Args:
         config: Collector source and storage backend configuration.
         refresh: Bypass historical completion within the selected range.
-        since: Refresh start; defaults to 29 days before the end.
+        since: Refresh start; defaults to the source's earliest known usage day.
         until: Refresh end; defaults to the collection's current UTC day.
         invoke_method: Entry point that initiated collection; defaults to Python.
 
@@ -317,12 +331,11 @@ def collect(
     refresh_range = None
     if refresh:
         end = until if until is not None else started_at.date()
-        start = since if since is not None else end - timedelta(days=29)
-        if start > end:
+        if since is not None and since > end:
             raise ValueError("--since must be on or before --until")
         if end > started_at.date():
             raise ValueError("--until must not be after the current UTC day")
-        refresh_range = (start, end)
+        refresh_range = (since, end)
     elif since is not None or until is not None:
         raise ValueError("date bounds require refresh=True")
     try:

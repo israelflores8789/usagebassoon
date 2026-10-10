@@ -18,6 +18,7 @@ from threading import Barrier, Event, Lock, Thread
 from types import TracebackType
 from typing import Self, cast, override
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pyarrow as pa
 import pytest
@@ -65,7 +66,7 @@ from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_run, persist_with_retries
 from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
-from usagebassoon.storage_model import note_id_for_session
+from usagebassoon.storage_model import note_id_for_session, preserve_daily_tokens
 
 
 def test_service_account_file_scopes_the_bigquery_http_transport(
@@ -101,10 +102,12 @@ def test_service_account_file_scopes_the_bigquery_http_transport(
         backend.close()
 
 
+@pytest.mark.parametrize("with_history", [False, True])
 def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
     collection_bundle: CollectionBundle,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    with_history: bool,
 ) -> None:
     """Exhausted metadata RPC retries remain eligible before backend open returns."""
     config = UsageBassoonConfig(
@@ -118,6 +121,22 @@ def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
     backend = _backend()
     attempts: list[int] = []
     published: list[NormalizedBundle] = []
+    prepared: list[pa.Table] = []
+    daily = bundle.tables["daily_stats"]
+    history: pa.Table | None = None
+    if with_history:
+        prior_rows: list[dict[str, object]] = daily.to_pylist()
+        for row in prior_rows:
+            row["input_tokens"] = cast(int, row["input_tokens"]) + 10
+            row["total_tokens"] = cast(int, row["total_tokens"]) + 10
+            row["collected_at"] = collection_bundle.started_at - timedelta(seconds=1)
+            row["event_id"] = str(uuid4())
+        history = pa.Table.from_pylist(prior_rows, schema=daily.schema)
+
+    def prepare(incoming: pa.Table, prior: pa.Table) -> pa.Table:
+        """Observe preparation once before any backend startup retry."""
+        prepared.append(incoming)
+        return preserve_daily_tokens(incoming, prior)
 
     def backoff(*_args: object, **_kwargs: object) -> Iterable[float]:
         """Force SDK retry exhaustion without waiting in the test."""
@@ -144,10 +163,26 @@ def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
     )
     monkeypatch.setattr("usagebassoon.persistence.open_backend", open_backend)
     monkeypatch.setattr("usagebassoon.persistence.persist_run", persist)
-    result = persist_with_retries(config, bundle, logging.getLogger("test"))
+    monkeypatch.setattr("usagebassoon.persistence.preserve_daily_tokens", prepare)
+    result = persist_with_retries(
+        config, bundle, logging.getLogger("test"), prior_daily=history
+    )
     assert result.inserted == 1
     assert attempts == [1, 2]
-    assert published == [bundle] and published[0] is bundle
+    assert len(published) == 1
+    if with_history:
+        assert len(prepared) == 1 and prepared[0] is daily
+        assert published[0].run_id == bundle.run_id
+        actual = published[0].tables["daily_stats"]
+        assert actual.column("event_id").equals(daily.column("event_id"))
+        assert actual.column("collected_at").equals(daily.column("collected_at"))
+        assert actual.column("input_tokens").to_pylist() == [
+            cast(int, value) + 10 for value in daily.column("input_tokens").to_pylist()
+        ]
+        assert bundle.tables["daily_stats"] is daily
+    else:
+        assert not prepared
+        assert published[0] is bundle
 
 
 def test_bigquery_partial_publication_never_marks_missing_facts_complete(

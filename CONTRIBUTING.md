@@ -205,6 +205,7 @@ The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.m
   - `tokscale models` provide daily statistics at the (client, session, model) level
   - `tokscale report` provides session metadata
   - `tokscale pricing` provides observed model rates
+- **Monotonicity.** Token usage is *never* deleted once persisted and can *never* be reduced, only increase. This rule does not bear on costs which are *calculated* values *from* token usage data.
 - **Tolerant Collection Payload.** UsageBassoon prioritizes token usage persistence and tolerates payloads that can be gathered later in the event of an error. Mandatory canonical commands include `tokscale models` and `tokscale graph`.
 - **Tolerant Schema Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "schema drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.

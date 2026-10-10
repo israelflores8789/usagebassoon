@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from string import Formatter
+from typing import cast
 from uuid import uuid4
 
 import pyarrow as pa
@@ -33,8 +34,17 @@ from usagebassoon.cli.reports._common import (
 )
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.persistence import persist_run
 from usagebassoon.schema_assets import QUERY_ASSET, _query_templates, query_sql
-from usagebassoon.storage_model import DEBUG_TABLES, EVENT_KEYS, STATE_KEYS
+from usagebassoon.storage_model import (
+    DEBUG_TABLES,
+    EVENT_KEYS,
+    STATE_KEYS,
+    TOKEN_COMPONENTS,
+    TOKEN_FIELDS,
+    preserve_daily_tokens,
+    token_total_sql,
+)
 
 pytestmark = pytest.mark.sql_parity
 
@@ -103,6 +113,33 @@ def test_packaged_asset_inventory_and_native_parsing() -> None:
                 assert sqlglot.parse(
                     package.joinpath(filename).read_text(), read=dialect
                 )
+
+    # Scheduled compaction and canonical reads preserve only accepted winners.
+    retained = {
+        field: f"CASE WHEN previous.{field} IS NULL THEN winner.{field} "
+        f"WHEN winner.{field} IS NULL THEN previous.{field} "
+        f"ELSE GREATEST(winner.{field}, previous.{field}) END"
+        for field in TOKEN_COMPONENTS
+    }
+    for dialect, filename, marker in (
+        ("bigquery", "views.sql", "CREATE OR REPLACE VIEW current_daily_stats AS"),
+        ("bigquery", "compaction.sql", "CREATE TEMP TABLE winners_daily_stats AS"),
+    ):
+        asset = (
+            resources.files(f"usagebassoon.sql.{dialect}")
+            .joinpath(filename)
+            .read_text()
+        )
+        section = asset.split(marker, 1)[1].split(";", 1)[0]
+        assert "WHERE winner.observation_rank = 1" in section
+        assert "MAX(input_tokens) OVER" not in section
+        assert (
+            token_total_sql(
+                retained,
+                "GREATEST(winner.total_tokens, COALESCE(previous.total_tokens, 0))",
+            )
+            in section
+        )
 
 
 def test_named_query_inventory_and_native_asts_match() -> None:
@@ -247,7 +284,7 @@ def test_compaction_deduplicates_usage_recollections_and_preserves_history(
         remote.append("daily_stats", data)
         remote.compact()
 
-        # A newer downward correction wins over the earlier larger count.
+        # Fresh metadata wins while token components retain their maxima.
         corrected = dict(
             increased,
             event_id=str(uuid4()),
@@ -259,7 +296,18 @@ def test_compaction_deduplicates_usage_recollections_and_preserves_history(
         remote.append("daily_stats", data)
         remote.append("daily_stats", data)
         expected = normalized_records(
-            pa.Table.from_pylist([corrected, retained, isolated], schema=schema)
+            pa.Table.from_pylist(
+                [
+                    {
+                        **corrected,
+                        "input_tokens": increased["input_tokens"],
+                        "total_tokens": increased["total_tokens"],
+                    },
+                    retained,
+                    isolated,
+                ],
+                schema=schema,
+            )
         )
         assert (
             normalized_records(remote.query("SELECT * FROM current_daily_stats"))
@@ -274,6 +322,118 @@ def test_compaction_deduplicates_usage_recollections_and_preserves_history(
         )
     finally:
         remote.close()
+
+
+@pytest.mark.parametrize("architecture", ["upsert", "append"])
+@pytest.mark.parametrize(
+    "publication_order", [(0, 1, 2, 3), (3, 2, 0, 1), (1, 3, 2, 0)]
+)
+def test_daily_token_components_never_regress(
+    collection_bundle: CollectionBundle,
+    architecture: str,
+    publication_order: tuple[int, int, int, int],
+) -> None:
+    """Retain component maxima across retries, clock order, compaction, and expiry."""
+    backend = (
+        DuckDBBackend(":memory:")
+        if architecture == "upsert"
+        else BigQueryReplayBackend()
+    )
+    if isinstance(backend, DuckDBBackend):
+        backend.apply_ddl()
+    schema = CANONICAL_TABLE_SCHEMAS["daily_stats"]
+    seed: dict[str, object] = (
+        normalize(collection_bundle).tables["daily_stats"].to_pylist()[0]
+    )
+    stamp = datetime(2026, 9, 10, tzinfo=UTC)
+    component_sets = (
+        (100, 20, 0, 0, 0),
+        (80, 40, 0, 0, 0),
+        (150, 0, 9, 8, 7),
+        (0, 0, 0, 0, 0),
+    )
+    offsets = (0, 2, -1, 3)
+    rows: list[dict[str, object]] = [
+        {
+            **seed,
+            **dict(zip(TOKEN_COMPONENTS, values, strict=True)),
+            "total_tokens": sum(values),
+            "event_id": str(uuid4()),
+            "collected_at": stamp + timedelta(hours=offset),
+            "tokscale_cost_usd": float(3 - index),
+        }
+        for index, (values, offset) in enumerate(
+            zip(component_sets, offsets, strict=True)
+        )
+    ]
+    current: list[dict[str, object]] = []
+    try:
+        for index in publication_order:
+            row = rows[index]
+            at = stamp + timedelta(hours=offsets[index])
+            bundle = normalize(
+                replace(
+                    collection_bundle,
+                    run_id=str(uuid4()),
+                    started_at=at,
+                    finished_at=at + timedelta(minutes=1),
+                )
+            )
+            bundle = replace(
+                bundle,
+                tables={
+                    "daily_stats": pa.Table.from_pylist([row], schema=schema),
+                    "collection_ledger": bundle.tables["collection_ledger"],
+                },
+            )
+            previous = current[0] if current else None
+            accepted = previous is None or (
+                cast(datetime, row["collected_at"]),
+                cast(int, row["total_tokens"]),
+                cast(str, row["event_id"]),
+            ) > (
+                cast(datetime, previous["collected_at"]),
+                cast(int, previous["total_tokens"]),
+                cast(str, previous["event_id"]),
+            )
+            expected = {
+                field: max(
+                    cast(int, row[field]), cast(int, previous[field]) if previous else 0
+                )
+                if accepted
+                else cast(int, previous[field])
+                for field in TOKEN_COMPONENTS
+            }
+            expected["total_tokens"] = sum(expected.values())
+            if isinstance(backend, BigQueryReplayBackend):
+                prepared = preserve_daily_tokens(
+                    bundle.tables["daily_stats"],
+                    backend.query("SELECT * FROM current_daily_stats"),
+                )
+                bundle = replace(
+                    bundle, tables={**bundle.tables, "daily_stats": prepared}
+                )
+            persist_run(backend, bundle)
+            persist_run(backend, bundle)
+            current = backend.query("SELECT * FROM current_daily_stats").to_pylist()
+            assert len(current) == 1
+            assert {field: current[0][field] for field in TOKEN_FIELDS} == expected
+            newest = row if accepted else previous
+            assert newest is not None
+            assert current[0]["collected_at"] == newest["collected_at"]
+            assert current[0]["tokscale_cost_usd"] == newest["tokscale_cost_usd"]
+            if isinstance(backend, BigQueryReplayBackend):
+                backend.compact()
+                backend.compact()
+                backend.engine.connection.execute("DELETE FROM raw_daily_stats")
+                assert (
+                    backend.query("SELECT * FROM current_daily_stats").to_pylist()
+                    == current
+                )
+        captured = backend.read_snapshot_tables(("daily_stats",))
+        assert captured.tables["daily_stats"].to_pylist() == current
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize("publication_order", [(0, 1, 2), (2, 1, 0), (1, 0, 2)])

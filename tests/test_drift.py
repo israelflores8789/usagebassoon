@@ -186,7 +186,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
         local_database=database,
     )
 
-    statuses, models, prices, reconciliation, schema_drift, _inventory = (
+    statuses, models, prices, reconciliation, schema_drift, _inventory, _daily = (
         load_ingest_status(config)
     )
 

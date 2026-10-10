@@ -49,7 +49,9 @@ from usagebassoon.storage_model import (
     CANONICAL_TABLE_SCHEMAS,
     DEBUG_TABLES,
     SNAPSHOT_TABLES,
+    TOKEN_COMPONENTS,
     newer_observation,
+    token_total_sql,
 )
 
 _LOG = logging.getLogger("usagebassoon")
@@ -353,12 +355,24 @@ class _DuckDBStorage(AbstractStorageBackend):
             f"target.{_identifier(key)} = source.{_identifier(key)}"
             for key in natural_keys
         )
-        change_predicate = newer_observation(table)
+        metadata_predicate = newer_observation(table)
+        change_predicate = metadata_predicate
+        token_values: dict[str, str] = {}
+        if table == "daily_stats":
+            token_values = {
+                field: f"GREATEST(target.{field}, source.{field})"
+                for field in TOKEN_COMPONENTS
+            }
+            token_values["total_tokens"] = token_total_sql(
+                token_values, "GREATEST(target.total_tokens, source.total_tokens)"
+            )
         assignments: list[str] = []
         for column in columns:
             quoted_column = _identifier(column)
             value = f"source.{quoted_column}"
-            if table == "sessions" and column == "first_seen_at":
+            if table == "daily_stats":
+                value = token_values.get(column, value)
+            elif table == "sessions" and column == "first_seen_at":
                 value = f"LEAST(target.{quoted_column}, {value})"
             elif table == "sessions" and column == "last_seen_at":
                 value = f"GREATEST(target.{quoted_column}, {value})"

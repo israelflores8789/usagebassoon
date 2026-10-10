@@ -507,6 +507,44 @@ def test_live_batch_matches_duckdb_and_retries_idempotently(
             "SELECT count(*) AS n FROM collection_runs WHERE source_id = :source_id",
             {"source_id": live_settings.source_id},
         ).to_pylist() == [{"n": 3}]
+
+        # Recollection can advance metadata and costs, but cannot reduce tokens.
+        regressed = selected(
+            _normalized_bundle(
+                replace(
+                    collection_bundle,
+                    started_at=collection_bundle.started_at + timedelta(hours=2),
+                    finished_at=collection_bundle.finished_at + timedelta(hours=2),
+                ),
+                live_settings.source_id,
+            )
+        )
+        current = _rows_for_source(remote, "daily_stats", live_settings.source_id)
+        row = {
+            **changed["daily_stats"],
+            "event_id": str(uuid4()),
+            "collected_at": collection_bundle.started_at + timedelta(hours=2),
+            "input_tokens": 0,
+            "total_tokens": total_tokens - input_tokens,
+            "tokscale_cost_usd": 0.0,
+        }
+        regressed = replace(
+            regressed,
+            tables={
+                **regressed.tables,
+                "daily_stats": pa.Table.from_pylist(
+                    [row], schema=regressed.tables["daily_stats"].schema
+                ),
+            },
+        )
+        persist_run(local, regressed)
+        persist_with_retries(configuration, regressed, _LOG)
+        persist_with_retries(configuration, regressed, _LOG)
+        actual = _rows_for_source(remote, "daily_stats", live_settings.source_id)
+        assert [row["total_tokens"] for row in actual] == [
+            row["total_tokens"] for row in current
+        ]
+        assert actual == _rows_for_source(local, "daily_stats", live_settings.source_id)
     finally:
         local.close()
         remote.close()

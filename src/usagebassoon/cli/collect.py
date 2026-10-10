@@ -54,10 +54,10 @@ def refresh(
         str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
     ] = None,
 ) -> None:
-    """Refresh this source's usage; default to 30 days ending today (UTC).
+    """Refresh this source's full history through today (UTC).
 
-    Retain absent usage keys and existing historical prices. Use refresh after
-    imports, scope changes, or collector corrections beyond the overlap window.
+    Bounds restrict usage days. Preserve absent keys and token-component maxima;
+    retain historical prices. Use refresh after imports or collector fixes.
     """
     dates: list[date | None] = []
     for value, option in ((since, "--since"), (until, "--until")):

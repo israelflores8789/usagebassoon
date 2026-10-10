@@ -789,7 +789,11 @@ def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
             "input_tokens": 200,
         }
         remote.append("daily_stats", pa.Table.from_pylist([latest], schema=schema))
-        remote._wait_for_job(job)
+        # Compaction uses its existing dedicated budget, not the collection wait.
+        job.result(
+            timeout=_COMPACTION_TIMEOUT_SECONDS,
+            retry=Retry(predicate=lambda _error: False),
+        )
         print(
             "BigQuery compaction with concurrent append: "
             f"{time.monotonic() - compaction_started:.3f}s",
@@ -812,6 +816,26 @@ def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
             {"op": "delete"}
         ]
         _compact(remote)
+        # A smaller fresh observation can add a component without losing tokens.
+        regressed = {
+            **latest,
+            "event_id": str(uuid4()),
+            "collected_at": datetime.now(UTC),
+            "input_tokens": 50,
+            "output_tokens": 7,
+            "total_tokens": 57,
+        }
+        data = pa.Table.from_pylist([regressed], schema=schema)
+        remote.append("daily_stats", data)
+        remote.append("daily_stats", data)
+        assert remote.query(
+            "SELECT input_tokens, output_tokens, total_tokens FROM current_daily_stats"
+            + where
+        ).to_pylist() == [
+            {"input_tokens": 200, "output_tokens": 7, "total_tokens": 207}
+        ]
+        _compact(remote)
+        _compact(remote)
         # Simulate expiry of an arrival bucket while retaining its old progress.
         remote._wait_for_job(
             remote.client.query(
@@ -829,7 +853,7 @@ def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
         )
         assert remote.query(
             "SELECT total_tokens FROM current_daily_stats" + where
-        ).to_pylist() == [{"total_tokens": 200}]
+        ).to_pylist() == [{"total_tokens": 207}]
         distinct = {**initial, "event_id": str(uuid4()), "session_id": "late-key"}
         remote.append("daily_stats", pa.Table.from_pylist([distinct], schema=schema))
         _compact(remote)
@@ -838,7 +862,7 @@ def test_live_compaction_cutoff_preserves_late_appends_and_gold_only_keys(
             + where
             + " ORDER BY session_id"
         ).to_pylist() == [
-            {"session_id": "backfill", "total_tokens": 200},
+            {"session_id": "backfill", "total_tokens": 207},
             {"session_id": "late-key", "total_tokens": 100},
         ]
         remote.append(

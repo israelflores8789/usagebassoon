@@ -232,6 +232,11 @@ def test_pricing_shape(pricing_rows: dict[str, PricingRow]) -> None:
     assert pricing_row.pricing.cache_read_input_token_cost == 7.5e-08
     assert pricing_row.pricing.cache_write_input_token_cost is None
 
+    payload = pricing_row.model_dump(by_alias=True)
+    for source in ("Custom", "user"):
+        payload["source"] = source
+        assert parse_pricing(payload).source == source
+
 
 def test_pricing_cache_creation_is_retained(
     pricing_rows: dict[str, PricingRow],

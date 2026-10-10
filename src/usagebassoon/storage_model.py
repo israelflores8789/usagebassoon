@@ -6,11 +6,81 @@
 import base64
 import json
 import re
+from collections.abc import Mapping
+from datetime import datetime
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pyarrow as pa
 
 DATA_SCHEMA_VERSION = 1
+
+# Only observations winning the shared freshness ordering may advance tokens.
+TOKEN_COMPONENTS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+)
+TOKEN_FIELDS = (*TOKEN_COMPONENTS, "total_tokens")
+
+
+def token_total_sql(components: Mapping[str, str], minimum: str) -> str:
+    """Build a total that preserves recorded usage and component maxima.
+
+    Args:
+        components: Trusted SQL expressions for every token component.
+        minimum: Trusted SQL expression for the greatest recorded total.
+
+    Returns:
+        The greater of the recorded total and the sum of retained components.
+    """
+    total = " + ".join(
+        f"COALESCE({components[field]}, 0)" for field in TOKEN_COMPONENTS
+    )
+    return f"GREATEST({minimum}, {total})"
+
+
+def preserve_daily_tokens(incoming: pa.Table, current: pa.Table) -> pa.Table:
+    """Prepare freshness-winning token observations before immutable publication.
+
+    Args:
+        incoming: Newly normalized daily observations with stable event IDs.
+        current: Source-scoped canonical facts captured during preflight.
+
+    Returns:
+        Winning observations retaining token maxima, with original metadata.
+    """
+    keys = STATE_KEYS["daily_stats"]
+    prior_rows: list[dict[str, object]] = current.to_pylist()
+    prior = {tuple(row[field] for field in keys): row for row in prior_rows}
+    rows: list[dict[str, object]] = incoming.to_pylist()
+    accepted: list[dict[str, object]] = []
+    for row in rows:
+        previous = prior.get(tuple(row[field] for field in keys))
+        if previous is not None:
+            order = tuple(
+                row[field] for field in ("collected_at", "total_tokens", "event_id")
+            )
+            previous_order = tuple(
+                previous[field]
+                for field in ("collected_at", "total_tokens", "event_id")
+            )
+            if cast(tuple[datetime, int, str], order) <= cast(
+                tuple[datetime, int, str], previous_order
+            ):
+                continue
+            for field in TOKEN_COMPONENTS:
+                row[field] = max(cast(int, row[field]), cast(int, previous[field] or 0))
+            row["total_tokens"] = max(
+                cast(int, previous["total_tokens"]),
+                cast(int, row["total_tokens"]),
+                sum(cast(int, row[field]) for field in TOKEN_COMPONENTS),
+            )
+        accepted.append(row)
+    return pa.Table.from_pylist(accepted, schema=incoming.schema)
+
 
 STATE_KEYS: dict[str, tuple[str, ...]] = {
     "sessions": ("source_id", "client", "session_id"),
@@ -66,7 +136,7 @@ def normalize_note_id(value: str) -> str:
 
 
 def observation_order(table: str, prefix: str = "") -> str:
-    """Return the shared latest-observation ordering for one relation."""
+    """Return the shared freshness ordering for accepting observations."""
     fields = [f"{prefix}collected_at DESC"]
     if table in {"tags", "notes"}:
         fields.append(f"({prefix}op = 'upsert') DESC")

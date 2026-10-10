@@ -15,6 +15,7 @@ from uuid import uuid4
 import pyarrow as pa
 import pytest
 
+from tests._bigquery_replay import BigQueryReplayBackend
 from tests.conftest import (
     EXPECTED_DAILY_STATS_ROWS,
     EXPECTED_REPORT_ROWS,
@@ -71,9 +72,10 @@ def test_normalize_preserves_canonical_nullable_types(
         day: {
             model: price.model_copy(
                 update={
+                    "source": "Custom",
                     "pricing": price.pricing.model_copy(
                         update={"cache_write_input_token_cost": None}
-                    )
+                    ),
                 }
             )
             for model, price in prices.items()
@@ -84,6 +86,34 @@ def test_normalize_preserves_canonical_nullable_types(
         replace(collection_bundle, pricing_by_day=missing_write_rates)
     ).tables["price_versions"]
     assert prices.column("price_cache_write_per_token").null_count == prices.num_rows
+    assert set(prices.column("source").to_pylist()) == {"Custom"}
+    for backend in (DuckDBBackend(":memory:"), BigQueryReplayBackend()):
+        try:
+            if isinstance(backend, DuckDBBackend):
+                backend.apply_ddl()
+            persist_run(
+                backend,
+                replace(
+                    normalized,
+                    tables={
+                        "price_versions": prices,
+                        "collection_ledger": normalized.tables["collection_ledger"],
+                    },
+                ),
+            )
+            if isinstance(backend, BigQueryReplayBackend):
+                backend.compact()
+            assert set(
+                backend.query("SELECT source FROM current_price_versions")
+                .column("source")
+                .to_pylist()
+            ) == {"Custom"}
+            captured = backend.read_snapshot_tables(("price_versions",))
+            assert set(
+                captured.tables["price_versions"].column("source").to_pylist()
+            ) == {"Custom"}
+        finally:
+            backend.close()
 
 
 def test_current_state_freshness_uses_collection_start(

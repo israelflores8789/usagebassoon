@@ -8,8 +8,10 @@ from __future__ import annotations
 import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+
+import pyarrow as pa
 
 from usagebassoon.backends.base import (
     CurrentStateWrite,
@@ -26,7 +28,12 @@ from usagebassoon.ingest import IngestStatus, IngestTarget, ReportInventory
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
 from usagebassoon.reconcile import ReconciliationIdentity
-from usagebassoon.storage_model import DEBUG_TABLES, STATE_KEYS
+from usagebassoon.storage_model import (
+    CANONICAL_TABLE_SCHEMAS,
+    DEBUG_TABLES,
+    STATE_KEYS,
+    preserve_daily_tokens,
+)
 
 _MAX_TRANSACTION_RETRY_SECONDS = 30.0
 _LOG = logging.getLogger(LOGGER_NAME)
@@ -69,6 +76,7 @@ def load_ingest_status(
     frozenset[ReconciliationIdentity],
     tuple[SchemaDriftState, ...],
     ReportInventory,
+    pa.Table,
 ]:
     """Load retry status, persisted coverage, and unresolved diagnostics."""
     backend = open_backend(config)
@@ -190,6 +198,10 @@ def load_ingest_status(
             frozenset(issue_identities),
             tuple(schema_drift),
             ReportInventory(inventory.sessions, frozenset(missing)),
+            pa.Table.from_pylist(
+                [row for row in planning if row["record_kind"] == "models"],
+                schema=CANONICAL_TABLE_SCHEMAS["daily_stats"],
+            ),
         )
     finally:
         close_backend(backend, context="loading ingest status", logger=_LOG)
@@ -225,8 +237,31 @@ def persist_with_retries(
     config: UsageBassoonConfig,
     bundle: NormalizedBundle,
     logger: logging.Logger,
+    *,
+    prior_daily: pa.Table | None = None,
 ) -> PersistSummary:
-    """Publish a stable observation batch with bounded backend retries."""
+    """Prepare a stable observation batch once, then publish with bounded retries.
+
+    Args:
+        config: Storage destination and bounded retry settings.
+        bundle: Normalized observations with stable run and event IDs.
+        logger: Operational logger for publication failures and retries.
+        prior_daily: Source-scoped canonical daily facts from preflight.
+
+    Returns:
+        Native publication counts for the prepared batch.
+    """
+    if (
+        prior_daily is not None
+        and (daily := bundle.tables.get("daily_stats")) is not None
+    ):
+        bundle = replace(
+            bundle,
+            tables={
+                **bundle.tables,
+                "daily_stats": preserve_daily_tokens(daily, prior_daily),
+            },
+        )
     attempts = config.collection.max_retries + 1
     for attempt in range(1, attempts + 1):
         backend: StorageBackend | None = None

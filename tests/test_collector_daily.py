@@ -42,7 +42,7 @@ from usagebassoon.ingest import (
 )
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
-from usagebassoon.normalizer import NormalizedBundle
+from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, NormalizedBundle
 from usagebassoon.persistence import PersistSummary
 from usagebassoon.system_metadata import InvokeMethod
 
@@ -528,6 +528,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         frozenset[tuple[str, str]],
         tuple[SchemaDriftState, ...],
         ReportInventory,
+        pa.Table,
     ]:
         """Return one completed historical day and one refreshable current day."""
         return (
@@ -550,11 +551,12 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
             frozenset(),
             (),
             ReportInventory(),
+            pa.Table.from_pylist([], schema=CANONICAL_TABLE_SCHEMAS["daily_stats"]),
         )
 
     def normalized(_bundle: CollectionBundle) -> NormalizedBundle:
         """Return an opaque normalized value because persistence is replaced."""
-        return cast(NormalizedBundle, object())
+        return NormalizedBundle("11111111-1111-4111-8111-111111111111", {})
 
     def persist(
         _configuration: UsageBassoonConfig,
@@ -668,6 +670,7 @@ def test_overlap_always_includes_three_past_graph_usage_days(
         frozenset[tuple[str, str]],
         tuple[SchemaDriftState, ...],
         ReportInventory,
+        pa.Table,
     ]:
         """Expose completion and retry state independently of graph discovery."""
         return (
@@ -677,6 +680,7 @@ def test_overlap_always_includes_three_past_graph_usage_days(
             frozenset(),
             (),
             ReportInventory(),
+            pa.Table.from_pylist([], schema=CANONICAL_TABLE_SCHEMAS["daily_stats"]),
         )
 
     def command(*_args: object, **_kwargs: object) -> JsonValue:
@@ -981,9 +985,10 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         collector.collect(replace(config, source_id=other))
         other_facts = facts(other)
 
-        # Explicit refresh recovers both changed totals and session corrections.
+        # Refresh recovers increases without reducing previously recorded tokens.
         stamp += timedelta(seconds=1)
         entries[0]["input"] = original_input + 35
+        second_input = cast(int, entries[1]["input"])
         entries[1]["input"] = cast(int, entries[1]["input"]) - 5
         collector.collect(config)
         assert requests[-1] == (day,)
@@ -995,7 +1000,8 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         fail = False
         collector.collect(config, refresh=True)
         assert requests[-1] == tuple(
-            stamp.date() - timedelta(days=offset) for offset in range(29, -1, -1)
+            day + timedelta(days=offset)
+            for offset in range((stamp.date() - day).days + 1)
         )
         assert input_count() == original_input + 35
         assert (
@@ -1005,7 +1011,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
                 if row["session_id"] == entries[1]["sessionId"]
                 and row["model"] == entries[1]["model"]
             )
-            == entries[1]["input"]
+            == second_input
         )
         collector.collect(config, refresh=True, since=day, until=day)
         assert len(facts()) == len(entries)
@@ -1040,10 +1046,27 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         assert requests[-1][0] == day + timedelta(days=1)
         assert requests[-1][-1] == stamp.date()
         stamp = datetime.combine(day + timedelta(days=30), datetime.min.time(), UTC)
+        no_contributions: JsonArray = []
+        graph["contributions"] = no_contributions
         collector.collect(config, refresh=True)
-        assert day not in requests[-1]
+        assert requests[-1][0] == day
+        assert requests[-1][-1] == stamp.date()
         collector.collect(config, refresh=True, until=day)
-        assert requests[-1][-1] == day
+        assert requests[-1] == (day,)
+        retained_facts = facts()
+        entries.clear()
+        for field in (
+            "totalInput",
+            "totalOutput",
+            "totalCacheRead",
+            "totalCacheWrite",
+            "totalMessages",
+        ):
+            daily[field] = 0
+        daily["totalCost"] = 0.0
+        stamp += timedelta(seconds=1)
+        collector.collect(config, refresh=True, since=day, until=day)
+        assert facts() == retained_facts
     finally:
         backend.close()
 
