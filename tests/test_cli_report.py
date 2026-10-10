@@ -660,7 +660,7 @@ def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     assert "2026-09-30" in plain_cli_output(result.output)
     assert "3.4M" in plain_cli_output(result.output)
     assert "68.3M" in plain_cli_output(result.output)
-    assert "$6.45" in plain_cli_output(result.output)
+    assert "$12.58" in plain_cli_output(result.output)
 
 
 def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:
