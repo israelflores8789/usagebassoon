@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: CI Local
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Ruff lint and format checks
+      run: just lint
+    - name: Pyrefly type check
+      run: just typecheck
+
+  sql-parity:
+    name: SQL dialect parity
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Run SQL dialect parity tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: just test
+        # Keep workflow arguments free of -q so pytest-md lists test names.
+        verbose: true
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: SQL dialect parity
+        custom-arguments: >-
+          -m sql_parity --junitxml=junit-sql-parity.xml
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-sql-parity
+        path: junit-sql-parity.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  unit:
+    name: Unit + local DuckDB (py ${{ matrix.python }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python ${{ matrix.python }}
+      run: uv python install ${{ matrix.python }}
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python ${{ matrix.python }}
+    - name: Run unit and local DuckDB tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        custom-pytest: just test-unit
+        verbose: true
+        emoji: true
+        job-summary: true
+        click-to-expand: true
+        report-title: Unit + local DuckDB (Python ${{ matrix.python }})
+        custom-arguments: >-
+          --junitxml=junit-unit-${{ matrix.python }}.xml
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-unit-py-${{ matrix.python }}
+        path: junit-unit-${{ matrix.python }}.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - name: Install Python 3.12
+      run: uv python install 3.12
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.12
+    - name: Build distributions
+      run: uv build --no-sources
+    - name: Validate distributions
+      run: uv run twine check dist/*
+
+  gate:
+    name: CI Local gate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    needs: [lint, sql-parity, unit, build]
+    if: always()
+    steps:
+    - name: Evaluate results
+      env:
+        LINT: ${{ needs.lint.result }}
+        SQL_PARITY: ${{ needs.sql-parity.result }}
+        UNIT: ${{ needs.unit.result }}
+        BUILD: ${{ needs.build.result }}
+      run: |
+        set -euo pipefail
+        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD"
+        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD"; do
+          [ "$result" = "success" ] || exit 1
+        done

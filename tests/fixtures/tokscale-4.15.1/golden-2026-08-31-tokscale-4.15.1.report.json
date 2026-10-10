@@ -1,0 +1,74 @@
+[
+  {
+    "session_id": "ses_b769b5f22cee1d44ada87295cd",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1788217385671,
+    "last_active": 1788223201313,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 1477916,
+    "total_output_tokens": 22144,
+    "total_cache_read": 4320826,
+    "total_cost": 1.5712789499999995,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 66,
+    "duration_minutes": 96927,
+    "summarized_at": 1788317745,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_5887a705379bdbc81003b859ea",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1788143709457,
+    "last_active": 1788145814990,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 943576,
+    "total_output_tokens": 21466,
+    "total_cache_read": 5583066,
+    "total_cost": 1.2831732000000002,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 86,
+    "duration_minutes": 35092,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_ea9ea8b07b8b3a64367656d04a",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1788143002203,
+    "last_active": 1788143256620,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 164475,
+    "total_output_tokens": 1508,
+    "total_cache_read": 821935,
+    "total_cost": 0.207835125,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 31,
+    "duration_minutes": 4240,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  }
+]

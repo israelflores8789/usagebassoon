@@ -1,0 +1,50 @@
+[
+  {
+    "session_id": "rollout-2026-09-22T04-53-04-7c207b2d-9ccc-05a8-1514-3c5653b5a400",
+    "client": "codex",
+    "workspace": "/project-beta",
+    "workspace_label": "project-beta",
+    "created_at": 1790053384859,
+    "last_active": 1790053800462,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 72485,
+    "total_output_tokens": 1397,
+    "total_cache_read": 757504,
+    "total_cost": 0.03607428,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 21,
+    "duration_minutes": 6926,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-22T00-46-43-46628d5d-526d-9170-81cd-b1c066204a9e",
+    "client": "codex",
+    "workspace": "/project-beta",
+    "workspace_label": "project-beta",
+    "created_at": 1790038516355,
+    "last_active": 1790038584074,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 51504,
+    "total_output_tokens": 1243,
+    "total_cache_read": 354560,
+    "total_cost": 0.0224008,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 12,
+    "duration_minutes": 1128,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

@@ -8,6 +8,7 @@ repos:
   rev: v1.50.0
   hooks:
   - id: typos
+    args: [--force-exclude]
 
 - repo: https://github.com/google/yamlfmt
   rev: v0.21.0
@@ -34,3 +35,4 @@ repos:
   - id: check-yaml
     args: [--unsafe, --allow-multiple-documents]
   - id: check-added-large-files
+    exclude: ^media/usagebassoon_readme_banner.*\.(png|jpg|jpeg)$

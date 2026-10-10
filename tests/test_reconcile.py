@@ -1,77 +1,296 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""test_reconcile.py — Reconciliation tests over a fixture set known to be partially stale.
-
-Appendix A invariant: models-vs-report has 10 drift issues (8 metric + 2
-cost, from two sessions served by report's cached assembly); models-vs-graph
-has zero issues. These counts are the regression net.
-"""
+"""test_reconcile.py — Tests for independent daily payload authorities."""
 
 from __future__ import annotations
 
-from collections import Counter
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from uuid import uuid4
 
-from usagebassoon.parsers.graph import GraphPayload
-from usagebassoon.parsers.models import ModelsPayload
-from usagebassoon.reconcile import ReconciliationResult, reconcile_models_graph
-
-from tests.conftest import (
-    EXPECTED_TOTAL_CACHE_READ,
-    EXPECTED_TOTAL_CACHE_WRITE,
-    EXPECTED_TOTAL_COST,
-    EXPECTED_TOTAL_INPUT,
-    EXPECTED_TOTAL_MESSAGES,
-    EXPECTED_TOTAL_OUTPUT,
+from usagebassoon.backends.duckdb_local import DuckDBBackend
+from usagebassoon.collector import RawCollection
+from usagebassoon.diagnostics import run_doctor
+from usagebassoon.ingest import (
+    CollectionBundle,
+    IngestEvidence,
+    IngestStatus,
+    build_collection_bundle,
+    plan_graph,
+    plan_models,
+)
+from usagebassoon.json_types import JsonObject
+from usagebassoon.normalizer import normalize
+from usagebassoon.parsers.daily import DailyModelsPayload
+from usagebassoon.persistence import persist_run
+from usagebassoon.reconcile import (
+    ReconciliationIssue,
+    ReconciliationResult,
+    reconcile_all,
 )
 
 
-def test_reconcile_report_drift_is_exactly_ten(
+def test_golden_daily_models_reconcile_cleanly(
     recon_result: ReconciliationResult,
 ) -> None:
-    """Assert the fixture set exhibits the known report-cache drift."""
-    counts = Counter(i.check for i in recon_result.issues)
-    assert counts == {"models_report_metric": 8, "models_report_cost": 2}
-    assert not recon_result.ok
+    """Accept internally consistent golden daily models payloads."""
+    assert recon_result.ok
 
 
-def test_reconcile_graph_is_clean(recon_result: ReconciliationResult) -> None:
-    """Assert graph reconciles with models with zero issues."""
-    graph_checks = [
-        i for i in recon_result.issues if i.check.startswith(("models_graph", "graph_summary"))
-    ]
-    assert graph_checks == []
-
-
-def test_reconcile_grand_totals(models_payload: ModelsPayload) -> None:
-    """Assert fixture grand totals match Appendix A exactly."""
-    assert models_payload.total_input == EXPECTED_TOTAL_INPUT
-    assert models_payload.total_output == EXPECTED_TOTAL_OUTPUT
-    assert models_payload.total_cache_read == EXPECTED_TOTAL_CACHE_READ
-    assert models_payload.total_cache_write == EXPECTED_TOTAL_CACHE_WRITE
-    assert models_payload.total_messages == EXPECTED_TOTAL_MESSAGES
-    assert abs(models_payload.total_cost - EXPECTED_TOTAL_COST) < 1e-9
-
-
-def test_reconcile_reasoning_is_additive(
-    models_payload: ModelsPayload,
-    graph_payload: GraphPayload,
+def test_model_totals_identify_assertion_across_days(
+    daily_models: dict[date, DailyModelsPayload],
 ) -> None:
-    """Assert reasoning sums on top of the four buckets."""
-    four_bucket = (
-        models_payload.total_input
-        + models_payload.total_output
-        + models_payload.total_cache_read
-        + models_payload.total_cache_write
+    """Report one stable issue per failed assertion across affected days."""
+    day = min(daily_models)
+    next_day = day + timedelta(days=1)
+    original = daily_models[day]
+    altered = original.totals.model_copy(
+        update={"total_input": original.totals.total_input + 1}
     )
-    reasoning = sum(e.reasoning for e in models_payload.entries)
-    assert four_bucket + reasoning == graph_payload.summary.total_tokens
+    changed = DailyModelsPayload(day, original.entries, altered)
+    result = reconcile_all({day: changed, next_day: changed})
+    assert result.affected_days == {day, next_day}
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert (issue.check, issue.key) == (
+        "models_payload_totals",
+        "total_input_mismatch",
+    )
+    assert next_day.isoformat() in issue.message
 
 
-def test_reconcile_clean_fixture_pair(
-    models_payload: ModelsPayload,
-    graph_payload: GraphPayload,
+def test_performance_rate_mismatch_is_reconciled_without_unsafe_facts(
+    daily_models: dict[date, DailyModelsPayload],
 ) -> None:
-    """Assert models-vs-graph alone reconciles with zero issues."""
-    result = reconcile_models_graph(models_payload, graph_payload)
-    assert result.ok
+    """Retain daily facts while reporting a conflicting Tokscale timing rate."""
+    day = min(daily_models)
+    original = daily_models[day]
+    first = original.entries[0]
+    rate = first.stats.tokscale_ms_per_1k_tokens
+    assert rate is not None
+    changed_row = replace(
+        first,
+        stats=first.stats.model_copy(update={"tokscale_ms_per_1k_tokens": rate + 1}),
+    )
+    changed = replace(original, entries=(changed_row, *original.entries[1:]))
+
+    result = reconcile_all({day: changed})
+
+    assert result.affected_days == {day}
+    assert result.unsafe_days == frozenset()
+    assert [(issue.check, issue.key) for issue in result.issues] == [
+        ("models_performance", "performance_rate_mismatch")
+    ]
+
+
+def test_repeated_issue_updates_one_row(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Retain first detection and update the latest run for one assertion."""
+    issue = ReconciliationIssue(
+        "models_payload_totals", "total_input_mismatch", "first observation"
+    )
+    first = replace(
+        collection_bundle,
+        reconciliation=ReconciliationResult((issue,)),
+    )
+    second = replace(
+        first,
+        run_id=str(uuid4()),
+        finished_at=first.finished_at + timedelta(days=1),
+        reconciliation=ReconciliationResult(
+            (replace(issue, message="second observation"),)
+        ),
+    )
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(first))
+        persist_run(backend, normalize(second))
+        rows = backend.query(
+            "SELECT check_name, issue_key, message, created_at, collected_at, "
+            "resolved, observation_count "
+            "FROM current_reconciliation_issues"
+        ).to_pylist()
+        assert rows == [
+            {
+                "check_name": issue.check,
+                "issue_key": issue.key,
+                "message": "second observation",
+                "created_at": first.finished_at,
+                "collected_at": second.finished_at,
+                "resolved": False,
+                "observation_count": 2,
+            }
+        ]
+        report = run_doctor(
+            backend,
+            backend_name="duckdb",
+            database=":memory:",
+            snapshot_enabled=False,
+        )
+        check = next(item for item in report.checks if item.name == "reconciliation")
+        assert check.status == "warning"
+        assert "models_payload_totals/total_input_mismatch" in check.details[0]
+        assert "2 observation(s)" in check.details[0]
+    finally:
+        backend.close()
+
+
+def test_mismatch_leaves_models_day_retryable(
+    daily_raws: dict[date, JsonObject],
+    graph_raw: JsonObject,
+) -> None:
+    """Keep a mismatched daily models response eligible for another collection."""
+    day = min(daily_raws)
+    raw_day = daily_raws[day]
+    declared = raw_day["totalInput"]
+    assert isinstance(declared, int)
+    changed = {**raw_day, "totalInput": declared + 1}
+    now = datetime.now(UTC)
+    bundle = build_collection_bundle(
+        RawCollection(graph_raw, {day: changed}, {}, {day: {}}),
+        run_id=str(uuid4()),
+        source_id="11111111-1111-4111-8111-111111111111",
+        started_at=now,
+        finished_at=now,
+        host=None,
+    )
+    assert bundle.reconciliation.issues[0].key == "total_input_mismatch"
+    assert {
+        (status.domain, status.status, status.failure_code)
+        for status in bundle.ingest_status
+    } == {
+        ("models", "partial", "reconciliation"),
+        ("pricing", "partial", "reconciliation"),
+    }
+
+
+def test_duplicate_models_key_is_recorded_without_staging_ambiguous_facts(
+    daily_raws: dict[date, JsonObject],
+    graph_raw: JsonObject,
+) -> None:
+    """Record the duplicate and retry the day without an unsafe upsert."""
+    day = min(daily_raws)
+    raw_day = daily_raws[day]
+    entries = raw_day["entries"]
+    assert isinstance(entries, list)
+    changed = {**raw_day, "entries": [*entries, entries[0]]}
+    now = datetime.now(UTC)
+    bundle = build_collection_bundle(
+        RawCollection(graph_raw, {day: changed}, {}, {}),
+        run_id=str(uuid4()),
+        source_id="11111111-1111-4111-8111-111111111111",
+        started_at=now,
+        finished_at=now,
+        host=None,
+    )
+    assert "duplicate_session_model" in {
+        issue.key for issue in bundle.reconciliation.issues
+    }
+    assert bundle.daily_models == {}
+    assert bundle.ingest_status[0].status == "partial"
+
+
+def test_successful_recheck_resolves_persisted_issue(
+    collection_bundle: CollectionBundle,
+) -> None:
+    """Close an observed assertion without losing its first failure detail."""
+    issue = ReconciliationIssue(
+        "models_payload_totals", "total_input_mismatch", "bad first total"
+    )
+    first = replace(collection_bundle, reconciliation=ReconciliationResult((issue,)))
+    second = replace(
+        first,
+        run_id=str(uuid4()),
+        finished_at=first.finished_at + timedelta(days=1),
+        reconciliation=ReconciliationResult((), resolved=((issue.check, issue.key),)),
+    )
+    backend = DuckDBBackend(":memory:")
+    try:
+        backend.apply_ddl()
+        persist_run(backend, normalize(first))
+        persist_run(backend, normalize(second))
+        row = backend.query(
+            "SELECT message, resolved, "
+            "observation_count "
+            "FROM current_reconciliation_issues"
+        ).to_pylist()[0]
+        assert row == {
+            "message": issue.message,
+            "resolved": True,
+            "observation_count": 1,
+        }
+        doctor = run_doctor(
+            backend,
+            backend_name="duckdb",
+            database=":memory:",
+            snapshot_enabled=False,
+        )
+        check = next(item for item in doctor.checks if item.name == "reconciliation")
+        assert check.status == "ok"
+        reopened = replace(
+            first,
+            run_id=str(uuid4()),
+            finished_at=second.finished_at + timedelta(days=1),
+        )
+        persist_run(backend, normalize(reopened))
+        assert backend.query(
+            "SELECT resolved, observation_count FROM current_reconciliation_issues "
+            "WHERE resolved = FALSE"
+        ).to_pylist() == [{"resolved": False, "observation_count": 2}]
+    finally:
+        backend.close()
+
+
+def test_resolution_requires_all_previous_bad_days_to_be_rechecked(
+    daily_raws: dict[date, JsonObject],
+    graph_raw: JsonObject,
+) -> None:
+    """Avoid clearing an assertion while an older failed day remains pending."""
+    day = min(daily_raws)
+    later = day + timedelta(days=1)
+    now = datetime.now(UTC)
+    run_id = str(uuid4())
+    graph_plan = plan_graph(graph_raw)
+    models_plan = plan_models({day: daily_raws[day]})
+    identity = ("models_payload_totals", "total_input_mismatch")
+    pending = IngestStatus(later, "models", "partial", 1, 0, "old", "reconciliation")
+    evidence = IngestEvidence(
+        graph_plan=graph_plan,
+        models_plan=models_plan,
+        report_days=frozenset(),
+        report_fetch_failures=frozenset(),
+        pricing_expected_models={},
+        pricing_existing_models={},
+        pricing_fetch_failures={},
+        prior_statuses={(later, "models"): pending},
+        prior_reconciliation_issues=frozenset({identity}),
+    )
+    raw = RawCollection(graph_raw, {day: daily_raws[day]}, {}, {})
+    bundle = build_collection_bundle(
+        raw,
+        run_id=run_id,
+        source_id="11111111-1111-4111-8111-111111111111",
+        started_at=now,
+        finished_at=now,
+        host=None,
+        evidence=evidence,
+    )
+    assert bundle.reconciliation.resolved == ()
+
+    refreshed = replace(
+        evidence,
+        prior_statuses={(day, "models"): replace(pending, day=day)},
+    )
+    cleared = build_collection_bundle(
+        raw,
+        run_id=run_id,
+        source_id="11111111-1111-4111-8111-111111111111",
+        started_at=now,
+        finished_at=now,
+        host=None,
+        evidence=refreshed,
+    )
+    assert cleared.reconciliation.resolved == (identity,)

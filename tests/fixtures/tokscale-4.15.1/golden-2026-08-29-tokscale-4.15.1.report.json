@@ -1,0 +1,122 @@
+[
+  {
+    "session_id": "ses_74e26b238a2550461d07575da5",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1788047275182,
+    "last_active": 1788049561689,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 1086728,
+    "total_output_tokens": 31470,
+    "total_cache_read": 7578698,
+    "total_cost": 1.6174746000000002,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 81,
+    "duration_minutes": 38108,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_44ae16890d3e411dd214628cfe",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1788036405453,
+    "last_active": 1788042237549,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 462048,
+    "total_output_tokens": 7515,
+    "total_cache_read": 2946615,
+    "total_cost": 0.654513375,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 66,
+    "duration_minutes": 97201,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_49bf2b19305acb26d3a74dd77b",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1787978925088,
+    "last_active": 1787979738286,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 999817,
+    "total_output_tokens": 3435,
+    "total_cache_read": 6741773,
+    "total_cost": 1.2789519749999996,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 35,
+    "duration_minutes": 13553,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_b5470accf91ca1dbfdcc3a1dd8",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1787973675336,
+    "last_active": 1787978898635,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 3491614,
+    "total_output_tokens": 15089,
+    "total_cache_read": 13142497,
+    "total_cost": 3.7262990250000003,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 99,
+    "duration_minutes": 87054,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  },
+  {
+    "session_id": "ses_140296a1c10418991b0e72f6b6",
+    "client": "opencode",
+    "workspace": "/project-alpha",
+    "workspace_label": "project-alpha",
+    "created_at": 1787969007862,
+    "last_active": 1787973932749,
+    "title": "Work on project-alpha",
+    "task_category": "other",
+    "description": "Session in project-alpha using gemini-3.7-flash.",
+    "complexity": "complex",
+    "task_group": "Work on project-alpha",
+    "total_input_tokens": 2341129,
+    "total_output_tokens": 15554,
+    "total_cache_read": 10483164,
+    "total_cost": 2.684546549999999,
+    "models_used": [
+      "gemini-3.7-flash"
+    ],
+    "message_count": 161,
+    "duration_minutes": 82081,
+    "summarized_at": 1788206091,
+    "fm_version": null
+  }
+]

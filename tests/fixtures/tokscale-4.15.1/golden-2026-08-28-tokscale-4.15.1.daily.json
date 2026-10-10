@@ -1,0 +1,11 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [],
+  "totalInput": 0,
+  "totalOutput": 0,
+  "totalCacheRead": 0,
+  "totalCacheWrite": 0,
+  "totalMessages": 0,
+  "totalCost": 0.0,
+  "processingTimeMs": 67
+}

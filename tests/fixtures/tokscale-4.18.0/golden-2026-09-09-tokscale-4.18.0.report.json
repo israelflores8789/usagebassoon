@@ -1,0 +1,52 @@
+[
+  {
+    "session_id": "rollout-2026-09-09T21-58-05-4473ba33-dbdd-956c-c978-a81e5f9960fa",
+    "client": "codex",
+    "workspace": "/project-delta",
+    "workspace_label": "project-delta",
+    "created_at": 1788991263584,
+    "last_active": 1789007168255,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 374820,
+    "total_output_tokens": 13843,
+    "total_cache_read": 6198016,
+    "total_cost": 1.01385752,
+    "models_used": [
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
+    ],
+    "message_count": 57,
+    "duration_minutes": 265077,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-09T01-26-58-e2cb2e36-c4c7-06d4-40a5-3170b0b650cb",
+    "client": "codex",
+    "workspace": "/project-delta",
+    "workspace_label": "project-delta",
+    "created_at": 1788917487448,
+    "last_active": 1788989463860,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 299753,
+    "total_output_tokens": 24599,
+    "total_cache_read": 6531840,
+    "total_cost": 2.6304824800000004,
+    "models_used": [
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
+    ],
+    "message_count": 85,
+    "duration_minutes": 1199606,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

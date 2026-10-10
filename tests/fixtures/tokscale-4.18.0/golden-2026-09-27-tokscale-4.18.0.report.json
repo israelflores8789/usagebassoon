@@ -1,0 +1,26 @@
+[
+  {
+    "session_id": "rollout-2026-09-27T23-37-33-69078e93-4bfc-3bc4-d94b-5d52c8da8e4d",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1790552292835,
+    "last_active": 1790552851423,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 124193,
+    "total_output_tokens": 4436,
+    "total_cache_read": 1038080,
+    "total_cost": 0.0447186,
+    "models_used": [
+      "gpt-6-luna"
+    ],
+    "message_count": 17,
+    "duration_minutes": 9309,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

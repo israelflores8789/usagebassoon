@@ -1,0 +1,74 @@
+[
+  {
+    "session_id": "rollout-2026-09-29T23-08-37-6a3dcabc-6c2b-246e-c621-168c482b54e1",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1790723511537,
+    "last_active": 1790727576122,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 133572,
+    "total_output_tokens": 7316,
+    "total_cache_read": 3840512,
+    "total_cost": 0.06659831999999999,
+    "models_used": [
+      "gpt-6-luna"
+    ],
+    "message_count": 50,
+    "duration_minutes": 67743,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-29T21-09-03-345ba0bf-90f9-e9e9-a467-b0d58bb8e6d1",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1790716485263,
+    "last_active": 1790722304904,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 321962,
+    "total_output_tokens": 9605,
+    "total_cache_read": 2945536,
+    "total_cost": 0.09203106,
+    "models_used": [
+      "gpt-6-luna"
+    ],
+    "message_count": 27,
+    "duration_minutes": 96994,
+    "summarized_at": null,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-29T04-40-16-9300c2e8-0947-aa38-ee88-4dbb6841ebbb",
+    "client": "codex",
+    "workspace": "/project-gamma",
+    "workspace_label": "project-gamma",
+    "created_at": 1790656845345,
+    "last_active": 1790662139513,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 637250,
+    "total_output_tokens": 51748,
+    "total_cache_read": 38011904,
+    "total_cost": 14.433677599999998,
+    "models_used": [
+      "gpt-6-sol"
+    ],
+    "message_count": 182,
+    "duration_minutes": 88236,
+    "summarized_at": null,
+    "fm_version": null
+  }
+]

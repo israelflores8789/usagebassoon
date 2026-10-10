@@ -1,0 +1,21 @@
+{
+  "modelId": "gpt-6-luna",
+  "matchedKey": "gpt-6-luna",
+  "source": "LiteLLM",
+  "resolution": {
+    "kind": "exact",
+    "candidateCount": 1,
+    "priceConsensus": true,
+    "exactModelIdentity": true,
+    "aliasApplied": false,
+    "normalized": false,
+    "stripped": false,
+    "submissionSafe": true
+  },
+  "pricing": {
+    "inputCostPerToken": 1e-07,
+    "outputCostPerToken": 5e-07,
+    "cacheReadInputTokenCost": 1e-08,
+    "cacheCreationInputTokenCost": 1.25e-07
+  }
+}

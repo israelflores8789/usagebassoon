@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+blank_issues_enabled: false
+contact_links:
+- name: "📚 UsageBassoon documentation"
+  url: "https://github.com/israelflores8789/usagebassoon/blob/main/README.md"
+  about: "Read installation, configuration, privacy, and command documentation."
+- name: "🤝 Contributing guide"
+  url: "https://github.com/israelflores8789/usagebassoon/blob/main/CONTRIBUTING.md"
+  about: "Read the development, pull-request, CLA, and release guidance."

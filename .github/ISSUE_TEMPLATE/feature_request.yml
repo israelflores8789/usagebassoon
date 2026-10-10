@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: "✨ Feature request"
+description: "Propose an improvement to collection, storage, reporting, or the Python API"
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+- type: markdown
+  attributes:
+    value: |
+      Thanks for proposing an improvement. Focus on the user problem and the intended behavior; implementation ideas are welcome but optional.
+- type: dropdown
+  id: area
+  attributes:
+    label: Area
+    options:
+    - Collection or tokscale integration
+    - Storage backend
+    - Snapshot or restore
+    - Reporting, query, or export
+    - Python API
+    - Documentation or developer experience
+    - Other
+  validations:
+    required: true
+- type: textarea
+  id: problem
+  attributes:
+    label: Problem or motivation
+    description: "What workflow, limitation, or user need does this address?"
+  validations:
+    required: true
+- type: textarea
+  id: proposal
+  attributes:
+    label: Proposed behavior
+    description: "Describe the desired user-facing behavior, including an example command or API where helpful."
+  validations:
+    required: true
+- type: textarea
+  id: alternatives
+  attributes:
+    label: Alternatives considered
+    description: "Optional: workarounds, competing designs, or why the current behavior is insufficient."
+- type: textarea
+  id: impact
+  attributes:
+    label: Compatibility, privacy, or storage impact
+    description: "Optional: note migrations, new credentials, retention concerns, or changes to persisted data."
+- type: checkboxes
+  id: contribution
+  attributes:
+    label: Contribution
+    options:
+    - label: "I would be willing to help implement or test this feature."
+      required: false

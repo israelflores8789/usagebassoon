@@ -1,0 +1,229 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""doctor.py — Typer command for read-only UsageBassoon health diagnostics."""
+
+from __future__ import annotations
+
+import logging
+import shlex
+from pathlib import Path
+from typing import Annotated
+
+import typer
+from rich.text import Text
+
+from usagebassoon.backends.factory import open_backend
+from usagebassoon.cli._output import output_console
+from usagebassoon.cli._utils import snapshot_archiver
+from usagebassoon.cli.spinner import spinner
+from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
+from usagebassoon.config import (
+    ConfigurationError,
+    ConfigurationManager,
+    UsageBassoonConfig,
+)
+from usagebassoon.diagnostics import (
+    DoctorCheck,
+    DoctorReport,
+    maintenance_health,
+    run_doctor,
+    snapshot_health,
+)
+from usagebassoon.display import sanitize_display
+from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.logger import configure as configure_logging
+from usagebassoon.privacy import sanitize_doctor_text
+from usagebassoon.scheduling import schedule_doctor_check
+from usagebassoon.version import __version__
+
+_LOG = logging.getLogger(LOGGER_NAME)
+
+
+def _print_report(
+    report: DoctorReport,
+    *,
+    raw: bool,
+    config_path: str | None,
+    database: str | None,
+) -> None:
+    """Render a structured doctor report with Rich."""
+    console = output_console()
+    styles = {"ok": "green", "warning": "yellow", "error": "red"}
+    for check in report.checks:
+        line = Text(f"{check.status.upper()} ", style=styles[check.status])
+        message = (
+            check.message
+            if raw
+            else sanitize_doctor_text(
+                check.message,
+                config_path=config_path,
+                database=database,
+            )
+        )
+        line.append(f"{sanitize_display(check.name)}: {sanitize_display(message)}")
+        console.print(line)
+        for detail in check.details:
+            text = (
+                detail
+                if raw
+                else sanitize_doctor_text(
+                    detail,
+                    config_path=config_path,
+                    database=database,
+                )
+            )
+            console.print(f"  - {sanitize_display(text)}", markup=False)
+    console.print(f"\nOverall status: {report.status}")
+
+
+def _configured_target(configuration: UsageBassoonConfig) -> str | None:
+    """Return the selected backend's target for doctor diagnostics."""
+    if configuration.backend == "duckdb":
+        return (
+            str(configuration.local_database) if configuration.local_database else None
+        )
+    if configuration.backend == "motherduck":
+        return (
+            configuration.motherduck.database
+            if configuration.motherduck is not None
+            else None
+        )
+    return (
+        configuration.bigquery.dataset if configuration.bigquery is not None else None
+    )
+
+
+def doctor(
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            help="Use this configuration file instead of the environment/default path.",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Return failure when warnings are present, too."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            min=1,
+            help="Maximum unresolved drift and recent run records to display.",
+        ),
+    ] = 20,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help="Show original diagnostic locations and connection details.",
+        ),
+    ] = False,
+) -> None:
+    """Check the configured backend, schema, drift, and ingest health."""
+    manager = ConfigurationManager(ConfigurationManager(config).path.absolute())
+    logger = _LOG
+    opened = None
+    config_error: str | None = None
+    connection_error: str | None = None
+    configuration = None
+    tokscale_check = DoctorCheck(
+        "tokscale", "error", "not checked because configuration could not be loaded"
+    )
+    try:
+        configuration = manager.load()
+        try:
+            with spinner(configuration):
+                command, version = preflight_tokscale(configuration)
+            tokscale_check = DoctorCheck(
+                "tokscale",
+                "ok",
+                f"version {version}",
+                (f"command: {shlex.join(command)}",),
+            )
+        except RuntimeError as error:
+            try:
+                command_detail = (
+                    f"command: {shlex.join(resolve_tokscale_command(configuration))}",
+                )
+            except RuntimeError:
+                command_detail = ()
+            tokscale_check = DoctorCheck(
+                "tokscale", "error", str(error), command_detail
+            )
+        try:
+            logger = configure_logging(configuration)
+        except Exception:
+            logger.exception("could not configure doctor logging")
+        try:
+            with spinner(configuration):
+                opened = open_backend(configuration)
+        except Exception as error:
+            logger.exception("could not open the configured backend")
+            connection_error = str(error)
+    except ConfigurationError as error:
+        config_error = str(error)
+
+    with spinner(configuration):
+        report = run_doctor(
+            opened,
+            backend_name=configuration.backend if configuration else "",
+            database=_configured_target(configuration) if configuration else None,
+            config_path=str(manager.path),
+            config_error=config_error,
+            connection_error=connection_error,
+            snapshot_enabled=(configuration.snapshots.enabled)
+            if configuration
+            else None,
+            snapshot_warnings=(
+                _snapshot_warnings(configuration)
+                if configuration and configuration.snapshots.enabled
+                else ()
+            ),
+            limit=limit,
+            logger=logger,
+        )
+        report = DoctorReport(
+            (
+                DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
+                tokscale_check,
+                *report.checks,
+                maintenance_health(opened),
+                snapshot_health(configuration),
+                schedule_doctor_check(configuration),
+            )
+        )
+    try:
+        if raw:
+            output_console(stderr=True).print(
+                "WARNING: raw doctor output may contain identifiers, paths, host "
+                "metadata, and other private information. Do not paste it into a "
+                "public GitHub issue. Use bassoon doctor without --raw for shareable "
+                "diagnostics.",
+                style="yellow",
+            )
+        _print_report(
+            report,
+            raw=raw,
+            config_path=str(manager.path),
+            database=_configured_target(configuration) if configuration else None,
+        )
+    finally:
+        if opened is not None:
+            try:
+                opened.close()
+            except Exception:
+                logger.exception("could not close the doctor backend")
+    if report.exit_code(strict=strict):
+        raise typer.Exit(code=1)
+
+
+def _snapshot_warnings(configuration: UsageBassoonConfig) -> tuple[str, ...]:
+    """Inspect enabled bucket lifecycle rules without failing doctor outright."""
+    try:
+        return snapshot_archiver(configuration).lifecycle_warnings()
+    except Exception as error:
+        _LOG.exception("Snapshot bucket lifecycle inspection failed")
+        return (f"Snapshot bucket lifecycle inspection unavailable: {error}",)

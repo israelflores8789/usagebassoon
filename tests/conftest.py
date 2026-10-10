@@ -3,152 +3,297 @@
 
 """conftest.py — Shared fixtures for the usagebassoon test suite.
 
-Golden payloads were captured from tokscale 4.15.1 on 2026-09-10 and
-sanitized. See Appendix A of the design doc for the invariants asserted
-across this suite.
+Golden payloads were captured from tokscale 4.18.0 and sanitized at daily
+collection granularity.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import cast
+from urllib.parse import unquote
 from uuid import uuid4
 
-import duckdb
 import pytest
-from usagebassoon.merge import CollectionBundle
+
+from usagebassoon.ingest import CollectionBundle, IngestStatus
+from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
+from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
 from usagebassoon.parsers.graph import GraphPayload, parse_graph
-from usagebassoon.parsers.models import ModelsPayload, parse_models
 from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, parse_report
 from usagebassoon.reconcile import ReconciliationResult, reconcile_all
 
-FIXTURES = Path(__file__).parent / "fixtures"
-
-EXPECTED_MODELS_ENTRIES = 88
-EXPECTED_REPORT_ROWS = 81
-EXPECTED_DAILY_ROWS = 23
-EXPECTED_DAYS = 18
-EXPECTED_TOTAL_INPUT = 78_318_668
-EXPECTED_TOTAL_OUTPUT = 1_415_099
-EXPECTED_TOTAL_CACHE_READ = 496_893_790
+# Explicit expectations are independent test oracles that catch semantic
+# regressions in parsing and normalization instead of merely rechecking the fixture.
+# If tests were based on the fixture alone, a parser could silently produce a bug
+# because the expected value would be compute from the same transformed fixture data.
+EXPECTED_REPORT_ROWS = 181
+EXPECTED_DAILY_ROWS = 57
+EXPECTED_DAYS = 35
+EXPECTED_DAILY_STATS_ROWS = 238
+EXPECTED_TOTAL_INPUT = 109_900_335
+EXPECTED_TOTAL_OUTPUT = 3_230_700
+EXPECTED_TOTAL_CACHE_READ = 1_225_022_558
 EXPECTED_TOTAL_CACHE_WRITE = 0
-EXPECTED_TOTAL_REASONING = 1_686_926
-EXPECTED_TOTAL_MESSAGES = 4_988
-EXPECTED_TOTAL_COST = 109.48238866000003
-EXPECTED_TOKSCALE_VERSION = "4.15.1"
+EXPECTED_TOTAL_REASONING = 4_389_637
+EXPECTED_TOTAL_MESSAGES = 11_656
+EXPECTED_TOTAL_COST = 261.3331709
+EXPECTED_GOLDEN_DATE = "2026-09-30"
+EXPECTED_PRICING_DATE = "2026-10-10"
+EXPECTED_TOKSCALE_VERSION = "4.18.0"
+FIXTURES = Path(__file__).parent / "fixtures" / f"tokscale-{EXPECTED_TOKSCALE_VERSION}"
+FIXTURE_PREFIX = f"golden-{EXPECTED_GOLDEN_DATE}-tokscale-{EXPECTED_TOKSCALE_VERSION}"
+SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
-def _load(name: str) -> Any:
+def _load(name: str) -> JsonValue:
     """Load a golden fixture by stem name.
 
     Args:
-        name: Fixture stem, e.g. "models".
+        name: Fixture stem, e.g. "graph".
 
     Returns:
         The decoded JSON payload.
     """
-    return json.loads((FIXTURES / f"golden-2026-09-10.{name}.json").read_text())
+    return cast(
+        JsonValue,
+        json.loads((FIXTURES / f"{FIXTURE_PREFIX}.{name}.json").read_text()),
+    )
+
+
+def _load_object(name: str) -> JsonObject:
+    """Load a golden fixture known to have an object top-level shape.
+
+    Args:
+        name: Fixture stem, e.g. "graph".
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        TypeError: If the fixture's top-level shape is not an object.
+    """
+    payload = _load(name)
+    if not isinstance(payload, dict):
+        raise TypeError(f"fixture {name} must be a JSON object")
+    return payload
+
+
+def _load_array(name: str) -> JsonArray:
+    """Load a golden fixture known to have an array top-level shape.
+
+    Args:
+        name: Fixture stem, e.g. "report".
+
+    Returns:
+        The decoded JSON array.
+
+    Raises:
+        TypeError: If the fixture's top-level shape is not an array.
+    """
+    payload = _load(name)
+    if not isinstance(payload, list):
+        raise TypeError(f"fixture {name} must be a JSON array")
+    return payload
+
+
+def _load_daily(day: date) -> JsonObject:
+    """Load one date-filtered models fixture.
+
+    Args:
+        day: Requested tokscale day.
+
+    Returns:
+        The decoded date-filtered models JSON object.
+    """
+    payload = cast(
+        JsonValue,
+        json.loads(
+            (
+                FIXTURES
+                / (
+                    f"golden-{day.isoformat()}-tokscale-"
+                    f"{EXPECTED_TOKSCALE_VERSION}.daily.json"
+                )
+            ).read_text()
+        ),
+    )
+    if not isinstance(payload, dict):
+        raise TypeError(f"daily fixture {day.isoformat()} must be a JSON object")
+    return payload
+
+
+def _load_report(day: date) -> JsonArray:
+    """Load one date-filtered tokscale report fixture."""
+    payload = cast(
+        JsonValue,
+        json.loads(
+            (
+                FIXTURES
+                / (
+                    f"golden-{day.isoformat()}-tokscale-"
+                    f"{EXPECTED_TOKSCALE_VERSION}.report.json"
+                )
+            ).read_text()
+        ),
+    )
+    if not isinstance(payload, list):
+        raise TypeError(f"report fixture {day.isoformat()} must be a JSON array")
+    return payload
 
 
 @pytest.fixture(scope="session")
-def models_raw() -> dict[str, Any]:
-    """Return the raw models payload as decoded JSON."""
-    return _load("models")
+def report_raw() -> JsonArray:
+    """Return the complete report captured within the configured usage-date range."""
+    return _load_array("report-full-history")
 
 
 @pytest.fixture(scope="session")
-def report_raw() -> list[dict[str, Any]]:
-    """Return the raw report payload as decoded JSON."""
-    return _load("report")
-
-
-@pytest.fixture(scope="session")
-def graph_raw() -> dict[str, Any]:
+def graph_raw() -> JsonObject:
     """Return the raw graph payload as decoded JSON."""
-    return _load("graph")
+    return _load_object("graph")
+
+
+def _load_pricing(
+    directory: Path, *, observation_day: date, version: str
+) -> dict[str, JsonObject]:
+    """Load captured rate cards, checking their filename and payload identities.
+
+    Args:
+        directory: Directory containing the versioned golden captures.
+        observation_day: UTC date on which prices were observed.
+        version: Exact tokscale version used for the capture.
+
+    Returns:
+        Raw rate cards keyed by their unmodified model IDs.
+
+    Raises:
+        TypeError: If a payload is not an object or lacks a nonempty model ID.
+        ValueError: If identities disagree, repeat, or no matching cards exist.
+    """
+    prefix = f"golden-{observation_day.isoformat()}-tokscale-{version}.pricing."
+    payloads: dict[str, JsonObject] = {}
+    for path in sorted(directory.iterdir()):
+        if not (path.name.startswith(prefix) and path.name.endswith(".json")):
+            continue
+        payload = cast(JsonValue, json.loads(path.read_text()))
+        if not isinstance(payload, dict):
+            raise TypeError(f"pricing fixture {path.name} must be a JSON object")
+        model = payload.get("modelId")
+        if not isinstance(model, str) or not model.strip():
+            raise TypeError(f"pricing fixture {path.name} must have a modelId")
+        filename_model = unquote(path.name[len(prefix) : -len(".json")])
+        if filename_model != model:
+            raise ValueError(f"pricing fixture {path.name} disagrees with modelId")
+        if model in payloads:
+            raise ValueError(f"duplicate pricing fixture for {model}")
+        payloads[model] = payload
+    if not payloads:
+        raise ValueError(f"no pricing fixtures for {observation_day} at {version}")
+    return payloads
 
 
 @pytest.fixture(scope="session")
-def pricing_raw() -> dict[str, Any]:
-    """Return the raw pricing payload as decoded JSON."""
-    return _load("pricing")
+def pricing_raws() -> dict[str, JsonObject]:
+    """Return all model rate cards from the configured pricing capture."""
+    return _load_pricing(
+        FIXTURES,
+        observation_day=date.fromisoformat(EXPECTED_PRICING_DATE),
+        version=EXPECTED_TOKSCALE_VERSION,
+    )
 
 
 @pytest.fixture(scope="session")
-def models_payload(models_raw: dict[str, Any]) -> ModelsPayload:
-    """Return the validated models payload."""
-    return parse_models(models_raw)
-
-
-@pytest.fixture(scope="session")
-def report_rows(report_raw: list[dict[str, Any]]) -> list[SessionRow]:
+def report_rows(report_raw: JsonArray) -> list[SessionRow]:
     """Return the validated report rows."""
     return parse_report(report_raw)
 
 
 @pytest.fixture(scope="session")
-def graph_payload(graph_raw: dict[str, Any]) -> GraphPayload:
+def graph_payload(graph_raw: JsonObject) -> GraphPayload:
     """Return the validated graph payload."""
     return parse_graph(graph_raw)
 
 
 @pytest.fixture(scope="session")
-def pricing_row(pricing_raw: dict[str, Any]) -> PricingRow:
-    """Return the validated pricing row."""
-    return parse_pricing(pricing_raw)
+def report_raws(graph_payload: GraphPayload) -> dict[date, JsonArray]:
+    """Return daily tokscale report output for every graph candidate day."""
+    return {
+        contribution.date: _load_report(contribution.date)
+        for contribution in graph_payload.contributions
+    }
 
 
 @pytest.fixture(scope="session")
-def recon_result(
-    models_payload: ModelsPayload,
-    report_rows: list[SessionRow],
-    graph_payload: GraphPayload,
-) -> ReconciliationResult:
+def daily_raws(graph_payload: GraphPayload) -> dict[date, JsonObject]:
+    """Return daily models payloads for every graph candidate day."""
+    return {
+        contribution.date: _load_daily(contribution.date)
+        for contribution in graph_payload.contributions
+    }
+
+
+@pytest.fixture(scope="session")
+def daily_models(daily_raws: dict[date, JsonObject]) -> dict[date, DailyModelsPayload]:
+    """Return date-attached model statistics for graph candidate days."""
+    return {day: parse_daily(payload, day=day) for day, payload in daily_raws.items()}
+
+
+@pytest.fixture(scope="session")
+def pricing_rows(pricing_raws: dict[str, JsonObject]) -> dict[str, PricingRow]:
+    """Return parsed rate cards preserving each model's actual prices."""
+    return {model: parse_pricing(payload) for model, payload in pricing_raws.items()}
+
+
+@pytest.fixture(scope="session")
+def recon_result(daily_models: dict[date, DailyModelsPayload]) -> ReconciliationResult:
     """Run full reconciliation over the golden fixture set."""
-    return reconcile_all(models_payload, report_rows, graph_payload)
-
-
-@pytest.fixture
-def connection() -> Iterator[duckdb.DuckDBPyConnection]:
-    """Yield an in-memory DuckDB connection with the full DDL applied."""
-    ddl = Path(__file__).parents[1] / "src" / "usagebassoon" / "sql" / "ddl.sql"
-    con = duckdb.connect(":memory:")
-    con.execute(ddl.read_text())
-    yield con
-    con.close()
+    return reconcile_all(daily_models)
 
 
 @pytest.fixture
 def collection_bundle(
-    models_payload: ModelsPayload,
     report_rows: list[SessionRow],
     graph_payload: GraphPayload,
-    pricing_row: PricingRow,
-    models_raw: dict[str, Any],
-    report_raw: list[dict[str, Any]],
-    graph_raw: dict[str, Any],
-    pricing_raw: dict[str, Any],
+    pricing_rows: dict[str, PricingRow],
+    daily_models: dict[date, DailyModelsPayload],
     recon_result: ReconciliationResult,
 ) -> CollectionBundle:
     """Build a complete, validated CollectionBundle from the fixtures."""
+    run_id = str(uuid4())
     return CollectionBundle(
-        run_id=uuid4(),
+        run_id=run_id,
+        source_id=SOURCE_ID,
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC) + timedelta(seconds=2),
         host="pytest",
-        models=models_payload,
+        daily_models=daily_models,
         report_rows=report_rows,
         graph=graph_payload,
-        pricing_by_model={"gemini-3.8-flash": pricing_row},
-        raw_exports={
-            "models": models_raw,
-            "report": report_raw,
-            "graph": graph_raw,
-            "pricing": pricing_raw,
-        },
+        pricing_by_day={date.fromisoformat(EXPECTED_PRICING_DATE): pricing_rows},
+        ingest_status=(
+            *(
+                IngestStatus(
+                    day=day,
+                    domain="models",
+                    status="complete",
+                    expected_count=1,
+                    succeeded_count=1,
+                    run_id=run_id,
+                )
+                for day in daily_models
+            ),
+            IngestStatus(
+                day=date.fromisoformat(EXPECTED_PRICING_DATE),
+                domain="pricing",
+                status="complete",
+                expected_count=len(pricing_rows),
+                succeeded_count=len(pricing_rows),
+                run_id=run_id,
+            ),
+        ),
         reconciliation=recon_result,
     )

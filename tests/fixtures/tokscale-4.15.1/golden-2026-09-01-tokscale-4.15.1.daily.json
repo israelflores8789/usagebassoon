@@ -1,0 +1,75 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_5e1a57ff05f14e2c8b4b32327d",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 759209,
+      "output": 5866,
+      "cacheRead": 9323980,
+      "cacheWrite": 0,
+      "reasoning": 8903,
+      "messageCount": 107,
+      "cost": 1.3240890000000007,
+      "performance": {
+        "msPer1KTokens": 62.379740537641375,
+        "totalDurationMs": 629908,
+        "timedTokens": 10097958,
+        "sampleCount": 107,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_ac328920fddf8c54fcab2c5168",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 1096187,
+      "output": 9953,
+      "cacheRead": 1342493,
+      "cacheWrite": 0,
+      "reasoning": 6874,
+      "messageCount": 50,
+      "cost": 0.9859284750000002,
+      "performance": {
+        "msPer1KTokens": 448.96064234392327,
+        "totalDurationMs": 1102426,
+        "timedTokens": 2455507,
+        "sampleCount": 49,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_b769b5f22cee1d44ada87295cd",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 810088,
+      "output": 3518,
+      "cacheRead": 2459721,
+      "cacheWrite": 0,
+      "reasoning": 5132,
+      "messageCount": 26,
+      "cost": 0.8244825749999999,
+      "performance": {
+        "msPer1KTokens": 124.44962709614487,
+        "totalDurationMs": 408003,
+        "timedTokens": 3278459,
+        "sampleCount": 26,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 2665484,
+  "totalOutput": 19337,
+  "totalCacheRead": 13126194,
+  "totalCacheWrite": 0,
+  "totalMessages": 183,
+  "totalCost": 3.1345000500000006,
+  "processingTimeMs": 71
+}

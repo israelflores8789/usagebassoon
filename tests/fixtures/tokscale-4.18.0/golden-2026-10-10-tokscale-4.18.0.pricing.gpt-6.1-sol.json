@@ -1,0 +1,21 @@
+{
+  "modelId": "gpt-6.1-sol",
+  "matchedKey": "gpt-6.1-sol",
+  "source": "LiteLLM",
+  "resolution": {
+    "kind": "exact",
+    "candidateCount": 1,
+    "priceConsensus": true,
+    "exactModelIdentity": true,
+    "aliasApplied": false,
+    "normalized": false,
+    "stripped": false,
+    "submissionSafe": true
+  },
+  "pricing": {
+    "inputCostPerToken": 2e-06,
+    "outputCostPerToken": 1e-05,
+    "cacheReadInputTokenCost": 1e-07,
+    "cacheCreationInputTokenCost": 2.5e-06
+  }
+}

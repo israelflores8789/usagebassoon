@@ -1,0 +1,51 @@
+[
+  {
+    "session_id": "rollout-2026-09-09T21-58-05-4473ba33-dbdd-956c-c978-a81e5f9960fa",
+    "client": "codex",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788991263584,
+    "last_active": 1788991582243,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gpt-5.6-luna.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 54180,
+    "total_output_tokens": 2910,
+    "total_cache_read": 364544,
+    "total_cost": 0.023450079999999998,
+    "models_used": [
+      "gpt-5.6-luna"
+    ],
+    "message_count": 12,
+    "duration_minutes": 5310,
+    "summarized_at": 1789000069,
+    "fm_version": null
+  },
+  {
+    "session_id": "rollout-2026-09-09T01-26-58-e2cb2e36-c4c7-06d4-40a5-3170b0b650cb",
+    "client": "codex",
+    "workspace": "/workspace",
+    "workspace_label": "workspace",
+    "created_at": 1788917487448,
+    "last_active": 1788989463860,
+    "title": "Work on workspace",
+    "task_category": "other",
+    "description": "Session in workspace using gpt-5.6-terra, gpt-5.6-luna.",
+    "complexity": "complex",
+    "task_group": "Work on workspace",
+    "total_input_tokens": 299753,
+    "total_output_tokens": 24599,
+    "total_cache_read": 6531840,
+    "total_cost": 2.6304824800000004,
+    "models_used": [
+      "gpt-5.6-terra",
+      "gpt-5.6-luna"
+    ],
+    "message_count": 85,
+    "duration_minutes": 1199606,
+    "summarized_at": 1789000069,
+    "fm_version": null
+  }
+]

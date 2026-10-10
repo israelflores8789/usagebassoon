@@ -1,0 +1,949 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""_common.py — Private shared report filters, queries, formatting, and samples."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from enum import StrEnum
+from functools import cache
+from importlib.resources import files
+from importlib.resources.abc import Traversable
+from pathlib import Path
+from typing import Literal, cast
+from uuid import UUID
+
+import pyarrow as pa
+import typer
+from rich.cells import cell_len
+
+from usagebassoon.backends.base import StorageBackend, close_backend
+from usagebassoon.cli._utils import configured_backend
+from usagebassoon.cli.spinner import spinner
+from usagebassoon.display import sanitize_display
+from usagebassoon.json_types import JsonValue
+from usagebassoon.parsers.daily import parse_daily
+from usagebassoon.parsers.report import parse_report
+from usagebassoon.privacy import sanitize_table
+from usagebassoon.schema_assets import query_sql
+
+type ReportRecord = dict[str, object]
+
+SAMPLE_LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
+SAMPLE_LATEST_DAY = date(2026, 9, 30)
+_MULTIPLICATION_SIGN = "\N{MULTIPLICATION SIGN}"
+CACHE_MULTIPLIER_HEADER = f"Cache {_MULTIPLICATION_SIGN}"
+
+
+class SessionSort(StrEnum):
+    """Validated descending sort choices for session reports."""
+
+    LAST_ACTIVE = "last-active"
+    CREATED_AT = "created-at"
+    DURATION = "duration"
+    INPUT = "input"
+    OUTPUT = "output"
+    CACHE_READ = "cache-read"
+    CACHE_WRITE = "cache-write"
+    REASONING = "reasoning"
+    TOTAL = "total"
+    COST = "cost"
+    COST_PER_MILLION = "cost-per-million"
+    PERFORMANCE = "performance"
+
+    @property
+    def column(self) -> str:
+        """Return the trusted query/result column for this choice."""
+        return {
+            self.LAST_ACTIVE: "last_active",
+            self.CREATED_AT: "created_at",
+            self.DURATION: "perf_duration_ms",
+            self.INPUT: "input_tokens",
+            self.OUTPUT: "output_tokens",
+            self.CACHE_READ: "cache_read",
+            self.CACHE_WRITE: "cache_write",
+            self.REASONING: "reasoning_tokens",
+            self.TOTAL: "total_tokens",
+            self.COST: "cost_usd",
+            self.COST_PER_MILLION: "cost_per_million",
+            self.PERFORMANCE: "ms_per_1k_tokens",
+        }[self]
+
+
+@dataclass(frozen=True, slots=True)
+class ReportFilters:
+    """Optional filters shared by all terminal reports.
+
+    Attributes:
+        source: Source UUID or the ``local`` sentinel before resolution.
+        client: Exact client filter.
+        model: Exact model filter.
+        workspace: Exact workspace filter.
+        tag: Effective source-aware curation tag filter.
+    """
+
+    source: str | None = None
+    client: str | None = None
+    model: str | None = None
+    workspace: str | None = None
+    tag: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleUsage:
+    """One deterministic usage fact used by report demonstration mode."""
+
+    source_id: str
+    day: date
+    client: str
+    session_id: str
+    workspace: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read: int
+    cache_write: int
+    reasoning: int
+    total_tokens: int
+    cost_usd: float | None
+    perf_duration_ms: int | None
+    perf_timed_tokens: int | None
+    created_at: datetime | None
+    last_active: datetime
+    tags: tuple[str, ...]
+
+
+def resolve_filters(filters: ReportFilters, local_source_id: str) -> ReportFilters:
+    """Resolve and validate the optional report source filter.
+
+    Args:
+        filters: Unresolved CLI filters.
+        local_source_id: Configured or deterministic local source UUID.
+
+    Returns:
+        Filters with a canonical UUID source identifier when requested.
+
+    Raises:
+        typer.BadParameter: If the source value is neither ``local`` nor a UUID.
+    """
+    if filters.source is None:
+        return filters
+    if filters.source.lower() == "local":
+        return replace(filters, source=local_source_id)
+    try:
+        return replace(filters, source=str(UUID(filters.source)))
+    except ValueError as error:
+        raise typer.BadParameter(
+            "--source must be a UUID or 'local'", param_hint="--source"
+        ) from error
+
+
+def parse_report_dates(
+    since: str | None, until: str | None
+) -> tuple[date | None, date | None]:
+    """Parse optional inclusive day bounds for a terminal report.
+
+    Args:
+        since: Lower day bound in YYYY-MM-DD form.
+        until: Upper day bound in YYYY-MM-DD form.
+
+    Returns:
+        Parsed lower and upper bounds, with omitted bounds left open.
+
+    Raises:
+        typer.BadParameter: A bound is malformed or the range is reversed.
+    """
+
+    def parse(value: str | None, option: str) -> date | None:
+        """Parse one optional day bound and name its CLI option on failure."""
+        if value is None:
+            return None
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"{option} must use YYYY-MM-DD", param_hint=option
+            ) from error
+        if parsed.isoformat() != value:
+            raise typer.BadParameter(f"{option} must use YYYY-MM-DD", param_hint=option)
+        return parsed
+
+    start = parse(since, "--since")
+    end = parse(until, "--until")
+    if start is not None and end is not None and start > end:
+        raise typer.BadParameter("--since must be on or before --until")
+    return start, end
+
+
+def report_where(
+    filters: ReportFilters,
+    *,
+    since: date | None = None,
+    until: date | None = None,
+    alias: str = "facts",
+    date_column: Literal["day", "last_active", "created_at", "activity_day"] = "day",
+) -> tuple[str, dict[str, str]]:
+    """Build dialect-neutral report predicates and bound string parameters.
+
+    The tag predicate uses a semijoin against ``session_tags`` so duplicate tag
+    assignments at different scopes cannot duplicate usage facts.
+
+    Args:
+        filters: Resolved report filters.
+        since: Inclusive lower day bound, when applicable.
+        until: Inclusive upper day bound, when applicable.
+        alias: SQL table alias for the report source view.
+        date_column: Source date or timestamp field to constrain.
+
+    Returns:
+        SQL ``WHERE`` fragment and its named bindings.
+    """
+    conditions: list[str] = []
+    parameters: dict[str, str] = {}
+    for name, value in (
+        ("source", filters.source),
+        ("client", filters.client),
+        ("model", filters.model),
+        ("workspace", filters.workspace),
+    ):
+        if value is not None:
+            column = "source_id" if name == "source" else name
+            conditions.append(f"{alias}.{column} = :{name}")
+            parameters[name] = value
+    if filters.tag is not None:
+        conditions.append(
+            "EXISTS ("
+            "SELECT 1 FROM session_tags AS tagged "
+            f"WHERE tagged.source_id = {alias}.source_id "
+            f"AND tagged.client = {alias}.client "
+            f"AND tagged.session_id = {alias}.session_id "
+            "AND tagged.tag = :tag"
+            ")"
+        )
+        parameters["tag"] = filters.tag
+    day_expression = (
+        f"{alias}.day"
+        if date_column == "day"
+        else f"CAST({alias}.{date_column} AS DATE)"
+    )
+    if since is not None:
+        conditions.append(f"{day_expression} >= CAST(:since AS DATE)")
+        parameters["since"] = since.isoformat()
+    if until is not None:
+        conditions.append(f"{day_expression} <= CAST(:until AS DATE)")
+        parameters["until"] = until.isoformat()
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    return where, parameters
+
+
+def _load_report_rows(
+    backend: StorageBackend,
+    name: Literal[
+        "report_daily", "report_models", "report_sessions", "report_session_models"
+    ],
+    where: str,
+    parameters: dict[str, str],
+    *,
+    ordering: str = "",
+    limit: int | None = None,
+) -> list[ReportRecord]:
+    """Execute a named native report query with trusted runtime fragments.
+
+    Args:
+        backend: Initialized backend supplying its SQL dialect.
+        name: Packaged report query shape.
+        where: Predicate fragment produced by ``report_where``.
+        parameters: Bound filter values, never inserted into SQL text.
+        ordering: Trusted columns and direction from ``SessionSort``.
+        limit: Positive row bound, or no bound.
+
+    Returns:
+        Report records from the backend's Arrow query result.
+
+    Raises:
+        ValueError: If the row limit is not a positive integer.
+    """
+    if limit is not None and (
+        not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+    ):
+        raise ValueError("report limit must be a positive integer")
+    sql = query_sql(backend.dialect, name).format(
+        where=where,
+        ordering=ordering,
+        limit="" if limit is None else f"LIMIT {limit}",
+    )
+    return [dict(record) for record in backend.query(sql, parameters).to_pylist()]
+
+
+def load_daily_usage(
+    backend: StorageBackend,
+    filters: ReportFilters,
+    *,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Load daily report rows from the dialect-paired report source view.
+
+    Args:
+        backend: Initialized storage backend.
+        filters: Resolved report filters.
+        limit: Maximum rows after newest-first ordering, when requested.
+        since: Inclusive lower day bound.
+        until: Inclusive upper day bound.
+
+    Returns:
+        One aggregated record per usage day, newest first.
+    """
+    where, parameters = report_where(filters, since=since, until=until)
+    return _load_report_rows(backend, "report_daily", where, parameters, limit=limit)
+
+
+def load_session_usage(
+    backend: StorageBackend,
+    filters: ReportFilters,
+    *,
+    by_model: bool,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Load session report rows from the dialect-paired report source view.
+
+    Args:
+        backend: Initialized storage backend.
+        filters: Resolved report filters.
+        by_model: Keep one row per session/model instead of one session row.
+        sort: Descending sort metric; creation sorting uses creation date bounds.
+        limit: Maximum rows after ordering, when requested.
+        since: Inclusive lower date bound on the selected timestamp.
+        until: Inclusive upper date bound on the selected timestamp.
+
+    Returns:
+        Aggregated session report records.
+    """
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "activity_day"
+    where, parameters = report_where(
+        filters, since=since, until=until, date_column=timestamp
+    )
+    ordering = (
+        "activity_day DESC NULLS LAST"
+        if sort == SessionSort.LAST_ACTIVE
+        else f"{sort.column} DESC NULLS LAST"
+    )
+    records = _load_report_rows(
+        backend,
+        "report_session_models" if by_model else "report_sessions",
+        where,
+        parameters,
+        ordering=ordering,
+        limit=limit,
+    )
+    for record in records:
+        record["last_active_stale"] = bool(record["last_active_stale"])
+    return records
+
+
+def load_model_usage(
+    backend: StorageBackend,
+    filters: ReportFilters,
+    *,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Aggregate filtered daily model facts by model and client."""
+    where, parameters = report_where(filters, since=since, until=until)
+    return _load_report_rows(backend, "report_models", where, parameters)
+
+
+def load_configured_daily_usage(
+    config: Path | None,
+    filters: ReportFilters,
+    *,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Open the configured warehouse and load daily report records."""
+    configuration, backend = configured_backend(config)
+    try:
+        with spinner(configuration):
+            return load_daily_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                limit=limit,
+                since=since,
+                until=until,
+            )
+    finally:
+        close_backend(backend, context="rendering a daily report")
+
+
+def load_configured_model_usage(
+    config: Path | None,
+    filters: ReportFilters,
+    *,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Open the configured warehouse and load filtered model totals."""
+    configuration, backend = configured_backend(config)
+    try:
+        with spinner(configuration):
+            return load_model_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                since=since,
+                until=until,
+            )
+    finally:
+        close_backend(backend, context="rendering a models report")
+
+
+def load_configured_session_usage(
+    config: Path | None,
+    filters: ReportFilters,
+    *,
+    by_model: bool,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Open the configured warehouse and load session report records."""
+    configuration, backend = configured_backend(config)
+    try:
+        with spinner(configuration):
+            return load_session_usage(
+                backend,
+                resolve_filters(filters, configuration.source_id),
+                by_model=by_model,
+                sort=sort,
+                limit=limit,
+                since=since,
+                until=until,
+            )
+    finally:
+        close_backend(backend, context="rendering a sessions report")
+
+
+def sample_daily_usage(
+    filters: ReportFilters,
+    *,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Return deterministic, filtered daily rows without opening a backend."""
+    grouped: dict[date, list[_SampleUsage]] = {}
+    for fact in _sample_usage(filters, since=since, until=until):
+        grouped.setdefault(fact.day, []).append(fact)
+    records = [_daily_record(day, facts) for day, facts in grouped.items()]
+    records.sort(key=_daily_sort_key, reverse=True)
+    return records if limit is None else records[:limit]
+
+
+def sample_session_usage(
+    filters: ReportFilters,
+    *,
+    by_model: bool,
+    sort: SessionSort = SessionSort.LAST_ACTIVE,
+    limit: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[ReportRecord]:
+    """Return deterministic, filtered session rows without opening a backend."""
+    grouped: dict[tuple[str, str, str, str | None], list[_SampleUsage]] = {}
+    for fact in _sample_usage(filters):
+        key = (
+            fact.source_id,
+            fact.client,
+            fact.session_id,
+            fact.model if by_model else None,
+        )
+        grouped.setdefault(key, []).append(fact)
+    records = [
+        _session_record(source_id, client, session_id, facts)
+        for (source_id, client, session_id, _), facts in grouped.items()
+    ]
+    timestamp = "created_at" if sort == SessionSort.CREATED_AT else "activity_day"
+    if since is not None or until is not None:
+        bounded: list[ReportRecord] = []
+        for record in records:
+            value = record[timestamp]
+            if value is None:
+                continue
+            day = (
+                _as_datetime(value).date()
+                if timestamp == "created_at"
+                else _as_date(value)
+            )
+            if (since is None or day >= since) and (until is None or day <= until):
+                bounded.append(record)
+        records = bounded
+
+    def sort_key(record: ReportRecord) -> tuple[float, float, str, str, str, str]:
+        """Match descending SQL metrics and ascending identity tie-breakers."""
+        return (
+            (
+                -float(_as_date(record["activity_day"]).toordinal())
+                if sort == SessionSort.LAST_ACTIVE
+                else -_session_sort_value(record, sort)
+            ),
+            -_session_sort_value(record, SessionSort.LAST_ACTIVE),
+            str(record["source_id"]),
+            str(record["client"]),
+            str(record["session_id"]),
+            str(record["model"]),
+        )
+
+    records.sort(key=sort_key)
+    return records if limit is None else records[:limit]
+
+
+def sample_model_usage(
+    filters: ReportFilters, *, since: date | None = None, until: date | None = None
+) -> list[ReportRecord]:
+    """Aggregate filtered golden daily facts by model and client."""
+    grouped: dict[tuple[str, str], list[_SampleUsage]] = {}
+    for fact in _sample_usage(filters, since=since, until=until):
+        grouped.setdefault((fact.model, fact.client), []).append(fact)
+    records = [
+        _model_record(model, client, facts)
+        for (model, client), facts in grouped.items()
+    ]
+    records.sort(key=_model_sort_key)
+    return records
+
+
+def _model_sort_key(record: ReportRecord) -> tuple[int, str, str]:
+    """Sort sample model rows by descending tokens and stable identifiers."""
+    return (
+        -integer_value(record["total_tokens"]),
+        str(record["model"]),
+        str(record["client"]),
+    )
+
+
+def parse_width(value: str) -> int | None:
+    """Parse a positive report width or the ``max`` no-truncation sentinel."""
+    if value.lower() == "max":
+        return None
+    try:
+        width = int(value)
+    except ValueError as error:
+        raise typer.BadParameter(
+            "--width must be a positive integer or 'max'", param_hint="--width"
+        ) from error
+    if width < 1:
+        raise typer.BadParameter(
+            "--width must be a positive integer or 'max'", param_hint="--width"
+        )
+    return width
+
+
+def sanitize_records(records: list[ReportRecord], sanitize: bool) -> list[ReportRecord]:
+    """Apply export-style pseudonymization to report records when requested."""
+    if not sanitize or not records:
+        return records
+    table = pa.Table.from_pylist(records)
+    return [dict(record) for record in sanitize_table(table).to_pylist()]
+
+
+def format_tokens(value: object) -> str:
+    """Format one token count with a one-decimal SI-style unit suffix."""
+    amount = numeric_value(value)
+    if amount is None:
+        return "—"
+    for divisor, suffix in ((1_000_000_000_000, "T"), (1_000_000, "M"), (1_000, "K")):
+        if abs(amount) >= divisor:
+            return f"{amount / divisor:.1f}{suffix}"
+    return f"{amount:.1f}"
+
+
+def format_cost(value: object, *, precision: int = 2) -> str:
+    """Format one optional USD amount without treating missing pricing as zero.
+
+    Args:
+        value: Nullable USD amount.
+        precision: Digits after the decimal point.
+
+    Returns:
+        Formatted USD amount or an em dash for incomplete pricing.
+    """
+    amount = numeric_value(value)
+    return "—" if amount is None else f"${amount:,.{precision}f}"
+
+
+def format_cost_per_million(
+    cost: object, total_tokens: object, *, precision: int = 3
+) -> str:
+    """Format an optional USD-per-million-total-tokens rate.
+
+    Args:
+        cost: Nullable USD amount.
+        total_tokens: Total token denominator.
+        precision: Digits after the decimal point.
+
+    Returns:
+        Formatted rate or an em dash for an undefined rate.
+    """
+    amount = numeric_value(cost)
+    total = integer_value(total_tokens)
+    if amount is None or total == 0:
+        return "—"
+    return f"${amount * 1_000_000 / total:,.{precision}f}"
+
+
+def format_ms_per_1k_tokens(
+    duration_ms: object, timed_tokens: object, *, precision: int = 0
+) -> str:
+    """Format milliseconds per thousand timed tokens from additive components."""
+    duration = numeric_value(duration_ms)
+    tokens = integer_value(timed_tokens)
+    if duration is None or tokens <= 0:
+        return "—"
+    return f"{duration * 1_000 / tokens:,.{precision}f}"
+
+
+def format_cache_multiplier(cache_read: object, input_tokens: object) -> str:
+    """Format cache-read divided by input as a Unicode multiplier."""
+    input_total = integer_value(input_tokens)
+    if input_total == 0:
+        return "—"
+    return f"{integer_value(cache_read) / input_total:,.2f}{_MULTIPLICATION_SIGN}"
+
+
+def format_timestamp(value: object, *, compact: bool = False) -> str:
+    """Format one optional session timestamp without seconds or timezone clutter.
+
+    Args:
+        value: Backend timestamp value, when present.
+        compact: Omit the year for bounded-width report tables.
+
+    Returns:
+        A readable local timestamp fragment or an em dash when absent.
+    """
+    if value is None:
+        return "—"
+    pattern = "%m-%d %H:%M" if compact else "%Y-%m-%d %H:%M"
+    return _as_datetime(value).strftime(pattern)
+
+
+def truncate_middle(value: object, width: int | None, maximum: int) -> str:
+    """Truncate one display value in the middle when bounded report width applies."""
+    text = sanitize_display(value)
+    if width is None or cell_len(text) <= maximum:
+        return text
+    if maximum < 3:
+        return "…"
+    prefix_budget = max((maximum - 1) // 2, cell_len(text[0]))
+    prefix_end = 0
+    while prefix_end < len(text) and cell_len(text[: prefix_end + 1]) <= prefix_budget:
+        prefix_end += 1
+    suffix_budget = maximum - cell_len(text[:prefix_end]) - 1
+    suffix_start = len(text)
+    while (
+        suffix_start > prefix_end
+        and cell_len(text[suffix_start - 1 :]) <= suffix_budget
+    ):
+        suffix_start -= 1
+    return f"{text[:prefix_end]}…{text[suffix_start:]}"
+
+
+def _sample_usage(
+    filters: ReportFilters, *, since: date | None = None, until: date | None = None
+) -> list[_SampleUsage]:
+    """Return filtered facts parsed from the packaged golden test fixtures."""
+    return [
+        fact
+        for fact in _golden_usage()
+        if _matches(fact, filters)
+        and (since is None or fact.day >= since)
+        and (until is None or fact.day <= until)
+    ]
+
+
+@cache
+def _golden_usage() -> tuple[_SampleUsage, ...]:
+    """Parse the sanitized golden fixtures into deterministic report test facts."""
+    fixture_root = _golden_fixture_root()
+    facts: list[_SampleUsage] = []
+    for daily_file in _golden_daily_files(fixture_root):
+        day = _fixture_day(daily_file.name)
+        report_file = fixture_root.joinpath(
+            daily_file.name.removesuffix(".daily.json") + ".report.json"
+        )
+        session_metadata = {
+            (row.client, row.session_id): (
+                row.workspace or "unknown",
+                row.created_at,
+                row.last_active or datetime(day.year, day.month, day.day, tzinfo=UTC),
+            )
+            for row in parse_report(_load_fixture_json(report_file))
+        }
+        for daily_row in parse_daily(_load_fixture_json(daily_file), day=day).entries:
+            stats = daily_row.stats
+            workspace, created_at, last_active = session_metadata.get(
+                (stats.client, stats.session_id),
+                ("unknown", None, datetime(day.year, day.month, day.day, tzinfo=UTC)),
+            )
+            facts.append(
+                _SampleUsage(
+                    source_id=SAMPLE_LOCAL_SOURCE_ID,
+                    day=day,
+                    client=stats.client,
+                    session_id=stats.session_id,
+                    workspace=workspace,
+                    model=stats.model,
+                    input_tokens=stats.input_tokens,
+                    output_tokens=stats.output_tokens,
+                    cache_read=stats.cache_read,
+                    cache_write=stats.cache_write,
+                    reasoning=stats.reasoning,
+                    total_tokens=(
+                        stats.input_tokens
+                        + stats.output_tokens
+                        + stats.cache_read
+                        + stats.cache_write
+                        + stats.reasoning
+                    ),
+                    cost_usd=stats.tokscale_cost_usd,
+                    perf_duration_ms=stats.perf_duration_ms,
+                    perf_timed_tokens=stats.perf_timed_tokens,
+                    created_at=created_at,
+                    last_active=last_active,
+                    tags=("golden",),
+                )
+            )
+    session_times: dict[tuple[str, str, str], tuple[datetime | None, datetime]] = {}
+    for fact in facts:
+        key = (fact.source_id, fact.client, fact.session_id)
+        previous = session_times.get(key)
+        if previous is None:
+            session_times[key] = (fact.created_at, fact.last_active)
+            continue
+        created_at = previous[0]
+        if fact.created_at is not None and (
+            created_at is None or fact.created_at < created_at
+        ):
+            created_at = fact.created_at
+        session_times[key] = (created_at, max(previous[1], fact.last_active))
+    normalized: list[_SampleUsage] = []
+    for fact in facts:
+        created_at, last_active = session_times[
+            (fact.source_id, fact.client, fact.session_id)
+        ]
+        normalized.append(replace(fact, created_at=created_at, last_active=last_active))
+    return tuple(normalized)
+
+
+def _golden_fixture_root() -> Path | Traversable:
+    """Return packaged fixtures, or source-tree fixtures during local development."""
+    packaged = files("usagebassoon.cli.reports").joinpath("_fixtures")
+    if packaged.is_dir():
+        return packaged
+    return Path(__file__).parents[4] / "tests" / "fixtures" / "tokscale-4.18.0"
+
+
+def _golden_daily_files(root: Path | Traversable) -> list[Path | Traversable]:
+    """Return golden daily fixture files in chronological filename order."""
+    candidates: list[Path | Traversable] = [
+        candidate
+        for candidate in root.iterdir()
+        if candidate.name.endswith(".daily.json")
+    ]
+    return sorted(candidates, key=_fixture_filename)
+
+
+def _fixture_filename(candidate: Path | Traversable) -> str:
+    """Return one fixture filename for chronological sorting."""
+    return candidate.name
+
+
+def _fixture_day(filename: str) -> date:
+    """Extract the collection day from one golden fixture filename."""
+    return date.fromisoformat(filename.removeprefix("golden-").split("-tokscale-")[0])
+
+
+def _load_fixture_json(path: Path | Traversable) -> JsonValue:
+    """Decode one packaged golden fixture as the project's recursive JSON type."""
+    return cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
+
+
+def _matches(fact: _SampleUsage, filters: ReportFilters) -> bool:
+    """Return whether one sample usage fact matches all active filters."""
+    return (
+        (filters.source is None or fact.source_id == filters.source)
+        and (filters.client is None or fact.client == filters.client)
+        and (filters.model is None or fact.model == filters.model)
+        and (filters.workspace is None or fact.workspace == filters.workspace)
+        and (filters.tag is None or filters.tag in fact.tags)
+    )
+
+
+def _daily_record(day: date, facts: Sequence[_SampleUsage]) -> ReportRecord:
+    """Aggregate sample facts into one daily report record."""
+    return _usage_record({"day": day}, facts)
+
+
+def _session_record(
+    source_id: str,
+    client: str,
+    session_id: str,
+    facts: Sequence[_SampleUsage],
+) -> ReportRecord:
+    """Aggregate sample facts into one session or session/model report record."""
+    creation_times = [fact.created_at for fact in facts if fact.created_at is not None]
+    last_active = max(fact.last_active for fact in facts)
+    last_usage_day = max(fact.day for fact in facts)
+    record = _usage_record(
+        {
+            "source_id": source_id,
+            "client": client,
+            "session_id": session_id,
+            "model": ", ".join(sorted({fact.model for fact in facts})),
+            "created_at": min(creation_times) if creation_times else None,
+            "last_active": last_active,
+            "last_usage_day": last_usage_day,
+            "activity_day": max(last_usage_day, last_active.date()),
+            "last_active_stale": last_usage_day > last_active.date(),
+        },
+        facts,
+    )
+    durations = [
+        fact.perf_duration_ms for fact in facts if fact.perf_duration_ms is not None
+    ]
+    record["perf_duration_ms"] = sum(durations) if durations else None
+    timed = _model_record("", client, facts)
+    record["perf_timed_duration_ms"] = timed["perf_duration_ms"]
+    record["perf_timed_tokens"] = timed["perf_timed_tokens"]
+    duration = numeric_value(timed["perf_duration_ms"])
+    tokens = integer_value(timed["perf_timed_tokens"])
+    record["ms_per_1k_tokens"] = (
+        1000 * duration / tokens if duration is not None and tokens > 0 else None
+    )
+    cost = numeric_value(record["cost_usd"])
+    total = integer_value(record["total_tokens"])
+    record["cost_per_million"] = (
+        1000000 * cost / total if cost is not None and total > 0 else None
+    )
+    return record
+
+
+def _model_record(
+    model: str, client: str, facts: Sequence[_SampleUsage]
+) -> ReportRecord:
+    """Aggregate sample usage and paired timing components for one model/client."""
+    record = _usage_record({"model": model, "client": client}, facts)
+    timed = [
+        fact
+        for fact in facts
+        if fact.perf_duration_ms is not None
+        and fact.perf_timed_tokens is not None
+        and fact.perf_timed_tokens > 0
+    ]
+    record["perf_duration_ms"] = (
+        sum(fact.perf_duration_ms or 0 for fact in timed) if timed else None
+    )
+    record["perf_timed_tokens"] = (
+        sum(fact.perf_timed_tokens or 0 for fact in timed) if timed else None
+    )
+    return record
+
+
+def _usage_record(base: ReportRecord, facts: Sequence[_SampleUsage]) -> ReportRecord:
+    """Add normalized usage totals to one sample aggregation record."""
+    return {
+        **base,
+        "input_tokens": sum(fact.input_tokens for fact in facts),
+        "raw_output_tokens": sum(fact.output_tokens for fact in facts),
+        "reasoning_tokens": sum(fact.reasoning for fact in facts),
+        "output_tokens": sum(fact.output_tokens + fact.reasoning for fact in facts),
+        "cache_read": sum(fact.cache_read for fact in facts),
+        "cache_write": sum(fact.cache_write for fact in facts),
+        "total_tokens": sum(fact.total_tokens for fact in facts),
+        "perf_duration_ms": (
+            sum(fact.perf_duration_ms or 0 for fact in facts)
+            if any(fact.perf_duration_ms is not None for fact in facts)
+            else None
+        ),
+        "measured_fact_count": sum(fact.perf_duration_ms is not None for fact in facts),
+        "total_fact_count": len(facts),
+        "cost_basis": "calculated",
+        "cost_usd": (
+            None
+            if any(fact.cost_usd is None for fact in facts)
+            else sum(fact.cost_usd or 0 for fact in facts)
+        ),
+    }
+
+
+def _daily_sort_key(record: ReportRecord) -> date:
+    """Return the descending sort value for one sample daily record."""
+    return _as_date(record["day"])
+
+
+def _session_sort_value(record: ReportRecord, sort: SessionSort) -> float:
+    """Return an unrounded sort metric, placing missing values last."""
+    value = record[sort.column]
+    if value is None:
+        return float("-inf")
+    if sort in {SessionSort.LAST_ACTIVE, SessionSort.CREATED_AT}:
+        return _as_datetime(value).timestamp()
+    number = numeric_value(value)
+    return number if number is not None else float("-inf")
+
+
+def integer_value(value: object) -> int:
+    """Coerce a known numeric report value to an integer."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float, str, Decimal)):
+        return int(value)
+    raise TypeError(f"expected numeric report value, got {type(value)!r}")
+
+
+def numeric_value(value: object) -> float | None:
+    """Coerce a nullable numeric report value to a float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float, str, Decimal)):
+        return float(value)
+    raise TypeError(f"expected numeric report value, got {type(value)!r}")
+
+
+def _as_date(value: object) -> date:
+    """Return a report date value or fail loudly on an invalid backend result."""
+    if isinstance(value, date):
+        return value
+    raise TypeError(f"expected date report value, got {type(value)!r}")
+
+
+def _as_datetime(value: object) -> datetime:
+    """Return a report timestamp value or fail loudly on an invalid backend result."""
+    if isinstance(value, datetime):
+        return value
+    raise TypeError(f"expected datetime report value, got {type(value)!r}")
+
+
+def _as_text(value: object) -> str:
+    """Return a report text value, using an empty string for absent values."""
+    return "" if value is None else str(value)
+
+
+def numeric_ratio(
+    numerator: object, denominator: object, scale: int = 1
+) -> float | None:
+    """Calculate an unrounded rate, preserving missing or undefined values."""
+    amount = numeric_value(numerator)
+    divisor = numeric_value(denominator)
+    if amount is None or divisor is None or divisor <= 0:
+        return None
+    return amount * scale / divisor

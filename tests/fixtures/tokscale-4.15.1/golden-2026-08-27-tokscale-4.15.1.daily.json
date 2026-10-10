@@ -1,0 +1,96 @@
+{
+  "groupBy": "client,session,model",
+  "entries": [
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_c9e0a9c094889461ef4d6503ec",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 961551,
+      "output": 5466,
+      "cacheRead": 3290638,
+      "cacheWrite": 0,
+      "reasoning": 17831,
+      "messageCount": 84,
+      "cost": 1.05532485,
+      "performance": {
+        "msPer1KTokens": 120.79492249536077,
+        "totalDurationMs": 516457,
+        "timedTokens": 4275486,
+        "sampleCount": 81,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_2f48d42430c6f313372ee21e40",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 179105,
+      "output": 9014,
+      "cacheRead": 617876,
+      "cacheWrite": 0,
+      "reasoning": 6762,
+      "messageCount": 31,
+      "cost": 0.23982945,
+      "performance": {
+        "msPer1KTokens": 312.2126293590827,
+        "totalDurationMs": 253753,
+        "timedTokens": 812757,
+        "sampleCount": 31,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_3abd4ad732990338619c167ba0",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 91772,
+      "output": 895,
+      "cacheRead": 142511,
+      "cacheWrite": 0,
+      "reasoning": 4114,
+      "messageCount": 15,
+      "cost": 0.09830107499999997,
+      "performance": {
+        "msPer1KTokens": 355.2103705932501,
+        "totalDurationMs": 84999,
+        "timedTokens": 239292,
+        "sampleCount": 15,
+        "tokenCoverage": 1.0
+      }
+    },
+    {
+      "client": "opencode",
+      "mergedClients": null,
+      "sessionId": "ses_cc789190145bfc52d12b908e75",
+      "model": "gemini-3.7-flash",
+      "provider": "google_vertex",
+      "input": 27290,
+      "output": 36,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "reasoning": 167,
+      "messageCount": 3,
+      "cost": 0.021228749999999998,
+      "performance": {
+        "msPer1KTokens": 275.41556032444623,
+        "totalDurationMs": 7572,
+        "timedTokens": 27493,
+        "sampleCount": 2,
+        "tokenCoverage": 1.0
+      }
+    }
+  ],
+  "totalInput": 1259718,
+  "totalOutput": 15411,
+  "totalCacheRead": 4051025,
+  "totalCacheWrite": 0,
+  "totalMessages": 133,
+  "totalCost": 1.414684125,
+  "processingTimeMs": 73
+}

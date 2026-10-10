@@ -1,0 +1,1131 @@
+# SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""config.py — Configuration parsing, validation, and persistence for UsageBassoon."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import stat
+import sys
+import tempfile
+import tomllib
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import timedelta
+from math import isfinite
+from pathlib import Path
+from typing import Literal, cast
+from uuid import UUID, uuid4
+
+from platformdirs import (
+    user_config_path,
+    user_data_path,
+    user_log_path,
+    user_state_path,
+)
+from yaspin.constants import SPINNER_ATTRS
+
+_LOG = logging.getLogger("usagebassoon")
+
+BackendName = Literal["duckdb", "motherduck", "bigquery"]
+CONFIG_PATH_ENV_VAR = "USAGEBASSOON_CONFIG"
+SUPPORTED_BACKENDS = frozenset({"duckdb", "motherduck", "bigquery"})
+_INTERVAL = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhd])\Z", re.I)
+_UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_BIGQUERY_LOCATION_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}\Z")
+_ROOT_CONFIG_KEYS = frozenset(
+    {
+        "source_id",
+        "backend",
+        "spinner",
+        "tokscale",
+        "collection",
+        "logging",
+        "snapshots",
+    }
+)
+_TOKSCALE_CONFIG_KEYS = frozenset(
+    {"bin", "env", "timeout", "max_stdout_bytes", "max_stderr_bytes"}
+)
+_BIGQUERY_CONFIG_KEYS = frozenset(
+    {
+        "project",
+        "dataset",
+        "location",
+        "credentials_file",
+        "maximum_bytes_billed",
+        "timeout",
+    }
+)
+_MOTHERDUCK_CONFIG_KEYS = frozenset({"database", "timeout"})
+_BACKEND_CONFIG_KEYS = frozenset({"provider", "duckdb", "motherduck", "bigquery"})
+_COLLECTION_CONFIG_KEYS = frozenset(
+    {"max_retries", "retry_initial_seconds", "schedule"}
+)
+_SCHEDULE_CONFIG_KEYS = frozenset({"interval"})
+_LOGGING_CONFIG_KEYS = frozenset({"directory", "max_files", "max_bytes", "disable"})
+_GCS_CONFIG_KEYS = frozenset(
+    {"uri", "project", "credentials_file", "enable", "disable_weekly"}
+)
+_SNAPSHOT_CONFIG_KEYS = frozenset({"path", "enable", "disable_weekly"})
+_SNAPSHOTS_CONFIG_KEYS = frozenset(
+    {"local", "gcs", "schedule", "max_snapshots", "timeout"}
+)
+DEFAULT_SCHEDULE_INTERVAL = "15m"
+DEFAULT_SNAPSHOT_INTERVAL = "12h"
+DEFAULT_TOKSCALE_TIMEOUT = "120s"
+TOKSCALE_CLEANUP_TIMEOUT_SECONDS = 2.0
+DEFAULT_BIGQUERY_TIMEOUT = "180s"
+DEFAULT_MOTHERDUCK_TIMEOUT = "120s"
+DEFAULT_SNAPSHOT_TIMEOUT = "10m"
+
+
+def _application_directory_name() -> str:
+    """Return the conventional app directory name for the current platform."""
+    return "UsageBassoon" if sys.platform in {"darwin", "win32"} else "usagebassoon"
+
+
+def default_config_path() -> Path:
+    """Return the platform-specific default TOML configuration path."""
+    return (
+        user_config_path(_application_directory_name(), appauthor=False) / "config.toml"
+    )
+
+
+def default_local_database_path() -> Path:
+    """Return the platform-specific default DuckDB file path."""
+    return (
+        user_data_path(_application_directory_name(), appauthor=False)
+        / "usagebassoon.duckdb"
+    )
+
+
+def default_log_directory() -> Path:
+    """Return the platform-specific directory for operational logs."""
+    app_name = _application_directory_name()
+    if sys.platform == "linux":
+        return user_state_path(app_name, appauthor=False) / "logs"
+    return user_log_path(app_name, appauthor=False)
+
+
+def default_snapshot_directory() -> Path:
+    """Return the platform-specific directory for local snapshots."""
+    return user_data_path(_application_directory_name(), appauthor=False) / "snapshots"
+
+
+def default_tokscale_directory() -> Path:
+    """Return persistent tokscale state outside configuration and project roots."""
+    return user_data_path(_application_directory_name(), appauthor=False) / "tokscale"
+
+
+class ConfigurationError(ValueError):
+    """Raised when the UsageBassoon configuration is absent or invalid."""
+
+
+def write_initial_config(path: Path) -> bool:
+    """Create a default local-DuckDB configuration without overwriting one.
+
+    Args:
+        path: Fully resolved target configuration path.
+
+    Returns:
+        True when a new configuration was created; otherwise False.
+
+    Raises:
+        OSError: If the configuration directory cannot be created or written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    from usagebassoon.buckets.local import _catalog_lock, sync_directory
+
+    with _catalog_lock(path.with_name(f".{path.name}.lock")):
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            payload = tomllib.loads(content)
+            if "source_id" in payload:
+                value = payload["source_id"]
+                if not isinstance(value, str) or _UUID_PATTERN.fullmatch(value) is None:
+                    raise ConfigurationError("source_id must be a UUID")
+                return False
+            separator = "\n\n" if content.lstrip(" \t").startswith("[") else "\n"
+            _atomic_replace(path, f'source_id = "{uuid4()}"{separator}' + content)
+            sync_directory(path.parent)
+            return False
+        content = (
+            f'source_id = "{uuid4()}"\nspinner = "pong"\n'
+            '\n[backend]\nprovider = "duckdb"\n'
+        )
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}."
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            sync_directory(path.parent)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                _LOG.warning(
+                    "could not remove temporary initial configuration file %s",
+                    temporary,
+                    exc_info=True,
+                )
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class BigQueryConfig:
+    """BigQuery connection settings.
+
+    Attributes:
+        project: GCP project identifier.
+        dataset: BigQuery dataset identifier.
+        location: BigQuery dataset and job location.
+        credentials_file: Optional service-account credential file path.
+        maximum_bytes_billed: Per-query billing cap for user-facing reads.
+        timeout_seconds: Complete operation budget, including result retrieval.
+    """
+
+    project: str
+    dataset: str
+    location: str = "US"
+    credentials_file: Path | None = None
+    maximum_bytes_billed: int = 1_073_741_824
+    timeout_seconds: float = 180.0
+
+
+@dataclass(frozen=True, slots=True)
+class GcsConfig:
+    """Google Cloud Storage snapshot settings.
+
+    Attributes:
+        enable: Whether to archive to Google Cloud Storage.
+        disable_weekly: Disable weekly recovery captures at this destination.
+        uri: GCS archive root used for snapshots.
+        project: GCP project identifier used by the Storage client.
+        credentials_file: Optional service-account credential file path.
+    """
+
+    uri: str
+    project: str
+    credentials_file: Path | None = None
+    enable: bool = False
+    disable_weekly: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MotherDuckConfig:
+    """MotherDuck connection settings.
+
+    Attributes:
+        database: MotherDuck database name without the ``md:`` prefix.
+        timeout_seconds: Complete backend operation budget, including commit.
+    """
+
+    database: str
+    timeout_seconds: float = 120.0
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleConfig:
+    """Configuration for the external or container collection scheduler.
+
+    Attributes:
+        interval: Positive duration between scheduled collection attempts.
+    """
+
+    interval: str = DEFAULT_SCHEDULE_INTERVAL
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionConfig:
+    """Retry settings for one scheduled collection cycle.
+
+    Attributes:
+        schedule: Independent collection cadence.
+        max_retries: Additional persistence attempts after the first failure.
+        retry_initial_seconds: Initial exponential-backoff delay.
+    """
+
+    schedule: ScheduleConfig = ScheduleConfig()
+    max_retries: int = 3
+    retry_initial_seconds: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    """Local operational log settings for scheduled collection failures.
+
+    Attributes:
+        disable: Suppress operational logs when true.
+        directory: Directory containing the active and rotated log files.
+        max_files: Number of retained log files including the active file.
+        max_bytes: Maximum size of the active file before rotation.
+    """
+
+    disable: bool = False
+    directory: Path = field(default_factory=default_log_directory)
+    max_files: int = 5
+    max_bytes: int = 5 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class LocalSnapshotConfig:
+    """Optional snapshot settings from the configuration file.
+
+    Attributes:
+        path: Local archive path, normalized from a filesystem path or file:// URI.
+        enable: Whether to archive to the local filesystem.
+        disable_weekly: Disable weekly recovery captures at this destination.
+    """
+
+    path: Path = field(default_factory=default_snapshot_directory)
+    enable: bool = False
+    disable_weekly: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotScheduleConfig:
+    """Independent snapshot cadence.
+
+    Attributes:
+        interval: Positive snapshot duration in minutes, hours, or days.
+    """
+
+    interval: str = DEFAULT_SNAPSHOT_INTERVAL
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotsConfig:
+    """Snapshot destinations and their shared scheduling policy.
+
+    Attributes:
+        timeout_seconds: Complete creation budget, including capture and verification.
+        max_snapshots: Shared retention ceiling for each enabled destination.
+        local: Local archive enablement and location.
+        gcs: Enabled Google Cloud Storage destination, when configured.
+        schedule: Independent archive cadence and weekly policy.
+    """
+
+    timeout_seconds: float = 600.0
+    max_snapshots: int = 3
+    local: LocalSnapshotConfig = field(default_factory=LocalSnapshotConfig)
+    gcs: GcsConfig | None = None
+    schedule: SnapshotScheduleConfig = SnapshotScheduleConfig()
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether at least one snapshot destination is enabled."""
+        return self.local.enable or (self.gcs is not None and self.gcs.enable)
+
+
+@dataclass(frozen=True, slots=True)
+class UsageBassoonConfig:
+    """Validated settings used by the library and CLI.
+
+    Attributes:
+        path: Configuration file from which these values were loaded.
+        source_id: Stable UUID namespace for one intentional collection source.
+        backend: Selected storage backend.
+        spinner: Yaspin animation name used for interactive CLI waits.
+        local_database: Local DuckDB file path, when DuckDB is selected.
+        motherduck: MotherDuck settings when that backend is selected.
+        bigquery: BigQuery settings when that backend is selected.
+        tokscale_bin: Optional tokscale executable override.
+        tokscale_env: Explicit parent environment variables passed to tokscale.
+        tokscale_timeout_seconds: Maximum duration for one tokscale command.
+        tokscale_max_stdout_bytes: Maximum captured tokscale standard output.
+        tokscale_max_stderr_bytes: Maximum captured tokscale standard error.
+        collection: Collection retry and scheduling settings.
+        logging: Local operational logging settings.
+        snapshots: Snapshot destinations and independent scheduling policy.
+    """
+
+    path: Path
+    source_id: str
+    backend: BackendName
+    spinner: str = "pong"
+    local_database: Path | None = None
+    motherduck: MotherDuckConfig | None = None
+    bigquery: BigQueryConfig | None = None
+    tokscale_bin: str | None = None
+    tokscale_env: tuple[str, ...] = ()
+    tokscale_timeout_seconds: float = 120.0
+    tokscale_max_stdout_bytes: int = 64 * 1024 * 1024
+    tokscale_max_stderr_bytes: int = 8 * 1024 * 1024
+    collection: CollectionConfig = CollectionConfig()
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    snapshots: SnapshotsConfig = field(default_factory=SnapshotsConfig)
+
+    @property
+    def backend_timeout_seconds(self) -> float | None:
+        """Resolve the active provider budget at the configuration boundary."""
+        if self.backend == "bigquery" and self.bigquery is not None:
+            return self.bigquery.timeout_seconds
+        if self.backend == "motherduck" and self.motherduck is not None:
+            return self.motherduck.timeout_seconds
+        return None
+
+
+def _reject_unknown_keys(
+    value: Mapping[str, object], name: str, allowed_keys: frozenset[str]
+) -> None:
+    """Reject keys that are not part of a supported configuration table."""
+    unknown = sorted(set(value) - allowed_keys)
+    if unknown:
+        scope = "the root configuration table" if name == "root" else f"[{name}]"
+        formatted = ", ".join(repr(key) for key in unknown)
+        raise ConfigurationError(f"unknown key(s) in {scope}: {formatted}")
+
+
+def _table(
+    value: object | None, name: str, allowed_keys: frozenset[str]
+) -> dict[str, object]:
+    """Return a TOML table or an empty mapping when it is absent."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigurationError(f"[{name}] must be a TOML table")
+    table = cast(dict[str, object], value)
+    _reject_unknown_keys(table, name, allowed_keys)
+    return table
+
+
+def _string(value: object | None, name: str, *, required: bool = False) -> str | None:
+    """Validate a nullable TOML string."""
+    if value is None:
+        if required:
+            raise ConfigurationError(f"{name} is required")
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{name} must be a non-empty string")
+    return value
+
+
+def _local_snapshot_config(value: object | None) -> LocalSnapshotConfig:
+    """Parse local snapshot enablement and location."""
+    table = _table(value, "snapshots.local", _SNAPSHOT_CONFIG_KEYS)
+    path = _string(table.get("path"), "snapshots.local.path")
+    if path is not None:
+        if path.startswith("file://"):
+            path = _string(path.removeprefix("file://"), "snapshots.local.path")
+        elif "://" in path:
+            raise ConfigurationError(
+                "snapshots.local.path must be a filesystem path or file:// URI"
+            )
+    return LocalSnapshotConfig(
+        path=Path(path).expanduser() if path else default_snapshot_directory(),
+        enable=_boolean(table.get("enable", False), "snapshots.local.enable"),
+        disable_weekly=_boolean(
+            table.get("disable_weekly", False), "snapshots.local.disable_weekly"
+        ),
+    )
+
+
+def _boolean(value: object, name: str) -> bool:
+    """Validate an explicit Boolean setting."""
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"{name} must be a Boolean")
+    return value
+
+
+def _snapshots_config(value: object | None) -> SnapshotsConfig:
+    """Parse archive destinations and enforce the single remote bucket policy."""
+    table = _table(value, "snapshots", _SNAPSHOTS_CONFIG_KEYS)
+    local = _local_snapshot_config(table.get("local"))
+    gcs = _gcs_config(table.get("gcs"))
+    remote_providers = {"gcs": gcs}
+    enabled = [
+        name
+        for name, settings in remote_providers.items()
+        if settings and settings.enable
+    ]
+    if len(enabled) > 1:
+        raise ConfigurationError(
+            "only one remote snapshot bucket provider may be enabled: "
+            + ", ".join(enabled)
+        )
+    schedule = _table(
+        table.get("schedule"),
+        "snapshots.schedule",
+        frozenset({"interval"}),
+    )
+    interval, _ = _duration(
+        schedule.get("interval", DEFAULT_SNAPSHOT_INTERVAL),
+        "snapshots.schedule.interval",
+        units="mhd",
+    )
+    assert interval is not None
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_SNAPSHOT_TIMEOUT), "snapshots.timeout", units="smh"
+    )
+    assert timeout is not None
+    return SnapshotsConfig(
+        timeout_seconds=timeout.total_seconds(),
+        max_snapshots=_positive_int(
+            table.get("max_snapshots", 3), "snapshots.max_snapshots"
+        ),
+        local=local,
+        gcs=gcs,
+        schedule=SnapshotScheduleConfig(interval=interval),
+    )
+
+
+def parse_interval(value: str | None, *, units: str = "smhd") -> timedelta | None:
+    """Parse a positive compact duration using the permitted unit letters.
+
+    Args:
+        value: Duration in compact ``<number><unit>`` form, or None.
+        units: Permitted unit letters from seconds, minutes, hours, and days.
+
+    Returns:
+        The parsed duration, or None when no value is provided.
+
+    Raises:
+        ValueError: If the duration is invalid or uses an unsupported unit.
+    """
+    if value is None:
+        return None
+    match = _INTERVAL.fullmatch(value)
+    if match is None or match["unit"].lower() not in units:
+        raise ValueError("invalid duration or unit")
+    amount = float(match["value"])
+    if not isfinite(amount) or amount <= 0:
+        raise ValueError("duration must be positive and finite")
+    try:
+        duration = timedelta(
+            seconds=amount
+            * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match["unit"].lower()]
+        )
+    except OverflowError as error:
+        raise ValueError("duration is too large") from error
+    if duration <= timedelta(0):
+        raise ValueError("duration must be positive")
+    return duration
+
+
+def _duration(
+    value: object | None, name: str, *, units: str
+) -> tuple[str | None, timedelta | None]:
+    """Validate one optional duration against its setting-specific units."""
+    text = _string(value, name)
+    if text is None:
+        return None, None
+    labels = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+    names = [labels[unit] for unit in units]
+    allowed = (
+        " or ".join(names)
+        if len(names) == 2
+        else ", ".join(names[:-1]) + f", or {names[-1]}"
+    )
+    message = f"{name} must be a positive duration using {allowed}"
+    try:
+        parsed = parse_interval(text, units=units)
+    except ValueError as error:
+        raise ConfigurationError(message) from error
+    if parsed is None:
+        raise ConfigurationError(message)
+    return text, parsed
+
+
+def _schedule_config(value: object | None) -> ScheduleConfig:
+    """Parse the configured scheduler interval."""
+    table = _table(value, "collection.schedule", _SCHEDULE_CONFIG_KEYS)
+    raw_interval = table.get("interval", DEFAULT_SCHEDULE_INTERVAL)
+    interval, parsed = _duration(
+        raw_interval, "collection.schedule.interval", units="mh"
+    )
+    if interval is None or parsed is None:
+        raise ConfigurationError("collection.schedule.interval must be positive")
+    return ScheduleConfig(interval=interval)
+
+
+def _positive_int(value: object, name: str) -> int:
+    """Return a strictly positive TOML integer.
+
+    Args:
+        value: Decoded TOML value.
+        name: Fully qualified configuration field name.
+
+    Raises:
+        ConfigurationError: If the value is not a positive integer.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigurationError(f"{name} must be a positive integer")
+    return value
+
+
+def _environment_names(value: object | None) -> tuple[str, ...]:
+    """Validate explicit tokscale environment variable names."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigurationError("tokscale.env must be a list of variable names")
+    names = tuple(value)
+    if len(set(names)) != len(names):
+        raise ConfigurationError("tokscale.env must not contain duplicate names")
+    if any(_ENVIRONMENT_VARIABLE_PATTERN.fullmatch(name) is None for name in names):
+        raise ConfigurationError("tokscale.env contains an invalid variable name")
+    return names
+
+
+def _tokscale_config(
+    value: object | None,
+) -> tuple[str | None, tuple[str, ...], float, int, int]:
+    """Parse restricted tokscale subprocess settings."""
+    table = _table(value, "tokscale", _TOKSCALE_CONFIG_KEYS)
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_TOKSCALE_TIMEOUT), "tokscale.timeout", units="sm"
+    )
+    assert timeout is not None
+    return (
+        _string(table.get("bin"), "tokscale.bin"),
+        _environment_names(table.get("env")),
+        timeout.total_seconds(),
+        _positive_int(
+            table.get("max_stdout_bytes", 64 * 1024 * 1024),
+            "tokscale.max_stdout_bytes",
+        ),
+        _positive_int(
+            table.get("max_stderr_bytes", 8 * 1024 * 1024),
+            "tokscale.max_stderr_bytes",
+        ),
+    )
+
+
+def _collection_config(value: object | None) -> CollectionConfig:
+    """Parse optional collection retry settings."""
+    table = _table(value, "collection", _COLLECTION_CONFIG_KEYS)
+    max_retries = table.get("max_retries", 3)
+    retry_initial_seconds = table.get("retry_initial_seconds", 1.0)
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
+        raise ConfigurationError(
+            "collection.max_retries must be a non-negative integer"
+        )
+    if (
+        not isinstance(retry_initial_seconds, (int, float))
+        or isinstance(retry_initial_seconds, bool)
+        or not isfinite(retry_initial_seconds)
+        or retry_initial_seconds <= 0
+    ):
+        raise ConfigurationError(
+            "collection.retry_initial_seconds must be a positive number"
+        )
+    return CollectionConfig(
+        schedule=_schedule_config(table.get("schedule")),
+        max_retries=max_retries,
+        retry_initial_seconds=float(retry_initial_seconds),
+    )
+
+
+def _logging_config(value: object | None) -> LoggingConfig:
+    """Parse optional local rotating-log settings."""
+    table = _table(value, "logging", _LOGGING_CONFIG_KEYS)
+    directory = _string(table.get("directory"), "logging.directory")
+    max_files = _positive_int(table.get("max_files", 5), "logging.max_files")
+    max_bytes = _positive_int(
+        table.get("max_bytes", 5 * 1024 * 1024), "logging.max_bytes"
+    )
+    return LoggingConfig(
+        disable=_boolean(table.get("disable", False), "logging.disable"),
+        directory=Path(directory).expanduser()
+        if directory
+        else default_log_directory(),
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+
+
+def _bigquery_config(value: object | None) -> BigQueryConfig | None:
+    """Parse optional BigQuery settings."""
+    if value is None:
+        return None
+    table = _table(value, "backend.bigquery", _BIGQUERY_CONFIG_KEYS)
+    project = _string(table.get("project"), "backend.bigquery.project", required=True)
+    dataset = _string(table.get("dataset"), "backend.bigquery.dataset", required=True)
+    location = _string(
+        table.get("location", "US"),
+        "backend.bigquery.location",
+        required=True,
+    )
+    credentials_file = _string(
+        table.get("credentials_file"),
+        "backend.bigquery.credentials_file",
+    )
+    if project is None or dataset is None or location is None:
+        raise ConfigurationError(
+            "backend.bigquery.project, backend.bigquery.dataset, and "
+            "backend.bigquery.location are required"
+        )
+    if _BIGQUERY_LOCATION_PATTERN.fullmatch(location) is None:
+        raise ConfigurationError(
+            "backend.bigquery.location must be a canonical location identifier"
+        )
+    maximum_bytes_billed = _positive_int(
+        table.get("maximum_bytes_billed", 1_073_741_824),
+        "backend.bigquery.maximum_bytes_billed",
+    )
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_BIGQUERY_TIMEOUT),
+        "backend.bigquery.timeout",
+        units="sm",
+    )
+    assert timeout is not None
+    return BigQueryConfig(
+        project=project,
+        dataset=dataset,
+        location=location,
+        credentials_file=Path(credentials_file).expanduser()
+        if credentials_file
+        else None,
+        maximum_bytes_billed=maximum_bytes_billed,
+        timeout_seconds=timeout.total_seconds(),
+    )
+
+
+def _motherduck_config(value: object | None) -> MotherDuckConfig | None:
+    """Parse optional MotherDuck connection settings."""
+    if value is None:
+        return None
+    table = _table(value, "backend.motherduck", _MOTHERDUCK_CONFIG_KEYS)
+    database = _string(
+        table.get("database"),
+        "backend.motherduck.database",
+        required=True,
+    )
+    if database is None:
+        raise ConfigurationError("backend.motherduck.database is required")
+    _, timeout = _duration(
+        table.get("timeout", DEFAULT_MOTHERDUCK_TIMEOUT),
+        "backend.motherduck.timeout",
+        units="sm",
+    )
+    assert timeout is not None
+    return MotherDuckConfig(database=database, timeout_seconds=timeout.total_seconds())
+
+
+def _local_database_config(
+    value: object | None,
+) -> Path:
+    """Resolve the optional local DuckDB path, using its default when omitted."""
+    local_database = _string(value, "backend.duckdb.database")
+    path = (
+        Path(local_database)
+        if local_database is not None
+        else default_local_database_path()
+    )
+    return path.expanduser()
+
+
+def _storage_config(
+    backend: BackendName,
+    payload: Mapping[str, object],
+) -> tuple[Path | None, MotherDuckConfig | None, BigQueryConfig | None]:
+    """Parse backend-specific target settings and enforce active-backend needs."""
+    if backend == "duckdb":
+        table = _table(payload.get("duckdb"), "backend.duckdb", frozenset({"database"}))
+        return _local_database_config(table.get("database")), None, None
+    if backend == "motherduck":
+        motherduck = _motherduck_config(payload.get("motherduck"))
+        if motherduck is None:
+            raise ConfigurationError(
+                "[backend.motherduck] is required for the MotherDuck backend"
+            )
+        return None, motherduck, None
+    bigquery = _bigquery_config(payload.get("bigquery"))
+    if bigquery is None:
+        raise ConfigurationError(
+            "[backend.bigquery] is required for the BigQuery backend"
+        )
+    return None, None, bigquery
+
+
+def validate_gcs_environment() -> None:
+    """Reject ambient endpoint overrides before GCS authentication or requests.
+
+    Raises:
+        ConfigurationError: If an emulator or custom storage endpoint is set.
+    """
+    for name in ("STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"):
+        if name in os.environ:
+            raise ConfigurationError(
+                f"{name} must be unset when using GCS snapshots; "
+                "emulator and custom endpoints are not supported"
+            )
+
+
+def _gcs_config(value: object | None) -> GcsConfig | None:
+    """Parse optional Google Cloud Storage snapshot settings."""
+    if value is None:
+        return None
+    table = _table(value, "snapshots.gcs", _GCS_CONFIG_KEYS)
+    enable = _boolean(table.get("enable", False), "snapshots.gcs.enable")
+    if enable:
+        validate_gcs_environment()
+    uri = _string(table.get("uri"), "snapshots.gcs.uri", required=enable)
+    project = _string(table.get("project"), "snapshots.gcs.project", required=enable)
+    credentials_file = _string(
+        table.get("credentials_file"), "snapshots.gcs.credentials_file"
+    )
+    if uri is not None:
+        from usagebassoon.buckets.gcs import parse_gcs_uri
+
+        try:
+            parse_gcs_uri(uri)
+        except ValueError as error:
+            raise ConfigurationError(str(error)) from error
+    return GcsConfig(
+        uri=uri or "",
+        project=project or "",
+        credentials_file=Path(credentials_file).expanduser()
+        if credentials_file
+        else None,
+        enable=enable,
+        disable_weekly=_boolean(
+            table.get("disable_weekly", False), "snapshots.gcs.disable_weekly"
+        ),
+    )
+
+
+def _parse_config(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    schedule_interval: str | None = None,
+    snapshot_schedule_interval: str | None = None,
+) -> UsageBassoonConfig:
+    """Validate decoded TOML and create the typed configuration object."""
+    _reject_unknown_keys(payload, "root", _ROOT_CONFIG_KEYS)
+    spinner = _string(payload.get("spinner", "pong"), "spinner", required=True)
+    if spinner is None or spinner not in SPINNER_ATTRS:
+        raise ConfigurationError(
+            f"spinner must be one of: {', '.join(sorted(SPINNER_ATTRS))}"
+        )
+    source_id = _string(payload.get("source_id"), "source_id", required=True)
+    backend_table = _table(payload.get("backend"), "backend", _BACKEND_CONFIG_KEYS)
+    backend_value = _string(
+        backend_table.get("provider", "duckdb"), "backend.provider", required=True
+    )
+    if backend_value not in SUPPORTED_BACKENDS:
+        raise ConfigurationError(
+            f"backend.provider must be one of: {', '.join(sorted(SUPPORTED_BACKENDS))}"
+        )
+    if source_id is None:
+        raise ConfigurationError("source_id is required")
+    if _UUID_PATTERN.fullmatch(source_id) is None:
+        raise ConfigurationError("source_id must be a canonical UUID")
+    try:
+        canonical_source_id = str(UUID(source_id))
+    except ValueError as error:
+        raise ConfigurationError("source_id must be a UUID") from error
+    backend = cast(BackendName, backend_value)
+    local_database, motherduck, bigquery = _storage_config(backend, backend_table)
+    (
+        tokscale_bin,
+        tokscale_env,
+        tokscale_timeout_seconds,
+        tokscale_max_stdout_bytes,
+        tokscale_max_stderr_bytes,
+    ) = _tokscale_config(payload.get("tokscale"))
+    collection_table = _table(
+        payload.get("collection"), "collection", _COLLECTION_CONFIG_KEYS
+    )
+    if schedule_interval is not None:
+        schedule_table = _table(
+            collection_table.get("schedule"),
+            "collection.schedule",
+            _SCHEDULE_CONFIG_KEYS,
+        )
+        collection_table = {
+            **collection_table,
+            "schedule": {**schedule_table, "interval": schedule_interval},
+        }
+    collection = _collection_config(collection_table)
+    interval_duration = parse_interval(collection.schedule.interval, units="mh")
+    assert interval_duration is not None
+    if (
+        interval_duration.total_seconds()
+        <= tokscale_timeout_seconds + TOKSCALE_CLEANUP_TIMEOUT_SECONDS
+    ):
+        raise ConfigurationError(
+            "collection.schedule.interval must be greater than tokscale.timeout "
+            f"plus {TOKSCALE_CLEANUP_TIMEOUT_SECONDS:g} seconds for cleanup"
+        )
+    snapshots_table = _table(
+        payload.get("snapshots"), "snapshots", _SNAPSHOTS_CONFIG_KEYS
+    )
+    if snapshot_schedule_interval is not None:
+        snapshot_schedule = _table(
+            snapshots_table.get("schedule"),
+            "snapshots.schedule",
+            frozenset({"interval"}),
+        )
+        snapshots_table = {
+            **snapshots_table,
+            "schedule": {**snapshot_schedule, "interval": snapshot_schedule_interval},
+        }
+    return UsageBassoonConfig(
+        path=path,
+        source_id=canonical_source_id,
+        backend=backend,
+        spinner=spinner,
+        local_database=local_database,
+        motherduck=motherduck,
+        bigquery=bigquery,
+        tokscale_bin=tokscale_bin,
+        tokscale_env=tokscale_env,
+        tokscale_timeout_seconds=tokscale_timeout_seconds,
+        tokscale_max_stdout_bytes=tokscale_max_stdout_bytes,
+        tokscale_max_stderr_bytes=tokscale_max_stderr_bytes,
+        collection=collection,
+        logging=_logging_config(payload.get("logging")),
+        snapshots=_snapshots_config(snapshots_table),
+    )
+
+
+def update_schedule_interval(
+    path: Path,
+    interval: str,
+    *,
+    domain: Literal["collection", "snapshots"] = "collection",
+) -> None:
+    """Persist one schedule interval in an existing TOML configuration.
+
+    Args:
+        path: Configuration file to update.
+        interval: Validated compact duration such as ``15m``.
+        domain: Scheduling namespace to update.
+
+    Raises:
+        OSError: If the configuration cannot be read or atomically replaced.
+        ValueError: If the interval contains unsafe TOML text.
+    """
+    name = f"{domain}.schedule"
+    units = "mh" if domain == "collection" else "mhd"
+    try:
+        parsed = parse_interval(interval, units=units)
+    except ValueError as error:
+        raise ValueError(
+            f"{name}.interval must be a positive duration using {units}"
+        ) from error
+    if parsed is None:
+        raise ValueError(f"{name}.interval must be positive")
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    schedule_start: int | None = None
+    schedule_end = len(lines)
+    interval_line: int | None = None
+    for index, line in enumerate(lines):
+        if re.fullmatch(rf"\s*\[{re.escape(name)}\]\s*(?:#.*)?(?:\r?\n)?", line):
+            schedule_start = index
+            continue
+        if schedule_start is not None and re.match(r"\s*\[.*\]", line):
+            schedule_end = index
+            break
+        if schedule_start is not None and re.match(r"\s*interval\s*=", line):
+            interval_line = index
+    replacement = f'interval = "{interval}"\n'
+    if interval_line is not None:
+        lines[interval_line] = replacement
+    elif schedule_start is not None:
+        lines.insert(schedule_end, replacement)
+    else:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend([f"[{name}]\n", replacement])
+    _atomic_replace(path, "".join(lines))
+
+
+def _atomic_replace(path: Path, content: str) -> None:
+    """Replace one file atomically while preserving its permission bits."""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            _LOG.warning(
+                "could not remove temporary configuration file %s",
+                temporary,
+                exc_info=True,
+            )
+        raise
+
+
+def _configuration_error_with_log(
+    path: Path,
+    error: ConfigurationError,
+    payload: object | None,
+) -> ConfigurationError:
+    """Log one configuration error and add the log location to its message."""
+    default_directory = default_log_directory()
+    log_config = LoggingConfig(directory=default_directory)
+    if isinstance(payload, Mapping):
+        try:
+            log_config = _logging_config(payload.get("logging"))
+        except ConfigurationError:
+            _LOG.exception(
+                "configuration logging settings are invalid; using the default log"
+            )
+
+    if log_config.disable:
+        from .logger import configure
+
+        configure(log_config)
+        return error
+
+    default_log_config = LoggingConfig(directory=default_directory)
+    candidates = [log_config]
+    if log_config != default_log_config:
+        candidates.append(default_log_config)
+
+    from usagebassoon.logger import log_configuration_error
+
+    last_error: Exception | None = None
+    attempted_path = default_directory / "usagebassoon.log"
+    for candidate in candidates:
+        attempted_path = candidate.directory.expanduser() / "usagebassoon.log"
+        try:
+            log_configuration_error(
+                f"configuration file {path} is invalid: {error}",
+                directory=candidate.directory,
+                max_files=candidate.max_files,
+                max_bytes=candidate.max_bytes,
+            )
+        except Exception as log_error:
+            last_error = log_error
+            _LOG.exception(
+                "could not write the configuration error log at %s", attempted_path
+            )
+            continue
+        return ConfigurationError(f"{error} (details logged to {attempted_path})")
+
+    return ConfigurationError(
+        f"{error} (could not write the configuration error log at "
+        f"{attempted_path}: {last_error})"
+    )
+
+
+class ConfigurationManager:
+    """Resolve and load one immutable UsageBassoon configuration.
+
+    Explicit ``--config`` paths take precedence over ``USAGEBASSOON_CONFIG``;
+    otherwise the manager uses the platform-specific user configuration path.
+    No source identity, backend choice, or storage target can be overridden
+    independently.
+    """
+
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        """Create a manager with optional explicit path and environment.
+
+        Args:
+            config_path: Explicit configuration file, normally from ``--config``.
+            environ: Environment mapping, injectable for tests.
+        """
+        self._config_path = config_path
+        self._environ = environ
+
+    @property
+    def path(self) -> Path:
+        """Return the resolved configuration path."""
+        if self._config_path is not None:
+            return self._config_path.expanduser()
+        environ: Mapping[str, str] = (
+            self._environ if self._environ is not None else os.environ
+        )
+        configured = environ.get(CONFIG_PATH_ENV_VAR)
+        if configured:
+            return Path(configured).expanduser()
+        return default_config_path()
+
+    def load(
+        self,
+        *,
+        schedule_interval: str | None = None,
+        snapshot_schedule_interval: str | None = None,
+    ) -> UsageBassoonConfig:
+        """Load and validate the resolved configuration file.
+
+        Args:
+            schedule_interval: Optional in-memory schedule override used by the
+                schedule command before persisting a requested interval.
+            snapshot_schedule_interval: Optional independent snapshot override.
+
+        Returns:
+            Typed, immutable configuration settings.
+
+        Raises:
+            ConfigurationError: If the file is unreadable, invalid TOML, or has
+                unsupported or invalid configuration values. Details are logged
+                to the operational log when it is writable.
+        """
+        path = self.path
+        decoded: object | None = None
+        try:
+            decoded = tomllib.loads(path.read_text())
+        except FileNotFoundError as error:
+            failure = ConfigurationError(f"configuration file not found: {path}")
+            raise _configuration_error_with_log(path, failure, decoded) from error
+        except OSError as error:
+            failure = ConfigurationError(
+                f"could not read configuration {path}: {error}"
+            )
+            raise _configuration_error_with_log(path, failure, decoded) from error
+        except UnicodeError as error:
+            failure = ConfigurationError(f"configuration is not valid UTF-8: {path}")
+            raise _configuration_error_with_log(path, failure, decoded) from error
+        except tomllib.TOMLDecodeError as error:
+            failure = ConfigurationError(
+                f"invalid TOML in configuration {path}: {error}"
+            )
+            raise _configuration_error_with_log(path, failure, decoded) from error
+        if not isinstance(decoded, dict):
+            failure = ConfigurationError("configuration root must be a TOML table")
+            raise _configuration_error_with_log(path, failure, decoded)
+        try:
+            configuration = _parse_config(
+                path,
+                cast(dict[str, object], decoded),
+                schedule_interval=schedule_interval,
+                snapshot_schedule_interval=snapshot_schedule_interval,
+            )
+        except ConfigurationError as error:
+            raise _configuration_error_with_log(path, error, decoded) from error
+        from .logger import configure
+
+        configure(configuration)
+        return configuration
