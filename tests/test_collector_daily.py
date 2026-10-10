@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -49,10 +50,26 @@ from usagebassoon.system_metadata import InvokeMethod
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.fixture(autouse=True)
+def _private_tokscale_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep collector state isolated from the user's persistent data directory."""
+    monkeypatch.setattr(
+        subprocess_collector,
+        "default_tokscale_directory",
+        lambda: tmp_path / "tokscale-data",
+    )
+
+
 class _FixedDatetime:
     """Provide one candidate day as the current UTC day for collection tests."""
 
     current: datetime = datetime(2026, 9, 10, tzinfo=UTC)
+    min: datetime = datetime.min
+
+    @staticmethod
+    def fromisoformat(value: str) -> datetime:
+        """Decode persisted checkpoint clocks using the real datetime parser."""
+        return datetime.fromisoformat(value)
 
     @classmethod
     def now(cls, tz: object | None = None) -> datetime:
@@ -213,8 +230,9 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
                 if fail
                 else nullcontext()
             ),
-            subprocess_collector.tokscale_profile(configuration) as environment,
+            subprocess_collector.tokscale_profile(configuration) as run_profile,
         ):
+            environment = run_profile.environment
             profile = Path(environment["TOKSCALE_CONFIG_DIR"])
             profile_paths.append(profile)
             assert not (profile / "wiki.db").exists()
@@ -243,6 +261,192 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     assert cache_paths[0] == cache_paths[1]
     assert (original / "wiki.db").read_text() == "stale wiki"
     assert (original / "cache" / "history").read_text() == "compacted turns"
+    assert cache_paths[0].is_relative_to(tmp_path / "tokscale-data")
+    assert not (tmp_path / "tokscale").exists()
+
+
+@pytest.mark.parametrize("architecture", ["upsert", "append"])
+def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    graph_raw: JsonObject,
+    daily_raws: dict[date, JsonObject],
+    report_raws: dict[date, JsonArray],
+    pricing_raws: dict[str, JsonObject],
+) -> None:
+    """Honor both file transitions despite daily coverage, inactivity, and lost ack."""
+    source = tmp_path / "user-profile"
+    source.mkdir()
+    monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(source))
+    day = max(daily_raws)
+    graph = deepcopy(graph_raw)
+    template = cast(JsonObject, cast(JsonArray, graph["contributions"])[0])
+    graph["contributions"] = [{**template, "date": day.isoformat()}]
+    daily = daily_raws[day]
+    models = sorted(
+        {
+            cast(str, row["model"])
+            for row in cast(JsonArray, daily["entries"])
+            if isinstance(row, dict)
+        }
+    )
+    changed = models[0]
+    active = True
+    fail_price = False
+    requests: list[str] = []
+    custom_file = source / "custom-pricing.json"
+    configuration = _config(tmp_path / "config.toml")
+    monkeypatch.setattr(
+        _FixedDatetime,
+        "current",
+        datetime.combine(day, datetime.min.time(), tzinfo=UTC),
+    )
+    monkeypatch.setattr(collector, "datetime", _FixedDatetime)
+    monkeypatch.setattr(subprocess_collector, "datetime", _FixedDatetime)
+    backend = (
+        DuckDBBackend(":memory:")
+        if architecture == "upsert"
+        else BigQueryReplayBackend()
+    )
+    if isinstance(backend, DuckDBBackend):
+        backend.apply_ddl()
+    else:
+        append = backend.append
+        lock = Lock()
+
+        def append_locked(table: str, rows: pa.Table) -> None:
+            """Keep the in-memory replay connection safe for concurrent appends."""
+            with lock:
+                append(table, rows)
+
+        monkeypatch.setattr(backend, "append", append_locked)
+
+    def command(
+        _configuration: UsageBassoonConfig,
+        _prefix: object,
+        *arguments: str,
+        **kwargs: object,
+    ) -> JsonValue:
+        """Resolve prices from the run's copied configuration, never live files."""
+        if arguments[0] == "graph":
+            return deepcopy(graph) if active else {**graph, "contributions": []}
+        if arguments[0] == "models":
+            return deepcopy(daily)
+        if arguments[0] == "report":
+            return [deepcopy(row) for rows in report_raws.values() for row in rows]
+        model = arguments[1]
+        requests.append(model)
+        if fail_price and model == changed:
+            raise RuntimeError("pricing unavailable")
+        environment = cast(dict[str, str], kwargs["environment"])
+        custom = (
+            Path(environment["TOKSCALE_CONFIG_DIR"]) / "custom-pricing.json"
+        ).exists() and model == changed
+        result = deepcopy(pricing_raws[model])
+        result["source"] = "Custom" if custom else "LiteLLM"
+        cast(JsonObject, result["resolution"])["kind"] = "custom" if custom else "exact"
+        cast(JsonObject, result["pricing"])["outputCostPerToken"] = (
+            0.01 if custom else 0.001
+        )
+        return result
+
+    monkeypatch.setattr(collector, "_json_command", command)
+    monkeypatch.setattr(subprocess_collector, "_json_command", command)
+
+    def open_backend(_config: UsageBassoonConfig) -> StorageBackend:
+        """Reuse the isolated backend for publication and recovery reads."""
+        return backend
+
+    def close_backend(*_args: object, **_kwargs: object) -> None:
+        """Keep the isolated backend alive through all collection attempts."""
+
+    monkeypatch.setattr(persistence, "open_backend", open_backend)
+    monkeypatch.setattr(persistence, "close_backend", close_backend)
+
+    def prices() -> dict[str, dict[str, object]]:
+        """Inspect the canonical price winner for this UTC observation day."""
+        return {
+            cast(str, row["model"]): row
+            for row in backend.query("SELECT * FROM current_price_versions").to_pylist()
+        }
+
+    try:
+        collector.collect(configuration)
+        initial = prices()
+        facts = backend.query(
+            "SELECT * EXCLUDE (event_id, collected_at) FROM current_daily_stats "
+            "ORDER BY day, model, session_id"
+        ).to_pylist()
+        custom_file.write_text(
+            json.dumps({"models": {changed: {"output_cost_per_million_tokens": 10000}}})
+        )
+        _FixedDatetime.current += timedelta(seconds=10)
+        fail_price = True
+        _, summary = collector.collect(configuration)
+        assert summary.incomplete_targets
+        state_path = next((tmp_path / "tokscale-data").iterdir()) / "state.json"
+        checkpoint = cast(
+            dict[str, object],
+            next(iter(json.loads(state_path.read_text())["targets"].values())),
+        )
+        assert checkpoint["custom_pricing_present"] is False
+        assert changed in cast(list[str], checkpoint["pending_models"])
+        fail_price = False
+        _FixedDatetime.current += timedelta(seconds=10)
+        collector.collect(configuration)
+        assert prices()[changed]["source"] == "Custom"
+        assert prices()[changed]["price_output_per_token"] == 0.01
+        for model in models[1:]:
+            assert prices()[model]["event_id"] == initial[model]["event_id"]
+        state_path.unlink()
+        custom_file.unlink()
+        active = False
+        _FixedDatetime.current += timedelta(seconds=10)
+        persist = collector.persist_with_retries
+
+        def lose_ack(*args: object, **kwargs: object) -> PersistSummary:
+            """Simulate accepted publication whose acknowledgement was lost."""
+            persist(
+                configuration,
+                cast(NormalizedBundle, args[1]),
+                cast(logging.Logger, args[2]),
+                prior_daily=cast(pa.Table, kwargs["prior_daily"]),
+            )
+            raise RuntimeError("publication acknowledgement lost")
+
+        monkeypatch.setattr(collector, "persist_with_retries", lose_ack)
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            collector.collect(configuration)
+        assert prices()[changed]["source"] == "LiteLLM"
+        assert prices()[changed]["price_output_per_token"] == 0.001
+        checkpoint = cast(
+            dict[str, object],
+            next(iter(json.loads(state_path.read_text())["targets"].values())),
+        )
+        assert checkpoint["custom_pricing_present"] is None
+        assert changed in cast(list[str], checkpoint["pending_models"])
+        requests.clear()
+        monkeypatch.setattr(collector, "persist_with_retries", persist)
+        _FixedDatetime.current += timedelta(seconds=10)
+        _, summary = collector.collect(configuration)
+        assert not summary.incomplete_targets
+        assert requests == [changed]
+        checkpoint = cast(
+            dict[str, object],
+            next(iter(json.loads(state_path.read_text())["targets"].values())),
+        )
+        assert checkpoint["custom_pricing_present"] is False
+        assert checkpoint["pending_models"] == []
+        assert (
+            backend.query(
+                "SELECT * EXCLUDE (event_id, collected_at) FROM current_daily_stats "
+                "ORDER BY day, model, session_id"
+            ).to_pylist()
+            == facts
+        )
+    finally:
+        backend.close()
 
 
 def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:

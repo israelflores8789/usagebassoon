@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -26,7 +26,13 @@ from typing import cast
 
 from platformdirs import user_config_path
 
-from usagebassoon.config import TOKSCALE_CLEANUP_TIMEOUT_SECONDS, UsageBassoonConfig
+from usagebassoon.buckets.local import _catalog_lock
+from usagebassoon.config import (
+    TOKSCALE_CLEANUP_TIMEOUT_SECONDS,
+    UsageBassoonConfig,
+    default_tokscale_directory,
+)
+from usagebassoon.deadlines import limited
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
@@ -51,6 +57,7 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
         "USERPROFILE",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
     }
 )
 _LOG = logging.getLogger(LOGGER_NAME)
@@ -68,6 +75,168 @@ class RawCollection:
     daily_models: Mapping[date, JsonObject]
     report_by_day: Mapping[date, JsonArray]
     pricing_by_day: Mapping[date, Mapping[str, JsonObject]]
+
+
+@dataclass
+class _CustomPricingState:
+    """Local publication checkpoint; backend prices remain authoritative."""
+
+    present: bool | None = None
+    models: set[str] = field(default_factory=set)
+    pending: set[str] = field(default_factory=set)
+    observed_at: datetime = field(
+        default_factory=lambda: datetime.min.replace(tzinfo=UTC)
+    )
+
+
+def _pricing_catalog(path: Path) -> JsonObject:
+    """Read an advisory local catalog, recovering missing or invalid state."""
+    try:
+        value: object = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or type(value.get("version")) is not int
+            or value["version"] != 1
+            or not isinstance(value.get("targets"), dict)
+        ):
+            raise ValueError("invalid local pricing catalog")
+        return cast(JsonObject, value)
+    except FileNotFoundError:
+        return {"version": 1, "targets": {}}
+    except (OSError, ValueError):
+        _LOG.warning(
+            "local pricing state is unavailable; prices will be reconciled",
+            exc_info=True,
+        )
+        return {"version": 1, "targets": {}}
+
+
+def _read_pricing_state(path: Path, target: str) -> _CustomPricingState:
+    """Decode the selected destination's custom-pricing presence and retry set."""
+    targets = cast(JsonObject, _pricing_catalog(path)["targets"])
+    if target not in targets:
+        return _CustomPricingState()
+    try:
+        value = targets[target]
+        if not isinstance(value, dict):
+            raise ValueError("invalid local pricing checkpoint")
+        present = value.get("custom_pricing_present")
+        if present is not None and not isinstance(present, bool):
+            raise ValueError("invalid custom-pricing presence")
+        models, pending = value.get("custom_models"), value.get("pending_models")
+        if not isinstance(models, list) or not isinstance(pending, list):
+            raise ValueError("invalid pricing model sets")
+        if not all(isinstance(model, str) for model in [*models, *pending]):
+            raise ValueError("invalid pricing model identities")
+        stamp = value.get("observed_at")
+        if not isinstance(stamp, str):
+            raise ValueError("invalid pricing checkpoint timestamp")
+        observed_at = datetime.fromisoformat(stamp)
+        if observed_at.tzinfo is None:
+            raise ValueError("pricing checkpoint timestamp must be timezone aware")
+        return _CustomPricingState(
+            present,
+            set(cast(list[str], models)),
+            set(cast(list[str], pending)),
+            observed_at,
+        )
+    except ValueError:
+        _LOG.warning(
+            "local pricing checkpoint is invalid; prices will be reconciled",
+            exc_info=True,
+        )
+        return _CustomPricingState()
+
+
+def _write_pricing_state(path: Path, target: str, state: _CustomPricingState) -> None:
+    """Atomically checkpoint control state without exposing it to tokscale."""
+    with (
+        limited(TOKSCALE_CLEANUP_TIMEOUT_SECONDS),
+        _catalog_lock(path.with_name(".pricing-state.lock")),
+    ):
+        if _read_pricing_state(path, target).observed_at > state.observed_at:
+            return
+        catalog = _pricing_catalog(path)
+        targets = cast(JsonObject, catalog["targets"])
+        models: JsonArray = [model for model in sorted(state.models)]
+        pending: JsonArray = [model for model in sorted(state.pending)]
+        targets[target] = {
+            "custom_pricing_present": state.present,
+            "custom_models": models,
+            "pending_models": pending,
+            "observed_at": state.observed_at.isoformat(),
+        }
+        descriptor, name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(catalog, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                _LOG.warning(
+                    "could not clean up local pricing state staging", exc_info=True
+                )
+
+
+@dataclass
+class TokscaleProfile:
+    """Per-run configuration snapshot with durable, destination-scoped control."""
+
+    environment: dict[str, str]
+    state_path: Path
+    target: str
+    custom_present: bool
+    state: _CustomPricingState
+    refresh_models: set[str] = field(default_factory=set)
+    ignored_models: set[str] = field(default_factory=set)
+
+    def prepare_prices(self, known: set[str], recovered: set[str]) -> set[str]:
+        """Record transition intent before any affected price can be published."""
+        self.state.models.update(recovered)
+        refresh = set(self.state.pending)
+        if self.state.present != self.custom_present:
+            refresh.update(known if self.custom_present else self.state.models)
+        self.refresh_models = refresh
+        self.state.pending.update(refresh)
+        _write_pricing_state(self.state_path, self.target, self.state)
+        return refresh
+
+    def filter_prices(
+        self,
+        prices: dict[date, dict[str, JsonObject]],
+        existing: Mapping[date, set[str]],
+        needed: set[str],
+    ) -> None:
+        """Leave unaffected already-observed automatic prices unchanged."""
+        for day, observations in prices.items():
+            for model, price in list(observations.items()):
+                if (
+                    self.custom_present
+                    and model in self.refresh_models
+                    and model not in self.state.models
+                    and model not in needed
+                    and model in existing.get(day, set())
+                    and price.get("source") != "Custom"
+                ):
+                    del observations[model]
+                    self.ignored_models.add(model)
+        self.state.pending.difference_update(self.ignored_models)
+        _write_pricing_state(self.state_path, self.target, self.state)
+
+    def acknowledge_prices(self, published: set[str], custom: set[str]) -> None:
+        """Advance presence only after affected observations have been accepted."""
+        self.state.pending.difference_update(published)
+        self.state.models.update(custom)
+        if not self.state.pending:
+            self.state.present = self.custom_present
+            if not self.custom_present:
+                self.state.models.clear()
+        _write_pricing_state(self.state_path, self.target, self.state)
 
 
 def resolve_tokscale_command(config: UsageBassoonConfig) -> tuple[str, ...]:
@@ -215,9 +384,10 @@ def _persistent_tokscale_cache(
     identity = "\0".join(
         (config.source_id, str(source.resolve()), environment.get("HOME", ""))
     )
-    root = config.path.absolute().parent / "tokscale"
+    root = default_tokscale_directory()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory = root / sha256(identity.encode()).hexdigest()
+    key = sha256(identity.encode()).hexdigest()
+    directory = root / key
     directory.mkdir(mode=0o700, exist_ok=True)
     cache = directory / "cache"
     if cache.is_dir():
@@ -225,8 +395,9 @@ def _persistent_tokscale_cache(
     # Publish a complete seed; concurrent collectors may adopt the first seed.
     with _tokscale_temporary_directory(prefix=".seed-", directory=directory) as staging:
         seed = staging / "cache"
-        if (source / "cache").is_dir():
-            shutil.copytree(source / "cache", seed)
+        origin = source / "cache"
+        if origin.is_dir():
+            shutil.copytree(origin, seed)
         else:
             seed.mkdir(mode=0o700)
         try:
@@ -267,14 +438,17 @@ def _link_tokscale_cache(profile: Path, cache: Path) -> None:
 @contextmanager
 def tokscale_profile(
     config: UsageBassoonConfig,
-) -> Generator[dict[str, str], None, None]:
+    *,
+    observed_at: datetime | None = None,
+) -> Generator[TokscaleProfile, None, None]:
     """Copy configuration into a fresh wiki profile with persistent caches.
 
     Args:
         config: Source identity and configuration location for persistent state.
+        observed_at: Collection start clock for ordering concurrent checkpoints.
 
     Yields:
-        Restricted child environment shared by this run's acquisition commands.
+        Restricted child environment and local custom-pricing control state.
 
     Raises:
         OSError: If configuration, persistent state, or profile cleanup fails.
@@ -290,7 +464,26 @@ def tokscale_profile(
         cache = _persistent_tokscale_cache(config, source, environment)
         _link_tokscale_cache(profile, cache)
         environment["TOKSCALE_CONFIG_DIR"] = str(profile)
-        yield environment
+        target = sha256(
+            repr(
+                (
+                    config.backend,
+                    config.local_database,
+                    config.motherduck,
+                    config.bigquery,
+                )
+            ).encode()
+        ).hexdigest()
+        state_path = cache.parent / "state.json"
+        state = _read_pricing_state(state_path, target)
+        state.observed_at = observed_at or datetime.now(UTC)
+        yield TokscaleProfile(
+            environment,
+            state_path,
+            target,
+            (profile / "custom-pricing.json").is_file(),
+            state,
+        )
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:

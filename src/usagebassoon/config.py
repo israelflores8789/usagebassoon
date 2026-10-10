@@ -120,6 +120,11 @@ def default_snapshot_directory() -> Path:
     return user_data_path(_application_directory_name(), appauthor=False) / "snapshots"
 
 
+def default_tokscale_directory() -> Path:
+    """Return persistent tokscale state outside configuration and project roots."""
+    return user_data_path(_application_directory_name(), appauthor=False) / "tokscale"
+
+
 class ConfigurationError(ValueError):
     """Raised when the UsageBassoon configuration is absent or invalid."""
 

@@ -34,6 +34,7 @@ from usagebassoon.logger import configure as configure_logging
 from usagebassoon.normalizer import failed_collection, normalize
 from usagebassoon.persistence import (
     PersistSummary,
+    load_custom_pricing_models,
     load_ingest_status,
     persist_with_retries,
 )
@@ -65,7 +66,8 @@ def _collect_locked(
         prior_daily,
     ) = load_ingest_status(config)
     try:
-        with tokscale_profile(config) as environment:
+        with tokscale_profile(config, observed_at=started_at) as profile:
+            environment = profile.environment
             prefix = _prefix(config)
             graph_raw = _object(
                 _json_command(
@@ -155,17 +157,36 @@ def _collect_locked(
             } - known_prices
             observation_day = datetime.now(UTC).date()
             needed_models = active_models | unpriced_models
+            recovered_custom = (
+                load_custom_pricing_models(config)
+                if persisted_prices
+                and (profile.state.present is None or profile.state.pending)
+                else set()
+            )
+            refresh_prices = profile.prepare_prices(
+                known_prices | needed_models, recovered_custom
+            )
             pricing_requests = {
-                observation_day: needed_models
-                - persisted_prices.get(observation_day, set())
+                observation_day: (
+                    needed_models - persisted_prices.get(observation_day, set())
+                )
+                | refresh_prices
             }
             pricing_by_day, pricing_failures = _fetch_pricing(
                 config,
                 prefix,
                 pricing_requests,
                 logger,
-                existing=persisted_prices,
+                existing={
+                    day: models - refresh_prices
+                    for day, models in persisted_prices.items()
+                },
                 environment=environment,
+            )
+            profile.filter_prices(
+                pricing_by_day,
+                persisted_prices,
+                needed_models - persisted_prices.get(observation_day, set()),
             )
             active_sessions = {
                 (row.stats.client, row.stats.session_id)
@@ -287,6 +308,21 @@ def _collect_locked(
     summary = persist_with_retries(
         config, normalize(bundle), logger, prior_daily=prior_daily
     )
+    try:
+        profile.acknowledge_prices(
+            {model for prices in bundle.pricing_by_day.values() for model in prices},
+            {
+                model
+                for prices in bundle.pricing_by_day.values()
+                for model, price in prices.items()
+                if price.source == "Custom"
+            },
+        )
+    except (OSError, RuntimeError):
+        logger.exception(
+            "custom pricing checkpoint failed after publication; "
+            "transition remains pending"
+        )
     incomplete = tuple(
         status
         for status in bundle.ingest_status

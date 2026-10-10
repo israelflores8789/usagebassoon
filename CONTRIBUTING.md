@@ -211,6 +211,16 @@ The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.m
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
 - **Protect Privacy by Default.** UsageBassoon attempts to protect sensitive user data by offering means to obfuscate. UsageBassoon also automatically obfuscates commands likely to be shared publicly (e.g. `bassoon doctor` and `bassoon export`). *Never* place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
 
+## Tokscale collection architecture
+
+UsageBassoon invokes `tokscale` as a subprocess and gathers token usage as JSON payload over stdout. During implementation, we discovered an issue where Tokscale is prone to stale data for sessions it's already seen. Thus, UsageBasson creates a sort of "sandbox" at UsageBassoon's XDG data directory, preserving the user's configuration and cache, while forcing Tokscale to regenerate its wiki each collection run. Just the wiki needs to be regenerated, not the cache. Testing found the latency to be tolerable while guaranteeing up-to-date session metadata reporting in Tokscale payloads.
+
+- **Disposable Wiki.** Each collection run shares one private temporary `TOKSCALE_CONFIG_DIR` across its subprocesses. The wiki starts empty so session metadata is regenerated, and the temporary profile is cleaned after success or failure.
+- **Copied Configuration.** Resolve the user's effective Tokscale directory and copy `settings.json` and `custom-pricing.json`, when present, into the temporary profile on every run. Preserve scanner roots, timezone, aliases, and custom pricing without modifying the user's profile.
+- **Persistent History.** Retain native message and pricing caches in UsageBassoon's platform data directory, scoped by source and Tokscale profile. Seed once from the user's native Tokscale cache, or start empty. Message caches can retain Claude turns whose original transcripts have been compacted away, so UsageBassoon preserves the cache.
+- **Local State.** UsageBassoon persists a `state.json` beside the persistent `cache/` sandbox. It tracks custom-pricing file presence, affected models, and pending updates per storage destination. It's operational state, not part of the persisted data model.
+- **Custom Pricing.** Ordinary pricing is observed once per model per UTC day, but UsageBassoon attempts to honor the user's custom pricing tokscale configuration. Appearance or removal of `custom-pricing.json` triggers an updated observation for affected models that day, including removal without new usage.
+
 ## Persistence architectures
 
 UsageBassoon categorizes data warehouses into two broad architectures and chooses a persistence architecture largely driven by how cheaply a warehouse handles mutation. Both architectures share the same Arrow model, underlying data model (natural keys, ordering rules, and canonical views), and canonical data flow. The difference lies in *how* data is persisted at collection-time, not in the data model or internal shuttling.

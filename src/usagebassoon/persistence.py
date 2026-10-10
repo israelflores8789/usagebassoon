@@ -207,6 +207,26 @@ def load_ingest_status(
         close_backend(backend, context="loading ingest status", logger=_LOG)
 
 
+def load_custom_pricing_models(config: UsageBassoonConfig) -> set[str]:
+    """Recover affected model identities when local pricing control is absent."""
+    backend = open_backend(config)
+    try:
+        rows = backend.query(
+            "SELECT DISTINCT model FROM current_price_versions "
+            f"WHERE source_id = {_source_literal(config.source_id)} "
+            "AND source = 'Custom'"
+        ).to_pylist()
+        models: set[str] = set()
+        for row in rows:
+            model = row["model"]
+            if not isinstance(model, str):
+                raise RuntimeError("stored custom pricing contains an invalid model")
+            models.add(model)
+        return models
+    finally:
+        close_backend(backend, context="reconciling custom pricing", logger=_LOG)
+
+
 def persist_run(backend: StorageBackend, bundle: NormalizedBundle) -> PersistSummary:
     """Publish one run using the backend's native persistence strategy."""
     permitted = frozenset(CURRENT_STATE_TABLES) | APPEND_ONLY_TABLES
