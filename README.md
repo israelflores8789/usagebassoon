@@ -576,6 +576,13 @@ UsageBassoon currently supports [MotherDuck](https://motherduck.com/docs/getting
 5. Grant the permissions below, configure `[backend.bigquery]`, and run `bassoon init`.
 6. You can run `bassoon collect` and `bassoon doctor` to check access and compaction backlog.
 
+```toml
+[backend.bigquery]
+project = "my-project-id"
+dataset = "my-dataset"
+location = "US"
+```
+
 > [!NOTE]
 > BigQuery uses an "append-and-compact" data model to reduce latency and take advantage of platform features. This means usage data is appended at collect-time and deduplicated in a compaction job nightly. Make sure you verify that the Scheduled Query is enabled! See [How Persistence Works](#how-persistence-works).
 
@@ -623,6 +630,13 @@ Google Cloud Storage (GCS) is an optional snapshot destination, independent of t
 3. Use a dedicated service account and configure `[snapshots.gcs]` in your `config.toml`. You can use Application Default Credentials or set `credentials_file` explicitly in `config.toml`.
 4. Grant the bucket permissions below to the service account used for snapshots. *Keep snapshots private*; they contain raw restoration data.
 5. Run `bassoon snapshot` to publish an archive and `bassoon doctor` to inspect bucket lifecycle rules.
+
+```toml
+[snapshots.gcs]
+enabled = true
+uri = "gs://my-private-bucket/usagebassoon"
+project = "my-gcp-project"
+```
 
 > [!NOTE]
 > UsageBassoon implements archive rotation. Use `STANDARD` storage class to avoid retrieval and early-deletion costs from colder classes. See [storage classes](https://docs.cloud.google.com/storage/docs/storage-classes).

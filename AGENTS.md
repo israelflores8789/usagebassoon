@@ -201,6 +201,10 @@ The following actions are **prohibited** and are reserved exclusively for the us
 - ALWAYS read raw and gold at the transaction cutoff with `FOR SYSTEM_TIME AS OF` in `compaction.sql`.
 - ALWAYS import `google-cloud-bigquery-datatransfer` lazily and only in explicit provisioning, recovery preparation, maintenance inspection, or registered physical schema upgrades. Ordinary collection and curation must never import it.
 
+### Known Issues
+
+- Tokscale is known to skip updating its wiki for sessions that it has already seen. The fix is to point `TOKSCALE_CONFIG_DIR` to a temporary directory, copying over tokscale's cache and configurations, to force tokscale to regenerate its wiki fresh. ANY tokscale call you make, for testing or otherwise, MUST implement this fix. Not doing so can return stale results.
+
 ## Design Brief
 
 The main **goal** is to *never* lose token-usage history. Users in ephemeral environments (containers, rotating VMs) should be able to persist agent usage with a single injected credential or ambient authentication where supported, without local credential files (for example, `MOTHERDUCK_TOKEN`). Design goals include:
@@ -237,6 +241,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Daily tokscale pricing:** `price_versions.day` records the UTC observation date, never a backfilled usage date. Fetch each needed model at most once per observation day after a successful persisted observation. `daily_cost` selects usable source/model rates from the usage date, the latest earlier observation, or the earliest later observation for historical estimates, then falls back to that fact's tokscale-reported cost. Expose `price_day` and `cost_basis`; never switch an entire aggregate to reported costs because one fact lacks rates. Historical price backfilling is outside v1.
 
 - **Collection acquisition and recovery:** Acquire days sequentially and publish one normalized batch. A failed or invalid models day does not discard successful days; persist failed/partial targets and include unfinished models targets in later planning even when absent from the graph. Manual collection and refresh warn when publication contains incomplete acquisition. Cold report discovery is source-scoped and recorded in the ledger; fetch all report history once, then discover missing sessions or explicitly refresh known creation days without rescanning every usage day.
+
 - **Tokscale profile lifecycle:** Copy settings and custom pricing into a fresh per-run wiki profile; retain source/profile-scoped message and pricing caches, seed existing cached history once, and refresh active sessions by creation date with one report request. Never discard cached compacted turns or modify the user's tokscale profile.
 
 - **Session activity evidence:** Preserve tokscale's `last_active`. Derive `last_usage_day` from canonical daily facts, never from `collected_at` or `last_seen_at`. A later usage day makes the reported timestamp stale; display date precision, sort by effective activity day, and use the original `last_active DESC` plus session identity to break ties. Trust same-day or later reported timestamps without claiming they are always fresh.
