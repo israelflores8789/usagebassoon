@@ -14,7 +14,7 @@
     "total_input_tokens": 133572,
     "total_output_tokens": 7316,
     "total_cache_read": 3840512,
-    "total_cost": 0.033299159999999994,
+    "total_cost": 0.06659831999999999,
     "models_used": [
       "gpt-6-luna"
     ],
@@ -38,7 +38,7 @@
     "total_input_tokens": 321962,
     "total_output_tokens": 9605,
     "total_cache_read": 2945536,
-    "total_cost": 0.04601553,
+    "total_cost": 0.09203106,
     "models_used": [
       "gpt-6-luna"
     ],
@@ -62,7 +62,7 @@
     "total_input_tokens": 637250,
     "total_output_tokens": 51748,
     "total_cache_read": 38011904,
-    "total_cost": 5.047350399999999,
+    "total_cost": 14.433677599999998,
     "models_used": [
       "gpt-6-sol"
     ],

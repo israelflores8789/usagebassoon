@@ -89,8 +89,8 @@
     "total_cache_read": 12500480,
     "total_cost": 3.540899480000001,
     "models_used": [
-      "gpt-5.6-luna",
-      "gpt-5.6-terra"
+      "gpt-5.6-terra",
+      "gpt-5.6-luna"
     ],
     "message_count": 108,
     "duration_minutes": 74789,
@@ -224,21 +224,22 @@
     "workspace": "/project-gamma",
     "workspace_label": "project-gamma",
     "created_at": 1789782924290,
-    "last_active": 1789783020067,
+    "last_active": 1789789053681,
     "title": null,
     "task_category": null,
     "description": null,
     "complexity": null,
     "task_group": null,
-    "total_input_tokens": 83850,
-    "total_output_tokens": 4382,
-    "total_cache_read": 421632,
-    "total_cost": 0.04153104,
+    "total_input_tokens": 423822,
+    "total_output_tokens": 37385,
+    "total_cache_read": 15806208,
+    "total_cost": 4.29772008,
     "models_used": [
-      "gpt-5.6-luna"
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
     ],
-    "message_count": 10,
-    "duration_minutes": 1596,
+    "message_count": 107,
+    "duration_minutes": 102156,
     "summarized_at": null,
     "fm_version": null
   }

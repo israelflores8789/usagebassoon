@@ -5,22 +5,23 @@
     "workspace": "/project-delta",
     "workspace_label": "project-delta",
     "created_at": 1788991263584,
-    "last_active": 1788991582243,
-    "title": "<redacted>",
-    "task_category": "other",
-    "description": "<redacted>",
-    "complexity": "complex",
-    "task_group": "Work on project-delta",
-    "total_input_tokens": 54180,
-    "total_output_tokens": 2910,
-    "total_cache_read": 364544,
-    "total_cost": 0.023450079999999998,
+    "last_active": 1789007168255,
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
+    "total_input_tokens": 374820,
+    "total_output_tokens": 13843,
+    "total_cache_read": 6198016,
+    "total_cost": 1.01385752,
     "models_used": [
-      "gpt-5.6-luna"
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
     ],
-    "message_count": 12,
-    "duration_minutes": 5310,
-    "summarized_at": 1789000069,
+    "message_count": 57,
+    "duration_minutes": 265077,
+    "summarized_at": null,
     "fm_version": null
   },
   {
@@ -30,22 +31,22 @@
     "workspace_label": "project-delta",
     "created_at": 1788917487448,
     "last_active": 1788989463860,
-    "title": "<redacted>",
-    "task_category": "other",
-    "description": "<redacted>",
-    "complexity": "complex",
-    "task_group": "Work on project-delta",
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
     "total_input_tokens": 299753,
     "total_output_tokens": 24599,
     "total_cache_read": 6531840,
     "total_cost": 2.6304824800000004,
     "models_used": [
-      "gpt-5.6-terra",
-      "gpt-5.6-luna"
+      "gpt-5.6-luna",
+      "gpt-5.6-terra"
     ],
     "message_count": 85,
     "duration_minutes": 1199606,
-    "summarized_at": 1789000069,
+    "summarized_at": null,
     "fm_version": null
   }
 ]

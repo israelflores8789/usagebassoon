@@ -6,11 +6,11 @@
     "workspace_label": "project-alpha",
     "created_at": 1787612831602,
     "last_active": 1787612874465,
-    "title": "<redacted>",
-    "task_category": "other",
-    "description": "<redacted>",
-    "complexity": "complex",
-    "task_group": "Work on project-alpha",
+    "title": null,
+    "task_category": null,
+    "description": null,
+    "complexity": null,
+    "task_group": null,
     "total_input_tokens": 56126,
     "total_output_tokens": 3066,
     "total_cache_read": 52609,
@@ -20,7 +20,7 @@
     ],
     "message_count": 5,
     "duration_minutes": 714,
-    "summarized_at": 1788206091,
+    "summarized_at": null,
     "fm_version": null
   }
 ]

@@ -14,7 +14,7 @@
     "total_input_tokens": 124193,
     "total_output_tokens": 4436,
     "total_cache_read": 1038080,
-    "total_cost": 0.0223593,
+    "total_cost": 0.0447186,
     "models_used": [
       "gpt-6-luna"
     ],

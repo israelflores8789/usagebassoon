@@ -14,7 +14,7 @@
     "total_input_tokens": 267332,
     "total_output_tokens": 4856,
     "total_cache_read": 2025984,
-    "total_cost": 0.02988027,
+    "total_cost": 0.05976054,
     "models_used": [
       "gpt-6-luna"
     ],
@@ -38,10 +38,10 @@
     "total_input_tokens": 668136,
     "total_output_tokens": 31759,
     "total_cache_read": 11681024,
-    "total_cost": 0.7779586999999998,
+    "total_cost": 1.5559173999999996,
     "models_used": [
-      "gpt-6-luna",
-      "gpt-6-sol"
+      "gpt-6-sol",
+      "gpt-6-luna"
     ],
     "message_count": 111,
     "duration_minutes": 3972867,
@@ -63,7 +63,7 @@
     "total_input_tokens": 443146,
     "total_output_tokens": 25374,
     "total_cache_read": 6559232,
-    "total_cost": 0.08558446,
+    "total_cost": 0.17116892,
     "models_used": [
       "gpt-6-luna"
     ],
@@ -87,7 +87,7 @@
     "total_input_tokens": 24608,
     "total_output_tokens": 182,
     "total_cache_read": 46464,
-    "total_cost": 0.0326744,
+    "total_cost": 0.0653488,
     "models_used": [
       "gpt-6-sol"
     ],
@@ -111,10 +111,10 @@
     "total_input_tokens": 627296,
     "total_output_tokens": 20119,
     "total_cache_read": 7624832,
-    "total_cost": 1.4104626500000002,
+    "total_cost": 2.8209253000000003,
     "models_used": [
-      "gpt-6-sol",
-      "gpt-6-luna"
+      "gpt-6-luna",
+      "gpt-6-sol"
     ],
     "message_count": 67,
     "duration_minutes": 107701,

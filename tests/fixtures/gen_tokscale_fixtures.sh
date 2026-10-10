@@ -7,6 +7,7 @@
 # Raw captures go into ./tmp/ relative to the current working directory. Sanitize with
 #   python3 tests/fixtures/sanitize_fixtures.py tmp/ --output-dir sanitized/
 # Move previous captures out of tmp/ before rerunning; existing directories are not overwritten.
+# Each run copies native settings and caches into a disposable profile with a fresh wiki.
 set -euo pipefail
 umask 077
 
@@ -108,6 +109,49 @@ if [[ -e "$OUTPUT_DIR" || -L "$OUTPUT_DIR" ]]; then
   printf 'Output already exists; choose a new OUTPUT_DIR: %s\n' "$OUTPUT_DIR" >&2
   exit 1
 fi
+
+# Resolve the native profile before overriding it for every capture subprocess.
+if [[ -n "${TOKSCALE_CONFIG_DIR:-}" ]]; then
+  native_profile="$TOKSCALE_CONFIG_DIR"
+else
+  case "$(uname -s)" in
+    Darwin) native_profile="${HOME:?}/.config/tokscale" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      native_profile="${APPDATA:?APPDATA is required to resolve the native Tokscale profile}/tokscale"
+      if command -v cygpath > /dev/null; then
+        native_profile="$(cygpath -u "$native_profile")"
+      fi
+      ;;
+    *) native_profile="${XDG_CONFIG_HOME:-${HOME:?}/.config}/tokscale" ;;
+  esac
+fi
+
+profile="$(mktemp -d "${TMPDIR:-/tmp}/usagebassoon-tokscale-fixtures.XXXXXXXX")"
+cleanup_profile() {
+  local status=$?
+  if ! rm -rf -- "$profile"; then
+    printf 'Could not clean up the temporary Tokscale profile.\n' >&2
+    if [[ "$status" -eq 0 ]]; then
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup_profile EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for filename in settings.json custom-pricing.json; do
+  if [[ -f "$native_profile/$filename" ]]; then
+    cp "$native_profile/$filename" "$profile/$filename"
+  fi
+done
+if [[ -d "$native_profile/cache" ]]; then
+  # Dereference cache links so subprocesses cannot write through to native state.
+  cp -RL "$native_profile/cache" "$profile/cache"
+fi
+export TOKSCALE_CONFIG_DIR="$profile"
+
 mkdir -p "$(dirname "$OUTPUT_DIR")"
 mkdir "$OUTPUT_DIR"
 
