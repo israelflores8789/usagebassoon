@@ -6,7 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 <h1 align="center">UsageBassoon</h1>
 
 <p align="center">
-  <img src="media/usagebassoon_readme_banner-800px.png" alt="Banner" width=400 />
+  <img src="https://raw.githubusercontent.com/israelflores8789/usagebassoon/main/media/usagebassoon_readme_banner-800px.png" alt="Banner" width=400 />
 </p>
 
 <p align="center"><strong>Persistent AI token usage statistics no matter where your agents live</strong></p>
