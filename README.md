@@ -120,6 +120,7 @@ bunx tokscale@4.18.0 --version
 
 > [!NOTE]
 > You can set `[tokscale].bin` in `config.toml` or the `TOKSCALE_BIN` environment variable to choose the command; the configuration value takes precedence. With neither set, UsageBassoon uses a local `tokscale` executable when available, otherwise `bunx tokscale@latest`. Pin the supported release with `bin = "bunx tokscale@4.18.0"`.
+> `bin` also accepts a direct executable path. On Windows, TOML literal strings preserve backslashes as written (`bin = 'C:\Users\you\AppData\Roaming\npm\tokscale.cmd'`); basic double-quoted strings require doubled backslashes (`bin = "C:\\Users\\you\\AppData\\Roaming\\npm\\tokscale.cmd"`).
 
 ### Source identity
 
@@ -310,7 +311,7 @@ source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically genera
 spinner = "pong"                                    # Optional; yaspin animation name, e.g. pong, dots, or line.
 
 [tokscale]                                          # Optional; `bin` overrides `TOKSCALE_BIN` when set.
-bin = "bunx tokscale@latest"                        # Command prefix with runner arguments.
+bin = "bunx tokscale@latest"                        # Executable path or command prefix with runner arguments.
                                                     # Examples: `npx tokscale@latest`,
                                                     #           `bunx tokscale@latest`, or
                                                     #           `deno x npm:tokscale@latest`.

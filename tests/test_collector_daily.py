@@ -111,6 +111,7 @@ def test_package_runner_commands_are_passed_to_tokscale(
         tokscale_bin=command,
     )
     monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
+    monkeypatch.setattr(subprocess_collector.shutil, "which", lambda _name: None)
     prefix = collector._prefix(configuration)
 
     assert prefix == expected_prefix
@@ -163,6 +164,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
 ) -> None:
     """Pass only documented and explicitly opted-in environment variables."""
     monkeypatch.setenv("PATH", "/test/bin")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("TOKSCALE_EXTRA_DIRS", "/agent-storage")
     monkeypatch.setenv("CUSTOM_TOKSCALE_AUTH", "allowed")
@@ -180,6 +182,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
     child = subprocess_collector._child_environment(configuration)
 
     assert child["PATH"] == "/test/bin"
+    assert child["SystemRoot"] == r"C:\Windows"
     assert child["LANG"] == "C.UTF-8"
     assert child["TOKSCALE_EXTRA_DIRS"] == "/agent-storage"
     assert child["CUSTOM_TOKSCALE_AUTH"] == "allowed"

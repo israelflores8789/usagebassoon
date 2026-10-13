@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
 from platformdirs import user_config_path
@@ -49,6 +49,7 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
         "LANG",
         "LANGUAGE",
         "PATH",
+        "SystemRoot",
         "TMPDIR",
         "TOKSCALE_CONFIG_DIR",
         "TOKSCALE_EXTRA_DIRS",
@@ -253,16 +254,68 @@ def resolve_tokscale_command(config: UsageBassoonConfig) -> tuple[str, ...]:
     """
     override = config.tokscale_bin or os.environ.get("TOKSCALE_BIN")
     if override:
+        executable = shutil.which(override)
+        if executable is not None:
+            return (executable,)
+        if (
+            PureWindowsPath(override).is_absolute()
+            or PurePosixPath(override).is_absolute()
+        ):
+            return (override,)
         try:
-            command = tuple(shlex.split(override))
+            command = _split_tokscale_command(override)
         except ValueError as error:
             raise RuntimeError("TOKSCALE_BIN is not a valid command line") from error
         if not command:
             raise RuntimeError("TOKSCALE_BIN did not contain an executable")
-        return command
-    if shutil.which("tokscale"):
-        return ("tokscale",)
-    return ("bunx", "tokscale@latest")
+        executable = shutil.which(command[0])
+        return (executable or command[0], *command[1:])
+    executable = shutil.which("tokscale")
+    if executable is not None:
+        return (executable,)
+    executable = shutil.which("bunx")
+    return (executable or "bunx", "tokscale@latest")
+
+
+def _split_tokscale_command(command: str) -> tuple[str, ...]:
+    """Split a configured command while preserving Windows path separators.
+
+    Args:
+        command: Executable path or command prefix from configuration.
+
+    Returns:
+        The executable and any command-prefix arguments.
+    """
+    if os.name != "nt":
+        return tuple(shlex.split(command))
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return tuple(lexer)
+
+
+def _start_tokscale_process(
+    command: Sequence[str], environment: Mapping[str, str]
+) -> subprocess.Popen[bytes]:
+    """Start tokscale with its bounded, privacy-filtered child environment.
+
+    Args:
+        command: Executable command and arguments.
+        environment: Explicit environment exposed to the child process.
+
+    Returns:
+        The running tokscale process.
+    """
+    return subprocess.Popen(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(environment),
+        shell=False,
+        start_new_session=os.name == "posix",
+    )
 
 
 def _prefix(config: UsageBassoonConfig) -> list[str]:
@@ -285,14 +338,8 @@ def preflight_tokscale(config: UsageBassoonConfig) -> tuple[tuple[str, ...], str
     """
     command = resolve_tokscale_command(config)
     try:
-        process = subprocess.Popen(
-            [*command, "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_child_environment(config),
-            shell=False,
-            start_new_session=os.name == "posix",
+        process = _start_tokscale_process(
+            [*command, "--version"], _child_environment(config)
         )
         stdout, stderr = _capture_process(
             process,
@@ -619,16 +666,9 @@ def _json_command(
     command = [*prefix, "--no-spinner", *arguments]
     command_name = sanitize_display(" ".join(arguments))
     try:
-        process = subprocess.Popen(
+        process = _start_tokscale_process(
             command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(environment)
-            if environment is not None
-            else _child_environment(config),
-            shell=False,
-            start_new_session=True,
+            environment if environment is not None else _child_environment(config),
         )
     except OSError as error:
         _LOG.exception("could not start tokscale %s", command_name)

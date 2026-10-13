@@ -105,6 +105,21 @@ def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() ->
     assert "SERVICE_SECRET=<redacted>" in sanitized
 
 
+def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
+    """Hide complete quoted and process-prefixed Windows paths."""
+    value = (
+        r"process: C:\Program Files\nodejs\node.exe[18212]: startup failed; "
+        r"command: 'C:\Program Files\nodejs\npx.cmd' tokscale@latest"
+    )
+
+    sanitized = sanitize_doctor_text(value, config_path=None, database=None)
+
+    assert sanitized == (
+        "process: <path>[18212]: startup failed; "
+        "command: <path> tokscale@latest"
+    )
+
+
 @pytest.mark.parametrize(
     ("config_path", "expected"),
     [

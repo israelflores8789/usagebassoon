@@ -12,6 +12,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import NoReturn, override
 
 import pytest
@@ -19,7 +20,11 @@ from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
-from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
+from usagebassoon.collector import (
+    _split_tokscale_command,
+    preflight_tokscale,
+    resolve_tokscale_command,
+)
 from usagebassoon.config import ConfigurationManager, LoggingConfig, UsageBassoonConfig
 from usagebassoon.persistence import PersistSummary
 from usagebassoon.scheduling import (
@@ -120,7 +125,11 @@ def test_tokscale_preflight_honors_configured_package_runner(
 ) -> None:
     """Probe configured npm/deno-style commands without assuming Bun."""
     configuration = _configuration(tmp_path, tokscale_bin="npx tokscale@latest")
+    resolved_npx = r"C:\Program Files\nodejs\npx.cmd"
     calls: list[list[str]] = []
+
+    def which(command: str) -> str | None:
+        return resolved_npx if command == "npx" else None
 
     popen = subprocess.Popen
 
@@ -133,10 +142,60 @@ def test_tokscale_preflight_honors_configured_package_runner(
         )
 
     monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
 
-    assert resolve_tokscale_command(configuration) == ("npx", "tokscale@latest")
-    assert preflight_tokscale(configuration) == (("npx", "tokscale@latest"), "4.18.0")
-    assert calls == [["npx", "tokscale@latest", "--version"]]
+    expected = (resolved_npx, "tokscale@latest")
+    assert resolve_tokscale_command(configuration) == expected
+    assert preflight_tokscale(configuration) == (expected, "4.18.0")
+    assert calls == [[resolved_npx, "tokscale@latest", "--version"]]
+
+
+def test_default_tokscale_uses_the_resolved_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the concrete PATH result for a globally installed Windows shim."""
+    configuration = _configuration(tmp_path)
+    resolved_tokscale = r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd"
+
+    def which(command: str) -> str | None:
+        return resolved_tokscale if command == "tokscale" else None
+
+    monkeypatch.delenv("TOKSCALE_BIN", raising=False)
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
+
+    assert resolve_tokscale_command(configuration) == (resolved_tokscale,)
+
+
+def test_tokscale_path_preserves_backslashes_and_spaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a configured absolute Windows executable path as one token."""
+    path = r"C:\Program Files\UsageBassoon Tools\tokscale.cmd"
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        local_database=Path(":memory:"),
+        tokscale_bin=path,
+    )
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", lambda _name: None)
+
+    assert resolve_tokscale_command(configuration) == (path,)
+
+
+def test_windows_command_parser_preserves_quoted_path_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep backslashes and spaces in a quoted Windows command path."""
+    monkeypatch.setattr(
+        "usagebassoon.collector.os", SimpleNamespace(name="nt")
+    )
+
+    assert _split_tokscale_command(
+        r'"C:\Program Files\nodejs\npx.cmd" tokscale@latest'
+    ) == (r"C:\Program Files\nodejs\npx.cmd", "tokscale@latest")
 
 
 def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:

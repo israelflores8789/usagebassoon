@@ -103,6 +103,37 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("toml_value", "expected"),
+    [
+        (
+            r'"C:\\Users\\Alice\\AppData\\Roaming\\npm\\tokscale.cmd"',
+            r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd",
+        ),
+        (
+            r"'C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd'",
+            r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd",
+        ),
+    ],
+)
+def test_tokscale_bin_accepts_toml_windows_path_strings(
+    tmp_path: Path,
+    toml_value: str,
+    expected: str,
+) -> None:
+    """Preserve Windows paths in both escaped and literal TOML strings."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend.provider = "duckdb"\nbackend.duckdb.database = ":memory:"\n'
+        f"[tokscale]\nbin = {toml_value}\n"
+    )
+
+    configuration = ConfigurationManager(path).load()
+
+    assert configuration.tokscale_bin == expected
+
+
+@pytest.mark.parametrize(
     "provider, default", [("bigquery", 180.0), ("motherduck", 120.0)]
 )
 def test_remote_operation_timeouts_and_snapshot_budget(
