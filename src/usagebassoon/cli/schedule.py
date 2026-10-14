@@ -233,7 +233,10 @@ def worker(
         bool,
         typer.Option(
             "--foreground",
-            help="Run in the current process; use this as the container main process.",
+            help=(
+                "Run in the current process; required on Windows or as a container "
+                "main process."
+            ),
         ),
     ] = False,
 ) -> None:

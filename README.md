@@ -391,11 +391,13 @@ Snapshot destinations are also independent of your storage backend. For example,
 
 ## Automated Scheduling
 
-`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows Task Scheduler integration is not supported at this time.
+`bassoon collect` performs one collection cycle. Native schedules are supported on macOS (launchd) and Linux (systemd). A detached `worker` is also supported for POSIX container environments.
+
+Windows native scheduling and the detached worker are *not* supported, but it is possible to run the worker in the foreground.
 
 ```bash
-bassoon schedule install --collect-interval 15m
-# or, for container environments
+bassoon schedule install --collect-interval 15m  # macOS or Linux
+# or, for a detached worker in a POSIX container
 bassoon schedule worker --collect-interval 15m
 
 bassoon schedule status
@@ -412,18 +414,18 @@ Native schedules launch a new `bassoon collect` process for each cycle and reloa
 bassoon schedule worker --interval 15m
 ```
 
-Starts a *detached* self-contained worker and reports its PID and log path, and it's managed in the same way system-native (systemd/launchd) scheduling is managed with `status / logs / stop`.
+Starts a *detached* self-contained worker and reports its PID and log path, and it's managed in the same way system-native (systemd/launchd) scheduling is managed with `status / logs / stop`. Note, detached worker mode is unsupported on Windows.
 
 A worker keeps the configuration loaded at startup for their entire lifetime, including `source_id`, storage backend, logging, and collection interval. Configuration files are *never* hot-swapped. For a detached worker, run `bassoon schedule stop` before editing the your `config.toml`, then run `bassoon schedule worker` to apply the new settings. Restart a foreground worker through its container or process supervisor.
 
 > [!TIP]
-> You can run the worker in the foreground so it remains the container's main process:
+> Run the worker in the foreground using the `--foreground` option. Useful on Windows or if you want the worker as your primary process in a container:
 >
 > ```bash
-> bassoon schedule worker --foreground --interval 15m
+> bassoon schedule worker --foreground --collect-interval 15m
 > ```
->
-> When using UsageBassoon in a container environment, consider a remote data warehouse like MotherDuck or BigQuery. Consider remote object storage like GCS if you want snapshot archives.
+
+When using UsageBassoon in a container environment, consider a remote data warehouse like MotherDuck or BigQuery. Consider remote object storage like GCS if you want snapshot archives.
 
 ## Tags and Notes
 

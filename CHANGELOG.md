@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added scoped subprocess management for tokscale collection and supervised resources, using POSIX process groups and per-invocation Windows Job Objects.
+- Added Windows foreground worker operation under an external process supervisor.
+
+### Changed
+
+- Windows detached worker startup now reports that it is unsupported and directs users to `bassoon schedule worker --foreground`; native Windows scheduling remains unsupported at this time. *Consider contributing!*
+
+### Fixed
+
+- Fixed Windows tokscale executable discovery and command startup, including `.cmd` shims and the child `SystemRoot` environment.
+- Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.
+
 ## [1.0.0] - 2026-10-08
 
 ### Added

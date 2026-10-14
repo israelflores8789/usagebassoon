@@ -25,6 +25,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "sqlglot>=30.18.0",
     "PyYAML>=6.0",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

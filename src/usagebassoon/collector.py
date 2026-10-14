@@ -11,7 +11,6 @@ import logging
 import os
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +35,7 @@ from usagebassoon.deadlines import limited
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.process import ManagedProcess, start_process, terminate_process
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
@@ -297,7 +297,7 @@ def _split_tokscale_command(command: str) -> tuple[str, ...]:
 
 def _start_tokscale_process(
     command: Sequence[str], environment: Mapping[str, str]
-) -> subprocess.Popen[bytes]:
+) -> ManagedProcess:
     """Start tokscale with its bounded, privacy-filtered child environment.
 
     Args:
@@ -307,14 +307,13 @@ def _start_tokscale_process(
     Returns:
         The running tokscale process.
     """
-    return subprocess.Popen(
-        list(command),
+    return start_process(
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=dict(environment),
         shell=False,
-        start_new_session=os.name == "posix",
     )
 
 
@@ -533,13 +532,10 @@ def tokscale_profile(
         )
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process(process: ManagedProcess | subprocess.Popen[bytes]) -> None:
     """Forcefully terminate a tokscale process group after a hard failure."""
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        terminate_process(process)
     except ProcessLookupError:
         return
     except OSError:
@@ -552,7 +548,7 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _capture_process(
-    process: subprocess.Popen[bytes],
+    process: ManagedProcess | subprocess.Popen[bytes],
     *,
     timeout_seconds: float,
     max_stdout_bytes: int,
@@ -650,6 +646,37 @@ def _capture_process(
             _LOG.exception("could not reap tokscale process %s", process.pid)
             if failure is None:
                 failure = RuntimeError("could not reap tokscale process")
+        if isinstance(process, ManagedProcess):
+            try:
+                process.close()
+            except OSError:
+                _LOG.exception("could not close tokscale process scope %s", process.pid)
+                if failure is None:
+                    failure = RuntimeError("could not close tokscale process scope")
+        if process.poll() is None:
+            try:
+                process.wait(
+                    timeout=max(0.0, (cleanup_deadline or deadline) - time.monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                _LOG.warning(
+                    "tokscale process %s remained alive after scope cleanup",
+                    process.pid,
+                    exc_info=True,
+                )
+                if failure is None:
+                    failure = RuntimeError(
+                        "tokscale process remained alive after cleanup"
+                    )
+            except OSError:
+                _LOG.exception(
+                    "could not reap tokscale process %s after scope cleanup",
+                    process.pid,
+                )
+                if failure is None:
+                    failure = RuntimeError(
+                        "could not reap tokscale process after cleanup"
+                    )
     if failure is not None:
         raise failure
     return bytes(outputs["stdout"]), bytes(outputs["stderr"])

@@ -813,6 +813,11 @@ def start_worker(
     Raises:
         SchedulingError: If a worker is already running or cannot be started.
     """
+    if os.name == "nt":
+        raise SchedulingError(
+            "detached schedule workers are not supported on Windows; "
+            "run `bassoon schedule worker --foreground` under a process supervisor"
+        )
     configuration = _worker_configuration(
         config_path, schedule_interval, snapshot_schedule_interval
     )
@@ -837,6 +842,7 @@ def start_worker(
         if configuration.logging.disable
         else _worker_log_path(configuration)
     ).open("a", encoding="utf-8")
+    process: subprocess.Popen[bytes] | None = None
     try:
         try:
             process = subprocess.Popen(
@@ -854,15 +860,17 @@ def start_worker(
             ) from error
     finally:
         log_handle.close()
+    assert process is not None
+    worker_process = process
     try:
         _write_atomic(
             existing.pid_path,
-            f"{process.pid}\n".encode(),
+            f"{worker_process.pid}\n".encode(),
             mode=0o600,
         )
     except OSError as error:
         try:
-            process.terminate()
+            worker_process.terminate()
         except ProcessLookupError:
             pass
         except OSError:
