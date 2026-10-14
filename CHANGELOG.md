@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added scoped subprocess management for tokscale collection and supervised resources, using POSIX process groups and per-invocation Windows Job Objects.
 - Added Windows foreground worker operation under an external process supervisor.
+- Doctor output now reports backend and snapshot-bucket authentication sources and available principals for easier debugging. The default output obfuscates user email handles and non-public email domains for privacy.
 
 ### Changed
 

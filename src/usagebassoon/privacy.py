@@ -70,6 +70,43 @@ _GCP_SERVICE_ACCOUNT_PATTERN = re.compile(
     r"(?P<account>[A-Za-z0-9._+-]+)@[A-Za-z0-9-]+(?P<domain>\.iam\.gserviceaccount\.com)\b",
     re.IGNORECASE,
 )
+_DOCTOR_EMAIL_PATTERN = re.compile(
+    r"(?P<account>[A-Za-z0-9._%+-]+)@"
+    r"(?P<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63})"
+    r"(?![A-Za-z0-9.-])"
+)
+_PUBLIC_EMAIL_DOMAINS = frozenset(
+    {
+        "aol.com",
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "icloud.com",
+        "live.com",
+        "mac.com",
+        "me.com",
+        "msn.com",
+        "outlook.com",
+        "proton.me",
+        "protonmail.com",
+        "yahoo.com",
+    }
+)
+_DOCTOR_AUTH_METHODS = frozenset(
+    {
+        "ADC",
+        "ADC via GOOGLE_APPLICATION_CREDENTIALS",
+        "credentials file",
+        "explicit credentials",
+        "explicit token",
+        "injected client",
+        "local file permissions",
+        "MOTHERDUCK_TOKEN (environment)",
+        "MOTHERDUCK_TOKEN (not set)",
+        "unavailable",
+    }
+)
 _APPLICATION_PATH_PREFIXES = (
     ("appdata", "local"),
     ("appdata", "locallow"),
@@ -184,6 +221,9 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
         Original assignment or a redacted value.
     """
     name = match["name"]
+    value = match[0][len(match["prefix"]) :].strip().strip("\"'")
+    if name.casefold() == "auth" and value in _DOCTOR_AUTH_METHODS:
+        return match[0]
     if _credential_name(name):
         return f"{match['prefix']}<redacted>"
     return match[0]
@@ -424,9 +464,10 @@ def sanitize_doctor_text(
         sanitized = _DOCTOR_POSIX_PATH_PATTERN.sub(
             _sanitize_doctor_path_match, sanitized
         )
-        return _GCP_SERVICE_ACCOUNT_PATTERN.sub(
+        sanitized = _GCP_SERVICE_ACCOUNT_PATTERN.sub(
             r"\g<account>@<project-id>\g<domain>", sanitized
         )
+        return _DOCTOR_EMAIL_PATTERN.sub(_redact_doctor_email, sanitized)
 
     if not config_path:
         return sanitize_part(value)
@@ -437,3 +478,50 @@ def sanitize_doctor_text(
     return sanitized_config_path.join(
         sanitize_part(part) for part in config_pattern.split(value)
     )
+
+
+def google_doctor_principal(credentials: object | None) -> str:
+    """Describe a Google credential principal for sanitized doctor output.
+
+    Args:
+        credentials: Resolved Google Auth credentials, when available.
+
+    Returns:
+        The effective service account, user account, external identity, or an
+        unavailable marker. Email masking is applied when doctor renders output.
+    """
+    if credentials is None:
+        return "unavailable"
+
+    service_account_email = getattr(credentials, "service_account_email", None)
+    if isinstance(service_account_email, str) and "@" in service_account_email:
+        return f"service account {service_account_email}"
+
+    account = getattr(credentials, "account", None)
+    if isinstance(account, str):
+        return (
+            f"user account {account}"
+            if "@" in account
+            else "user account (email unavailable)"
+        )
+
+    module = type(credentials).__module__
+    if any(
+        marker in module for marker in ("external_account", "identity_pool", ".aws")
+    ):
+        return "external identity (email unavailable)"
+    if "compute_engine" in module or "impersonated_credentials" in module:
+        return "service account (email unavailable)"
+    return "principal unavailable"
+
+
+def _redact_doctor_email(match: re.Match[str]) -> str:
+    """Keep only a short handle prefix and allow-listed public email domains."""
+    account = match.group("account")
+    visible_count = 2 if len(account) > 4 else 1 if len(account) > 2 else 0
+    visible = f"{account[:visible_count]}..." if visible_count else "..."
+    domain = match.group("domain")
+    safe_domain = domain.casefold()
+    if safe_domain not in _PUBLIC_EMAIL_DOMAINS:
+        safe_domain = "<domain>"
+    return f"{visible}@{safe_domain}"

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import time
@@ -77,6 +78,7 @@ from usagebassoon.deadlines import (
 from usagebassoon.deadlines import (
     operation as operation_budget,
 )
+from usagebassoon.privacy import google_doctor_principal
 from usagebassoon.schema_assets import (
     SCHEMA_VERSION,
     pending_migrations,
@@ -358,6 +360,17 @@ class BigQueryBackend(AbstractStorageBackend):
             raise ValueError("timeout_seconds must be positive")
         if credentials is not None and credentials_file is not None:
             raise ValueError("credentials and credentials_file cannot be combined")
+        self._doctor_auth_source = (
+            "injected client"
+            if client is not None
+            else "credentials file"
+            if credentials_file is not None
+            else "explicit credentials"
+            if credentials is not None
+            else "ADC via GOOGLE_APPLICATION_CREDENTIALS"
+            if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            else "ADC"
+        )
         with operation_budget(timeout_seconds):
             resolved_credentials = credentials
             if credentials_file is not None:
@@ -399,6 +412,10 @@ class BigQueryBackend(AbstractStorageBackend):
                 raise RuntimeError(
                     "BigQuery authentication failed; configure ADC or credentials_file"
                 ) from error
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Return a safe-to-render authentication source and effective principal."""
+        return self._doctor_auth_source, google_doctor_principal(self._credentials)
 
     @contextmanager
     @override

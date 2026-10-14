@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 from usagebassoon.privacy import (
+    google_doctor_principal,
     redact_credentials,
     sanitize_doctor_text,
     sanitize_table,
@@ -242,3 +243,72 @@ def test_doctor_masks_service_account_project_and_preserves_gcs_resource() -> No
         "on '//storage.googleapis.com/projects/_/buckets/usagebassoon-snapshots'"
     )
     assert sanitize_doctor_text(value, config_path=None, database=None) == expected
+
+
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    ("email", "expected"),
+    [
+        ("isabelle@gmail.com", "is...@gmail.com"),
+        ("abc@gmail.com", "a...@gmail.com"),
+        ("ab@gmail.com", "...@gmail.com"),
+        ("a@gmail.com", "...@gmail.com"),
+        ("sam+usage@outlook.com", "sa...@outlook.com"),
+        ("isabelle@company.example", "is...@<domain>"),
+    ],
+)
+def test_doctor_masks_user_email_handles_and_non_public_domains(
+    email: str, expected: str
+) -> None:
+    """Retain a recognizable public-domain label without exposing full emails."""
+    sanitized = sanitize_doctor_text(
+        f"Principal: user account {email}",
+        config_path=None,
+        database=None,
+    )
+    assert sanitized == f"Principal: user account {expected}"
+    assert email not in sanitized
+
+
+@pytest.mark.windows_compatible
+def test_doctor_preserves_known_auth_labels_and_redacts_other_auth_values() -> None:
+    """Safe doctor auth descriptions survive the generic secret-assignment filter."""
+    safe = sanitize_doctor_text(
+        "Auth: ADC via GOOGLE_APPLICATION_CREDENTIALS",
+        config_path=None,
+        database=None,
+    )
+    unsafe = sanitize_doctor_text(
+        "Auth: synthetic-secret", config_path=None, database=None
+    )
+    assert safe == "Auth: ADC via GOOGLE_APPLICATION_CREDENTIALS"
+    assert unsafe == "Auth: <redacted>"
+
+
+@pytest.mark.windows_compatible
+def test_google_doctor_principal_distinguishes_accounts_from_external_identity() -> (
+    None
+):
+    """Describe known Google principal types without requiring provider requests."""
+    from types import SimpleNamespace
+
+    service_account = SimpleNamespace(
+        service_account_email="usagebassoon@project.iam.gserviceaccount.com"
+    )
+    user_account = SimpleNamespace(account="isabelle@gmail.com")
+
+    class ExternalCredentials:
+        """Model a Google external-account credential without loading Google Auth."""
+
+        __module__ = "google.auth.external_account"
+
+    external_account = ExternalCredentials()
+
+    assert google_doctor_principal(service_account) == (
+        "service account usagebassoon@project.iam.gserviceaccount.com"
+    )
+    assert google_doctor_principal(user_account) == "user account isabelle@gmail.com"
+    assert (
+        google_doctor_principal(external_account)
+        == "external identity (email unavailable)"
+    )

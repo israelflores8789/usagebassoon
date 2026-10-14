@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
 import pyarrow as pa
 
@@ -41,6 +43,14 @@ REQUIRED_RELATIONS: tuple[str, ...] = (
     "report_summary",
     "report_models",
 )
+
+
+@runtime_checkable
+class DoctorAuthenticationProvider(Protocol):
+    """Optional capability for a backend or bucket to describe its identity."""
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Return its authentication source and effective principal."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +126,56 @@ def maintenance_health(backend: StorageBackend | None) -> DoctorCheck:
     return DoctorCheck("maintenance", "ok" if ready else "warning", message)
 
 
+def backend_authentication_check(
+    configuration: UsageBassoonConfig | None,
+    backend: StorageBackend | None,
+) -> DoctorCheck:
+    """Report the configured backend authentication source and principal."""
+    authentication = "unavailable"
+    principal = "unavailable"
+    if configuration is not None:
+        if configuration.backend == "duckdb":
+            authentication = "local file permissions"
+            principal = "not applicable"
+        elif configuration.backend == "motherduck":
+            authentication = (
+                "MOTHERDUCK_TOKEN (environment)"
+                if os.environ.get("MOTHERDUCK_TOKEN")
+                else "MOTHERDUCK_TOKEN (not set)"
+            )
+            principal = "unavailable (token identity is not exposed)"
+        elif configuration.bigquery is not None:
+            authentication = _google_auth_source(
+                configuration.bigquery.credentials_file
+            )
+            principal = "unavailable (backend connection failed)"
+
+    if backend is not None and isinstance(backend, DoctorAuthenticationProvider):
+        try:
+            authentication, principal = backend.doctor_authentication()
+        except Exception:
+            _LOG.warning(
+                "doctor backend authentication inspection failed", exc_info=True
+            )
+            principal = "unavailable"
+
+    return DoctorCheck(
+        "backend_authentication",
+        "ok",
+        "configured backend authentication",
+        (f"Auth: {authentication}", f"Principal: {principal}"),
+    )
+
+
+def _google_auth_source(credentials_file: Path | None) -> str:
+    """Describe a Google credential source without exposing its file path."""
+    if credentials_file is not None:
+        return "credentials file"
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return "ADC via GOOGLE_APPLICATION_CREDENTIALS"
+    return "ADC"
+
+
 def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     """Report recovery coverage and last creation verification for each archive."""
     if configuration is None:
@@ -133,9 +193,32 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
 
     details: list[str] = []
     warnings: list[str] = []
+    authentication: dict[str, tuple[str, str]] = {}
+    if settings.local.enable:
+        authentication["Local"] = ("local file permissions", "not applicable")
+    if settings.gcs is not None and settings.gcs.enable:
+        authentication["GCS"] = (
+            _google_auth_source(settings.gcs.credentials_file),
+            "unavailable (bucket not opened)",
+        )
     try:
         archiver = SnapshotArchiver.from_config(configuration)
         reader = SnapshotReader(archiver._archives, archiver._bucket)
+        from usagebassoon.buckets.factory import bucket_label
+
+        for bucket in reader.buckets:
+            label = bucket_label(bucket.uri)
+            if isinstance(bucket, DoctorAuthenticationProvider):
+                try:
+                    authentication[label] = bucket.doctor_authentication()
+                except Exception:
+                    _LOG.warning(
+                        "doctor snapshot authentication inspection failed for %s",
+                        label,
+                        exc_info=True,
+                    )
+                    current = authentication.get(label, ("unknown", "unavailable"))
+                    authentication[label] = (current[0], "unavailable")
         rows = reader.listing()
         now = datetime.now(UTC)
         for bucket in reader.buckets:
@@ -234,6 +317,13 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     except Exception as error:
         _LOG.warning("doctor archive inspection failed", exc_info=True)
         warnings.append(f"archive inspection unavailable: {error}")
+    for label, (auth_method, principal) in authentication.items():
+        details.extend(
+            (
+                f"{label} snapshot Auth: {auth_method}",
+                f"{label} snapshot Principal: {principal}",
+            )
+        )
     return DoctorCheck(
         "backup_freshness",
         "warning" if warnings else "ok",

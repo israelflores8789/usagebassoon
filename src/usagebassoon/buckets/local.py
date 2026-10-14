@@ -150,6 +150,10 @@ class LocalSnapshotBucket:
         self.uri = uri.rstrip("/")
         self._root = Path(self.uri.removeprefix("file://")).expanduser().resolve()
 
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Describe local filesystem access without exposing the OS identity."""
+        return "local file permissions", "not applicable"
+
     def _path(self, relative_name: str) -> Path:
         """Resolve one safe snapshot object path below the configured root."""
         relative = validate_relative_name(relative_name)

@@ -150,6 +150,8 @@ def test_doctor_reports_configured_tokscale_command_and_version(
         < plain_cli_output(result.output).index("OK configuration:")
     )
     assert "command: npx tokscale@latest" in plain_cli_output(result.output)
+    assert "Auth: local file permissions" in plain_cli_output(result.output)
+    assert "Principal: not applicable" in plain_cli_output(result.output)
 
 
 @pytest.mark.windows_compatible
@@ -228,6 +230,8 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     assert "scheduled recovery capture is overdue" in check.message
     assert "current weekly recovery slot is overdue" not in check.message
     assert any("1 of 4 target slots available" in detail for detail in check.details)
+    assert "Local snapshot Auth: local file permissions" in check.details
+    assert "Local snapshot Principal: not applicable" in check.details
 
 
 @pytest.mark.windows_compatible

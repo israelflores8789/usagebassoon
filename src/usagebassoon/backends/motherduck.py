@@ -250,12 +250,19 @@ class MotherDuckBackend(AbstractStorageBackend):
             )
         self.database = database
         self.timeout_seconds = timeout_seconds
+        self._doctor_auth_source = (
+            "explicit token" if token else "MOTHERDUCK_TOKEN (environment)"
+        )
         with operation(timeout_seconds):
             self._resource = SupervisedResource(
                 _resource_factory(database, resolved, timeout_seconds),
                 interrupt=_interrupt_resource,
                 close=_close_resource,
             )
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Report the token source without inspecting or exposing the token."""
+        return self._doctor_auth_source, "unavailable (token identity is not exposed)"
 
     def _call[A, T](
         self,

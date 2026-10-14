@@ -26,6 +26,7 @@ from usagebassoon.config import (
 from usagebassoon.diagnostics import (
     DoctorCheck,
     DoctorReport,
+    backend_authentication_check,
     maintenance_health,
     run_doctor,
     snapshot_health,
@@ -190,6 +191,7 @@ def doctor(
                 DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
                 tokscale_check,
                 *report.checks,
+                backend_authentication_check(configuration, opened),
                 maintenance_health(opened),
                 snapshot_health(configuration),
                 schedule_doctor_check(configuration),
