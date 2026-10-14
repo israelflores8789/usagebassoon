@@ -178,9 +178,7 @@ def _missing_scheduler_message(scheduler: str) -> str:
     """Return the actionable message for an unavailable native scheduler."""
     return (
         f"Warning: {scheduler} was not found or is unavailable. If UsageBassoon is "
-        "running in a container, consider MotherDuck or BigQuery for data "
-        "persistence and GCS for snapshots. Run `bassoon schedule worker "
-        "--foreground` as the container's main process."
+        "running in a container, use `bassoon schedule worker`."
     )
 
 

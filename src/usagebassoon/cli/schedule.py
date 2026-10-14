@@ -206,7 +206,8 @@ def remove() -> None:
 
 
 @schedule_app.command(
-    help="Run `bassoon schedule worker --foreground` as the container's main process."
+    help="Run `bassoon schedule worker --foreground` to run as the main process,"
+    " for example, in a container's entrypoint script."
 )
 def worker(
     collect_interval: Annotated[
