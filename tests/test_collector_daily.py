@@ -111,7 +111,11 @@ def test_package_runner_commands_are_passed_to_tokscale(
         tokscale_bin=command,
     )
     monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
-    monkeypatch.setattr(subprocess_collector.shutil, "which", lambda _name: None)
+
+    def which(_name: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(subprocess_collector.shutil, "which", which)
     prefix = collector._prefix(configuration)
 
     assert prefix == expected_prefix

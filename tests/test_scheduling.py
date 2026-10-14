@@ -180,7 +180,11 @@ def test_tokscale_path_preserves_backslashes_and_spaces(
         local_database=Path(":memory:"),
         tokscale_bin=path,
     )
-    monkeypatch.setattr("usagebassoon.collector.shutil.which", lambda _name: None)
+
+    def which(_command: str) -> str | None:
+        return None
+
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
 
     assert resolve_tokscale_command(configuration) == (path,)
 
@@ -189,9 +193,7 @@ def test_windows_command_parser_preserves_quoted_path_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep backslashes and spaces in a quoted Windows command path."""
-    monkeypatch.setattr(
-        "usagebassoon.collector.os", SimpleNamespace(name="nt")
-    )
+    monkeypatch.setattr("usagebassoon.collector.os", SimpleNamespace(name="nt"))
 
     assert _split_tokscale_command(
         r'"C:\Program Files\nodejs\npx.cmd" tokscale@latest'
@@ -605,6 +607,7 @@ def test_native_snapshot_artifacts_have_independent_cadence(
     monkeypatch.setattr(module, "_systemd_unit_dir", lambda: tmp_path)
     monkeypatch.setattr(module, "_snapshot_plist", lambda: tmp_path / "snapshot.plist")
     monkeypatch.setattr(module, "_resolve_bassoon", lambda: "/usr/bin/bassoon")
+    monkeypatch.setattr(module.os, "getuid", lambda: 501, raising=False)
     calls: list[list[str]] = []
 
     def run(

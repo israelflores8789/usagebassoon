@@ -114,9 +114,9 @@ def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
 
     sanitized = sanitize_doctor_text(value, config_path=None, database=None)
 
-    assert sanitized == (
-        "process: <path>[18212]: startup failed; "
-        "command: <path> tokscale@latest"
+    assert (
+        sanitized
+        == "process: <path>[18212]: startup failed; command: <path> tokscale@latest"
     )
 
 

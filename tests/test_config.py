@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
@@ -396,7 +397,7 @@ def test_unknown_config_keys_fail_and_are_written_to_the_log(
     )
     if scope == "root":
         content += "unexpected_setting = true\n"
-    content += f'\n[logging]\ndirectory = "{log_directory}"\n'
+    content += f"\n[logging]\ndirectory = '{log_directory}'\n"
     if scope == "tokscale":
         content += "\n[tokscale]\nunexpected_setting = true\n"
     path.write_text(content)
@@ -429,7 +430,7 @@ def test_invalid_logging_settings_use_the_default_error_log(
     with pytest.raises(ConfigurationError, match=r"logging\.max_files"):
         ConfigurationManager(path).load()
 
-    log_path = tmp_path / ".local/state/usagebassoon/logs/usagebassoon.log"
+    log_path = default_log_directory() / "usagebassoon.log"
     assert log_path.is_file()
     assert "logging.max_files must be a positive integer" in log_path.read_text()
 
@@ -446,7 +447,7 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
         '[backend.bigquery]\nproject = "usagebassoon-test"\n'
         'dataset = "usagebassoon_it"\n'
         'location = "us-central1"\n'
-        f'credentials_file = "{credentials}"\n'
+        f"credentials_file = '{credentials}'\n"
         "[collection]\nmax_retries = 4\nretry_initial_seconds = 0.5\n"
         "[logging]\nmax_files = 5\nmax_bytes = 4096\n"
     )
@@ -552,9 +553,9 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
         'backend.provider = "duckdb"\nbackend.duckdb.database = ":memory:"\n'
         '[snapshots.gcs]\nenable = true\nuri = "gs://bucket/archive"\n'
         'project = "usagebassoon-test"\n'
-        f'credentials_file = "{credentials}"\n'
+        f"credentials_file = '{credentials}'\n"
         "[snapshots.local]\n"
-        f'path = "{tmp_path / "snapshots"}"\n'
+        f"path = '{tmp_path / 'snapshots'}'\n"
         '[snapshots]\nmax_snapshots = 5\n[snapshots.schedule]\ninterval = "12h"\n'
     )
 
@@ -727,7 +728,8 @@ def test_update_snapshot_interval_preserves_collection_and_policy(
     assert config.snapshots.schedule.interval == "2d"
     assert config.snapshots.local.disable_weekly is existing
     assert config.snapshots.local.path == Path("my archive")
-    assert path.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
@@ -740,7 +742,7 @@ def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         "[snapshots.local]\nenable = true\ndisable_weekly = true\n"
         "[snapshots.gcs]\nenable = false\ndisable_weekly = false\n"
-        f'project = "recovery-project"\ncredentials_file = "{credentials}"\n'
+        f"project = 'recovery-project'\ncredentials_file = '{credentials}'\n"
     )
     config = ConfigurationManager(path).load()
     assert config.snapshots.local.disable_weekly
@@ -754,7 +756,7 @@ def test_disabled_logging_applies_to_configuration_errors(tmp_path: Path) -> Non
     path = tmp_path / "config.toml"
     directory = tmp_path / "disabled-logs"
     path.write_text(
-        f'source_id = "invalid"\n[logging]\ndisable = true\ndirectory = "{directory}"\n'
+        f"source_id = 'invalid'\n[logging]\ndisable = true\ndirectory = '{directory}'\n"
     )
     with pytest.raises(ConfigurationError, match="source_id") as captured:
         ConfigurationManager(path).load()
