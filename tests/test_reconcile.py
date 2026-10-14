@@ -9,6 +9,8 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collector import RawCollection
 from usagebassoon.diagnostics import run_doctor
@@ -31,6 +33,7 @@ from usagebassoon.reconcile import (
 )
 
 
+@pytest.mark.windows_compatible
 def test_golden_daily_models_reconcile_cleanly(
     recon_result: ReconciliationResult,
 ) -> None:
@@ -38,6 +41,7 @@ def test_golden_daily_models_reconcile_cleanly(
     assert recon_result.ok
 
 
+@pytest.mark.windows_compatible
 def test_model_totals_identify_assertion_across_days(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:
@@ -60,6 +64,7 @@ def test_model_totals_identify_assertion_across_days(
     assert next_day.isoformat() in issue.message
 
 
+@pytest.mark.windows_compatible
 def test_performance_rate_mismatch_is_reconciled_without_unsafe_facts(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:
@@ -84,6 +89,7 @@ def test_performance_rate_mismatch_is_reconciled_without_unsafe_facts(
     ]
 
 
+@pytest.mark.windows_compatible
 def test_repeated_issue_updates_one_row(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -138,6 +144,7 @@ def test_repeated_issue_updates_one_row(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_mismatch_leaves_models_day_retryable(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,
@@ -167,6 +174,7 @@ def test_mismatch_leaves_models_day_retryable(
     }
 
 
+@pytest.mark.windows_compatible
 def test_duplicate_models_key_is_recorded_without_staging_ambiguous_facts(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,
@@ -193,6 +201,7 @@ def test_duplicate_models_key_is_recorded_without_staging_ambiguous_facts(
     assert bundle.ingest_status[0].status == "partial"
 
 
+@pytest.mark.windows_compatible
 def test_successful_recheck_resolves_persisted_issue(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -244,6 +253,7 @@ def test_successful_recheck_resolves_persisted_issue(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_resolution_requires_all_previous_bad_days_to_be_rechecked(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,

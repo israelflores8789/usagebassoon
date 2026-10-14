@@ -30,6 +30,7 @@ from usagebassoon.persistence import load_ingest_status
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.windows_compatible
 def test_unresolved_schema_drift_returns_newest_events_first() -> None:
     """Filter resolved events and order remaining diagnostic records by freshness."""
     backend = DuckDBBackend(":memory:")
@@ -74,6 +75,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
     """Report drift and run issues while leaving persisted rows unchanged."""
     backend = DuckDBBackend(":memory:")
@@ -147,6 +149,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -> None:
     """Load persisted event identity and first-detection metadata for rechecks."""
     database = tmp_path / "drift.duckdb"
@@ -206,6 +209,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
     )
 
 
+@pytest.mark.windows_compatible
 def test_run_doctor_reports_active_bigquery_transactions() -> None:
     """Surface active warehouse transactions in BigQuery diagnostics."""
 
@@ -236,6 +240,7 @@ def test_run_doctor_reports_active_bigquery_transactions() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_ingest_issues_rejects_non_positive_limit() -> None:
     """Reject invalid diagnostic limits before issuing SQL."""
     backend = MagicMock(spec=StorageBackend)
@@ -244,6 +249,7 @@ def test_ingest_issues_rejects_non_positive_limit() -> None:
     backend.query.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("table", ["schema_drift_events", "reconciliation_issues"])
 def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
     table: str,
@@ -289,6 +295,7 @@ def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("workers", [1, 2])
 def test_doctor_uses_backend_capabilities_without_provider_selectors(
     workers: int,
@@ -366,6 +373,7 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_doctor_schema_fallback_identifies_missing_relation_for_any_backend() -> None:
     """Keep precise schema errors when the shared combined probe fails."""
     backend = DuckDBBackend(":memory:")

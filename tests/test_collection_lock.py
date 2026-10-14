@@ -11,6 +11,7 @@ from usagebassoon.collection_lock import CollectionBusy, collection_lock
 from usagebassoon.config import UsageBassoonConfig
 
 
+@pytest.mark.windows_compatible
 def test_local_collection_lock_excludes_other_database_and_releases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -31,6 +32,7 @@ def test_local_collection_lock_excludes_other_database_and_releases(
         pass
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("backend", ["motherduck", "bigquery"])
 def test_remote_collection_does_not_take_local_lock(
     backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -147,7 +147,11 @@ def _local_snapshot_config(
 @pytest.fixture(autouse=True)
 def _bound_live_test_duration() -> Iterator[None]:
     """Fail a live test instead of leaving a CI worker blocked indefinitely."""
-    if not hasattr(signal, "SIGALRM"):
+    if (
+        not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "ITIMER_REAL")
+    ):
         yield
         return
 

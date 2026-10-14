@@ -28,6 +28,7 @@ COMMANDS = (
 )
 
 
+@pytest.mark.windows_compatible
 def test_root_help_lists_every_registered_command() -> None:
     """Expose every public command from the root help page."""
     result = CliRunner().invoke(app, ["--help"])
@@ -39,6 +40,7 @@ def test_root_help_lists_every_registered_command() -> None:
     assert "--version" in plain_output
 
 
+@pytest.mark.windows_compatible
 def test_version_matches_the_python_api_and_distribution() -> None:
     """Report the installed version consistently across CLI and Python API."""
     result = CliRunner().invoke(app, ["--version"])
@@ -49,6 +51,7 @@ def test_version_matches_the_python_api_and_distribution() -> None:
     assert usagebassoon.__version__ == expected
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("command", COMMANDS)
 def test_each_command_has_working_help(command: str) -> None:
     """Keep every registered command discoverable through Typer help."""

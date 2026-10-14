@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -47,17 +48,16 @@ def _remove_temporary(path: Path) -> None:
 
 def sync_directory(path: Path) -> None:
     """Sync directory entries on platforms that support directory descriptors."""
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
+    if sys.platform != "win32":
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(descriptor)
-        except OSError as error:
-            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                raise
-    finally:
-        os.close(descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                    raise
+        finally:
+            os.close(descriptor)
 
 
 def durable_directory(path: Path) -> None:
@@ -165,6 +165,10 @@ class LocalSnapshotBucket:
     @staticmethod
     def _version(stat: os.stat_result) -> str:
         """Identify a physical file revision independently of its content digest."""
+        if os.name == "nt":
+            # Windows exposes creation time through stat() but change time through
+            # fstat(); using it makes a version depend on how the file was opened.
+            return f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
         return (
             f"{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}:"
             f"{stat.st_mtime_ns}:{stat.st_size}"
@@ -274,10 +278,15 @@ class LocalSnapshotBucket:
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
-            # Hard-link publication is atomic and fails if the identity exists.
+            # Exclusive publication is atomic and preserves immutable object names.
             with _catalog_lock(self._lock(relative_name)):
-                os.link(temporary, target)
-                temporary.unlink()
+                if os.name == "nt":
+                    # Windows rename is atomic and refuses to replace an existing
+                    # destination, even where hard-link creation is unavailable.
+                    temporary.rename(target)
+                else:
+                    os.link(temporary, target)
+                    temporary.unlink()
                 sync_directory(target.parent)
                 checksum, stat = _file_metadata(target)
                 version = self._version(stat)

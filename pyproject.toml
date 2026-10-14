@@ -124,6 +124,8 @@ markers = [
     "gcs_live: runs against the dedicated UsageBassoon GCS test bucket.",
     "motherduck_live: runs against the dedicated usagebassoon_it MotherDuck database.",
     "sql_parity: runs hermetic DuckDB and SQLGlot dialect-parity tests.",
+    "windows_smoke: exercises required Windows runtime behavior without cloud services.",
+    "windows_compatible: test has been verified as portable on Windows and POSIX.",
 ]
 
 [tool.coverage.run]

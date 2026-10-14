@@ -89,6 +89,7 @@ def _config(path: Path) -> UsageBassoonConfig:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("command", "expected_prefix"),
     [
@@ -121,6 +122,7 @@ def test_package_runner_commands_are_passed_to_tokscale(
     assert prefix == expected_prefix
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_command_uses_each_candidate_day(
     monkeypatch: pytest.MonkeyPatch,
     daily_raws: dict[date, JsonObject],
@@ -162,6 +164,7 @@ def test_daily_models_command_uses_each_candidate_day(
     ]
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_child_environment_excludes_unrelated_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -195,6 +198,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
     assert "AWS_ACCESS_KEY_ID" not in child
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fail", [False, True])
 def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     tmp_path: Path,
@@ -272,6 +276,7 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     assert not (tmp_path / "tokscale").exists()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
     tmp_path: Path,
@@ -456,6 +461,7 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
     """Terminate a subprocess that exceeds the configured hard timeout."""
     configuration = UsageBassoonConfig(
@@ -483,6 +489,8 @@ def test_tokscale_cleanup_bounds_surviving_pipe_holders(
     tmp_path: Path, pipe_name: str, excessive: bool
 ) -> None:
     """Bound timeout/size cleanup, close pipes, and release the collection lock."""
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("requires POSIX process signals")
     ready = tmp_path / "holder.pid"
     descriptor = 1 if pipe_name == "stdout" else 2
     script = (
@@ -542,6 +550,7 @@ def test_tokscale_cleanup_bounds_surviving_pipe_holders(
         process.wait(timeout=2)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fault", ["kill", "read", "closed-pipes"])
 def test_tokscale_cleanup_bounds_process_failures(
     monkeypatch: pytest.MonkeyPatch,
@@ -603,6 +612,7 @@ def test_tokscale_cleanup_bounds_process_failures(
         process.wait(timeout=2)
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preserves_slow_valid_output(tmp_path: Path) -> None:
     """Capture incremental valid JSON before the hard maximum, without spinners."""
     configuration = replace(
@@ -620,6 +630,7 @@ def test_tokscale_preserves_slow_valid_output(tmp_path: Path) -> None:
     ) == {"value": 42}
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
     """Reject excessive graph output before it can exhaust collector memory."""
     configuration = UsageBassoonConfig(
@@ -639,6 +650,7 @@ def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
     """Reject excessive tokscale diagnostics before retaining unbounded text."""
     configuration = UsageBassoonConfig(
@@ -657,6 +669,7 @@ def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     tmp_path: Path,
@@ -804,6 +817,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     assert set(captured[0].report_by_day) == {date.min}
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_failure_records_incomplete_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -848,6 +862,7 @@ def test_daily_models_failure_records_incomplete_targets(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_overlap_always_includes_three_past_graph_usage_days(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -925,6 +940,7 @@ def test_overlap_always_includes_three_past_graph_usage_days(
     assert requested == [(retry_day, days[0], *days[-3:], today)]
 
 
+@pytest.mark.windows_compatible
 def test_report_failure_is_logged_and_does_not_abort_collection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -951,6 +967,7 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
     assert "session report collection failed" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
 @pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
@@ -996,6 +1013,7 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     assert "collection cycle failed before completion" in log
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 def test_historical_refresh_preserves_usage_and_source_isolation(
     architecture: str,
@@ -1282,6 +1300,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 @pytest.mark.parametrize("fault", ["fetch", "contract", "parse", "duplicate"])
 def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
@@ -1427,6 +1446,7 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fails", [False, True])
 def test_pricing_deduplicates_historical_requests_and_uses_observation_day(
     fails: bool,
@@ -1469,6 +1489,7 @@ def test_pricing_deduplicates_historical_requests_and_uses_observation_day(
     assert not requests
 
 
+@pytest.mark.windows_compatible
 def test_empty_source_records_report_discovery_without_repeating_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1506,6 +1527,7 @@ def test_empty_source_records_report_discovery_without_repeating_it(
     assert len(reports) == 1
 
 
+@pytest.mark.windows_compatible
 def test_report_refresh_groups_creation_days_and_allows_timezone_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

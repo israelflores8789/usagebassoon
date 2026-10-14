@@ -9,7 +9,6 @@ import errno
 import json
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -35,7 +34,12 @@ from usagebassoon.deadlines import limited
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
-from usagebassoon.process import ManagedProcess, start_process, terminate_process
+from usagebassoon.process import (
+    ManagedProcess,
+    split_command,
+    start_process,
+    terminate_process,
+)
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
@@ -286,13 +290,7 @@ def _split_tokscale_command(command: str) -> tuple[str, ...]:
     Returns:
         The executable and any command-prefix arguments.
     """
-    if os.name != "nt":
-        return tuple(shlex.split(command))
-    lexer = shlex.shlex(command, posix=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    lexer.escape = ""
-    return tuple(lexer)
+    return split_command(command, windows=os.name == "nt")
 
 
 def _start_tokscale_process(

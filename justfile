@@ -59,6 +59,24 @@ test-unit *args:
     USAGEBASSOON_LOG_DIRECTORY="$test_log_directory" {{ pytest }} -v -s \
         -m "not (bigquery_live or gcs_live or motherduck_live or sql_parity)" {{ args }}
 
+# Run only explicitly classified Windows smoke and cross-platform tests.
+[positional-arguments]
+[script("uv", "run", "python")]
+test-windows *args:
+    import os
+    import subprocess
+    import sys
+    from tempfile import TemporaryDirectory
+
+    markers = "(windows_smoke or windows_compatible) and not (bigquery_live or gcs_live or motherduck_live or sql_parity)"
+    with TemporaryDirectory(prefix="usagebassoon-test-logs-") as directory:
+        environment = dict(os.environ, USAGEBASSOON_LOG_DIRECTORY=directory)
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-v", "-s", "-m", markers, *sys.argv[1:]],
+            env=environment,
+        )
+    raise SystemExit(result.returncode)
+
 # Fallback for long cloud runs: persist partial failure output for restricted shells.
 test-bq-live test-name="tests/test_backend_bigquery_live.py" reset="0":
     #!/usr/bin/env bash
@@ -119,6 +137,20 @@ lint:
 
     exit "$status"
 
+[script("uv", "run", "python")]
+lint-windows:
+    import subprocess
+    import sys
+
+    results = [
+        subprocess.run([sys.executable, "-m", "ruff", *arguments]).returncode
+        for arguments in (
+            ["check", "{{ src_dir }}", "{{ test_dir }}"],
+            ["format", "--check", "{{ src_dir }}", "{{ test_dir }}"],
+        )
+    ]
+    raise SystemExit(any(results))
+
 lint-yaml:
     #!/usr/bin/env bash
     set -u
@@ -157,6 +189,9 @@ check-license:
 # ---- full CI gate ----
 
 ci: test-unit lint typecheck
+
+# Validate Windows portability alongside the primary POSIX CI gate.
+ci-windows: test-windows lint-windows typecheck
 
 # --- CD / release ---
 

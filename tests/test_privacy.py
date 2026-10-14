@@ -15,6 +15,7 @@ from usagebassoon.privacy import (
 )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "text",
     [
@@ -37,6 +38,7 @@ def test_credential_redaction_retains_diagnostic_locations(text: str) -> None:
     assert "failed" in sanitized
 
 
+@pytest.mark.windows_compatible
 def test_credential_redaction_covers_encoded_unlabeled_values() -> None:
     """Known values remain private when encoded in URLs or structured diagnostics."""
     secret = 'opaque /value"\ncredential'
@@ -48,6 +50,7 @@ def test_credential_redaction_covers_encoded_unlabeled_values() -> None:
     assert sanitized == "<redacted> <redacted> <redacted> <redacted>"
 
 
+@pytest.mark.windows_compatible
 def test_sanitize_table_pseudonymizes_hosts_and_embedded_sensitive_text() -> None:
     """Keep host labels stable while redacting paths and credentials."""
     table = pa.table(
@@ -83,6 +86,7 @@ def test_sanitize_table_pseudonymizes_hosts_and_embedded_sensitive_text() -> Non
     assert all(row["note"] == "[redacted]" for row in rows)
 
 
+@pytest.mark.windows_compatible
 def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() -> None:
     """Remove common credential representations from doctor diagnostics."""
     value = (
@@ -105,6 +109,7 @@ def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() ->
     assert "SERVICE_SECRET=<redacted>" in sanitized
 
 
+@pytest.mark.windows_compatible
 def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
     """Hide complete quoted and process-prefixed Windows paths."""
     value = (
@@ -120,6 +125,7 @@ def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("config_path", "expected"),
     [
@@ -153,6 +159,7 @@ def test_doctor_obfuscates_config_directories(config_path: str, expected: str) -
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "database", ["usagebassoon_it", "/private/store.duckdb", r"C:\private\store.duckdb"]
 )

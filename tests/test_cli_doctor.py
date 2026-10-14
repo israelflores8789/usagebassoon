@@ -28,14 +28,17 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
     return config, backend
 
 
+@pytest.mark.windows_compatible
 def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
     """Make doctor issue-ready by default while warning on raw diagnostics."""
     missing = tmp_path / "private" / "config.toml"
@@ -47,14 +50,15 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
     assert sanitized.exit_code == 1
     assert str(missing) not in plain_cli_output(sanitized.output)
     output = plain_cli_output(sanitized.output)
-    assert "/directory-alpha/" in output
-    assert "/config.toml" in output
+    assert "/directory-alpha/" in output.replace("\\", "/")
+    assert "/config.toml" in output.replace("\\", "/")
     assert "<config-path>" not in output
     assert raw.exit_code == 1
     assert str(missing) in plain_cli_output(raw.output).replace("\n", "")
     assert "raw doctor output may contain" in plain_cli_output(raw.stderr)
 
 
+@pytest.mark.windows_compatible
 def test_doctor_strict_fails_when_unresolved_drift_is_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -100,6 +104,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     assert strict.exit_code == 1
 
 
+@pytest.mark.windows_compatible
 def test_doctor_reports_configured_tokscale_command_and_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -112,7 +117,7 @@ def test_doctor_reports_configured_tokscale_command_and_version(
 
     popen = subprocess.Popen
 
-    def fake_popen(command: list[str], **_kwargs: object) -> subprocess.Popen[bytes]:
+    def fake_popen(command: list[str], _environment: object) -> subprocess.Popen[bytes]:
         calls.append(command)
         return popen(
             [sys.executable, "-c", "print('tokscale 4.18.0')"],
@@ -120,7 +125,12 @@ def test_doctor_reports_configured_tokscale_command_and_version(
             stderr=subprocess.PIPE,
         )
 
-    monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("usagebassoon.collector._start_tokscale_process", fake_popen)
+
+    def unavailable(_command: str) -> str | None:
+        return None
+
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", unavailable)
 
     def fake_schedule_check(_configuration: object) -> DoctorCheck:
         """Keep scheduler subprocesses outside the tokscale probe test."""
@@ -142,6 +152,7 @@ def test_doctor_reports_configured_tokscale_command_and_version(
     assert "command: npx tokscale@latest" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_doctor_reports_failed_tokscale_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -164,6 +175,7 @@ def test_doctor_reports_failed_tokscale_probe(
     assert "OK configuration:" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -218,6 +230,7 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     assert any("1 of 4 target slots available" in detail for detail in check.details)
 
 
+@pytest.mark.windows_compatible
 def test_advisory_maintenance_failure_is_logged(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -243,6 +256,7 @@ def test_advisory_maintenance_failure_is_logged(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_compaction_read_failure_is_logged_and_other_checks_continue(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -273,6 +287,7 @@ def test_compaction_read_failure_is_logged_and_other_checks_continue(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -301,7 +316,7 @@ def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
     )
     rows: list[dict[str, object]] = [
         {
-            "uri": str(root / str(index)),
+            "uri": f"{root}/{index}",
             "captured_at": (start - timedelta(weeks=index)).isoformat(),
             "weekly_slot": (start - timedelta(weeks=index)).strftime("%G-W%V"),
             "roles": ["weekly"],
@@ -326,6 +341,7 @@ def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
     )
 
 
+@pytest.mark.windows_compatible
 def test_doctor_resolves_relative_config_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -335,13 +351,14 @@ def test_doctor_resolves_relative_config_path(
     sanitized = runner.invoke(app, ["doctor", "--config", "ub_dev.toml"])
     raw = runner.invoke(app, ["doctor", "--raw", "--config", "ub_dev.toml"])
     assert sanitized.exit_code == raw.exit_code == 1
-    assert "/directory-alpha/" in plain_cli_output(sanitized.output)
-    assert "/ub_dev.toml" in plain_cli_output(sanitized.output)
+    assert "/directory-alpha/" in plain_cli_output(sanitized.output).replace("\\", "/")
+    assert "/ub_dev.toml" in plain_cli_output(sanitized.output).replace("\\", "/")
     assert str(tmp_path / "ub_dev.toml") in plain_cli_output(raw.output).replace(
         "\n", ""
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["bigquery", "motherduck"])
 def test_doctor_displays_remote_target_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
@@ -355,7 +372,8 @@ def test_doctor_displays_remote_target_name(
             'backend.bigquery.dataset = "usagebassoon_it"\n'
             if provider == "bigquery"
             else 'backend.motherduck.database = "usagebassoon_it"\n'
-        )
+        ),
+        encoding="utf-8",
     )
 
     def fake_open(_configuration: object) -> DuckDBBackend:
@@ -375,8 +393,8 @@ def test_doctor_displays_remote_target_name(
         assert f"backend={provider}, database=usagebassoon_it" in output
         assert "<database>" not in output
         assert "path:" in output
-        assert "/directory-alpha/" in output
-        assert "/config.toml" in output
+        assert "/directory-alpha/" in output.replace("\\", "/")
+        assert "/config.toml" in output.replace("\\", "/")
         assert str(config) not in output
     finally:
         backend.close()

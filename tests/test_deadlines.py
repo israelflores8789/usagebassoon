@@ -28,6 +28,7 @@ from usagebassoon.deadlines import (
 )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("kind", ["instance", "class", "partial", "builtin"])
 def test_supervised_call_rejects_bound_callable_before_ipc(kind: str) -> None:
     """Reject captured instances before touching a child or operation deadline."""
@@ -78,6 +79,7 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     return controlled
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "seconds", [0.0, -1.0, float("inf"), -float("inf"), float("nan")]
 )
@@ -87,6 +89,7 @@ def test_deadline_rejects_invalid_budgets(seconds: float) -> None:
         Deadline(seconds)
 
 
+@pytest.mark.windows_compatible
 def test_remaining_allowance_decreases_without_renewing_caps(clock: Clock) -> None:
     """Request limits cap the shared allowance without creating new deadlines."""
     with operation(180) as deadline:
@@ -102,6 +105,7 @@ def test_remaining_allowance_decreases_without_renewing_caps(clock: Clock) -> No
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("elapsed", [10.0, 11.0])
 def test_expired_deadline_refuses_further_work(clock: Clock, elapsed: float) -> None:
     """The exact expiry boundary and later instants both reject another request."""
@@ -113,6 +117,7 @@ def test_expired_deadline_refuses_further_work(clock: Clock, elapsed: float) -> 
         deadline.remaining(30)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("nested_seconds", [None, 1.0, 600.0])
 def test_nested_operation_reuses_the_enclosing_deadline(
     clock: Clock, nested_seconds: float | None
@@ -133,6 +138,7 @@ def test_nested_operation_reuses_the_enclosing_deadline(
         assert remaining_seconds(None) == 10
 
 
+@pytest.mark.windows_compatible
 def test_operation_restores_context_after_a_nested_failure(clock: Clock) -> None:
     """An inner exception restores its parent's scope without replacing the error."""
     failure = RuntimeError("primary failure")
@@ -146,6 +152,7 @@ def test_operation_restores_context_after_a_nested_failure(clock: Clock) -> None
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_operation_checks_expiry_on_successful_exit(clock: Clock) -> None:
     """Work that returns after exhausting its budget cannot report success."""
     with pytest.raises(OperationTimeout), operation(1):
@@ -153,6 +160,7 @@ def test_operation_checks_expiry_on_successful_exit(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_expired_parent_prevents_nested_operation_entry(clock: Clock) -> None:
     """A new helper cannot start or renew work inside an expired operation."""
     entered = False
@@ -165,6 +173,7 @@ def test_expired_parent_prevents_nested_operation_entry(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_primary_exception_survives_operation_expiry(clock: Clock) -> None:
     """Expiry checks must not hide the exception that interrupted an operation."""
     failure = ValueError("original failure")
@@ -175,6 +184,7 @@ def test_primary_exception_survives_operation_expiry(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_unbounded_operation_keeps_request_safeguards(clock: Clock) -> None:
     """An unbounded local scope leaves request defaults intact without a timer."""
     with operation(None) as deadline:
@@ -187,6 +197,7 @@ def test_unbounded_operation_keeps_request_safeguards(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_expired_operation_has_one_independent_cleanup_allowance(clock: Clock) -> None:
     """Repeated and nested cleanup reuse one grace without hiding a primary error."""
     failure = RuntimeError("primary failure")
@@ -214,6 +225,7 @@ def test_expired_operation_has_one_independent_cleanup_allowance(clock: Clock) -
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_limited_scopes_tighten_restore_and_share_cleanup(clock: Clock) -> None:
     """Child bounds preserve parent time, context and one cleanup allowance."""
     with operation(100) as parent:
@@ -245,6 +257,7 @@ def test_limited_scopes_tighten_restore_and_share_cleanup(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fail", [False, True])
 def test_standalone_cleanup_restores_context(clock: Clock, fail: bool) -> None:
     """Cleanup outside an operation gets a bounded grace and restores context."""
@@ -266,6 +279,7 @@ def test_standalone_cleanup_restores_context(clock: Clock, fail: bool) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_concurrent_cleanup_shares_one_allowance(clock: Clock) -> None:
     """Concurrent workers inherit one grace instead of allocating one per worker."""
     barrier = Barrier(4)
@@ -296,6 +310,7 @@ def test_concurrent_cleanup_shares_one_allowance(clock: Clock) -> None:
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_bounded_method_reuses_parent_and_gives_new_operations_fresh_budgets(
     clock: Clock,
 ) -> None:
@@ -331,6 +346,7 @@ def test_bounded_method_reuses_parent_and_gives_new_operations_fresh_budgets(
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["before", "after"])
 def test_checked_work_rejects_expired_entry_or_return(
     clock: Clock, boundary: str
@@ -354,6 +370,7 @@ def test_checked_work_rejects_expired_entry_or_return(
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_checked_work_preserves_results_without_creating_a_new_scope(
     clock: Clock,
 ) -> None:

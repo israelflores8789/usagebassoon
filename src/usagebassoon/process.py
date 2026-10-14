@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -16,6 +17,25 @@ from typing import IO, Protocol, cast
 _LOG = logging.getLogger("usagebassoon")
 
 type ProcessStream = int | IO[bytes] | None
+
+
+def split_command(command: str, *, windows: bool) -> tuple[str, ...]:
+    """Split a configured command using the selected platform's path rules.
+
+    Args:
+        command: Executable path followed by optional quoted arguments.
+        windows: Preserve backslashes used by Windows executable paths.
+
+    Returns:
+        The executable and its arguments without surrounding quotes.
+    """
+    if not windows:
+        return tuple(shlex.split(command))
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return tuple(lexer)
 
 
 def _platform_attribute(module: ModuleType, name: str) -> object:

@@ -34,6 +34,7 @@ from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.storage_model import STATE_KEYS, normalize_note_id
 
 
+@pytest.mark.windows_compatible
 def test_note_uuid_contract_is_compact_deterministic_and_unambiguous() -> None:
     """Keep the UUID namespace/encoding stable and distinguish every key field."""
     note = NoteAssignment("source", "codex", "session", "first")
@@ -63,6 +64,7 @@ def test_note_uuid_contract_is_compact_deterministic_and_unambiguous() -> None:
             normalize_note_id(invalid)
 
 
+@pytest.mark.windows_compatible
 def test_note_id_access_preserves_lifetimes_and_natural_key_dedup(
     warehouse: StorageBackend,
 ) -> None:
@@ -121,6 +123,7 @@ def test_note_id_access_preserves_lifetimes_and_natural_key_dedup(
         assert get_note_by_id(warehouse, note.note_id) == current
 
 
+@pytest.mark.windows_compatible
 def test_note_pages_are_bounded_ordered_and_source_aware(
     warehouse: StorageBackend,
 ) -> None:
@@ -177,6 +180,7 @@ def warehouse(request: pytest.FixtureRequest) -> Iterator[StorageBackend]:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_assignment_lifetimes_and_no_op_timestamps(warehouse: StorageBackend) -> None:
     """Edits and rename preserve creation; explicit deletion starts a new lifetime."""
     created = datetime(2026, 9, 1, tzinfo=UTC)
@@ -239,6 +243,7 @@ def test_assignment_lifetimes_and_no_op_timestamps(warehouse: StorageBackend) ->
             assert row["op"] == "upsert"
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_restore_preserves_winning_curation_fields(
     warehouse: StorageBackend, tmp_path: Path
 ) -> None:
@@ -280,6 +285,7 @@ def test_snapshot_restore_preserves_winning_curation_fields(
             destination.close()
 
 
+@pytest.mark.windows_compatible
 def test_global_tags_and_source_scoped_notes_survive_compaction(
     warehouse: StorageBackend,
 ) -> None:
@@ -378,6 +384,7 @@ def test_global_tags_and_source_scoped_notes_survive_compaction(
     ]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("table", ["tags", "notes"])
 def test_curation_upsert_ties_use_event_uuid_in_both_writer_strategies(
     warehouse: StorageBackend, table: str

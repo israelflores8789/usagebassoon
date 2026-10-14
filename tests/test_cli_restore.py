@@ -20,8 +20,12 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 def _write_config(path: Path, database: Path) -> None:
     """Write a local-DuckDB configuration for restore command tests."""
     path.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n[snapshots.local]\nenable = true\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n"
+        "[snapshots.local]\n"
+        "enable = true\n",
+        encoding="utf-8",
     )
 
 
@@ -39,6 +43,7 @@ def _seed_session(database: Path, session_id: str) -> None:
     backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -63,7 +68,7 @@ def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
     )
 
     assert snapshot_result.exit_code == 0
-    assert restore_result.exit_code == 0
+    assert restore_result.exit_code == 0, plain_cli_output(restore_result.output)
     assert "sessions=1" in plain_cli_output(restore_result.output)
     backend = DuckDBBackend(destination_database)
     try:
@@ -74,6 +79,7 @@ def test_restore_rehydrates_an_empty_warehouse_from_latest_snapshot(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("answer", ["n", "y"])
 def test_explicit_restore_from_disabled_location_requires_separate_confirmation(
     tmp_path: Path,
@@ -96,10 +102,16 @@ def test_explicit_restore_from_disabled_location_requires_separate_confirmation(
     target.close()
     config = tmp_path / "config.toml"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.duckdb.database = "{database}"\n'
-        "[snapshots.local]\nenable = false\n"
-        '[snapshots.gcs]\nenable = true\nuri = "gs://unused/archive"\n'
-        'project = "unused"\ncredentials_file = "/missing/credentials.json"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        f"backend.duckdb.database = '{database}'\n"
+        "[snapshots.local]\n"
+        "enable = false\n"
+        "[snapshots.gcs]\n"
+        "enable = true\n"
+        'uri = "gs://unused/archive"\n'
+        'project = "unused"\n'
+        'credentials_file = "/missing/credentials.json"\n',
+        encoding="utf-8",
     )
 
     def forbidden_cloud(*_args: object, **_kwargs: object) -> object:
@@ -123,6 +135,7 @@ def test_explicit_restore_from_disabled_location_requires_separate_confirmation(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_restore_source_advice_failure_does_not_block_immutable_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -156,6 +169,7 @@ def test_restore_source_advice_failure_does_not_block_immutable_recovery(
     assert "Source matching is unavailable" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_restore_rejects_a_populated_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,6 +204,7 @@ def test_restore_rejects_a_populated_destination(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("answer", ["n\n", "\n", ""])
 def test_restore_requires_confirmation_before_writing_warehouse(
     tmp_path: Path, answer: str

@@ -109,6 +109,7 @@ def display(monkeypatch: pytest.MonkeyPatch) -> Display:
     return recorder
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "reason", ["redirected", "CI", "GITHUB_ACTIONS", "dumb", "narrow"]
 )
@@ -129,6 +130,7 @@ def test_noninteractive_operations_stay_quiet(
     assert stream.getvalue() == ""
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("system", "no_color", "expected"),
     [
@@ -170,6 +172,7 @@ def test_configured_animation_and_theme_colors(
     assert not display.active
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
 def test_real_animation_stops_on_failure(
     terminal: Terminal, error: type[BaseException]
@@ -182,6 +185,7 @@ def test_real_animation_stops_on_failure(
     assert "\x1b[38;2;12;34;56m" in terminal.getvalue()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "report", ["activity", "daily", "graph", "models", "sessions", "summary"]
 )
@@ -191,6 +195,7 @@ def test_sample_reports_skip_spinner(display: Display, report: str) -> None:
     assert not display.calls
 
 
+@pytest.mark.windows_compatible
 def test_query_uses_configured_spinner_and_keeps_json_clean(
     tmp_path: Path, terminal: Terminal, display: Display
 ) -> None:
@@ -213,6 +218,7 @@ def test_query_uses_configured_spinner_and_keeps_json_clean(
     assert terminal.getvalue()
 
 
+@pytest.mark.windows_compatible
 def test_note_editor_runs_between_spinner_operations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -231,7 +237,7 @@ def test_note_editor_runs_between_spinner_operations(
         assert not check
         assert not display.active
         assert len(display.calls) == 2
-        Path(command[-1]).write_text("An edited note")
+        Path(command[-1]).write_text("An edited note", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(note_module.subprocess, "run", edit)
@@ -254,6 +260,7 @@ def test_note_editor_runs_between_spinner_operations(
     assert terminal.getvalue()
 
 
+@pytest.mark.windows_compatible
 def test_restore_confirmation_precedes_spinner(
     terminal: Terminal, display: Display
 ) -> None:
@@ -263,6 +270,7 @@ def test_restore_confirmation_precedes_spinner(
     assert terminal.getvalue() == ""
 
 
+@pytest.mark.windows_compatible
 def test_query_closes_backend_if_spinner_startup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

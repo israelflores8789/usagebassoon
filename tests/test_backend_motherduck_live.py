@@ -93,7 +93,11 @@ _LOG = logging.getLogger("usagebassoon-motherduck-live")
 @pytest.fixture(autouse=True)
 def _bound_live_test_duration() -> Iterator[None]:
     """Fail a blocked live test within the per-test time limit."""
-    if not hasattr(signal, "SIGALRM"):
+    if (
+        not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "ITIMER_REAL")
+    ):
         yield
         return
 

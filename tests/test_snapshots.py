@@ -49,6 +49,7 @@ from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 from usagebassoon.snapshot.reader import SnapshotReader
 
 
+@pytest.mark.windows_compatible
 def test_bucket_modules_do_not_depend_on_snapshot_orchestration() -> None:
     """Keep provider adapters below snapshot format and lifecycle modules."""
     for module in resources.files("usagebassoon.buckets").iterdir():
@@ -79,6 +80,7 @@ def test_bucket_modules_do_not_depend_on_snapshot_orchestration() -> None:
             ), f"{module.name}: bucket imports snapshot orchestration"
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_deadline_prevents_publication_and_allows_next_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -111,6 +113,7 @@ def test_snapshot_deadline_prevents_publication_and_allows_next_attempt(
     assert len(store.list_snapshots()) == 1
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_deadline_interrupts_local_capture_and_releases_transaction(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -142,6 +145,7 @@ def test_snapshot_deadline_interrupts_local_capture_and_releases_transaction(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["local", "gcs"])
 @pytest.mark.parametrize("boundary", ["data", "sidecar", "forget"])
 def test_retirement_retries_every_cleanup_boundary(
@@ -205,6 +209,7 @@ def test_retirement_retries_every_cleanup_boundary(
         assert bucket.list("pending") == ()
 
 
+@pytest.mark.windows_smoke
 def test_local_object_versions_reject_identical_recreations(tmp_path: Path) -> None:
     """Stale reads, deletes, and JSON CAS cannot target identical new files."""
     bucket = LocalSnapshotBucket(str(tmp_path / "archive"))
@@ -234,11 +239,18 @@ def test_local_object_versions_reject_identical_recreations(tmp_path: Path) -> N
         bucket.read_bytes(uploaded.name, version=uploaded.version)
         == source.read_bytes()
     )
+    with pytest.raises(FileExistsError):
+        bucket.upload_file(uploaded.name, source)
+    assert (
+        bucket.read_bytes(uploaded.name, version=uploaded.version)
+        == source.read_bytes()
+    )
     downloaded = bucket.download_file(uploaded.name, tmp_path / "download.parquet")
     assert downloaded.version == uploaded.version
     assert downloaded.checksum == uploaded.checksum
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("complete", [False, True])
 def test_publication_cleans_abandoned_stages_but_preserves_completed_units(
     tmp_path: Path, complete: bool
@@ -261,6 +273,7 @@ def test_publication_cleans_abandoned_stages_but_preserves_completed_units(
         assert bool(bucket.list("interrupted")) is complete
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["local", "gcs"])
 def test_rotation_bounds_control_records_and_preserves_pins(
     tmp_path: Path, provider: str
@@ -295,6 +308,7 @@ def test_rotation_bounds_control_records_and_preserves_pins(
             assert not (tmp_path / "archive" / identifier).exists()
 
 
+@pytest.mark.windows_compatible
 def test_deleted_orphans_stay_recovery_only_during_discovery_and_repair(
     tmp_path: Path,
 ) -> None:
@@ -329,6 +343,7 @@ def test_deleted_orphans_stay_recovery_only_during_discovery_and_repair(
     assert catalog.control()[0]["records"] == {}
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["local", "gcs"])
 def test_changed_cleanup_revision_remains_pending_without_blocking_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
@@ -374,6 +389,7 @@ def test_changed_cleanup_revision_remains_pending_without_blocking_publication(
     assert store.list_snapshots() == [published.rsplit("/", 1)[-1]]
 
 
+@pytest.mark.windows_compatible
 def test_completed_deletion_allows_explicit_reimport_of_the_same_identity(
     tmp_path: Path,
 ) -> None:
@@ -407,6 +423,7 @@ def _backend() -> DuckDBBackend:
     return backend
 
 
+@pytest.mark.windows_smoke
 def test_snapshot_restore_preserves_collection_invocation_methods(
     tmp_path: Path,
     collection_bundle: CollectionBundle,
@@ -453,6 +470,7 @@ def test_snapshot_restore_preserves_collection_invocation_methods(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_registered_remote_providers_share_capture_and_complete_lifecycle(
     tmp_path: Path,
 ) -> None:
@@ -512,6 +530,7 @@ def test_registered_remote_providers_share_capture_and_complete_lifecycle(
     assert store.reader.listing(copied)[0]["pinned"] is True
 
 
+@pytest.mark.windows_compatible
 def test_protocol_bucket_injection_supports_unregistered_provider_subroots(
     tmp_path: Path,
 ) -> None:
@@ -544,6 +563,7 @@ def test_protocol_bucket_injection_supports_unregistered_provider_subroots(
     assert store.reader.listing(snapshot)[0]["pinned"] is True
 
 
+@pytest.mark.windows_compatible
 def test_unknown_remote_scheme_fails_without_creating_local_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -576,6 +596,7 @@ def _append_note(backend: DuckDBBackend) -> None:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("limit", [None, 1])
 def test_local_rotation_retains_newest_complete_snapshots(
     tmp_path: Path, limit: int | None
@@ -612,6 +633,7 @@ def test_local_rotation_retains_newest_complete_snapshots(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_failed_table_never_publishes_a_manifest(tmp_path: Path) -> None:
     """Reject a partial capture instead of producing a misleading snapshot."""
     store = SnapshotStore(f"file://{tmp_path}/archive")
@@ -622,6 +644,7 @@ def test_failed_table_never_publishes_a_manifest(tmp_path: Path) -> None:
     assert not list((tmp_path / "archive").glob("*/manifest.json"))
 
 
+@pytest.mark.windows_compatible
 def test_zero_row_tables_are_complete_manifest_entries(tmp_path: Path) -> None:
     """Record every empty table as captured rather than silently omitting it."""
     backend = _backend()
@@ -643,6 +666,7 @@ def test_zero_row_tables_are_complete_manifest_entries(tmp_path: Path) -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_catalog_rejects_traversal_ids_and_local_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -670,6 +694,7 @@ def test_snapshot_catalog_rejects_traversal_ids_and_local_cleanup(
     assert outside.read_text() == "keep"
 
 
+@pytest.mark.windows_compatible
 def test_restore_rejects_traversal_manifest_and_object_names(tmp_path: Path) -> None:
     """Constrain portable object references even with a matching manifest digest."""
     source, target = _backend(), _backend()
@@ -699,6 +724,7 @@ def test_restore_rejects_traversal_manifest_and_object_names(tmp_path: Path) -> 
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_restore_verifies_manifest_and_object_sha256(tmp_path: Path) -> None:
     """Reject corrupt bytes before JSON or Parquet parsing can consume them."""
     archive = tmp_path / "archive"
@@ -727,6 +753,7 @@ def test_restore_verifies_manifest_and_object_sha256(tmp_path: Path) -> None:
         target.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("damage", "message"),
     [
@@ -818,6 +845,7 @@ def test_restore_validates_contract_even_when_checksums_match(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_store_restore_requires_an_empty_backend(tmp_path: Path) -> None:
     """Enforce empty destinations for direct library callers as well as the CLI."""
     backend = _backend()
@@ -832,6 +860,7 @@ def test_snapshot_store_restore_requires_an_empty_backend(tmp_path: Path) -> Non
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:
     """Keep cadence independent of manual capture and reject a stolen fence."""
     backend = _backend()
@@ -857,6 +886,7 @@ def test_interval_reservation_takeover_and_fencing(tmp_path: Path) -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_local_catalog_claim_has_one_winner_under_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -890,6 +920,7 @@ def test_local_catalog_claim_has_one_winner_under_race(
     assert sum(winners) == 1
 
 
+@pytest.mark.windows_compatible
 def test_portable_copy_recovers_without_catalog_and_preserves_pin(
     tmp_path: Path,
 ) -> None:
@@ -921,6 +952,7 @@ def test_portable_copy_recovers_without_catalog_and_preserves_pin(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_pins_preserve_manifest_digest_and_survive_rotation(tmp_path: Path) -> None:
     """Pins change lifecycle state while immutable content stays recoverable."""
     backend = _backend()
@@ -946,6 +978,7 @@ def test_pins_preserve_manifest_digest_and_survive_rotation(tmp_path: Path) -> N
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_weekly_retention_is_independent_and_never_fabricates_slots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -983,6 +1016,7 @@ def test_weekly_retention_is_independent_and_never_fabricates_slots(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_global_latest_warns_and_falls_back_before_restore(tmp_path: Path) -> None:
     """Sort by capture point across roots and skip a corrupted automatic copy."""
     source, target = _backend(), _backend()
@@ -1015,6 +1049,7 @@ def test_global_latest_warns_and_falls_back_before_restore(tmp_path: Path) -> No
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_restore_rejects_unexpected_data_and_rolls_back_late_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1055,6 +1090,7 @@ def test_restore_rejects_unexpected_data_and_rolls_back_late_failure(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_corrupt_index_repair_preserves_evidence_and_control(tmp_path: Path) -> None:
     """Rebuild an index without overwriting independent reservation metadata."""
     backend = _backend()
@@ -1091,6 +1127,7 @@ def test_corrupt_index_repair_preserves_evidence_and_control(tmp_path: Path) -> 
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_temporary_disk_exhaustion_stops_selection_without_destination_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1121,6 +1158,7 @@ def test_temporary_disk_exhaustion_stops_selection_without_destination_writes(
         target.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("mutable", ["catalog.json", "control.json", "state.json"])
 def test_emergency_restore_ignores_corrupt_mutable_metadata(
     tmp_path: Path, mutable: str
@@ -1148,6 +1186,7 @@ def test_emergency_restore_ignores_corrupt_mutable_metadata(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_retired_immutable_copy_remains_readable_before_cleanup(tmp_path: Path) -> None:
     """Retirement affects management eligibility, not immutable recovery validity."""
     source, target = _backend(), _backend()
@@ -1168,6 +1207,7 @@ def test_retired_immutable_copy_remains_readable_before_cleanup(tmp_path: Path) 
         target.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("operation", ["publish", "retire", "pin"])
 def test_takeover_between_authority_read_and_mutation_blocks_stale_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
@@ -1209,6 +1249,7 @@ def test_takeover_between_authority_read_and_mutation_blocks_stale_owner(
     assert state["published"] is False and state["pinned"] is False
 
 
+@pytest.mark.windows_compatible
 def test_lost_restore_acknowledgement_resolves_receipt_without_replaying(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1242,6 +1283,7 @@ def test_lost_restore_acknowledgement_resolves_receipt_without_replaying(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_download_reservation_blocks_rotation_until_files_are_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1282,6 +1324,7 @@ def test_download_reservation_blocks_rotation_until_files_are_verified(
         source.close()
 
 
+@pytest.mark.windows_compatible
 def test_rescue_copy_preserves_immutables_when_source_lifecycle_is_damaged(
     tmp_path: Path,
 ) -> None:
@@ -1305,6 +1348,7 @@ def test_rescue_copy_preserves_immutables_when_source_lifecycle_is_damaged(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_verified_download_survives_corrupted_reservation_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1334,6 +1378,7 @@ def test_verified_download_survives_corrupted_reservation_release(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_repair_indexes_only_verified_copies_without_destroying_recovery_data(
     tmp_path: Path,
 ) -> None:
@@ -1360,6 +1405,7 @@ def test_repair_indexes_only_verified_copies_without_destroying_recovery_data(
         target.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("local_enabled", [False, True])
 @pytest.mark.parametrize("gcs_enabled", [False, True])
 def test_archiver_uses_only_enabled_destinations(
@@ -1418,6 +1464,7 @@ def test_archiver_uses_only_enabled_destinations(
         assert control["policy"] == {"max_snapshots": 5, "weekly_slots": 4}
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("disable_weekly", [False, True])
 @pytest.mark.parametrize("cross_week", [False, True])
 def test_automatic_snapshots_observe_independent_cadence_and_weekly_policy(
@@ -1482,20 +1529,26 @@ def test_automatic_snapshots_observe_independent_cadence_and_weekly_policy(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_archive_read_configuration_does_not_require_a_backend(tmp_path: Path) -> None:
     """Discover archives without requiring valid backend settings."""
     path = tmp_path / "config.toml"
     path.write_text(
         'backend.provider = "unavailable"\n'
-        f'[snapshots.local]\nenable = true\npath = "{tmp_path / "archive"}"\n'
-        '[snapshots.schedule]\ninterval = "2d"\n'
-        "[snapshots.gcs]\nenable = false\n"
+        "[snapshots.local]\n"
+        "enable = true\n"
+        f"path = '{tmp_path / 'archive'}'\n"
+        "[snapshots.schedule]\n"
+        'interval = "2d"\n'
+        "[snapshots.gcs]\n"
+        "enable = false\n"
     )
     store = SnapshotStore.for_read(path)
     assert store.destination_uris == (str(tmp_path / "archive"),)
     assert store.interval == timedelta(days=2)
 
 
+@pytest.mark.windows_compatible
 def test_archive_discovery_honors_logging_opt_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1508,8 +1561,11 @@ def test_archive_discovery_honors_logging_opt_out(
     monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(directory))
     path = tmp_path / "config.toml"
     path.write_text(
-        f'[snapshots.local]\nenable = true\npath = "{tmp_path / "archive"}"\n'
-        "[logging]\ndisable = true\n"
+        "[snapshots.local]\n"
+        "enable = true\n"
+        f"path = '{tmp_path / 'archive'}'\n"
+        "[logging]\n"
+        "disable = true\n"
     )
     store = SnapshotStore.for_read(path)
     assert store.destination_uris == (str(tmp_path / "archive"),)
@@ -1517,6 +1573,7 @@ def test_archive_discovery_honors_logging_opt_out(
     assert not directory.exists()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("body_fails", [False, True])
 def test_reservation_release_failure_preserves_operation_outcome(
     tmp_path: Path,
@@ -1558,6 +1615,7 @@ def test_reservation_release_failure_preserves_operation_outcome(
     assert Catalog(bucket).control()[0]["reservation"] is not None
 
 
+@pytest.mark.windows_compatible
 def test_read_only_recovery_logs_reservation_failure_without_callback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1587,6 +1645,7 @@ def test_read_only_recovery_logs_reservation_failure_without_callback(
         source.close()
 
 
+@pytest.mark.windows_compatible
 def test_maintenance_notice_failure_does_not_hide_restore_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1621,6 +1680,7 @@ def test_maintenance_notice_failure_does_not_hide_restore_failure(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_local_publication_failure_survives_failed_temporary_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1654,6 +1714,7 @@ def test_local_publication_failure_survives_failed_temporary_cleanup(
         monkeypatch.undo()
 
 
+@pytest.mark.windows_compatible
 def test_relocated_directories_remain_visible_after_partial_authority(
     tmp_path: Path,
 ) -> None:
@@ -1681,6 +1742,7 @@ def test_relocated_directories_remain_visible_after_partial_authority(
         source.close()
 
 
+@pytest.mark.windows_compatible
 def test_stale_portable_projection_cannot_overwrite_a_new_pin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1720,6 +1782,7 @@ def test_stale_portable_projection_cannot_overwrite_a_new_pin(
     assert second.state("owned") == portable
 
 
+@pytest.mark.windows_compatible
 def test_pin_projection_failure_is_reported_and_retry_preserves_relocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1756,6 +1819,7 @@ def test_pin_projection_failure_is_reported_and_retry_preserves_relocation(
         source.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("damage", ["reservation", "fence", "policy", "records"])
 def test_corrupt_coordination_blocks_mutation_but_not_recovery(
     tmp_path: Path,
@@ -1783,6 +1847,7 @@ def test_corrupt_coordination_blocks_mutation_but_not_recovery(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_fallback_removes_rejected_downloads_before_the_next_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1826,6 +1891,7 @@ def test_fallback_removes_rejected_downloads_before_the_next_candidate(
         source.close()
 
 
+@pytest.mark.windows_compatible
 def test_successful_restore_survives_failed_information_callbacks(
     tmp_path: Path,
 ) -> None:
@@ -1848,6 +1914,7 @@ def test_successful_restore_survives_failed_information_callbacks(
         target.close()
 
 
+@pytest.mark.windows_compatible
 def test_explicit_cloud_recovery_uses_disabled_provider_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1868,8 +1935,10 @@ def test_explicit_cloud_recovery_uses_disabled_provider_credentials(
     config = tmp_path / "config.toml"
     config.write_text(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
-        '[snapshots.gcs]\nenable = false\nproject = "recovery-project"\n'
-        f'credentials_file = "{credentials}"\n'
+        "[snapshots.gcs]\n"
+        "enable = false\n"
+        'project = "recovery-project"\n'
+        f"credentials_file = '{credentials}'\n"
     )
     calls: list[dict[str, object]] = []
 
@@ -1895,6 +1964,7 @@ def test_explicit_cloud_recovery_uses_disabled_provider_credentials(
     )
 
 
+@pytest.mark.windows_compatible
 def test_latest_recovery_survives_unavailable_cloud_authentication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1932,6 +2002,7 @@ def test_latest_recovery_survives_unavailable_cloud_authentication(
     assert any("credentials unavailable" in message for message in warnings)
 
 
+@pytest.mark.windows_compatible
 def test_portable_pin_repair_uses_authority_when_sidecar_json_is_damaged(
     tmp_path: Path,
 ) -> None:
@@ -1954,6 +2025,7 @@ def test_portable_pin_repair_uses_authority_when_sidecar_json_is_damaged(
         source.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("selection", ["latest", "id"])
 def test_disabled_known_archive_is_recoverable_by_id_or_latest(
     tmp_path: Path,
@@ -1981,6 +2053,7 @@ def test_disabled_known_archive_is_recoverable_by_id_or_latest(
         assert not store.selection_enabled(prepared.candidate.uri)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "phase",
     [

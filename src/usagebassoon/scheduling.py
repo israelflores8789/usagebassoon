@@ -500,7 +500,11 @@ def _install_systemd(
         if loginctl is None:
             warnings.append("loginctl was not found; user lingering was not enabled")
         else:
-            user = os.environ.get("USER") or str(os.getuid())
+            user = os.environ.get("USER")
+            if not user:
+                if not hasattr(os, "getuid"):
+                    raise SchedulingError("systemd requires a POSIX user identity")
+                user = str(os.getuid())
             result = _run([loginctl, "enable-linger", user], check=False)
             if result.returncode != 0:
                 detail = result.stderr.strip() or "permission was denied"
@@ -554,6 +558,8 @@ def _launchd_plist_bytes(
 
 def _launch_domain() -> str:
     """Return the current user's launchd GUI domain."""
+    if not hasattr(os, "getuid"):
+        raise SchedulingError("launchd requires a POSIX user identity")
     return f"gui/{os.getuid()}"
 
 

@@ -118,6 +118,35 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
 
+  windows:
+    name: Windows smoke and compatible tests
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+    - uses: extractions/setup-just@v4
+    - name: Install Python 3.13
+      run: uv python install 3.13
+    - name: Sync environment
+      run: uv sync --locked --all-extras --dev --python 3.13
+    - name: Run Windows CI
+      run: just ci-windows
+      env:
+        PYTEST_ADDOPTS: --junitxml=junit-windows.xml
+    - name: Upload Windows JUnit results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: junit-windows
+        path: junit-windows.xml
+        if-no-files-found: warn
+        retention-days: 14
+
   build:
     name: Build and validate distributions
     runs-on: ubuntu-26.04
@@ -142,7 +171,7 @@ jobs:
     name: CI Local gate
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [lint, sql-parity, unit, build]
+    needs: [lint, sql-parity, unit, windows, build]
     if: always()
     steps:
     - name: Evaluate results
@@ -150,10 +179,11 @@ jobs:
         LINT: ${{ needs.lint.result }}
         SQL_PARITY: ${{ needs.sql-parity.result }}
         UNIT: ${{ needs.unit.result }}
+        WINDOWS: ${{ needs.windows.result }}
         BUILD: ${{ needs.build.result }}
       run: |
         set -euo pipefail
-        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT build=$BUILD"
-        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$BUILD"; do
+        echo "lint=$LINT sql_parity=$SQL_PARITY unit=$UNIT windows=$WINDOWS build=$BUILD"
+        for result in "$LINT" "$SQL_PARITY" "$UNIT" "$WINDOWS" "$BUILD"; do
           [ "$result" = "success" ] || exit 1
         done

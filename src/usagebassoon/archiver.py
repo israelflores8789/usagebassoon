@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import tomllib
 from base64 import b64encode
 from collections.abc import Callable, Sequence
@@ -173,12 +174,14 @@ class SnapshotArchiver:
         location = bucket_uri(uri)
         if location not in self._buckets:
             parents = [
-                root for root in self._buckets if location.startswith(root + "/")
+                root
+                for root in self._buckets
+                if location.startswith(root + ("/" if "://" in root else os.sep))
             ]
             if parents:
                 root = max(parents, key=len)
                 bucket: SnapshotBucket = ScopedSnapshotBucket(
-                    self._buckets[root], location[len(root) + 1 :]
+                    self._buckets[root], location[len(root) + 1 :].replace(os.sep, "/")
                 )
             else:
                 bucket = self._bucket_factory(location)
@@ -220,6 +223,7 @@ class SnapshotArchiver:
         """Determine whether an explicit location belongs to an enabled archive."""
         if selection == "latest" or not (
             "/" in selection
+            or Path(selection).is_absolute()
             or selection.startswith((".", "~"))
             or Path(selection).exists()
         ):
@@ -227,7 +231,8 @@ class SnapshotArchiver:
         location = snapshot_location(selection)
         for configured in self._locations:
             root = bucket_uri(configured)
-            if location == root or location.startswith(root + "/"):
+            separator = "/" if "://" in root else os.sep
+            if location == root or location.startswith(root + separator):
                 return True
         return False
 

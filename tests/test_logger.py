@@ -19,6 +19,7 @@ from usagebassoon.config import LoggingConfig
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR, configure
 
 
+@pytest.mark.windows_compatible
 def test_log_directory_environment_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -36,6 +37,7 @@ def test_log_directory_environment_override(
     assert not (tmp_path / "configured-logs" / "usagebassoon.log").exists()
 
 
+@pytest.mark.windows_compatible
 def test_log_sink_writes_under_the_configured_state_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -49,6 +51,7 @@ def test_log_sink_writes_under_the_configured_state_directory(
     assert "warehouse cycle failed" in (tmp_path / "usagebassoon.log").read_text()
 
 
+@pytest.mark.windows_compatible
 def test_unavailable_log_directory_falls_back_to_stderr(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -70,6 +73,7 @@ def test_unavailable_log_directory_falls_back_to_stderr(
     assert "fallback collection error" in plain_cli_output(captured.err)
 
 
+@pytest.mark.windows_compatible
 def test_logging_disable_closes_sinks_and_can_be_reenabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -88,6 +92,7 @@ def test_logging_disable_closes_sinks_and_can_be_reenabled(
     assert "disabled message" not in path.read_text()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("sink", ["rotating", "fallback", "write_failure"])
 def test_operational_sinks_redact_complete_exception_records(
     tmp_path: Path,
@@ -186,6 +191,8 @@ def test_operational_timestamps_use_utc_in_non_utc_timezone(
     fallback: bool,
 ) -> None:
     """Both durable and fallback logs must label the actual UTC instant."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("requires process timezone switching")
     monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     directory = tmp_path / "logs"
     if fallback:

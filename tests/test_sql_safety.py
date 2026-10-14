@@ -31,12 +31,14 @@ def initialized_config(tmp_path: Path) -> Path:
         backend.close()
     config = tmp_path / "config.toml"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n"
     )
     return config
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "sql",
     [
@@ -67,6 +69,7 @@ def test_public_sql_validator_rejects_external_or_expressive_sql(
         validate_read_only_sql(sql, dialect=dialect)
 
 
+@pytest.mark.windows_compatible
 def test_public_sql_validator_accepts_one_allowlisted_bounded_relation() -> None:
     """Permit a simple allowlisted relation with a bound filter parameter."""
     sql, parameters = build_relation_query(
@@ -80,6 +83,7 @@ def test_public_sql_validator_accepts_one_allowlisted_bounded_relation() -> None
     assert parameters == {"filter_0": "codex"}
 
 
+@pytest.mark.windows_compatible
 def test_public_sql_validator_uses_bigquery_identifier_quoting() -> None:
     """Generate SQL that BigQuery accepts for an allowlisted relation."""
     sql, parameters = build_relation_query(
@@ -94,6 +98,7 @@ def test_public_sql_validator_uses_bigquery_identifier_quoting() -> None:
     assert parameters == {}
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("api", ["arrow", "dataframe"])
 def test_python_query_apis_apply_the_public_validator(
     initialized_config: Path, api: str
@@ -113,6 +118,7 @@ def test_python_query_apis_apply_the_public_validator(
         read("SELECT * FROM daily_cost", config=initialized_config)
 
 
+@pytest.mark.windows_compatible
 def test_public_query_preserves_colon_containing_session_identity(
     initialized_config: Path,
 ) -> None:
@@ -132,6 +138,7 @@ def test_public_query_preserves_colon_containing_session_identity(
     assert result.to_pylist() == [{"session_id": "provider:session"}]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "relation",
     [

@@ -385,10 +385,21 @@ The project separates local tests from SQL dialect-parity tests:
 | `just lint`               | Runs Ruff lint and format checks                             |
 | `just typecheck`          | Runs strict Pyrefly checks                                   |
 | `just ci`                 | Runs the project’s standard hermetic CI gate                 |
+| `just test-windows`       | Runs explicitly marked Windows smoke and compatible local tests |
+| `just lint-windows`       | Runs the same Ruff checks through a Windows script recipe    |
+| `just ci-windows`         | Runs Windows tests, Ruff, and native Windows Pyrefly checks  |
 | `just spell`              | Runs the Typos spelling check                                |
 | `just check-dist`         | Builds distributions and validates them with Twine           |
 
 `sql_parity` is a required separate check even when `just test-unit` passes. SQL changes must update both dialects and include parity coverage.
+
+POSIX is the primary environment for the full test suite, dialect parity, and live cloud integrations. Windows is considered a necessary evil ;) and is only run to ensure Windows-specific features and compatible behavior. Both CI workflows also require a Windows runner using `just ci-windows`. Windows tests *exclude all live integration test* (e.g. live BigQuery tests etc.) and dialect parity tests.
+
+While all tests, except for Windows-specific tests, are run in POSIX, we classify Windows-compatible tests with `@pytest.mark.windows_compatible`. Tests marked `@pytest.mark.windows_smoke` are specific to Windows for required Windows runtime checks. We *only* add a skip condition if the test *requires* Windows APIs to function.
+
+Tests requiring POSIX terminal APIs, permission modes, detached descendants, or process timezone switching have explicit platform skips and remain outside the Windows selection. Pure scheduler serialization and mocked service tests can remain Windows-compatible. New unmarked tests will run in the primary POSIX suite until their Windows compatibility is reviewed.
+
+Pyrefly is configured to check the runner's native platform. Keep platform-specific implementations behind explicit platform or capability guards. Do **not** suppress diagnostics or exclude source modules to get test or typechecks to pass the Windows gate.
 
 Use focused tests while developing:
 

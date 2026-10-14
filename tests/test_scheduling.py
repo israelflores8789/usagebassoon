@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -63,12 +65,14 @@ def _configuration(
     return ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 def test_systemd_time_span_supports_arbitrary_valid_intervals() -> None:
     """Translate configured minute/hour intervals to systemd seconds."""
     assert _systemd_time_span("15m") == "900s"
     assert _systemd_time_span("2h") == "7200s"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("platform", "invoke_method"),
     [("linux", InvokeMethod.SYSTEMD), ("darwin", InvokeMethod.LAUNCHD)],
@@ -119,6 +123,7 @@ def test_native_collection_artifacts_pass_invocation_method_to_cli(
     assert "Collected run native-run" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preflight_honors_configured_package_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -133,15 +138,21 @@ def test_tokscale_preflight_honors_configured_package_runner(
 
     popen = subprocess.Popen
 
-    def fake_popen(command: list[str], **_: object) -> subprocess.Popen[bytes]:
-        calls.append(command)
+    def fake_start_process(
+        command: Sequence[str], environment: Mapping[str, str]
+    ) -> subprocess.Popen[bytes]:
+        """Record tokscale argv while returning a harmless completed process."""
+        del environment
+        calls.append(list(command))
         return popen(
             [sys.executable, "-c", "print('tokscale 4.18.0')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
-    monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "usagebassoon.collector._start_tokscale_process", fake_start_process
+    )
     monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
 
     expected = (resolved_npx, "tokscale@latest")
@@ -150,6 +161,7 @@ def test_tokscale_preflight_honors_configured_package_runner(
     assert calls == [[resolved_npx, "tokscale@latest", "--version"]]
 
 
+@pytest.mark.windows_compatible
 def test_default_tokscale_uses_the_resolved_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -167,6 +179,7 @@ def test_default_tokscale_uses_the_resolved_path(
     assert resolve_tokscale_command(configuration) == (resolved_tokscale,)
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_path_preserves_backslashes_and_spaces(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -189,6 +202,7 @@ def test_tokscale_path_preserves_backslashes_and_spaces(
     assert resolve_tokscale_command(configuration) == (path,)
 
 
+@pytest.mark.windows_compatible
 def test_windows_command_parser_preserves_quoted_path_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,6 +214,7 @@ def test_windows_command_parser_preserves_quoted_path_arguments(
     ) == (r"C:\Program Files\nodejs\npx.cmd", "tokscale@latest")
 
 
+@pytest.mark.windows_compatible
 def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:
     """Include the installed version in both status presentation formats."""
     from usagebassoon.scheduling import human_status, status_json
@@ -221,6 +236,7 @@ def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:
     assert json.loads(status_json(status))["usagebassoon_version"] == __version__
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preflight_reports_missing_default_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -241,6 +257,7 @@ def test_tokscale_preflight_reports_missing_default_install(
         preflight_tokscale(configuration)
 
 
+@pytest.mark.windows_compatible
 def test_doctor_surfaces_missing_native_scheduler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -265,6 +282,7 @@ def test_doctor_surfaces_missing_native_scheduler(
     assert "bassoon schedule worker" in check.message
 
 
+@pytest.mark.windows_smoke
 def test_worker_interval_is_persisted_before_the_first_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -303,6 +321,21 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
     )
 
 
+@pytest.mark.windows_smoke
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows")
+def test_windows_detached_worker_reports_foreground_guidance(tmp_path: Path) -> None:
+    """Explain that Windows workers run in the foreground under a supervisor."""
+    result = CliRunner().invoke(
+        app,
+        ["schedule", "worker", "--config", str(tmp_path / "config.toml")],
+    )
+    output = plain_cli_output(result.output)
+    assert result.exit_code == 1
+    assert "detached schedule workers are not supported on Windows" in output
+    assert "--foreground" in output
+
+
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("change", ["edited", "replaced", "invalid", "deleted", "none"])
 def test_worker_keeps_startup_configuration_until_restart(
     tmp_path: Path,
@@ -388,6 +421,7 @@ def test_worker_keeps_startup_configuration_until_restart(
         assert "22222222-2222-4222-8222-222222222222" not in stderr
 
 
+@pytest.mark.windows_compatible
 def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     """Report unsupported day-granularity worker intervals before startup."""
     configuration = _configuration(tmp_path)
@@ -397,6 +431,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
         [
             "schedule",
             "worker",
+            "--foreground",
             "--config",
             str(configuration.path),
             "--collect-interval",
@@ -408,6 +443,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     assert "minutes or hours" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("collect_flag", "snapshot_flag"),
     [("--collect-interval", "--snapshot-interval"), ("-c", "-s")],
@@ -462,6 +498,7 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
     assert str(started.log_path) in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("collect_flag", ["--collect-interval", "-c"])
 def test_schedule_install_persists_explicit_interval(
     tmp_path: Path,
@@ -518,6 +555,7 @@ def test_schedule_install_persists_explicit_interval(
     )
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_worker_runs_while_collection_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -579,6 +617,7 @@ def test_snapshot_worker_runs_while_collection_is_blocked(
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.windows_compatible
 def test_native_snapshot_artifacts_have_independent_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
@@ -629,6 +668,7 @@ def test_native_snapshot_artifacts_have_independent_cadence(
         assert "--automatic" in payload["ProgramArguments"]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("disabled_weekly", [False, True])
 def test_snapshot_schedule_defaults_and_disable_flags(
     tmp_path: Path, disabled_weekly: bool
@@ -657,6 +697,7 @@ def test_snapshot_schedule_defaults_and_disable_flags(
     assert snapshot_schedule_seconds(disabled) is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("snapshot_flag", ["--snapshot-interval", "-s"])
 def test_schedule_install_persists_independent_snapshot_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_flag: str
@@ -704,6 +745,7 @@ def test_schedule_install_persists_independent_snapshot_interval(
     assert ConfigurationManager(config.path).load() == observed[0]
 
 
+@pytest.mark.windows_compatible
 def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     """Validate and persist both independent schedules before worker startup."""
     from usagebassoon.scheduling import _worker_configuration
@@ -715,6 +757,7 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     assert ConfigurationManager(config.path).load() == loaded
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("role", "failure_kind"),
     [
@@ -817,6 +860,7 @@ def test_worker_continues_after_an_operational_cycle_failure(
         assert records[0].exc_info[1] is failure
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("origin", ["child", "backend"])
 @pytest.mark.parametrize("disabled", [False, True])
 def test_worker_failure_outputs_protect_active_credentials(
@@ -918,6 +962,7 @@ def test_worker_failure_outputs_protect_active_credentials(
         assert "collection publication failed" in log
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("content", ["not-a-pid", "0", "-1"])
 def test_invalid_worker_pid_state_blocks_worker_control(
     tmp_path: Path,
@@ -933,6 +978,7 @@ def test_invalid_worker_pid_state_blocks_worker_control(
         _read_worker_pid(path)
 
 
+@pytest.mark.windows_compatible
 def test_unreadable_worker_pid_state_is_not_absence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -950,6 +996,7 @@ def test_unreadable_worker_pid_state_is_not_absence(
     assert isinstance(caught.value.__cause__, PermissionError)
 
 
+@pytest.mark.windows_compatible
 def test_healthy_collection_does_not_mask_an_inactive_snapshot_schedule(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

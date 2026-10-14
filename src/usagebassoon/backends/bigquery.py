@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,7 +23,7 @@ from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
-from typing import BinaryIO, cast, override
+from typing import IO, cast, override
 from uuid import uuid4
 
 import pyarrow as pa
@@ -1538,7 +1539,7 @@ class BigQueryBackend(AbstractStorageBackend):
     @bounded
     def _submit_load(
         self,
-        payload: BinaryIO,
+        payload: IO[bytes],
         destination: str,
         *,
         job_config: bigquery.LoadJobConfig,
@@ -1587,7 +1588,9 @@ class BigQueryBackend(AbstractStorageBackend):
         """Load canonical Arrow data through an explicit Parquet payload."""
         parquet_options = bigquery.ParquetOptions()
         parquet_options.enable_list_inference = True
-        with TemporaryFile(mode="w+b") as payload:
+        with TemporaryFile(mode="w+b") as temporary:
+            # Windows TemporaryFile wraps a named file; upload its binary stream.
+            payload = temporary.file if sys.platform == "win32" else temporary
             pq.write_table(data, payload)
             payload.seek(0)
             self._wait_for_job(

@@ -54,7 +54,8 @@ class BigQueryReplayBackend(BigQueryBackend):
     @override
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
         """Read the actual canonical views while avoiding cloud transport."""
-        return self.engine.query(sql.replace("`", '"'), parameters)
+        translated = sqlglot.transpile(sql, read="bigquery", write="duckdb")[0]
+        return self.engine.query(translated, parameters)
 
     @override
     def _load(

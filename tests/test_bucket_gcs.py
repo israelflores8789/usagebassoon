@@ -36,6 +36,7 @@ from usagebassoon.config import ConfigurationError
 from usagebassoon.snapshot.catalog import ArchiveBusy, Catalog
 
 
+@pytest.mark.windows_compatible
 def test_service_account_file_scopes_the_gcs_http_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -92,6 +93,7 @@ def gcs_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     return clock
 
 
+@pytest.mark.windows_compatible
 def test_gcs_paces_shared_object_across_adapters(gcs_clock: list[float]) -> None:
     """Creation, overwrite and deletion share pacing; distinct names do not."""
     client = MagicMock(spec=GcsClient)
@@ -109,6 +111,7 @@ def test_gcs_paces_shared_object_across_adapters(gcs_clock: list[float]) -> None
     assert gcs_clock[0] == pytest.approx(2.2)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_contended_mutation_times_out_without_sending_or_leaking_gate() -> None:
     """A blocked mutation expires safely and leaves the gate reusable."""
@@ -144,6 +147,7 @@ def test_gcs_contended_mutation_times_out_without_sending_or_leaking_gate() -> N
     blob.delete.assert_called_once()
 
 
+@pytest.mark.windows_compatible
 def test_gcs_retries_rate_limit_with_jitter_and_stable_generation(
     monkeypatch: pytest.MonkeyPatch,
     gcs_clock: list[float],
@@ -175,6 +179,7 @@ def test_gcs_retries_rate_limit_with_jitter_and_stable_generation(
         assert call.kwargs["retry"] is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["backoff", "cleanup_pacing", "request_ceiling"])
 def test_gcs_waits_and_requests_respect_deadlines(
     monkeypatch: pytest.MonkeyPatch,
@@ -222,6 +227,7 @@ def test_gcs_waits_and_requests_respect_deadlines(
         assert blob.download_as_bytes.call_count == 1
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_lost_write_response_never_removes_generation_guard() -> None:
     """An ambiguous commit followed by 412 fails closed rather than overwriting."""
@@ -243,6 +249,7 @@ def test_gcs_lost_write_response_never_removes_generation_guard() -> None:
     blob.reload.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("guard", [None, 0])
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_unsafe_writes_and_permanent_failures_are_not_retried(
@@ -259,6 +266,7 @@ def test_gcs_unsafe_writes_and_permanent_failures_are_not_retried(
     assert blob.upload_from_string.call_count == 1
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_metadata_retry_does_not_replay_successful_upload() -> None:
     """A failed metadata read retries independently of a completed mutation."""
@@ -273,6 +281,7 @@ def test_gcs_metadata_retry_does_not_replay_successful_upload() -> None:
     assert blob.upload_from_string.call_count == 1
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_listing_metadata_failure_does_not_multiply_retries() -> None:
     """Keep paginator and individual metadata recovery in separate retry scopes."""
@@ -290,6 +299,7 @@ def test_gcs_listing_metadata_failure_does_not_multiply_retries() -> None:
     assert client.list_blobs.call_count == 1
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.usefixtures("gcs_clock")
 def test_gcs_partial_listing_restarts_without_duplicate_results() -> None:
     """Retry a failed pagination pass without retaining its incomplete results."""
@@ -310,6 +320,7 @@ def test_gcs_partial_listing_restarts_without_duplicate_results() -> None:
     assert client.list_blobs.call_count == 2
 
 
+@pytest.mark.windows_compatible
 def test_gcs_transfer_and_metadata_consume_the_same_operation_budget(
     tmp_path: Path,
     gcs_clock: list[float],
@@ -494,6 +505,7 @@ class MemoryGcsArchive:
         return GcsObject(relative_name, generation, len(payload), None)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "unsafe_name",
     ["../private", "/absolute", "C:\\Users\\Alice", "\\\\server\\share", "a/../b"],
@@ -526,6 +538,7 @@ def test_gcs_archive_rejects_unsafe_names_before_provider_calls(
     assert client.list_calls == 0
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("name", ["STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"])
 def test_gcs_endpoint_overrides_fail_before_credentials_or_client_creation(
     tmp_path: Path,
@@ -559,6 +572,7 @@ def test_gcs_endpoint_overrides_fail_before_credentials_or_client_creation(
     client.bucket.assert_called_once_with("bucket")
 
 
+@pytest.mark.windows_compatible
 def test_gcs_default_client_retains_production_https_and_certificate_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -583,6 +597,7 @@ def test_gcs_default_client_retains_production_https_and_certificate_verificatio
         client.close()
 
 
+@pytest.mark.windows_compatible
 def test_gcs_archive_uses_configured_request_timeout() -> None:
     """Apply the GCS timeout to a provider listing request."""
     client = _RecordingClient()
@@ -594,6 +609,7 @@ def test_gcs_archive_uses_configured_request_timeout() -> None:
     assert client.list_timeout is not None and 0 < client.list_timeout <= 25.0
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "operation", ["read", "json", "create", "replace", "upload", "download", "delete"]
 )
@@ -670,6 +686,7 @@ def test_gcs_adapter_passes_generation_guards_and_timeouts(
         )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("operation", ["read", "delete", "replace"])
 @pytest.mark.parametrize(
     "error_type", [NotFound, PreconditionFailed, ServiceUnavailable]
@@ -709,6 +726,7 @@ def test_gcs_adapter_distinguishes_generation_conflicts_from_service_failures(
     )
 
 
+@pytest.mark.windows_compatible
 def test_gcs_reservation_expires_during_slow_snapshot() -> None:
     """Reject a stale publisher after another writer replaces an expired claim."""
     archive = MemoryGcsArchive()
@@ -734,6 +752,7 @@ def test_gcs_reservation_expires_during_slow_snapshot() -> None:
     assert first.entries() == []
 
 
+@pytest.mark.windows_compatible
 def test_gcs_reservation_can_be_renewed_before_expiry() -> None:
     """Retain the same fence during renewal and block competing mutations."""
     archive = MemoryGcsArchive()
@@ -745,6 +764,7 @@ def test_gcs_reservation_can_be_renewed_before_expiry() -> None:
             pytest.fail("second archive owner entered")
 
 
+@pytest.mark.windows_compatible
 def test_catalog_checks_read_authority_without_rewriting_each_time() -> None:
     """Fresh reservations permit repeated checks without control mutation bursts."""
     archive = MemoryGcsArchive()
@@ -770,6 +790,7 @@ def test_catalog_checks_read_authority_without_rewriting_each_time() -> None:
     )
 
 
+@pytest.mark.windows_compatible
 def test_catalog_renewal_cannot_outlive_observed_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -818,6 +839,7 @@ def test_catalog_renewal_cannot_outlive_observed_lease(
     assert catalog.control()[0] == document
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_renews_reservation_during_long_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -850,6 +872,7 @@ def test_snapshot_renews_reservation_during_long_capture(
     assert backend.queries == len(SNAPSHOT_TABLES)
 
 
+@pytest.mark.windows_compatible
 def test_simultaneous_gcs_catalog_claim_has_one_winner() -> None:
     """Force both claimants to observe one generation before atomic provider CAS."""
     barrier = Barrier(2)
@@ -896,6 +919,7 @@ def test_simultaneous_gcs_catalog_claim_has_one_winner() -> None:
     assert sum(winners) == 1
 
 
+@pytest.mark.windows_compatible
 def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
     """Retire exact generations and forget completed cleanup."""
     archive = MemoryGcsArchive()
@@ -910,6 +934,7 @@ def test_gcs_catalog_rotation_uses_generation_safe_publication() -> None:
     assert Catalog(archive).state(retired) is None
 
 
+@pytest.mark.windows_compatible
 def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -937,6 +962,7 @@ def test_dual_destinations_capture_once_and_publish_the_same_snapshot(
         )
 
 
+@pytest.mark.windows_compatible
 def test_pending_destination_renews_during_slow_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -974,6 +1000,7 @@ def test_pending_destination_renews_during_slow_publication(
     assert renewed.is_set()
 
 
+@pytest.mark.windows_compatible
 def test_dual_publication_failure_keeps_new_healthy_and_previous_failed_copies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1013,6 +1040,7 @@ def test_dual_publication_failure_keeps_new_healthy_and_previous_failed_copies(
     assert any(obj.name == Path(first).name + "/COMPLETE" for obj in archive.list(""))
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("project", ["ci-test-project", None])
 def test_gcs_live_project_uses_ci_variable_without_adc_project_discovery(
     monkeypatch: pytest.MonkeyPatch,

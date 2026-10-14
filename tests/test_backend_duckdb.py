@@ -32,6 +32,7 @@ from usagebassoon.normalizer import normalize
 from usagebassoon.persistence import persist_run
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("sql", "parameters", "expected"),
     [
@@ -80,6 +81,7 @@ def test_duckdb_query_preserves_quoted_sql_and_binds_only_parameters(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["duckdb", "motherduck", "bigquery"])
 @pytest.mark.parametrize("initialize", [False, True])
 def test_backend_factory_applies_settings_and_enforces_readiness(
@@ -150,6 +152,7 @@ def test_backend_factory_applies_settings_and_enforces_readiness(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_registered_backend_uses_shared_open_and_snapshot_contract(
     tmp_path: Path,
 ) -> None:
@@ -187,6 +190,7 @@ def test_registered_backend_uses_shared_open_and_snapshot_contract(
         open_backend(configuration)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("provider", ["duckdb", "motherduck", "bigquery"])
 def test_backend_factory_rejects_missing_selected_settings(
     tmp_path: Path, provider: BackendName
@@ -201,6 +205,7 @@ def test_backend_factory_rejects_missing_selected_settings(
         open_backend(configuration)
 
 
+@pytest.mark.windows_compatible
 def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -226,6 +231,7 @@ def test_duckdb_replaying_a_committed_run_is_an_idempotent_no_op(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -255,6 +261,7 @@ def test_duckdb_batch_rolls_back_every_write_when_a_later_append_fails(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
     from usagebassoon.storage_model import SNAPSHOT_TABLES
 
@@ -280,6 +287,7 @@ def test_local_backend_applies_current_duckdb_schema(tmp_path: Path) -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_local_backend_merges_current_state_in_place(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -318,6 +326,7 @@ def test_local_backend_merges_current_state_in_place(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_transactional_read_session_preserves_snapshot_after_external_commit() -> None:
     """Pin local DuckDB reads while another cursor commits."""
     connection_backend = DuckDBBackend(":memory:")
@@ -337,6 +346,7 @@ def test_transactional_read_session_preserves_snapshot_after_external_commit() -
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("damage", ["missing", "empty", "hash", "newer"])
 def test_preflight_rejects_invalid_readiness_without_changing_data(damage: str) -> None:
     """Fail closed on invalid initialization evidence and preserve existing data."""
@@ -383,6 +393,7 @@ def test_preflight_rejects_invalid_readiness_without_changing_data(damage: str) 
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "failure", [RuntimeError("primary failure"), KeyboardInterrupt()]
 )

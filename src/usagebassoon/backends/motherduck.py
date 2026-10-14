@@ -342,16 +342,20 @@ class MotherDuckBackend(AbstractStorageBackend):
         self, kind: _ScopeKind, tables: tuple[str, ...] = ()
     ) -> Generator[datetime | None]:
         """Keep a native context open until the matching parent scope finishes."""
-        stamp = self._call(_begin_scope, (kind, tables))
+        begun = False
         try:
+            stamp = self._call(_begin_scope, (kind, tables))
+            begun = True
             yield stamp
             self._call(_end_scope, None)
         except BaseException as error:
-            try:
-                with cleanup_budget():
-                    self._call(_end_scope, error)
-            except Exception:
-                _LOG.exception("could not unwind failed MotherDuck %s scope", kind)
+            # Scope setup can finish in the child just as its deadline expires.
+            if begun or isinstance(error, OperationTimeout):
+                try:
+                    with cleanup_budget():
+                        self._call(_end_scope, error)
+                except Exception:
+                    _LOG.exception("could not unwind failed MotherDuck %s scope", kind)
             raise
 
     @contextmanager

@@ -5,15 +5,44 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import platform
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol, cast
 
 _LOG = logging.getLogger("usagebassoon")
+
+
+class _MemoryStatusFunction(Protocol):
+    """Subset of the Win32 memory-status function used through ctypes."""
+
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self, status: object, /) -> int:
+        """Populate a memory-status structure and report success."""
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    """Win32 MEMORYSTATUSEX structure returned by GlobalMemoryStatusEx."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
 
 
 class InvokeMethod(StrEnum):
@@ -48,20 +77,38 @@ class SystemMetadata:
 
 
 def _physical_memory_bytes() -> int | None:
-    """Return physical memory capacity using portable POSIX interfaces.
+    """Return physical memory capacity using the host's native memory interface.
 
     Returns:
         Total physical memory in bytes, or None when unavailable.
     """
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        page_count = os.sysconf("SC_PHYS_PAGES")
-    except (AttributeError, OSError, ValueError):
-        _LOG.exception("physical memory metadata is unavailable")
-        return None
-    if not isinstance(page_size, int) or not isinstance(page_count, int):
-        return None
-    return page_size * page_count
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_status = cast(
+                _MemoryStatusFunction,
+                kernel32.GlobalMemoryStatusEx,
+            )
+            get_status.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+            get_status.restype = ctypes.c_int
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if not get_status(ctypes.byref(status)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            return int(status.ullTotalPhys)
+        except Exception:
+            _LOG.exception("physical memory metadata is unavailable")
+            return None
+    else:
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            page_count = os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            _LOG.exception("physical memory metadata is unavailable")
+            return None
+        if not isinstance(page_size, int) or not isinstance(page_count, int):
+            return None
+        return page_size * page_count
 
 
 def _linux_cpu_model() -> str | None:
