@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pyarrow as pa
 import pytest
 
@@ -104,25 +106,43 @@ def test_sanitize_doctor_text_redacts_windows_query_and_environment_secrets() ->
     assert "query-secret" not in sanitized
     assert "quoted-secret" not in sanitized
     assert "bare-secret" not in sanitized
-    assert "<path>" in sanitized
+    assert r"C:\Users\<user>\config.toml" in sanitized
     assert "PASSWORD=<redacted>" in sanitized
     assert "SERVICE_SECRET=<redacted>" in sanitized
 
 
 @pytest.mark.windows_compatible
-def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
-    """Hide complete quoted and process-prefixed Windows paths."""
-    value = (
-        r"process: C:\Program Files\nodejs\node.exe[18212]: startup failed; "
-        r"command: 'C:\Program Files\nodejs\npx.cmd' tokscale@latest"
-    )
-
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            r"process: C:\Program Files\nodejs\node.exe[18212]: startup failed; "
+            r"command: 'C:\Program Files\nodejs\npx.cmd' tokscale@latest",
+            r"process: C:\Program Files\nodejs\node.exe[18212]: startup failed; "
+            r"command: 'C:\Program Files\nodejs\npx.cmd' tokscale@latest",
+        ),
+        (
+            "process: /home/alice/Documents/usagebassoon/config.toml failed",
+            "process: /home/<user>/Documents/<project>/config.toml failed",
+        ),
+        (
+            "command: '/home/Alice Smith/Documents/usagebassoon/config.toml'",
+            "command: '/home/<user>/Documents/<project>/config.toml'",
+        ),
+        (
+            r"process: C:\Users\Alice Smith\Documents\usagebassoon\config.toml",
+            r"process: C:\Users\<user>\Documents\<project>\config.toml",
+        ),
+    ],
+)
+def test_sanitize_doctor_text_preserves_windows_and_posix_paths(
+    value: str,
+    expected: str,
+) -> None:
+    """Keep path context while masking recognized user and project directories."""
     sanitized = sanitize_doctor_text(value, config_path=None, database=None)
 
-    assert (
-        sanitized
-        == "process: <path>[18212]: startup failed; command: <path> tokscale@latest"
-    )
+    assert sanitized == expected
 
 
 @pytest.mark.windows_compatible
@@ -130,25 +150,28 @@ def test_sanitize_doctor_text_redacts_windows_paths_with_spaces() -> None:
     ("config_path", "expected"),
     [
         (
-            "/home/alice/private/ub_dev.toml",
-            "/directory-alpha/directory-bravo/directory-charlie/ub_dev.toml",
+            "/home/alice/Documents/usagebassoon/ub_dev.toml",
+            "/home/<user>/Documents/<project>/ub_dev.toml",
         ),
         (
             "/home/Alice Smith/ub_dev.toml",
-            "/directory-alpha/directory-bravo/ub_dev.toml",
+            "/home/<user>/ub_dev.toml",
         ),
         (
-            r"C:\Users\Alice Smith\ub_dev.toml",
-            r"C:\directory-alpha\directory-bravo\ub_dev.toml",
+            r"C:\Users\Alice Smith\Documents\usagebassoon\ub_dev.toml",
+            r"C:\Users\<user>\Documents\<project>\ub_dev.toml",
         ),
         (
-            r"\\private-server\private-share\Alice\ub_dev.toml",
-            r"\\directory-alpha\directory-bravo\directory-charlie\ub_dev.toml",
+            r"\\private-server\private-share\Users\Alice\Documents\usagebassoon\ub_dev.toml",
+            r"\\<host>\<share>\Users\<user>\Documents\<project>\ub_dev.toml",
         ),
     ],
 )
-def test_doctor_obfuscates_config_directories(config_path: str, expected: str) -> None:
-    """Retain absolute path structure and filename without exposing directories."""
+def test_doctor_preserves_common_config_path_components(
+    config_path: str,
+    expected: str,
+) -> None:
+    """Preserve common directories while hiding user and project names."""
     sanitized = sanitize_doctor_text(
         f"path: {config_path}; failed to read {config_path}; PASSWORD=secret",
         config_path=config_path,
@@ -170,3 +193,52 @@ def test_doctor_retains_named_targets_and_redacts_database_paths(database: str) 
     )
     expected = "<path>" if "store.duckdb" in database else database
     assert sanitized == f"database={expected}; TOKEN=<redacted>"
+
+
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    ("config_path", "expected"),
+    [
+        (
+            r"C:\Users\Alice\AppData\Local\UsageBassoon\config.toml",
+            r"C:\Users\<user>\AppData\Local\UsageBassoon\config.toml",
+        ),
+        (
+            "/home/alice/.config/usagebassoon/config.toml",
+            "/home/<user>/.config/usagebassoon/config.toml",
+        ),
+        (
+            "/home/alice/.local/share/usagebassoon/config.toml",
+            "/home/<user>/.local/share/usagebassoon/config.toml",
+        ),
+        (
+            "/Users/alice/Library/Application Support/UsageBassoon/config.toml",
+            "/Users/<user>/Library/Application Support/UsageBassoon/config.toml",
+        ),
+    ],
+)
+def test_doctor_preserves_application_directories_matching_working_directory(
+    config_path: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Application names remain visible even when the working project has that name."""
+    monkeypatch.setattr("usagebassoon.privacy.Path.cwd", lambda: Path("usagebassoon"))
+    assert (
+        sanitize_doctor_text(
+            f"path: {config_path}", config_path=config_path, database=None
+        )
+        == f"path: {expected}"
+    )
+
+
+@pytest.mark.windows_compatible
+def test_doctor_masks_service_account_project_and_preserves_gcs_resource() -> None:
+    """Hide account project IDs without misclassifying Google resource names as UNC."""
+    value = (
+        "usagebassoon@gen-lang-client-0670612427.iam.gserviceaccount.com denied "
+        "on '//storage.googleapis.com/projects/_/buckets/usagebassoon-snapshots'"
+    )
+    expected = (
+        "usagebassoon@<project-id>.iam.gserviceaccount.com denied "
+        "on '//storage.googleapis.com/projects/_/buckets/usagebassoon-snapshots'"
+    )
+    assert sanitize_doctor_text(value, config_path=None, database=None) == expected

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, quote_plus
 
 import pyarrow as pa
@@ -63,6 +63,80 @@ _WINDOWS_PATH_PATTERN = re.compile(
     r")"
 )
 _POSIX_PATH_PATTERN = re.compile(r"(?<!\w)(?:~|/)[^\s,:;)]*")
+_DOCTOR_POSIX_PATH_PATTERN = re.compile(
+    r"(?<![\w/:])(?:(?P<quote>['\"])(?:~|/[^'\"\r\n]*)(?P=quote)|(?:~|/)[^\s,:;)]*)"
+)
+_GCP_SERVICE_ACCOUNT_PATTERN = re.compile(
+    r"(?P<account>[A-Za-z0-9._+-]+)@[A-Za-z0-9-]+(?P<domain>\.iam\.gserviceaccount\.com)\b",
+    re.IGNORECASE,
+)
+_APPLICATION_PATH_PREFIXES = (
+    ("appdata", "local"),
+    ("appdata", "locallow"),
+    ("appdata", "roaming"),
+    (".config",),
+    (".local", "share"),
+    ("library", "application support"),
+)
+_USER_DIRECTORY_PARENTS = frozenset({"home", "users", "documents and settings"})
+_PUBLIC_USER_DIRECTORIES = frozenset({"all users", "default", "default user", "public"})
+_PROJECT_PARENT_DIRECTORIES = frozenset(
+    {
+        "code",
+        "dev",
+        "documents",
+        "project",
+        "projects",
+        "repo",
+        "repos",
+        "src",
+        "work",
+        "workspace",
+        "workspaces",
+    }
+)
+_COMMON_PATH_DIRECTORIES = frozenset(
+    {
+        ".cache",
+        ".config",
+        ".local",
+        "appdata",
+        "application support",
+        "applications",
+        "bin",
+        "desktop",
+        "dev",
+        "documents",
+        "downloads",
+        "etc",
+        "home",
+        "library",
+        "lib",
+        "lib64",
+        "local",
+        "media",
+        "mnt",
+        "opt",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "public",
+        "run",
+        "sbin",
+        "share",
+        "src",
+        "system32",
+        "temp",
+        "tmp",
+        "usr",
+        "users",
+        "var",
+        "volumes",
+        "windows",
+        "workspace",
+        "workspaces",
+    }
+)
 
 
 def _label(prefix: str, index: int) -> str:
@@ -240,13 +314,96 @@ def sanitize_table(table: pa.Table) -> pa.Table:
     return pa.Table.from_pylist(records, schema=table.schema)
 
 
+def _sanitize_doctor_path(value: str, *, preserve_filename: bool = True) -> str:
+    """Preserve path structure while masking recognizable user and project names.
+
+    Args:
+        value: A Windows, POSIX, or relative filesystem path.
+        preserve_filename: Whether to keep the final path component as a filename.
+
+    Returns:
+        A readable path with known user and project directories replaced.
+    """
+    if value.startswith("//storage.googleapis.com/"):
+        return value
+    windows_path = PureWindowsPath(value)
+    path = windows_path if windows_path.drive or "\\" in value else PurePosixPath(value)
+    parts = list(path.parts[1:] if path.anchor else path.parts)
+    try:
+        home_name = Path.home().name.casefold()
+    except (OSError, RuntimeError):
+        home_name = ""
+    try:
+        project_name = Path.cwd().name.casefold()
+    except OSError:
+        project_name = ""
+
+    sanitized_parts: list[str] = []
+    for index, part in enumerate(parts):
+        normalized = part.casefold()
+        previous = parts[index - 1].casefold() if index else ""
+        is_last = index == len(parts) - 1
+        replacement: str | None = None
+        ancestors = tuple(component.casefold() for component in parts[:index])
+        in_application_data = any(
+            ancestors[start : start + len(prefix)] == prefix
+            for prefix in _APPLICATION_PATH_PREFIXES
+            for start in range(len(ancestors))
+        )
+
+        is_user_directory = bool(home_name and normalized == home_name) or (
+            previous in _USER_DIRECTORY_PARENTS
+            and normalized not in _PUBLIC_USER_DIRECTORIES
+        )
+        is_project_directory = bool(
+            project_name
+            and normalized == project_name
+            and normalized not in _COMMON_PATH_DIRECTORIES
+            and not in_application_data
+        ) or (
+            previous in _PROJECT_PARENT_DIRECTORIES
+            and normalized not in _COMMON_PATH_DIRECTORIES
+            and (not is_last or not preserve_filename)
+        )
+
+        if is_user_directory:
+            replacement = "<user>"
+        elif is_project_directory:
+            replacement = "<project>"
+
+        sanitized_parts.append(replacement or part)
+
+    if isinstance(path, PureWindowsPath) and path.drive.startswith("\\\\"):
+        anchor = "\\\\<host>\\<share>\\"
+        return anchor + "\\".join(sanitized_parts)
+    return str(type(path)(path.anchor, *sanitized_parts))
+
+
+def _sanitize_doctor_path_match(match: re.Match[str]) -> str:
+    """Sanitize one path match while retaining any surrounding quotes."""
+    matched = match[0]
+    if len(matched) >= 2 and matched[0] in "'\"" and matched[-1] == matched[0]:
+        quote = matched[0]
+        path = matched[1:-1]
+        preserve_filename = not path.endswith(("/", "\\"))
+        sanitized_path = _sanitize_doctor_path(
+            path,
+            preserve_filename=preserve_filename,
+        )
+        return f"{quote}{sanitized_path}{quote}"
+    return _sanitize_doctor_path(
+        matched,
+        preserve_filename=not matched.endswith(("/", "\\")),
+    )
+
+
 def sanitize_doctor_text(
     value: str,
     *,
     config_path: str | None,
     database: str | None,
 ) -> str:
-    """Obfuscate configuration directories and redact credentials and other paths.
+    """Keep path context while masking users and projects and redacting secrets.
 
     Args:
         value: One doctor display string.
@@ -258,27 +415,25 @@ def sanitize_doctor_text(
     """
 
     def sanitize_part(part: str) -> str:
-        """Redact a diagnostic fragment while retaining named remote targets."""
+        """Redact credentials and preserve useful path components."""
         if database and any(separator in database for separator in ("/", "\\")):
-            part = part.replace(database, "<path>")
-        return _sanitize_text(part, {})
+            flags = re.IGNORECASE if PureWindowsPath(database).drive else 0
+            part = re.sub(re.escape(database), "<path>", part, flags=flags)
+        sanitized = redact_credentials(part)
+        sanitized = _WINDOWS_PATH_PATTERN.sub(_sanitize_doctor_path_match, sanitized)
+        sanitized = _DOCTOR_POSIX_PATH_PATTERN.sub(
+            _sanitize_doctor_path_match, sanitized
+        )
+        return _GCP_SERVICE_ACCOUNT_PATTERN.sub(
+            r"\g<account>@<project-id>\g<domain>", sanitized
+        )
 
     if not config_path:
         return sanitize_part(value)
-    path = (
-        PureWindowsPath(config_path)
-        if PureWindowsPath(config_path).is_absolute()
-        else PurePosixPath(config_path)
+    windows_config_path = PureWindowsPath(config_path).drive != ""
+    flags = re.IGNORECASE if windows_config_path else 0
+    config_pattern = re.compile(re.escape(config_path), flags)
+    sanitized_config_path = redact_credentials(_sanitize_doctor_path(config_path))
+    return sanitized_config_path.join(
+        sanitize_part(part) for part in config_pattern.split(value)
     )
-    anchor = path.anchor
-    first_index = 1
-    if isinstance(path, PureWindowsPath) and path.drive.startswith("\\\\"):
-        anchor = "\\\\directory-alpha\\directory-bravo\\"
-        first_index = 3
-    directories = tuple(
-        _label("directory", index)
-        for index in range(first_index, first_index + len(path.parts) - 2)
-    )
-    obfuscated = str(type(path)(anchor, *directories, path.name))
-    obfuscated = redact_credentials(obfuscated)
-    return obfuscated.join(sanitize_part(part) for part in value.split(config_path))

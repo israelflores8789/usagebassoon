@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Windows detached worker startup now reports that it is unsupported and directs users to `bassoon schedule worker --foreground`; native Windows scheduling remains unsupported at this time. *Consider contributing!*
+- Doctor diagnostics now preserve filesystem path context and default application directories for debugging. It still replaces recognized user and project directory names with `<user>` and `<project>`, but no longer masks entire paths. It also detects GCP service-account project IDs and masks as `<project-id>`.
 
 ### Fixed
 
