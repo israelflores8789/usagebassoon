@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed doctor collection health warnings to clear after a source's later successful run while retaining warnings for failed or partial targets that remain unresolved.
 - Fixed Windows tokscale executable discovery and command startup, including `.cmd` shims and the child `SystemRoot` environment.
 - Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.
 - Documented the `storage.buckets.get` permission required for GCS lifecycle inspection by `bassoon doctor`.

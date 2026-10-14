@@ -112,7 +112,7 @@ def doctor(
         typer.Option(
             "--limit",
             min=1,
-            help="Maximum unresolved drift and recent run records to display.",
+            help="Maximum unresolved drift and collection records to display.",
         ),
     ] = 20,
     raw: Annotated[
