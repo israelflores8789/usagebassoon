@@ -647,11 +647,13 @@ project = "my-gcp-project"
 #### Permissions UsageBassoon may use
 
 - **Cloud Storage, snapshot bucket scope**
-  - `storage.objects.create / get / delete / list`: publish, read, and rotate snapshot archives and their catalogs, read archives for restore, and read lifecycle rules for doctor. Runtime archive writes and retention, and doctor.
+  - `storage.objects.create / get / delete / list`: publish, read, and rotate snapshot archives and their catalogs, and read archives for restore. Runtime archive, retention, and restore.
+  - `storage.buckets.get`: read bucket metadata, including lifecycle rules for `bassoon doctor`. Runtime doctor.
 
 #### Roles that provide them
 
 - `roles/storage.objectUser` on the snapshot bucket for a snapshot writer: object create, get, list, and delete.
+- `roles/storage.bucketViewer` (Beta) on the snapshot bucket for `bassoon doctor`: read bucket metadata, including lifecycle rules.
 
 See Google's [Cloud Storage IAM roles and permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage).
 

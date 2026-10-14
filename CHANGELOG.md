@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fixed Windows tokscale executable discovery and command startup, including `.cmd` shims and the child `SystemRoot` environment.
 - Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.
+- Documented the `storage.buckets.get` permission required for GCS lifecycle inspection by `bassoon doctor`.
 
 ## [1.0.0] - 2026-10-08
 
