@@ -147,6 +147,8 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 ## Rules
 
 - ALL Python code should target Python 3.12+ syntax only.
+- USE absolute package imports, including imports deferred inside functions; do NOT use relative dot imports.
+- AVOID circular dependencies.
 - ALWAYS use existing modules unless the task requires a new storage backend, snapshot bucket, CLI command, or core feature; this also includes test modules.
 - ALL generated/edited Python source MUST pass Ruff and Pyrefly; RUN `just lint` and `just typecheck` after editing *any* Python code.
 - Do NOT suppress diagnostics to make checks pass. Do NOT introduce implicit `Any` or use bare generic types.

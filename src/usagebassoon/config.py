@@ -998,7 +998,7 @@ def _configuration_error_with_log(
             )
 
     if log_config.disable:
-        from .logger import configure
+        from usagebassoon.logger import configure
 
         configure(log_config)
         return error
@@ -1125,7 +1125,7 @@ class ConfigurationManager:
             )
         except ConfigurationError as error:
             raise _configuration_error_with_log(path, error, decoded) from error
-        from .logger import configure
+        from usagebassoon.logger import configure
 
         configure(configuration)
         return configuration

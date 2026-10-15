@@ -114,7 +114,7 @@ convention = "google"
 preset = "strict"
 python-version = "3.12"
 project-includes = ["src", "tests"]
-search-path = ["."]
+search-path = ["src", "."]
 min-severity = "warn"
 
 [tool.pytest.ini_options]

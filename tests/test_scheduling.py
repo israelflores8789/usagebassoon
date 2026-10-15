@@ -874,6 +874,7 @@ def test_worker_failure_outputs_protect_active_credentials(
     from dataclasses import replace
     from sys import executable
 
+    import usagebassoon.privacy as privacy
     import usagebassoon.scheduling as module
     from usagebassoon.collector import _json_command
     from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
@@ -881,6 +882,11 @@ def test_worker_failure_outputs_protect_active_credentials(
     monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(tmp_path / "logs"))
     monkeypatch.setenv("MOTHERDUCK_TOKEN", "unlabeled-backend-credential")
     monkeypatch.setenv("CUSTOM_INPUT", "unlabeled-child-credential")
+    monkeypatch.setattr(
+        privacy,
+        "_CREDENTIAL_NAME_DENYLIST",
+        privacy._CREDENTIAL_NAME_DENYLIST | {"CUSTOM_INPUT"},
+    )
     config = replace(
         _configuration(tmp_path),
         tokscale_env=("CUSTOM_INPUT",),

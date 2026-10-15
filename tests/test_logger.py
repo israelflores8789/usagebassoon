@@ -106,7 +106,7 @@ def test_operational_sinks_redact_complete_exception_records(
 
     monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
     monkeypatch.setenv("MOTHERDUCK_TOKEN", "opaque-backend-credential")
-    monkeypatch.setenv("EXTRA_DIAGNOSTIC", "opaque-child-credential")
+    monkeypatch.setenv("EXTRA_DIAGNOSTIC_TOKEN", "opaque-child-credential")
     directory = tmp_path / "logs"
     if sink == "fallback":
         directory.write_text("occupied")
@@ -115,7 +115,7 @@ def test_operational_sinks_redact_complete_exception_records(
             path=tmp_path / "config.toml",
             source_id="11111111-1111-4111-8111-111111111111",
             backend="duckdb",
-            tokscale_env=("EXTRA_DIAGNOSTIC",),
+            tokscale_env=("EXTRA_DIAGNOSTIC_TOKEN",),
             logging=LoggingConfig(directory=directory, max_files=2, max_bytes=512),
         )
     )
@@ -131,7 +131,7 @@ def test_operational_sinks_redact_complete_exception_records(
 
         monkeypatch.setattr(handler, "doRollover", fail_rotation)
     # Capture-time values remain protected after the environment changes.
-    monkeypatch.delenv("EXTRA_DIAGNOSTIC")
+    monkeypatch.delenv("EXTRA_DIAGNOSTIC_TOKEN")
     configure(LoggingConfig(directory=directory, max_files=2, max_bytes=512))
     cause = RuntimeError("backend failed: opaque-backend-credential")
     failure = OSError("child failed: opaque-child-credential")
@@ -180,6 +180,67 @@ def test_operational_sinks_redact_complete_exception_records(
     assert failure.__cause__ is cause
     assert failure.__traceback__ is traceback
     assert "opaque-child-credential" in str(failure)
+
+
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize("fallback", [False, True])
+def test_log_redaction_preserves_prose_and_forwarded_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fallback: bool,
+) -> None:
+    """Redact credential occurrences while preserving raw diagnostic context."""
+    from usagebassoon.config import UsageBassoonConfig
+
+    monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
+    workspace = r"C:\Users\Alice\Documents\project"
+    credentials_file = "/config/credentials.json"
+    monkeypatch.setenv("PGPASSWORD", "root")
+    monkeypatch.setenv("KEYBOARD_LAYOUT", "us")
+    monkeypatch.setenv("PUBLIC_WORKSPACE", workspace)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", credentials_file)
+    monkeypatch.setenv("MOTHERDUCK_TOKEN", "opaque-backend-credential")
+    monkeypatch.setenv("CUSTOM_TOKEN", "opaque-forwarded-credential")
+    directory = tmp_path / "logs"
+    if fallback:
+        directory.write_text("occupied")
+    logger = configure(
+        UsageBassoonConfig(
+            path=tmp_path / "config.toml",
+            source_id="11111111-1111-4111-8111-111111111111",
+            backend="duckdb",
+            tokscale_env=(
+                "KEYBOARD_LAYOUT",
+                "PUBLIC_WORKSPACE",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "CUSTOM_TOKEN",
+            ),
+            logging=LoggingConfig(directory=directory),
+        )
+    )
+    logger.error(
+        "usagebassoon: unknown key(s) in the root configuration table; "
+        "workspace=%s; GOOGLE_APPLICATION_CREDENTIALS=%s; "
+        "backend=%s; child=%s; PGPASSWORD=root",
+        workspace,
+        credentials_file,
+        "opaque-backend-credential",
+        "opaque-forwarded-credential",
+    )
+    for handler in logger.handlers:
+        handler.flush()
+    output = (
+        plain_cli_output(capsys.readouterr().err)
+        if fallback
+        else (directory / "usagebassoon.log").read_text()
+    )
+    assert "usagebassoon: unknown key(s) in the root configuration table" in output
+    assert workspace in output
+    assert f"GOOGLE_APPLICATION_CREDENTIALS={credentials_file}" in output
+    assert "opaque-backend-credential" not in output
+    assert "opaque-forwarded-credential" not in output
+    assert "PGPASSWORD=<redacted>" in output
 
 
 @pytest.mark.skipif(not hasattr(time, "tzset"), reason="process timezone switching")

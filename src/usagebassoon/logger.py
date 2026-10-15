@@ -15,8 +15,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO, override
 
-from .config import LoggingConfig, UsageBassoonConfig
-from .privacy import credential_values, redact_credentials
+from usagebassoon.config import LoggingConfig, UsageBassoonConfig
+from usagebassoon.privacy import credential_values, redact_credentials
 
 LOGGER_NAME = "usagebassoon"
 LOG_DIRECTORY_ENV_VAR = "USAGEBASSOON_LOG_DIRECTORY"
@@ -162,6 +162,7 @@ def configure(config: LoggingConfig | UsageBassoonConfig) -> logging.Logger:
     """
     global _CREDENTIAL_ENVIRONMENT_NAMES, _KNOWN_CREDENTIALS, _SETTINGS
     if isinstance(config, UsageBassoonConfig):
+        # Forwarded names are candidates; credential_values classifies their values.
         _CREDENTIAL_ENVIRONMENT_NAMES = tuple(
             dict.fromkeys((*_CREDENTIAL_ENVIRONMENT_NAMES, *config.tokscale_env))
         )

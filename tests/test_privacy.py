@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 from usagebassoon.privacy import (
+    credential_values,
     google_doctor_principal,
     redact_credentials,
     sanitize_doctor_text,
@@ -51,6 +52,116 @@ def test_credential_redaction_covers_encoded_unlabeled_values() -> None:
         known_values=(secret,),
     )
     assert sanitized == "<redacted> <redacted> <redacted> <redacted>"
+
+
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    "name",
+    [
+        "KEY",
+        "KEY_SUFFIX",
+        "PREFIX_KEY",
+        "PREFIX_KEY_SUFFIX",
+        "api-key",
+        "APIKEY",
+        "accessToken",
+        "clientSecret",
+        "PRIVATEKEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "MOTHERDUCK_TOKEN",
+        "PGPASSWORD",
+        "MYSQL_PWD",
+        "SERVICE_CREDENTIALS",
+        "HTTP_AUTHORIZATION",
+    ],
+)
+def test_credential_names_cover_components_and_known_compounds(name: str) -> None:
+    """Mask labelled credentials in assignments and queries across naming styles."""
+    assert redact_credentials(f"{name}=synthetic-secret") == f"{name}=<redacted>"
+    assert redact_credentials(f"https://example.test/?{name}=synthetic-secret") == (
+        "https://example.test/<redacted-query>"
+    )
+
+
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    "name",
+    [
+        "KEYBOARD",
+        "KEYBOARD_LAYOUT",
+        "MONKEY",
+        "TOKENIZER",
+        "AUTH_METHOD",
+        "AUTH_SOURCE",
+        "AUTH_TYPE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "CREDENTIAL_FILE",
+        "CREDENTIALS_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "OLDPWD",
+        "PWD",
+        "SSH_AUTH_SOCK",
+        "PUBLIC_WORKSPACE",
+        "TOKSCALE_CONFIG_DIR",
+        "TOKSCALE_EXTRA_DIRS",
+    ],
+)
+def test_noncredential_names_preserve_labelled_values(name: str) -> None:
+    """Keep known metadata and partial-word matches out of credential redaction."""
+    text = f"{name}=ordinary-value https://example.test/?{name}=ordinary-value"
+    assert redact_credentials(text) == text
+
+
+@pytest.mark.windows_compatible
+def test_bare_credentials_are_limited_to_supported_and_forwarded_scopes() -> None:
+    """Forwarding metadata does not register its value or unrelated ambient secrets."""
+    environment = {
+        "MOTHERDUCK_TOKEN": "opaque-backend-credential",
+        "CUSTOM_AUTH": "opaque-child-credential",
+        "APIKEY": "opaque-api-key",
+        "PUBLIC_WORKSPACE": r"C:\Users\Alice\Documents\project",
+        "KEYBOARD_LAYOUT": "us",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/config/credentials.json",
+        "PGPASSWORD": "root",
+        "UNRELATED_TOKEN": "unrelated-credential",
+    }
+    names = tuple(
+        name for name in environment if name not in {"PGPASSWORD", "UNRELATED_TOKEN"}
+    )
+    assert credential_values(environment) == ("opaque-backend-credential",)
+    assert set(credential_values(environment, environment_names=names)) == {
+        "opaque-backend-credential",
+        "opaque-child-credential",
+        "opaque-api-key",
+    }
+    assert credential_values(
+        {"PGPASSWORD": "root"}, environment_names=("PGPASSWORD",)
+    ) == ("root",)
+
+
+@pytest.mark.windows_compatible
+def test_credential_name_overrides_support_future_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact policy exceptions override heuristics, with redaction taking priority."""
+    import usagebassoon.privacy as privacy
+
+    monkeypatch.setattr(
+        privacy,
+        "_CREDENTIAL_NAME_ALLOWLIST",
+        privacy._CREDENTIAL_NAME_ALLOWLIST | {"CUSTOM_TOKEN", "OPAQUE_SETTING"},
+    )
+    monkeypatch.setattr(
+        privacy,
+        "_CREDENTIAL_NAME_DENYLIST",
+        privacy._CREDENTIAL_NAME_DENYLIST | {"OPAQUE_SETTING"},
+    )
+    environment = {"CUSTOM_TOKEN": "ordinary-value", "OPAQUE_SETTING": "secret-value"}
+    assert credential_values(environment, environment_names=environment) == (
+        "secret-value",
+    )
 
 
 @pytest.mark.windows_compatible

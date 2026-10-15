@@ -410,8 +410,10 @@ def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
 def test_unknown_config_keys_fail_and_are_written_to_the_log(
     tmp_path: Path,
     scope: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject unsupported keys and log their location before failing."""
+    monkeypatch.setenv("PGPASSWORD", "root")
     path = tmp_path / "config.toml"
     log_directory = tmp_path / "configured-logs"
     content = (

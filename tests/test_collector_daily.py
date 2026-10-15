@@ -175,6 +175,8 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("TOKSCALE_EXTRA_DIRS", "/agent-storage")
     monkeypatch.setenv("CUSTOM_TOKSCALE_AUTH", "allowed")
+    monkeypatch.setenv("PUBLIC_WORKSPACE", "/workspace/project")
+    monkeypatch.setenv("PGPASSWORD", "root")
     monkeypatch.setenv("MOTHERDUCK_TOKEN", "secret")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secret.json")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "secret")
@@ -183,7 +185,7 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
         source_id=SOURCE_ID,
         backend="duckdb",
         local_database=Path(":memory:"),
-        tokscale_env=("CUSTOM_TOKSCALE_AUTH",),
+        tokscale_env=("CUSTOM_TOKSCALE_AUTH", "PUBLIC_WORKSPACE"),
     )
 
     child = subprocess_collector._child_environment(configuration)
@@ -193,6 +195,8 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
     assert child["LANG"] == "C.UTF-8"
     assert child["TOKSCALE_EXTRA_DIRS"] == "/agent-storage"
     assert child["CUSTOM_TOKSCALE_AUTH"] == "allowed"
+    assert child["PUBLIC_WORKSPACE"] == "/workspace/project"
+    assert "PGPASSWORD" not in child
     assert "MOTHERDUCK_TOKEN" not in child
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in child
     assert "AWS_ACCESS_KEY_ID" not in child

@@ -398,15 +398,18 @@ def test_doctor_resolves_relative_config_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Both raw and sanitized diagnostics use an absolute explicit config path."""
-    monkeypatch.chdir(tmp_path)
+    workspace = tmp_path / "Documents" / "private-project"
+    workspace.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
     runner = CliRunner()
     sanitized = runner.invoke(app, ["doctor", "--config", "ub_dev.toml"])
     raw = runner.invoke(app, ["doctor", "--raw", "--config", "ub_dev.toml"])
     assert sanitized.exit_code == raw.exit_code == 1
-    assert "/<project>/" in plain_cli_output(sanitized.output).replace("\\", "/")
-    assert tmp_path.name not in plain_cli_output(sanitized.output)
-    assert "/ub_dev.toml" in plain_cli_output(sanitized.output).replace("\\", "/")
-    assert str(tmp_path / "ub_dev.toml") in plain_cli_output(raw.output).replace(
+    output = plain_cli_output(sanitized.output).replace("\n", "").replace("\\", "/")
+    assert "/Documents/<project>/" in output
+    assert workspace.name not in output
+    assert "/ub_dev.toml" in output
+    assert str(workspace / "ub_dev.toml") in plain_cli_output(raw.output).replace(
         "\n", ""
     )
 

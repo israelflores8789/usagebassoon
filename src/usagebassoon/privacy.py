@@ -33,7 +33,55 @@ _CREDENTIAL_MARKERS = (
     "SECRET",
     "AUTH",
     "CREDENTIAL",
+    "CREDENTIALS",
+    "AUTHORIZATION",
+    "PWD",
 )
+# Exact uppercase names override component detection; the denylist takes priority.
+_CREDENTIAL_NAME_ALLOWLIST = frozenset(
+    {
+        "AUTH_METHOD",
+        "AUTH_SOURCE",
+        "AUTH_TYPE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "CREDENTIAL_FILE",
+        "CREDENTIALS_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "KEYBOARD",
+        "KEYBOARD_LAYOUT",
+        "OLDPWD",
+        "PUBLIC_WORKSPACE",
+        "PWD",
+        "SSH_AUTH_SOCK",
+        "TOKSCALE_CONFIG_DIR",
+        "TOKSCALE_EXTRA_DIRS",
+    }
+)
+_CREDENTIAL_NAME_DENYLIST = frozenset(
+    {
+        "ACCESSKEY",
+        "ACCESSKEYID",
+        "ACCESSTOKEN",
+        "APIKEY",
+        "AUTHORIZATION",
+        "AUTHTOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CLIENTSECRET",
+        "CREDENTIALS",
+        "MOTHERDUCK_TOKEN",
+        "MYSQL_PWD",
+        "PGPASSWORD",
+        "PRIVATEKEY",
+        "REFRESHTOKEN",
+        "SECRETKEY",
+        "SESSIONTOKEN",
+    }
+)
+# Ambient bare values are limited to authentication sources used by UsageBassoon.
+_CREDENTIAL_VALUE_ENVIRONMENT_NAMES = frozenset({"MOTHERDUCK_TOKEN"})
 _URI_CREDENTIAL_PATTERN = re.compile(r"(\w+://)[^\s/@]+@")
 _QUERY_SECRET_PATTERN = re.compile(
     r"[?&;](?P<name>[\w-]+)=[^\s&#;\"']*",
@@ -41,7 +89,10 @@ _QUERY_SECRET_PATTERN = re.compile(
 )
 _ENV_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<prefix>[\"']?\b(?P<name>(?=[\w-]*(?:"
-    + "|".join(_CREDENTIAL_MARKERS)
+    + "|".join(
+        re.escape(name).replace("_", "[_-]")
+        for name in sorted(set(_CREDENTIAL_MARKERS) | _CREDENTIAL_NAME_DENYLIST)
+    )
     + r"))[A-Za-z_][A-Za-z0-9_-]*)[\"']?\s*[=:]\s*)"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;{}\[\]\"']+)",
     re.IGNORECASE,
@@ -236,7 +287,12 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
 
 def _credential_name(name: str) -> bool:
     """Return whether a field or environment name denotes authentication material."""
-    return any(token in name.upper() for token in _CREDENTIAL_MARKERS)
+    normalized = name.upper().replace("-", "_")
+    if normalized in _CREDENTIAL_NAME_DENYLIST:
+        return True
+    if normalized in _CREDENTIAL_NAME_ALLOWLIST:
+        return False
+    return any(part in _CREDENTIAL_MARKERS for part in normalized.split("_"))
 
 
 def _redact_query_secret(match: re.Match[str]) -> str:
@@ -247,20 +303,22 @@ def _redact_query_secret(match: re.Match[str]) -> str:
 def credential_values(
     environ: Mapping[str, str], *, environment_names: Iterable[str] = ()
 ) -> tuple[str, ...]:
-    """Select active credentials, including explicitly supplied child variables.
+    """Select credential values from supported authentication and child scopes.
 
     Args:
         environ: Active process environment.
-        environment_names: Additional potentially sensitive variable names.
+        environment_names: Explicitly forwarded child variable names to classify.
 
     Returns:
         Nonempty values requiring exact redaction even when echoed without labels.
     """
-    names = set(environment_names)
+    names = _CREDENTIAL_VALUE_ENVIRONMENT_NAMES | {
+        name.upper() for name in environment_names
+    }
     return tuple(
         value
         for name, value in environ.items()
-        if value and (name in names or _credential_name(name))
+        if value and name.upper() in names and _credential_name(name)
     )
 
 

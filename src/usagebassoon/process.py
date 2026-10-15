@@ -174,17 +174,14 @@ def start_process(
     if os.name == "nt":
         from usagebassoon.win32process import start_windows_process
 
-        return cast(
-            ManagedProcess,
-            start_windows_process(
-                args,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=stderr,
-                env=env,
-                shell=shell,
-                bufsize=bufsize,
-            ),
+        return start_windows_process(
+            args,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            shell=shell,
+            bufsize=bufsize,
         )
 
     process = subprocess.Popen(
