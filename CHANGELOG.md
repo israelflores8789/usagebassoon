@@ -22,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Windows detached worker startup now reports that it is unsupported and directs users to `bassoon schedule worker --foreground`; native Windows scheduling remains unsupported at this time. *Consider contributing!*
 - Doctor diagnostics now preserve filesystem path context and default application directories for debugging. It still replaces recognized user and project directory names with `<user>` and `<project>`, but no longer masks entire paths. It also detects GCP service-account project IDs and masks as `<project-id>`.
+- Development dependencies now include `rust-just>=1.58.0`, and the Just configuration enables the script recipes used for Windows checks.
 
 ### Fixed
 
+- Updated doctor path assertions, restore warning coverage, and the SQL parity query inventory to match current behavior while preserving Windows compatibility and isolating restore tests from user configuration.
 - Fixed doctor collection health warnings to clear after a source's later successful run while retaining warnings for failed or partial targets that remain unresolved.
 - Fixed Windows tokscale executable discovery and command startup, including `.cmd` shims and the child `SystemRoot` environment.
 - Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.

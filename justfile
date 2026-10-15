@@ -3,6 +3,7 @@
 # UsageBassoon justfile recipes
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
+set unstable := true
 
 pytest := "uv run pytest"
 src_dir := "src"

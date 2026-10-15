@@ -73,6 +73,7 @@ dev = [
     "types-grpcio>=1.0",
     "types-protobuf>=5.0",
     "types-PyYAML>=6.0",
+    "rust-just>=1.58.0",
 ]
 
 [tool.hatch.version]

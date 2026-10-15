@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, TextIO, override
 
 import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 from yaspin.core import Spinner
@@ -261,11 +262,26 @@ def test_note_editor_runs_between_spinner_operations(
 
 
 @pytest.mark.windows_compatible
-def test_restore_confirmation_precedes_spinner(
-    terminal: Terminal, display: Display
+def test_restore_warning_precedes_backend_setup(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal, display: Display
 ) -> None:
-    result = CliRunner().invoke(app, ["restore"], input="n\n")
+    """Emit the quiescence warning before backend setup or animation begins."""
+    import usagebassoon.cli.restore as restore_module
+
+    calls: list[Path | None] = []
+
+    def stop_setup(config: Path | None) -> tuple[UsageBassoonConfig, StorageBackend]:
+        """Stop before accessing any user configuration or storage backend."""
+        calls.append(config)
+        raise typer.Abort
+
+    monkeypatch.setattr(restore_module, "configured_backend", stop_setup)
+    result = CliRunner().invoke(app, ["restore"])
     assert result.exit_code != 0
+    assert calls == [None]
+    assert "stop all UsageBassoon instances and writers" in plain_cli_output(
+        result.stderr
+    )
     assert not display.calls
     assert terminal.getvalue() == ""
 

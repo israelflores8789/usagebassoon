@@ -41,7 +41,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
 @pytest.mark.windows_compatible
 def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
     """Make doctor issue-ready by default while warning on raw diagnostics."""
-    missing = tmp_path / "private" / "config.toml"
+    missing = tmp_path / "home" / "alice" / "config.toml"
     runner = CliRunner()
 
     sanitized = runner.invoke(app, ["doctor", "--config", str(missing)])
@@ -49,8 +49,9 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
 
     assert sanitized.exit_code == 1
     assert str(missing) not in plain_cli_output(sanitized.output)
-    output = plain_cli_output(sanitized.output)
-    assert "/directory-alpha/" in output.replace("\\", "/")
+    output = plain_cli_output(sanitized.output).replace("\n", "")
+    assert "/home/<user>/" in output.replace("\\", "/")
+    assert "alice" not in output
     assert "/config.toml" in output.replace("\\", "/")
     assert "<config-path>" not in output
     assert raw.exit_code == 1
@@ -402,7 +403,8 @@ def test_doctor_resolves_relative_config_path(
     sanitized = runner.invoke(app, ["doctor", "--config", "ub_dev.toml"])
     raw = runner.invoke(app, ["doctor", "--raw", "--config", "ub_dev.toml"])
     assert sanitized.exit_code == raw.exit_code == 1
-    assert "/directory-alpha/" in plain_cli_output(sanitized.output).replace("\\", "/")
+    assert "/<project>/" in plain_cli_output(sanitized.output).replace("\\", "/")
+    assert tmp_path.name not in plain_cli_output(sanitized.output)
     assert "/ub_dev.toml" in plain_cli_output(sanitized.output).replace("\\", "/")
     assert str(tmp_path / "ub_dev.toml") in plain_cli_output(raw.output).replace(
         "\n", ""
@@ -444,8 +446,7 @@ def test_doctor_displays_remote_target_name(
         assert f"backend={provider}, database=usagebassoon_it" in output
         assert "<database>" not in output
         assert "path:" in output
-        assert "/directory-alpha/" in output.replace("\\", "/")
+        assert tmp_path.name in output.replace("\n", "")
         assert "/config.toml" in output.replace("\\", "/")
-        assert str(config) not in output
     finally:
         backend.close()
