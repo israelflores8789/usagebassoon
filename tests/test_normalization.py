@@ -27,7 +27,7 @@ from tests.conftest import (
     EXPECTED_TOTAL_OUTPUT,
     EXPECTED_TOTAL_REASONING,
 )
-from usagebassoon import system_metadata
+from usagebassoon import collection_policy, system_metadata
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
@@ -53,6 +53,32 @@ def test_normalize_emits_daily_tables_and_collection_status(
     assert all(
         table.column("event_id").null_count == 0 for table in normalized.tables.values()
     )
+
+
+@pytest.mark.windows_compatible
+def test_collection_policy_applies_generic_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apply matching policy overrides and preserve records meeting skip rules."""
+    policy = collection_policy.CollectionPolicy(
+        domain="records",
+        when={"kind": "usage"},
+        overrides={"status": "reviewed"},
+        skip_if={"owner": "protected"},
+    )
+    monkeypatch.setattr(collection_policy, "_COLLECTION_POLICIES", (policy,))
+    record = {"kind": "usage", "owner": "ordinary", "status": "pending"}
+
+    assert collection_policy.apply_collection_policy("records", record) == {
+        "kind": "usage",
+        "owner": "ordinary",
+        "status": "reviewed",
+    }
+    assert collection_policy.apply_collection_policy(
+        "records",
+        {"kind": "usage", "owner": "protected", "status": "pending"},
+    ) == {"kind": "usage", "owner": "protected", "status": "pending"}
+    assert collection_policy.apply_collection_policy("other", record) == record
 
 
 @pytest.mark.windows_compatible
