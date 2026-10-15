@@ -287,6 +287,121 @@ def test_restore_warning_precedes_backend_setup(
 
 
 @pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    ("location_answer", "answer"), [("n", "y"), ("y", "n"), ("y", "y")]
+)
+def test_restore_prompts_stop_spinner_before_cleanup_and_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: Terminal,
+    display: Display,
+    location_answer: str,
+    answer: str,
+) -> None:
+    """Review a verified snapshot without animation before authorizing writes."""
+    import usagebassoon.cli.restore as restore_module
+    from tests.test_cli_restore import _seed_session, _write_config
+    from usagebassoon.archiver import SnapshotArchiver
+    from usagebassoon.backends.duckdb_local import DuckDBBackend
+    from usagebassoon.snapshot.reader import PreparedSnapshot
+
+    source_database = tmp_path / "source.duckdb"
+    _seed_session(source_database, "ses_source")
+    source = DuckDBBackend(source_database)
+    try:
+        uri = SnapshotArchiver(str(tmp_path / "archive")).write(
+            source, run_id="prompt", manual=True
+        )
+    finally:
+        source.close()
+    assert uri is not None
+    database = tmp_path / "destination.duckdb"
+    backend = DuckDBBackend(database)
+    backend.apply_ddl()
+    backend.close()
+    config = tmp_path / "config.toml"
+    _write_config(config, database)
+    events: list[str] = []
+    files: list[Path] = []
+    original_location = restore_module.confirm_location
+    original_confirm = typer.confirm
+    original_cleanup = DuckDBBackend.cleanup_restore_stages
+
+    def location(archiver: SnapshotArchiver, selection: str) -> None:
+        """Check that the disabled-location prompt runs without animation."""
+        assert not display.active
+        events.append("location")
+        original_location(archiver, selection)
+
+    def advice(_source_id: str, prepared: PreparedSnapshot) -> str:
+        """Observe verified files while providing deterministic source advice."""
+        assert not display.active
+        files.extend(prepared.files.values())
+        assert files and all(path.is_file() for path in files)
+        events.append("advice")
+        return "Source identity advice."
+
+    def confirm(text: str, *, default: bool, abort: bool) -> bool:
+        """Keep the final confirmation outside animation and before cleanup."""
+        assert not display.active
+        assert events == ["location", "advice"]
+        events.append("confirm")
+        return original_confirm(text, default=default, abort=abort)
+
+    def cleanup(self: DuckDBBackend) -> None:
+        """Allow cleanup only after confirmation, with progress indication."""
+        assert display.active
+        assert events == ["location", "advice", "confirm"]
+        assert all(path.is_file() for path in files)
+        events.append("cleanup")
+        original_cleanup(self)
+
+    monkeypatch.setattr(restore_module, "confirm_location", location)
+    monkeypatch.setattr(restore_module, "source_identity_warning", advice)
+    monkeypatch.setattr(typer, "confirm", confirm)
+    monkeypatch.setattr(DuckDBBackend, "cleanup_restore_stages", cleanup)
+    result = CliRunner().invoke(
+        app,
+        [
+            "restore",
+            "--config",
+            str(config),
+            "--from-snapshot",
+            uri,
+            "--cleanup-stages",
+        ],
+        input=f"{location_answer}\n{answer}\n",
+    )
+    output = plain_cli_output(result.output)
+    accepted = location_answer == answer == "y"
+    assert (result.exit_code == 0) is accepted, output
+    assert "Snapshot:" in output and "Destination:" in output
+    if location_answer == "n":
+        assert events == ["location"]
+        assert "Have all writers stopped" not in output
+    else:
+        assert events == ["location", "advice", "confirm"] + (
+            ["cleanup"] if accepted else []
+        )
+        assert output.index("Snapshot:") < output.index("Have all writers stopped")
+        assert output.index("Destination:") < output.index("Have all writers stopped")
+        assert output.index("Source identity advice.") < output.index(
+            "Have all writers stopped"
+        )
+    assert not display.active
+    assert all(not path.exists() for path in files)
+    assert len(display.calls) == (3 if accepted else 2)
+    assert terminal.getvalue()
+    backend = DuckDBBackend(database)
+    try:
+        assert backend.query("SELECT session_id FROM sessions").to_pylist() == (
+            [{"session_id": "ses_source"}] if accepted else []
+        )
+    finally:
+        backend.close()
+
+
+@pytest.mark.windows_compatible
 def test_query_closes_backend_if_spinner_startup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

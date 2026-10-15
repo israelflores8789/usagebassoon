@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
@@ -207,9 +208,9 @@ def test_restore_rejects_a_populated_destination(
 @pytest.mark.windows_compatible
 @pytest.mark.parametrize("answer", ["n\n", "\n", ""])
 def test_restore_requires_confirmation_before_writing_warehouse(
-    tmp_path: Path, answer: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
 ) -> None:
-    """Declining, accepting the default, or EOF cannot start restoration."""
+    """Declining, accepting the default, or EOF cannot start cleanup or restore."""
     configuration = tmp_path / "config.toml"
     database = tmp_path / "destination.duckdb"
     _write_config(configuration, database)
@@ -221,9 +222,22 @@ def test_restore_requires_confirmation_before_writing_warehouse(
     uri = SnapshotArchiver(str(archive)).write(backend, run_id="manual", manual=True)
     assert uri is not None
     backend.close()
+    cleanup = MagicMock(side_effect=AssertionError("cleanup before confirmation"))
+    check = MagicMock(side_effect=AssertionError("preflight before confirmation"))
+    restore = MagicMock(side_effect=AssertionError("restore before confirmation"))
+    monkeypatch.setattr(DuckDBBackend, "cleanup_restore_stages", cleanup)
+    monkeypatch.setattr(DuckDBBackend, "check_restore_empty", check)
+    monkeypatch.setattr(DuckDBBackend, "restore_snapshot", restore)
     result = CliRunner().invoke(
         app,
-        ["restore", "--config", str(configuration), "--from-snapshot", uri],
+        [
+            "restore",
+            "--config",
+            str(configuration),
+            "--from-snapshot",
+            uri,
+            "--cleanup-stages",
+        ],
         input="y\n" + answer,
     )
     output = plain_cli_output(result.output)
@@ -231,6 +245,9 @@ def test_restore_requires_confirmation_before_writing_warehouse(
     assert "stop all UsageBassoon instances" in output
     assert "[y/N]" in output
     assert "Aborted" in output
+    cleanup.assert_not_called()
+    check.assert_not_called()
+    restore.assert_not_called()
     backend = DuckDBBackend(database)
     try:
         assert backend.query("SELECT * FROM restore_receipts").num_rows == 0
