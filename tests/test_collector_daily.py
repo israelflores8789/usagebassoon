@@ -32,7 +32,7 @@ from usagebassoon import persistence
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collection_lock import collection_lock
-from usagebassoon.collector import RawCollection
+from usagebassoon.collector import RawCollection, _tokscale_uses_utc
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import (
@@ -58,6 +58,12 @@ def _private_tokscale_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         "default_tokscale_directory",
         lambda: tmp_path / "tokscale-data",
     )
+
+    def uses_utc(_config: UsageBassoonConfig, _environment: object) -> bool:
+        """Keep mocked collection tests independent of an installed tokscale CLI."""
+        return True
+
+    monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", uses_utc)
 
 
 class _FixedDatetime:
@@ -204,27 +210,121 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
 
 @pytest.mark.windows_compatible
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize(
+    "settings_state",
+    [
+        "chicago",
+        "utc",
+        "missing",
+        "missing-scanner",
+        "invalid-json",
+        "non-object",
+        "invalid-scanner",
+        "null-scanner",
+        "invalid-encoding",
+        "invalid-types",
+        "invalid-scanner-types",
+        "unreadable",
+        "bom",
+    ],
+)
 def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     fail: bool,
+    settings_state: str,
 ) -> None:
-    """Keep cached history and pricing across runs, cleaning profiles on failure."""
+    """Pin UTC every run, preserving settings, cached history, and custom pricing."""
     original = tmp_path / "user-profile"
     (original / "cache").mkdir(parents=True)
-    settings = '{"scanner":{"bucketTimezone":"Etc/UTC"},"modelAliases":{}}'
+    settings: JsonObject = {
+        "scanner": {
+            "bucketTimezone": "UTC" if settings_state == "utc" else "America/Chicago",
+            "extraScanPaths": {"codex": ["/other/history"]},
+            "opencodeDbPaths": ["/other/opencode.db"],
+        },
+        "modelAliases": {"original": "alias"},
+        "colorPalette": "blue",
+        "includeUnusedModels": False,
+        "private-settings-sentinel": [None, 7, {"nested": "unchanged"}],
+    }
+    if settings_state == "missing-scanner":
+        settings.pop("scanner")
+    elif settings_state in {"invalid-scanner", "null-scanner"}:
+        settings["scanner"] = (
+            ["invalid"] if settings_state == "invalid-scanner" else None
+        )
+    elif settings_state == "invalid-types":
+        settings["includeUnusedModels"] = "invalid"
+    elif settings_state == "invalid-scanner-types":
+        cast(JsonObject, settings["scanner"])["opencodeDbPaths"] = "invalid"
+    settings_bytes = json.dumps(settings).encode("utf-8")
+    expected_settings = deepcopy(settings)
+    expected_scanner: JsonObject = {}
+    if isinstance(scanner := expected_settings.get("scanner"), dict):
+        expected_scanner = scanner
+    expected_scanner["bucketTimezone"] = "UTC"
+    expected_settings["scanner"] = expected_scanner
+    if settings_state == "bom":
+        settings_bytes = b"\xef\xbb\xbf" + settings_bytes
+    if settings_state in {
+        "invalid-json",
+        "invalid-encoding",
+        "non-object",
+        "unreadable",
+        "missing",
+    }:
+        expected_settings = {"scanner": {"bucketTimezone": "UTC"}}
+    if settings_state in {"invalid-types", "invalid-scanner-types"}:
+        expected_settings = {"scanner": {"bucketTimezone": "UTC"}}
+    if settings_state == "invalid-json":
+        settings_bytes = b'{"private-settings-sentinel":'
+    elif settings_state == "invalid-encoding":
+        settings_bytes = b"\xffprivate-settings-sentinel"
+    elif settings_state == "non-object":
+        settings_bytes = b'["private-settings-sentinel"]'
     pricing = '{"models":{"custom":{"input_cost_per_million_tokens":7}}}'
-    (original / "settings.json").write_text(settings)
+    original_settings = original / "settings.json"
+    if settings_state != "missing":
+        original_settings.write_bytes(settings_bytes)
+    read_text = Path.read_text
+    private_error = "private-settings-sentinel"
+
+    def read_settings(
+        path: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        """Simulate unreadable user settings without blocking private settings."""
+        if path == original_settings and settings_state == "unreadable":
+            raise PermissionError(private_error)
+        return read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_settings)
     (original / "custom-pricing.json").write_text(pricing)
     (original / "wiki.db").write_text("stale wiki")
     (original / "credentials.json").write_text("private")
     (original / "cache" / "history").write_text("compacted turns")
     monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(original))
     configuration = _config(tmp_path / "config.toml")
+    timezone_script = (
+        "import json,os,pathlib; "
+        "p=pathlib.Path(os.environ['TOKSCALE_CONFIG_DIR']); "
+        "s=json.loads((p/'settings.json').read_text()); "
+        "valid=isinstance(s.get('includeUnusedModels',False),bool) "
+        "and isinstance(s['scanner'].get('opencodeDbPaths',[]),list); "
+        "print(s['scanner']['bucketTimezone'] if valid else '(unset)')"
+    )
+    monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", _tokscale_uses_utc)
+
+    def timezone_command(_config: UsageBassoonConfig) -> list[str]:
+        """Run the effective-settings probe against the fixture command."""
+        return [executable, "-c", timezone_script]
+
+    monkeypatch.setattr(subprocess_collector, "_prefix", timezone_command)
     script = (
         "import json,os,pathlib; "
         "p=pathlib.Path(os.environ['TOKSCALE_CONFIG_DIR']); "
-        "print(json.dumps({'settings':(p/'settings.json').read_text(), "
+        "print(json.dumps({'settings':json.loads((p/'settings.json').read_text()), "
         "'pricing':(p/'custom-pricing.json').read_text(), "
         "'history':(p/'cache'/'history').read_text()})); "
         "(p/'wiki.db').write_text('fresh wiki')"
@@ -259,12 +359,15 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
                 [executable, "-c", script],
                 environment=environment,
             ) == {
-                "settings": settings,
+                "settings": expected_settings,
                 "pricing": pricing,
                 "history": "compacted turns" if len(cache_paths) == 1 else "retained",
             }
             assert (profile / "wiki.db").read_text() == "fresh wiki"
             (cache / "history").write_text("retained")
+            (profile / "settings.json").write_text(
+                '{"scanner":{"bucketTimezone":"America/Chicago"}}'
+            )
             if fail:
                 monkeypatch.setattr(
                     tempfile.TemporaryDirectory, "cleanup", cleanup_failure
@@ -276,6 +379,29 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     assert cache_paths[0] == cache_paths[1]
     assert (original / "wiki.db").read_text() == "stale wiki"
     assert (original / "cache" / "history").read_text() == "compacted turns"
+    assert (original / "custom-pricing.json").read_text() == pricing
+    if settings_state == "missing":
+        assert not original_settings.exists()
+    else:
+        assert original_settings.read_bytes() == settings_bytes
+    if settings_state in {
+        "invalid-json",
+        "invalid-encoding",
+        "non-object",
+        "unreadable",
+    }:
+        warnings = [
+            record
+            for record in caplog.records
+            if "could not reuse tokscale settings" in record.message
+        ]
+        assert len(warnings) == 2
+        assert all(record.exc_info for record in warnings)
+    elif settings_state in {"invalid-scanner", "null-scanner"}:
+        assert caplog.text.count("invalid tokscale scanner settings") == 2
+    elif settings_state in {"invalid-types", "invalid-scanner-types"}:
+        assert caplog.text.count("tokscale rejected the prepared settings") == 2
+    assert "private-settings-sentinel" not in caplog.text
     assert cache_paths[0].is_relative_to(tmp_path / "tokscale-data")
     assert not (tmp_path / "tokscale").exists()
 
@@ -345,6 +471,11 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         **kwargs: object,
     ) -> JsonValue:
         """Resolve prices from the run's copied configuration, never live files."""
+        environment = cast(dict[str, str], kwargs["environment"])
+        profile = Path(environment["TOKSCALE_CONFIG_DIR"])
+        assert json.loads((profile / "settings.json").read_text()) == {
+            "scanner": {"bucketTimezone": "UTC"}
+        }
         if arguments[0] == "graph":
             return deepcopy(graph) if active else {**graph, "contributions": []}
         if arguments[0] == "models":
@@ -355,7 +486,6 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         requests.append(model)
         if fail_price and model == changed:
             raise RuntimeError("pricing unavailable")
-        environment = cast(dict[str, str], kwargs["environment"])
         custom = (
             Path(environment["TOKSCALE_CONFIG_DIR"]) / "custom-pricing.json"
         ).exists() and model == changed

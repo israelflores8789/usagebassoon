@@ -55,10 +55,11 @@ def daily(
         typer.Option("--limit", min=1, help="Maximum newest-first dates to display."),
     ] = 16,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")

@@ -432,10 +432,11 @@ def activity(
         typer.Option("--days", min=1, help="Trailing calendar days; default 120."),
     ] = None,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     metric: Annotated[
         list[str] | None,

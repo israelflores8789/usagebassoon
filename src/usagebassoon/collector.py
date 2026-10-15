@@ -479,6 +479,83 @@ def _link_tokscale_cache(profile: Path, cache: Path) -> None:
         link.symlink_to(cache, target_is_directory=True)
 
 
+def _prepare_tokscale_settings(source: Path, destination: Path) -> None:
+    """Preserve usable settings and pin UTC in the private collection profile.
+
+    Missing or unusable settings recover to a UTC-only document. Invalid scanner
+    objects are replaced without discarding other top-level settings. The user's
+    original file is never written, and diagnostics omit its contents.
+
+    Args:
+        source: Original settings file to read on this collection run.
+        destination: Private settings file to prepare before any acquisition.
+
+    Raises:
+        OSError: If the private settings file cannot be written.
+    """
+    settings: JsonObject = {}
+    try:
+        value: object = json.loads(source.read_text(encoding="utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("tokscale settings must be an object")
+        settings = cast(JsonObject, value)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError) as error:
+        # Decoding errors can include private input bytes in their exception text.
+        _LOG.warning(
+            "could not reuse tokscale settings (%s); using UTC-only private settings",
+            type(error).__name__,
+            exc_info=(
+                RuntimeError,
+                RuntimeError("original tokscale settings could not be reused"),
+                error.__traceback__,
+            ),
+        )
+    scanner_value = settings.get("scanner")
+    scanner: JsonObject = {}
+    if isinstance(scanner_value, dict):
+        scanner = scanner_value
+    elif "scanner" in settings:
+        _LOG.warning(
+            "invalid tokscale scanner settings; "
+            "replacing only the private scanner object"
+        )
+    scanner["bucketTimezone"] = "UTC"
+    settings["scanner"] = scanner
+    destination.write_text(json.dumps(settings, ensure_ascii=True), encoding="utf-8")
+
+
+def _tokscale_uses_utc(
+    config: UsageBassoonConfig, environment: Mapping[str, str]
+) -> bool:
+    """Check the effective pin without scanning usage or rewriting settings.
+
+    Args:
+        config: Command resolution and subprocess resource bounds.
+        environment: Prepared private profile exposed to tokscale.
+
+    Returns:
+        Whether tokscale successfully loaded the exact UTC pin.
+
+    Raises:
+        OSError: If the subprocess cannot start.
+        RuntimeError: If the bounded configuration read fails.
+    """
+    process = _start_tokscale_process(
+        [*_prefix(config), "--no-spinner", "config", "get", "timezone"], environment
+    )
+    stdout, _stderr = _capture_process(
+        process,
+        timeout_seconds=config.tokscale_timeout_seconds,
+        max_stdout_bytes=min(config.tokscale_max_stdout_bytes, 4096),
+        max_stderr_bytes=config.tokscale_max_stderr_bytes,
+    )
+    if process.returncode:
+        raise RuntimeError("could not verify the private tokscale UTC setting")
+    return stdout.strip() == b"UTC"
+
+
 @contextmanager
 def tokscale_profile(
     config: UsageBassoonConfig,
@@ -496,18 +573,28 @@ def tokscale_profile(
 
     Raises:
         OSError: If configuration, persistent state, or profile cleanup fails.
-        RuntimeError: If the persistent cache cannot be attached.
+        RuntimeError: If UTC cannot be verified or the persistent cache cannot attach.
     """
     environment = _child_environment(config)
     source = _tokscale_config_directory(environment)
     with _tokscale_temporary_directory(prefix="usagebassoon-tokscale-") as profile:
-        for filename in ("settings.json", "custom-pricing.json"):
-            path = source / filename
-            if path.exists():
-                shutil.copyfile(path, profile / filename)
+        _prepare_tokscale_settings(source / "settings.json", profile / "settings.json")
+        environment["TOKSCALE_CONFIG_DIR"] = str(profile)
+        if not _tokscale_uses_utc(config, environment):
+            _LOG.warning(
+                "tokscale rejected the prepared settings; "
+                "retrying with UTC-only private settings"
+            )
+            (profile / "settings.json").write_text(
+                '{"scanner":{"bucketTimezone":"UTC"}}', encoding="utf-8"
+            )
+            if not _tokscale_uses_utc(config, environment):
+                raise RuntimeError("tokscale did not honor the private UTC setting")
+        pricing = source / "custom-pricing.json"
+        if pricing.exists():
+            shutil.copyfile(pricing, profile / "custom-pricing.json")
         cache = _persistent_tokscale_cache(config, source, environment)
         _link_tokscale_cache(profile, cache)
-        environment["TOKSCALE_CONFIG_DIR"] = str(profile)
         target = sha256(
             repr(
                 (

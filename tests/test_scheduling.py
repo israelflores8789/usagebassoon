@@ -764,6 +764,8 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
         ("collection", "error"),
         ("collection", "busy"),
         ("collection", "timeout"),
+        ("collection", "settings-write"),
+        ("collection", "settings-rejected"),
         ("snapshot", "error"),
     ],
 )
@@ -777,6 +779,7 @@ def test_worker_continues_after_an_operational_cycle_failure(
 ) -> None:
     """Failed cycles remain observable and do not prevent the next scheduled run."""
     import usagebassoon.scheduling as module
+    from usagebassoon import collector as subprocess_collector
     from usagebassoon.collection_lock import CollectionBusy, collection_lock
     from usagebassoon.collector import _json_command
 
@@ -789,6 +792,42 @@ def test_worker_continues_after_an_operational_cycle_failure(
         if failure_kind == "busy"
         else OSError("cycle unavailable")
     )
+    if failure_kind in {"settings-write", "settings-rejected"}:
+        original = tmp_path / "user-profile"
+        original.mkdir()
+        monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(original))
+        monkeypatch.setattr(
+            subprocess_collector,
+            "default_tokscale_directory",
+            lambda: tmp_path / "tokscale-data",
+        )
+
+        def uses_utc(_config: UsageBassoonConfig, _environment: object) -> bool:
+            """Exercise recovery after a first-cycle write or UTC rejection."""
+            return failure_kind != "settings-rejected" or len(attempts) != 1
+
+        monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", uses_utc)
+        write_text = Path.write_text
+
+        def write_settings(
+            path: Path,
+            data: str,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+        ) -> int:
+            """Fail only the first cycle's private UTC-settings write."""
+            if (
+                failure_kind == "settings-write"
+                and path.name == "settings.json"
+                and len(attempts) == 1
+            ):
+                raise failure
+            return write_text(
+                path, data, encoding=encoding, errors=errors, newline=newline
+            )
+
+        monkeypatch.setattr(Path, "write_text", write_settings)
 
     class StopAfterTwoCycles(Event):
         """Advance two cycles without sleeping or leaving a worker running."""
@@ -803,6 +842,20 @@ def test_worker_continues_after_an_operational_cycle_failure(
     def cycle(configuration: UsageBassoonConfig) -> None:
         nonlocal failure
         attempts.append(configuration)
+        if failure_kind in {"settings-write", "settings-rejected"}:
+            try:
+                with subprocess_collector.tokscale_profile(configuration) as profile:
+                    settings = (
+                        Path(profile.environment["TOKSCALE_CONFIG_DIR"])
+                        / "settings.json"
+                    )
+                    assert json.loads(settings.read_text()) == {
+                        "scanner": {"bucketTimezone": "UTC"}
+                    }
+            except RuntimeError as error:
+                failure = error
+                raise
+            return
         if failure_kind == "timeout":
             command = (
                 "import time; time.sleep(8)" if len(attempts) == 1 else "print('{}')"

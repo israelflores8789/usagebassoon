@@ -147,10 +147,11 @@ def graph(
         typer.Option("--days", min=1, max=31, help="Trailing calendar days to show."),
     ] = None,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     metric: Annotated[
         str,

@@ -139,7 +139,7 @@ bunx tokscale@4.18.0 --version
 
 All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only.
 
-All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
+All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` (*UTC timezone only supported at this time*) bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 

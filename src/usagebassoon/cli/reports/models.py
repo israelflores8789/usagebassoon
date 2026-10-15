@@ -54,10 +54,11 @@ def models(
         Path | None, typer.Option("--config", help="Use this configuration file.")
     ] = None,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
