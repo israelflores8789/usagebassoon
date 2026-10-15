@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added scoped subprocess management for tokscale collection and supervised resources, using POSIX process groups and per-invocation Windows Job Objects.
 - Added Windows foreground worker operation under an external process supervisor.
+- Added repeatable `--exclude-model` options to activity, daily, graph, models, sessions, and summary reports.
 - Doctor output now reports backend and snapshot-bucket authentication sources and available principals for easier debugging. The default output preserves safe authentication labels and obfuscates user email handles and non-public email domains for privacy.
 
 ### Changed
@@ -23,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows detached worker startup now reports that it is unsupported and directs users to `bassoon schedule worker --foreground`; native Windows scheduling remains unsupported at this time. *Consider contributing!*
 - Doctor diagnostics now preserve filesystem path context and default application directories for debugging. It still replaces recognized user and project directory names with `<user>` and `<project>`, but no longer masks entire paths. It also detects GCP service-account project IDs and masks as `<project-id>`.
 - Development dependencies now include `rust-just>=1.58.0`, and the Just configuration enables the script recipes used for Windows checks.
+- `codex-auto-review` is considered *free* and does not count toward reported costs; however, token usage from `codex-auto-review` is still persisted and user-configured custom pricing in Tokscale is honored. See issue #4.
 
 ### Fixed
 

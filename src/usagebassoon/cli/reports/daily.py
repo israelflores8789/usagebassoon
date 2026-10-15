@@ -66,6 +66,12 @@ def daily(
     model: Annotated[
         str | None, typer.Option("--model", help="Filter by exact model.")
     ] = None,
+    exclude_model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-model", help="Exclude an exact model; may be repeated."
+        ),
+    ] = None,
     workspace: Annotated[
         str | None, typer.Option("--workspace", help="Filter by exact workspace.")
     ] = None,
@@ -110,6 +116,7 @@ def daily(
         source=source,
         client=client,
         model=model,
+        exclude_models=tuple(exclude_model or ()),
         workspace=workspace,
         tag=tag,
     )
