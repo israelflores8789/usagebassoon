@@ -59,6 +59,45 @@ def test_doctor_sanitizes_config_location_unless_raw(tmp_path: Path) -> None:
 
 
 @pytest.mark.windows_compatible
+def test_doctor_auth_method_is_clear_in_shareable_and_raw_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve safe auth-source labels in both render modes."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from usagebassoon.cli.doctor import _print_report
+    from usagebassoon.diagnostics import DoctorReport
+
+    outputs: list[StringIO] = []
+
+    def capture_console(**_kwargs: object) -> Console:
+        output = StringIO()
+        outputs.append(output)
+        return Console(file=output, force_terminal=False)
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.output_console", capture_console)
+    report = DoctorReport(
+        (
+            DoctorCheck(
+                "backend_authentication",
+                "ok",
+                "configured backend authentication",
+                ("Auth: ADC from a credentials file", "Principal: unavailable"),
+            ),
+        )
+    )
+    _print_report(report, raw=False, config_path=None, database=None)
+    shareable = outputs[-1].getvalue()
+    _print_report(report, raw=True, config_path=None, database=None)
+    raw = outputs[-1].getvalue()
+
+    assert "Auth: ADC from a credentials file" in shareable
+    assert "Auth: ADC from a credentials file" in raw
+
+
+@pytest.mark.windows_compatible
 def test_doctor_strict_fails_when_unresolved_drift_is_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -149,6 +188,12 @@ def test_doctor_reports_configured_tokscale_command_and_version(
         < plain_cli_output(result.output).index("OK tokscale: version 4.18.0")
         < plain_cli_output(result.output).index("OK configuration:")
     )
+    output = plain_cli_output(result.output)
+    assert (
+        output.index("OK backend:")
+        < output.index("OK backend_authentication:")
+        < output.index("OK schema:")
+    )
     assert "command: npx tokscale@latest" in plain_cli_output(result.output)
     assert "Auth: local file permissions" in plain_cli_output(result.output)
     assert "Principal: not applicable" in plain_cli_output(result.output)
@@ -230,8 +275,10 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
     assert "scheduled recovery capture is overdue" in check.message
     assert "current weekly recovery slot is overdue" not in check.message
     assert any("1 of 4 target slots available" in detail for detail in check.details)
-    assert "Local snapshot Auth: local file permissions" in check.details
-    assert "Local snapshot Principal: not applicable" in check.details
+    assert check.details[:2] == (
+        "Local snapshot Auth: local file permissions",
+        "Local snapshot Principal: not applicable",
+    )
 
 
 @pytest.mark.windows_compatible

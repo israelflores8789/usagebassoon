@@ -65,7 +65,7 @@ def test_service_account_file_scopes_the_gcs_http_transport(
         credentials_file=tmp_path / "credentials.json",
     )
     assert archive.doctor_authentication() == (
-        "credentials file",
+        "configured service-account credentials file",
         "service account collector@example.iam.gserviceaccount.com",
     )
     client = cast(storage.Client, archive.client)

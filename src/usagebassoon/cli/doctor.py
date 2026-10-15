@@ -186,12 +186,21 @@ def doctor(
             limit=limit,
             logger=logger,
         )
+        authentication_check = backend_authentication_check(configuration, opened)
+        checks = list(report.checks)
+        backend_check_index = next(
+            (index for index, check in enumerate(checks) if check.name == "backend"),
+            None,
+        )
+        checks.insert(
+            backend_check_index + 1 if backend_check_index is not None else len(checks),
+            authentication_check,
+        )
         report = DoctorReport(
             (
                 DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
                 tokscale_check,
-                *report.checks,
-                backend_authentication_check(configuration, opened),
+                *checks,
                 maintenance_health(opened),
                 snapshot_health(configuration),
                 schedule_doctor_check(configuration),

@@ -274,14 +274,20 @@ def test_doctor_masks_user_email_handles_and_non_public_domains(
 def test_doctor_preserves_known_auth_labels_and_redacts_other_auth_values() -> None:
     """Safe doctor auth descriptions survive the generic secret-assignment filter."""
     safe = sanitize_doctor_text(
-        "Auth: ADC via GOOGLE_APPLICATION_CREDENTIALS",
+        "GCS snapshot Auth: ADC from a credentials file",
+        config_path=None,
+        database=None,
+    )
+    configured = sanitize_doctor_text(
+        "Auth: configured service-account credentials file",
         config_path=None,
         database=None,
     )
     unsafe = sanitize_doctor_text(
-        "Auth: synthetic-secret", config_path=None, database=None
+        "Auth: credentials=synthetic-secret", config_path=None, database=None
     )
-    assert safe == "Auth: ADC via GOOGLE_APPLICATION_CREDENTIALS"
+    assert safe == "GCS snapshot Auth: ADC from a credentials file"
+    assert configured == "Auth: configured service-account credentials file"
     assert unsafe == "Auth: <redacted>"
 
 

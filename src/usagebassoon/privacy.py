@@ -96,8 +96,8 @@ _PUBLIC_EMAIL_DOMAINS = frozenset(
 _DOCTOR_AUTH_METHODS = frozenset(
     {
         "ADC",
-        "ADC via GOOGLE_APPLICATION_CREDENTIALS",
-        "credentials file",
+        "ADC from a credentials file",
+        "configured service-account credentials file",
         "explicit credentials",
         "explicit token",
         "injected client",
@@ -222,8 +222,13 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
     """
     name = match["name"]
     value = match[0][len(match["prefix"]) :].strip().strip("\"'")
-    if name.casefold() == "auth" and value in _DOCTOR_AUTH_METHODS:
-        return match[0]
+    if name.casefold() == "auth":
+        line_end = match.string.find("\n", match.end())
+        suffix_end = len(match.string) if line_end < 0 else line_end
+        suffix = match.string[match.end() : suffix_end]
+        complete_value = f"{value}{suffix}".strip().strip("\"'")
+        if complete_value in _DOCTOR_AUTH_METHODS:
+            return match[0]
     if _credential_name(name):
         return f"{match['prefix']}<redacted>"
     return match[0]

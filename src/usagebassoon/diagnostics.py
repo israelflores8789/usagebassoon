@@ -171,9 +171,9 @@ def backend_authentication_check(
 def _google_auth_source(credentials_file: Path | None) -> str:
     """Describe a Google credential source without exposing its file path."""
     if credentials_file is not None:
-        return "credentials file"
+        return "configured service-account credentials file"
     if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        return "ADC via GOOGLE_APPLICATION_CREDENTIALS"
+        return "ADC from a credentials file"
     return "ADC"
 
 
@@ -318,8 +318,9 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     except Exception as error:
         _LOG.warning("doctor archive inspection failed", exc_info=True)
         warnings.append(f"archive inspection unavailable: {error}")
+    authentication_details: list[str] = []
     for label, (auth_method, principal) in authentication.items():
-        details.extend(
+        authentication_details.extend(
             (
                 f"{label} snapshot Auth: {auth_method}",
                 f"{label} snapshot Principal: {principal}",
@@ -329,7 +330,7 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
         "backup_freshness",
         "warning" if warnings else "ok",
         "; ".join(warnings) if warnings else "recovery points are available",
-        tuple(details),
+        (*authentication_details, *details),
     )
 
 

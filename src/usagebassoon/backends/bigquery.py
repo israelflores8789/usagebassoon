@@ -363,11 +363,11 @@ class BigQueryBackend(AbstractStorageBackend):
         self._doctor_auth_source = (
             "injected client"
             if client is not None
-            else "credentials file"
+            else "configured service-account credentials file"
             if credentials_file is not None
             else "explicit credentials"
             if credentials is not None
-            else "ADC via GOOGLE_APPLICATION_CREDENTIALS"
+            else "ADC from a credentials file"
             if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
             else "ADC"
         )
