@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session labels now use the last eight characters of the complete session ID to distinguish sessions with shared ID prefixes, including compound Codex IDs.
 - Fixed credential redaction to preserve diagnostic prose and nonsecret environment values, with extensible name allowlists and denylists and scoped masking of unlabelled credential values. Updated the relative doctor configuration-path test to use a recognizable project workspace.
 - Updated doctor path assertions, restore warning coverage, and the SQL parity query inventory to match current behavior while preserving Windows compatibility and isolating restore tests from user configuration.
 - Fixed doctor collection health warnings to clear after a source's later successful run while retaining warnings for failed or partial targets that remain unresolved.

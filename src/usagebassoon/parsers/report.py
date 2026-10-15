@@ -199,17 +199,13 @@ def make_session_label(row: SessionRow) -> str:
         row: A validated session row.
 
     Returns:
-        A label of the form '{workspace} · {date} · {short id}'.
+        A label of the form '{workspace} · {date} · {last eight id characters}'.
 
     Notes:
-        Codex ids are 'rollout-<timestamp>-<uuid>'; the uuid carries the
-        identity, so the label uses the first uuid group. OpenCode ids are
-        random base-62; the 12-char prefix distinguishes all fixture sessions.
+        Use the complete session ID's suffix for every client, including
+        compound Codex IDs, to avoid collisions from shared prefixes.
     """
     label = row.workspace_label or "session"
     day = row.created_at.date().isoformat() if row.created_at else "unknown-date"
-    sid = row.session_id
-    # parts: rollout, YYYY, MM, DDTHH, MI, SS, then uuid groups
-    parts = sid.split("-")
-    short = parts[6] if sid.startswith("rollout-") and len(parts) > 6 else sid[:12]
+    short = row.session_id[-8:]
     return f"{label} · {day} · {short}"

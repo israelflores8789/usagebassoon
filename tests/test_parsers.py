@@ -205,9 +205,44 @@ def test_report_duplicate_stable_metadata_must_match(field: str) -> None:
 
 @pytest.mark.windows_compatible
 def test_session_label_unique(report_rows: list[SessionRow]) -> None:
-    """Assert deterministic labels are unique across all fixture sessions."""
+    """Distinguish shared prefixes and compound IDs with eight-character suffixes."""
     labels = [make_session_label(r) for r in report_rows]
+    for client, session_id, suffix in (
+        (
+            "codex",
+            "rollout-2026-10-13T01-58-47-01234567-89ab-7cde-8fab-0123456789ab",
+            "456789ab",
+        ),
+        (
+            "codex",
+            "rollout-2026-10-13T01-59-03-01234567-89ab-7cde-8fab-01234567cdef",
+            "4567cdef",
+        ),
+        (
+            "codex",
+            "rollout-2026-10-13T03-51-50-01234567-89ab-7cde-8fab-0123456789ab"
+            "_01234567-89ab-7cde-8fab-0123feedface",
+            "feedface",
+        ),
+        ("opencode", "ses_sharedprefix1234abcdefgh", "abcdefgh"),
+        ("opencode", "ses_sharedprefix1234ijklmnop", "ijklmnop"),
+    ):
+        row = SessionRow.model_validate(
+            {
+                "client": client,
+                "session_id": session_id,
+                "workspace_label": "project",
+                "created_at": "2026-10-13T00:00:00Z",
+            }
+        )
+        label = make_session_label(row)
+        assert label == f"project · 2026-10-13 · {suffix}"
+        labels.append(label)
     assert len(set(labels)) == len(labels)
+    assert (
+        make_session_label(SessionRow(client="codex", session_id="tiny"))
+        == "session · unknown-date · tiny"
+    )
 
 
 @pytest.mark.windows_compatible
