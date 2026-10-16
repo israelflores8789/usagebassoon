@@ -1040,7 +1040,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
             )
         )
         with _phase("populated BigQuery CLI restore rejection"):
-            rejected = runner.invoke(app, command, input="y\n")
+            rejected = runner.invoke(app, command, input="y\ny\n")
         assert rejected.exit_code != 0
         assert "restore requires an empty warehouse" in plain_cli_output(
             rejected.output
