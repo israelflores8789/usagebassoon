@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Doctor diagnostics now preserve filesystem path context and default application directories for debugging. It still replaces recognized user and project directory names with `<user>` and `<project>`, but no longer masks entire paths. It also detects GCP service-account project IDs and masks as `<project-id>`.
 - Development dependencies now include `rust-just>=1.58.0`, and the Just configuration enables the script recipes used for Windows checks.
 - `codex-auto-review` is considered *free* and does not count toward reported costs; however, token usage from `codex-auto-review` is still persisted and user-configured custom pricing in Tokscale is honored. See issue #4.
+- `bassoon init` now includes the config schema URL and a warning above the source ID in newly generated config files, with spacing that clearly associates the warning with the source ID.
 
 ### Fixed
 

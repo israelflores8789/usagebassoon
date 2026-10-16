@@ -94,6 +94,11 @@ def test_init_creates_source_config_and_local_schema(
     original = config_path.read_bytes()
     assert set(tomllib.loads(original.decode())) == {"source_id", "backend", "spinner"}
     configuration = ConfigurationManager(config_path).load()
+    assert original.decode().startswith(
+        "#:schema https://raw.githubusercontent.com/israelflores8789/usagebassoon/main/config.schema.json\n\n"
+        "# Do not modify this source ID unless you know what you are doing.\n"
+        f'source_id = "{configuration.source_id}"\n\n'
+    )
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
     assert configuration.spinner == "pong"
