@@ -28,14 +28,17 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
     return config, backend
 
 
+@pytest.mark.windows_compatible
 def test_audit_orders_runs_newest_first_and_honors_limit(tmp_path: Path) -> None:
     """Render only the requested newest audit records."""
     config, backend = _configured_store(tmp_path)
@@ -70,6 +73,7 @@ def test_audit_orders_runs_newest_first_and_honors_limit(tmp_path: Path) -> None
     assert "old-run" not in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_audit_rejects_a_non_positive_limit(tmp_path: Path) -> None:
     """Let Typer reject audit limits outside the declared option range."""
     config, backend = _configured_store(tmp_path)
@@ -83,6 +87,7 @@ def test_audit_rejects_a_non_positive_limit(tmp_path: Path) -> None:
     assert "Invalid value" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
     tmp_path: Path,
 ) -> None:
@@ -182,6 +187,7 @@ def test_source_audit_uses_latest_run_metadata_and_includes_ledgerless_sources(
     ]
 
 
+@pytest.mark.windows_compatible
 def test_source_identity_warning_uses_complete_matching_evidence_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

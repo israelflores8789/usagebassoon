@@ -28,6 +28,8 @@ from time import monotonic
 from types import BuiltinMethodType, MethodType, MethodWrapperType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, override
 
+from usagebassoon.process import ManagedProcess, start_process
+
 if TYPE_CHECKING:
     from usagebassoon.config import LoggingConfig
 
@@ -104,7 +106,7 @@ class SupervisedResource[R]:
             raise RuntimeError("supervised resources require an operation deadline")
         self._lock = Lock()
         self._closed = False
-        self._process: subprocess.Popen[bytes] = subprocess.Popen(
+        self._process: ManagedProcess = start_process(
             [
                 sys.executable,
                 "-c",
@@ -273,6 +275,10 @@ class SupervisedResource[R]:
                 self._process.stdin.close()
             if self._process.stdout is not None:
                 self._process.stdout.close()
+            try:
+                self._process.close()
+            except OSError:
+                _LOG.exception("could not close supervised resource process scope")
 
 
 def _resource_worker() -> None:

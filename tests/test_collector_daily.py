@@ -32,7 +32,7 @@ from usagebassoon import persistence
 from usagebassoon.backends.base import StorageBackend
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collection_lock import collection_lock
-from usagebassoon.collector import RawCollection
+from usagebassoon.collector import RawCollection, _tokscale_uses_utc
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
 from usagebassoon.drift import SchemaDriftState
 from usagebassoon.ingest import (
@@ -58,6 +58,12 @@ def _private_tokscale_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         "default_tokscale_directory",
         lambda: tmp_path / "tokscale-data",
     )
+
+    def uses_utc(_config: UsageBassoonConfig, _environment: object) -> bool:
+        """Keep mocked collection tests independent of an installed tokscale CLI."""
+        return True
+
+    monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", uses_utc)
 
 
 class _FixedDatetime:
@@ -89,6 +95,7 @@ def _config(path: Path) -> UsageBassoonConfig:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("command", "expected_prefix"),
     [
@@ -111,11 +118,17 @@ def test_package_runner_commands_are_passed_to_tokscale(
         tokscale_bin=command,
     )
     monkeypatch.setenv("TOKSCALE_BIN", "ignored-environment-override")
+
+    def which(_name: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(subprocess_collector.shutil, "which", which)
     prefix = collector._prefix(configuration)
 
     assert prefix == expected_prefix
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_command_uses_each_candidate_day(
     monkeypatch: pytest.MonkeyPatch,
     daily_raws: dict[date, JsonObject],
@@ -157,15 +170,19 @@ def test_daily_models_command_uses_each_candidate_day(
     ]
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_child_environment_excludes_unrelated_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pass only documented and explicitly opted-in environment variables."""
     monkeypatch.setenv("PATH", "/test/bin")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("TOKSCALE_EXTRA_DIRS", "/agent-storage")
     monkeypatch.setenv("CUSTOM_TOKSCALE_AUTH", "allowed")
+    monkeypatch.setenv("PUBLIC_WORKSPACE", "/workspace/project")
+    monkeypatch.setenv("PGPASSWORD", "root")
     monkeypatch.setenv("MOTHERDUCK_TOKEN", "secret")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/secret.json")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "secret")
@@ -174,42 +191,140 @@ def test_tokscale_child_environment_excludes_unrelated_credentials(
         source_id=SOURCE_ID,
         backend="duckdb",
         local_database=Path(":memory:"),
-        tokscale_env=("CUSTOM_TOKSCALE_AUTH",),
+        tokscale_env=("CUSTOM_TOKSCALE_AUTH", "PUBLIC_WORKSPACE"),
     )
 
     child = subprocess_collector._child_environment(configuration)
 
     assert child["PATH"] == "/test/bin"
+    assert child["SystemRoot"] == r"C:\Windows"
     assert child["LANG"] == "C.UTF-8"
     assert child["TOKSCALE_EXTRA_DIRS"] == "/agent-storage"
     assert child["CUSTOM_TOKSCALE_AUTH"] == "allowed"
+    assert child["PUBLIC_WORKSPACE"] == "/workspace/project"
+    assert "PGPASSWORD" not in child
     assert "MOTHERDUCK_TOKEN" not in child
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in child
     assert "AWS_ACCESS_KEY_ID" not in child
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize(
+    "settings_state",
+    [
+        "chicago",
+        "utc",
+        "missing",
+        "missing-scanner",
+        "invalid-json",
+        "non-object",
+        "invalid-scanner",
+        "null-scanner",
+        "invalid-encoding",
+        "invalid-types",
+        "invalid-scanner-types",
+        "unreadable",
+        "bom",
+    ],
+)
 def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     fail: bool,
+    settings_state: str,
 ) -> None:
-    """Keep cached history and pricing across runs, cleaning profiles on failure."""
+    """Pin UTC every run, preserving settings, cached history, and custom pricing."""
     original = tmp_path / "user-profile"
     (original / "cache").mkdir(parents=True)
-    settings = '{"scanner":{"bucketTimezone":"Etc/UTC"},"modelAliases":{}}'
+    settings: JsonObject = {
+        "scanner": {
+            "bucketTimezone": "UTC" if settings_state == "utc" else "America/Chicago",
+            "extraScanPaths": {"codex": ["/other/history"]},
+            "opencodeDbPaths": ["/other/opencode.db"],
+        },
+        "modelAliases": {"original": "alias"},
+        "colorPalette": "blue",
+        "includeUnusedModels": False,
+        "private-settings-sentinel": [None, 7, {"nested": "unchanged"}],
+    }
+    if settings_state == "missing-scanner":
+        settings.pop("scanner")
+    elif settings_state in {"invalid-scanner", "null-scanner"}:
+        settings["scanner"] = (
+            ["invalid"] if settings_state == "invalid-scanner" else None
+        )
+    elif settings_state == "invalid-types":
+        settings["includeUnusedModels"] = "invalid"
+    elif settings_state == "invalid-scanner-types":
+        cast(JsonObject, settings["scanner"])["opencodeDbPaths"] = "invalid"
+    settings_bytes = json.dumps(settings).encode("utf-8")
+    expected_settings = deepcopy(settings)
+    expected_scanner: JsonObject = {}
+    if isinstance(scanner := expected_settings.get("scanner"), dict):
+        expected_scanner = scanner
+    expected_scanner["bucketTimezone"] = "UTC"
+    expected_settings["scanner"] = expected_scanner
+    if settings_state == "bom":
+        settings_bytes = b"\xef\xbb\xbf" + settings_bytes
+    if settings_state in {
+        "invalid-json",
+        "invalid-encoding",
+        "non-object",
+        "unreadable",
+        "missing",
+    }:
+        expected_settings = {"scanner": {"bucketTimezone": "UTC"}}
+    if settings_state in {"invalid-types", "invalid-scanner-types"}:
+        expected_settings = {"scanner": {"bucketTimezone": "UTC"}}
+    if settings_state == "invalid-json":
+        settings_bytes = b'{"private-settings-sentinel":'
+    elif settings_state == "invalid-encoding":
+        settings_bytes = b"\xffprivate-settings-sentinel"
+    elif settings_state == "non-object":
+        settings_bytes = b'["private-settings-sentinel"]'
     pricing = '{"models":{"custom":{"input_cost_per_million_tokens":7}}}'
-    (original / "settings.json").write_text(settings)
+    original_settings = original / "settings.json"
+    if settings_state != "missing":
+        original_settings.write_bytes(settings_bytes)
+    read_text = Path.read_text
+    private_error = "private-settings-sentinel"
+
+    def read_settings(
+        path: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        """Simulate unreadable user settings without blocking private settings."""
+        if path == original_settings and settings_state == "unreadable":
+            raise PermissionError(private_error)
+        return read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_settings)
     (original / "custom-pricing.json").write_text(pricing)
     (original / "wiki.db").write_text("stale wiki")
     (original / "credentials.json").write_text("private")
     (original / "cache" / "history").write_text("compacted turns")
     monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(original))
     configuration = _config(tmp_path / "config.toml")
+    timezone_script = (
+        "import json,os,pathlib; "
+        "p=pathlib.Path(os.environ['TOKSCALE_CONFIG_DIR']); "
+        "s=json.loads((p/'settings.json').read_text()); "
+        "valid=isinstance(s.get('includeUnusedModels',False),bool) "
+        "and isinstance(s['scanner'].get('opencodeDbPaths',[]),list); "
+        "print(s['scanner']['bucketTimezone'] if valid else '(unset)')"
+    )
+    monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", _tokscale_uses_utc)
+
+    def timezone_command(_config: UsageBassoonConfig) -> list[str]:
+        """Run the effective-settings probe against the fixture command."""
+        return [executable, "-c", timezone_script]
+
+    monkeypatch.setattr(subprocess_collector, "_prefix", timezone_command)
     script = (
         "import json,os,pathlib; "
         "p=pathlib.Path(os.environ['TOKSCALE_CONFIG_DIR']); "
-        "print(json.dumps({'settings':(p/'settings.json').read_text(), "
+        "print(json.dumps({'settings':json.loads((p/'settings.json').read_text()), "
         "'pricing':(p/'custom-pricing.json').read_text(), "
         "'history':(p/'cache'/'history').read_text()})); "
         "(p/'wiki.db').write_text('fresh wiki')"
@@ -244,12 +359,15 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
                 [executable, "-c", script],
                 environment=environment,
             ) == {
-                "settings": settings,
+                "settings": expected_settings,
                 "pricing": pricing,
                 "history": "compacted turns" if len(cache_paths) == 1 else "retained",
             }
             assert (profile / "wiki.db").read_text() == "fresh wiki"
             (cache / "history").write_text("retained")
+            (profile / "settings.json").write_text(
+                '{"scanner":{"bucketTimezone":"America/Chicago"}}'
+            )
             if fail:
                 monkeypatch.setattr(
                     tempfile.TemporaryDirectory, "cleanup", cleanup_failure
@@ -261,10 +379,34 @@ def test_tokscale_profile_retains_cache_and_custom_pricing_with_a_fresh_wiki(
     assert cache_paths[0] == cache_paths[1]
     assert (original / "wiki.db").read_text() == "stale wiki"
     assert (original / "cache" / "history").read_text() == "compacted turns"
+    assert (original / "custom-pricing.json").read_text() == pricing
+    if settings_state == "missing":
+        assert not original_settings.exists()
+    else:
+        assert original_settings.read_bytes() == settings_bytes
+    if settings_state in {
+        "invalid-json",
+        "invalid-encoding",
+        "non-object",
+        "unreadable",
+    }:
+        warnings = [
+            record
+            for record in caplog.records
+            if "could not reuse tokscale settings" in record.message
+        ]
+        assert len(warnings) == 2
+        assert all(record.exc_info for record in warnings)
+    elif settings_state in {"invalid-scanner", "null-scanner"}:
+        assert caplog.text.count("invalid tokscale scanner settings") == 2
+    elif settings_state in {"invalid-types", "invalid-scanner-types"}:
+        assert caplog.text.count("tokscale rejected the prepared settings") == 2
+    assert "private-settings-sentinel" not in caplog.text
     assert cache_paths[0].is_relative_to(tmp_path / "tokscale-data")
     assert not (tmp_path / "tokscale").exists()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
     tmp_path: Path,
@@ -329,6 +471,11 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         **kwargs: object,
     ) -> JsonValue:
         """Resolve prices from the run's copied configuration, never live files."""
+        environment = cast(dict[str, str], kwargs["environment"])
+        profile = Path(environment["TOKSCALE_CONFIG_DIR"])
+        assert json.loads((profile / "settings.json").read_text()) == {
+            "scanner": {"bucketTimezone": "UTC"}
+        }
         if arguments[0] == "graph":
             return deepcopy(graph) if active else {**graph, "contributions": []}
         if arguments[0] == "models":
@@ -339,7 +486,6 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         requests.append(model)
         if fail_price and model == changed:
             raise RuntimeError("pricing unavailable")
-        environment = cast(dict[str, str], kwargs["environment"])
         custom = (
             Path(environment["TOKSCALE_CONFIG_DIR"]) / "custom-pricing.json"
         ).exists() and model == changed
@@ -449,6 +595,7 @@ def test_custom_pricing_presence_refreshes_today_and_recovers_pending_state(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_timeout_kills_the_process(tmp_path: Path) -> None:
     """Terminate a subprocess that exceeds the configured hard timeout."""
     configuration = UsageBassoonConfig(
@@ -476,6 +623,8 @@ def test_tokscale_cleanup_bounds_surviving_pipe_holders(
     tmp_path: Path, pipe_name: str, excessive: bool
 ) -> None:
     """Bound timeout/size cleanup, close pipes, and release the collection lock."""
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("requires POSIX process signals")
     ready = tmp_path / "holder.pid"
     descriptor = 1 if pipe_name == "stdout" else 2
     script = (
@@ -535,6 +684,7 @@ def test_tokscale_cleanup_bounds_surviving_pipe_holders(
         process.wait(timeout=2)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fault", ["kill", "read", "closed-pipes"])
 def test_tokscale_cleanup_bounds_process_failures(
     monkeypatch: pytest.MonkeyPatch,
@@ -596,6 +746,7 @@ def test_tokscale_cleanup_bounds_process_failures(
         process.wait(timeout=2)
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preserves_slow_valid_output(tmp_path: Path) -> None:
     """Capture incremental valid JSON before the hard maximum, without spinners."""
     configuration = replace(
@@ -613,6 +764,7 @@ def test_tokscale_preserves_slow_valid_output(tmp_path: Path) -> None:
     ) == {"value": 42}
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
     """Reject excessive graph output before it can exhaust collector memory."""
     configuration = UsageBassoonConfig(
@@ -632,6 +784,7 @@ def test_tokscale_stdout_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
     """Reject excessive tokscale diagnostics before retaining unbounded text."""
     configuration = UsageBassoonConfig(
@@ -650,6 +803,7 @@ def test_tokscale_stderr_limit_kills_the_process(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     tmp_path: Path,
@@ -797,6 +951,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
     assert set(captured[0].report_by_day) == {date.min}
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_failure_records_incomplete_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -841,6 +996,7 @@ def test_daily_models_failure_records_incomplete_targets(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_overlap_always_includes_three_past_graph_usage_days(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -918,6 +1074,7 @@ def test_overlap_always_includes_three_past_graph_usage_days(
     assert requested == [(retry_day, days[0], *days[-3:], today)]
 
 
+@pytest.mark.windows_compatible
 def test_report_failure_is_logged_and_does_not_abort_collection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -944,6 +1101,7 @@ def test_report_failure_is_logged_and_does_not_abort_collection(
     assert "session report collection failed" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
 @pytest.mark.parametrize("invoke_method", [None, *InvokeMethod])
 def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
@@ -989,6 +1147,7 @@ def test_graph_failure_aborts_cycle_and_logs_to_operational_log(
     assert "collection cycle failed before completion" in log
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 def test_historical_refresh_preserves_usage_and_source_isolation(
     architecture: str,
@@ -1275,6 +1434,7 @@ def test_historical_refresh_preserves_usage_and_source_isolation(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("architecture", ["upsert", "append"])
 @pytest.mark.parametrize("fault", ["fetch", "contract", "parse", "duplicate"])
 def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
@@ -1420,6 +1580,7 @@ def test_multimonth_collection_retains_successes_and_retries_missing_graph_day(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("fails", [False, True])
 def test_pricing_deduplicates_historical_requests_and_uses_observation_day(
     fails: bool,
@@ -1462,6 +1623,7 @@ def test_pricing_deduplicates_historical_requests_and_uses_observation_day(
     assert not requests
 
 
+@pytest.mark.windows_compatible
 def test_empty_source_records_report_discovery_without_repeating_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1499,6 +1661,7 @@ def test_empty_source_records_report_discovery_without_repeating_it(
     assert len(reports) == 1
 
 
+@pytest.mark.windows_compatible
 def test_report_refresh_groups_creation_days_and_allows_timezone_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

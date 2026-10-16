@@ -54,16 +54,23 @@ def models(
         Path | None, typer.Option("--config", help="Use this configuration file.")
     ] = None,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
     ] = None,
     model: Annotated[
         str | None, typer.Option("--model", help="Filter by exact model.")
+    ] = None,
+    exclude_model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-model", help="Exclude an exact model; may be repeated."
+        ),
     ] = None,
     workspace: Annotated[
         str | None, typer.Option("--workspace", help="Filter by exact workspace.")
@@ -109,6 +116,7 @@ def models(
         source=source,
         client=client,
         model=model,
+        exclude_models=tuple(exclude_model or ()),
         workspace=workspace,
         tag=tag,
     )

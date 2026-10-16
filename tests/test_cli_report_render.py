@@ -27,6 +27,7 @@ def _rows(payload: str) -> list[ReportRecord]:
     return cast(list[ReportRecord], json.loads(payload))
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("report", ["daily", "models", "sessions"])
 def test_json_stdout_matches_saved_csv(report: str, tmp_path: Path) -> None:
     """Exercise each report's format wiring, numeric schema, and full identifiers."""
@@ -42,7 +43,7 @@ def test_json_stdout_matches_saved_csv(report: str, tmp_path: Path) -> None:
     result = runner.invoke(app, [*base, "--csv", "--save", str(destination)])
     assert result.exit_code == 0, result.output
     assert plain_cli_output(result.stdout) == ""
-    actual = list(csv.DictReader(io.StringIO(destination.read_text())))
+    actual = list(csv.DictReader(io.StringIO(destination.read_text(encoding="utf-8"))))
     assert len(actual) == len(expected)
     for row, exported in zip(expected, actual, strict=True):
         assert exported.keys() == row.keys()
@@ -61,6 +62,7 @@ def test_json_stdout_matches_saved_csv(report: str, tmp_path: Path) -> None:
             assert row["ms_per_1k_tokens"] == pytest.approx(duration * 1_000 / tokens)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("report", ["daily", "models", "sessions"])
 def test_empty_rows_and_conflicting_formats(report: str) -> None:
     """Return valid empty JSON and a stable CSV header; reject conflicting flags."""
@@ -80,6 +82,7 @@ def test_empty_rows_and_conflicting_formats(report: str) -> None:
     assert "mutually exclusive" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_session_output_preserves_grouping_limit_and_sanitization(
     tmp_path: Path,
 ) -> None:
@@ -111,6 +114,7 @@ def test_session_output_preserves_grouping_limit_and_sanitization(
         assert sanitized["cost_usd"] == rows[0]["cost_usd"]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("report", ["daily", "models", "sessions"])
 def test_nullable_rates_and_decimal_costs(
     report: str, monkeypatch: pytest.MonkeyPatch

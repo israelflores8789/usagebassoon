@@ -147,7 +147,11 @@ def _local_snapshot_config(
 @pytest.fixture(autouse=True)
 def _bound_live_test_duration() -> Iterator[None]:
     """Fail a live test instead of leaving a CI worker blocked indefinitely."""
-    if not hasattr(signal, "SIGALRM"):
+    if (
+        not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "ITIMER_REAL")
+    ):
         yield
         return
 
@@ -1036,7 +1040,7 @@ def test_live_restore_requires_an_explicit_disposable_reset(
             )
         )
         with _phase("populated BigQuery CLI restore rejection"):
-            rejected = runner.invoke(app, command, input="y\n")
+            rejected = runner.invoke(app, command, input="y\ny\n")
         assert rejected.exit_code != 0
         assert "restore requires an empty warehouse" in plain_cli_output(
             rejected.output

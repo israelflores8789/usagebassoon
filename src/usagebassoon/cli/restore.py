@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated
 
@@ -48,45 +49,70 @@ def restore(
     )
     configuration, backend = configured_backend(config)
     try:
-        with spinner(configuration):
-            try:
-                archiver = snapshot_archiver(configuration)
-                with archiver.reader.prepare(snapshot, warning=notice) as prepared:
+        try:
+            with ExitStack() as stack:
+                preparation_notices: list[str] = []
+                try:
+                    with spinner(configuration):
+                        archiver = snapshot_archiver(configuration)
+                        prepared = stack.enter_context(
+                            archiver.reader.prepare(
+                                snapshot, warning=preparation_notices.append
+                            )
+                        )
+                finally:
+                    for message in preparation_notices:
+                        notice(message)
+                notice(
+                    f"Snapshot: {prepared.candidate.uri} "
+                    f"(captured {prepared.candidate.captured_at})"
+                )
+                if configuration.backend == "bigquery" and configuration.bigquery:
+                    destination = (
+                        f"{configuration.bigquery.project}."
+                        f"{configuration.bigquery.dataset}"
+                    )
+                elif configuration.backend == "motherduck" and configuration.motherduck:
+                    destination = configuration.motherduck.database
+                else:
+                    destination = str(configuration.local_database)
+                notice(f"Destination: {configuration.backend} {destination}")
+                confirm_location(archiver, prepared.candidate.uri)
+                try:
+                    identity_warning = source_identity_warning(
+                        configuration.source_id, prepared
+                    )
+                except Exception:
+                    logging.getLogger("usagebassoon").warning(
+                        "Restore source-identity advice is unavailable",
+                        exc_info=True,
+                    )
+                    identity_warning = (
+                        "Source matching is unavailable; "
+                        "restore preserves archived source IDs."
+                    )
+                if identity_warning:
+                    notice(identity_warning)
+                typer.confirm(
+                    "Have all writers stopped, and do you wish to proceed?",
+                    default=False,
+                    abort=True,
+                )
+                with spinner(configuration):
                     if cleanup_stages:
                         backend.cleanup_restore_stages()
                     if not backend.restore_committed(restore_operation_id(prepared)):
                         backend.check_restore_empty()
-                    confirm_location(archiver, prepared.candidate.uri)
-                    try:
-                        identity_warning = source_identity_warning(
-                            configuration.source_id, prepared
-                        )
-                    except Exception:
-                        logging.getLogger("usagebassoon").warning(
-                            "Restore source-identity advice is unavailable",
-                            exc_info=True,
-                        )
-                        identity_warning = (
-                            "Source matching is unavailable; "
-                            "restore preserves archived source IDs."
-                        )
-                    if identity_warning:
-                        notice(identity_warning)
-                    typer.confirm(
-                        "Have all writers stopped, and do you wish to proceed?",
-                        default=False,
-                        abort=True,
-                    )
                     restored = restore_prepared(
                         backend, prepared, notice=notice, preflight_checked=True
                     )
-            except typer.Abort:
-                raise
-            except (OSError, RuntimeError, ValueError) as error:
-                raise typer.BadParameter(str(error)) from error
-            except Exception as error:
-                logging.getLogger("usagebassoon").exception("Snapshot restore failed")
-                raise typer.BadParameter(str(error)) from error
+        except typer.Abort:
+            raise
+        except (OSError, RuntimeError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+        except Exception as error:
+            logging.getLogger("usagebassoon").exception("Snapshot restore failed")
+            raise typer.BadParameter(str(error)) from error
     finally:
         close_backend(backend, context="restoring a snapshot")
     details = ", ".join(f"{table}={count}" for table, count in restored.items())

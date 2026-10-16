@@ -27,11 +27,14 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 def _write_config(path: Path, database: Path) -> None:
     """Write a local-DuckDB configuration for collection command tests."""
     path.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
 
 
+@pytest.mark.windows_compatible
 def test_collect_reports_the_delegated_persistence_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -59,6 +62,7 @@ def test_collect_reports_the_delegated_persistence_summary(
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("refresh", [False, True])
 def test_manual_collection_warns_after_persisting_partial_data(
     refresh: bool,
@@ -88,6 +92,7 @@ def test_manual_collection_warns_after_persisting_partial_data(
     assert "Run bassoon collect again" in plain_cli_output(result.stderr)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "override", [None, "STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"]
 )
@@ -124,6 +129,7 @@ def test_collect_formats_configuration_errors_as_cli_errors(
     collect.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 def test_collect_reports_local_collection_contention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -148,6 +154,7 @@ def test_collect_reports_local_collection_contention(
     )
 
 
+@pytest.mark.windows_compatible
 def test_collect_formats_unexpected_errors_without_a_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -178,6 +185,7 @@ def test_collect_formats_unexpected_errors_without_a_traceback(
     assert "unexpected collection command failure" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("options", "since", "until", "parent_config"),
     [
@@ -236,6 +244,7 @@ def test_collect_refresh_delegates_source_and_date_bounds(
     assert "Collected run refresh-run" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "options",
     [

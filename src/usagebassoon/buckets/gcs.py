@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +30,7 @@ from usagebassoon.deadlines import (
     operation,
     remaining_seconds,
 )
+from usagebassoon.privacy import google_doctor_principal
 
 _LOG = logging.getLogger("usagebassoon")
 _MUTATION_INTERVAL = 1.1
@@ -269,6 +271,16 @@ class GcsSnapshotBucket:
         self.project = project
         self.credentials_file = credentials_file
         self.timeout_seconds = timeout_seconds
+        self._doctor_auth_source = (
+            "injected client"
+            if client is not None
+            else "configured service-account credentials file"
+            if credentials_file is not None
+            else "ADC from a credentials file"
+            if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            else "ADC"
+        )
+        resolved_credentials: object | None = None
         with operation(timeout_seconds):
             if client is None:
                 from usagebassoon.config import validate_gcs_environment
@@ -280,7 +292,6 @@ class GcsSnapshotBucket:
                     raise RuntimeError(
                         "GCS snapshots require the usagebassoon[gcs] extra"
                     ) from error
-                resolved_credentials = None
                 if credentials_file is not None:
                     try:
                         from google.auth.exceptions import GoogleAuthError
@@ -333,7 +344,12 @@ class GcsSnapshotBucket:
             else:
                 client_value = client
             self.client = client_value
+            self._credentials = resolved_credentials
             self.bucket = client_value.bucket(self.bucket_name)
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Return the GCS credential source and effective Google principal."""
+        return self._doctor_auth_source, google_doctor_principal(self._credentials)
 
     def _request[T](
         self,

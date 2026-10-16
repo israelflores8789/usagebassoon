@@ -69,6 +69,7 @@ from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 from usagebassoon.storage_model import note_id_for_session, preserve_daily_tokens
 
 
+@pytest.mark.windows_compatible
 def test_service_account_file_scopes_the_bigquery_http_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -102,6 +103,7 @@ def test_service_account_file_scopes_the_bigquery_http_transport(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("with_history", [False, True])
 def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
     collection_bundle: CollectionBundle,
@@ -185,6 +187,7 @@ def test_bigquery_startup_retry_exhaustion_retries_the_same_batch(
         assert published[0] is bundle
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_partial_publication_never_marks_missing_facts_complete(
     collection_bundle: CollectionBundle, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -226,6 +229,7 @@ def test_bigquery_partial_publication_never_marks_missing_facts_complete(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["submission", "upload", "cancellation"])
 def test_bigquery_stalled_transport_returns_and_next_operation_runs(
     boundary: str,
@@ -338,6 +342,7 @@ def test_bigquery_stalled_transport_returns_and_next_operation_runs(
         thread.join(timeout=2)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["submission", "metadata", "cancellation"])
 def test_bigquery_transient_http_requests_recover_within_the_budget(
     boundary: str,
@@ -458,6 +463,7 @@ def test_bigquery_transient_http_requests_recover_within_the_budget(
         thread.join(timeout=2)
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_parallel_loads_and_ledger_share_one_attempt_budget(
     monkeypatch: pytest.MonkeyPatch,
     collection_bundle: CollectionBundle,
@@ -692,6 +698,7 @@ def _backend() -> BigQueryBackend:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("sql", "parameters", "expected"),
     [
@@ -829,6 +836,7 @@ class _StorageReadClient:
         ]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("timeout", [None, 45.0])
 def test_bigquery_job_timeout_cancels_and_is_retryable(timeout: float | None) -> None:
     """Honor default/custom waits, cancel stuck jobs, and report retryable failure."""
@@ -851,6 +859,7 @@ def test_bigquery_job_timeout_cancels_and_is_retryable(timeout: float | None) ->
     assert not backend.is_retryable_error(ValueError("invalid observation"))
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_query_configuration_sets_the_billing_ceiling() -> None:
     """Apply the configured bytes-billed cap to every query-job configuration."""
     backend = BigQueryBackend(
@@ -863,6 +872,7 @@ def test_bigquery_query_configuration_sets_the_billing_ceiling() -> None:
     assert backend._query_config().maximum_bytes_billed == 1_073_741_824
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("location", ["US`", "US; DROP TABLE jobs", "us central1"])
 def test_bigquery_rejects_locations_unsafe_for_information_schema(
     location: str,
@@ -877,6 +887,7 @@ def test_bigquery_rejects_locations_unsafe_for_information_schema(
         )
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -915,6 +926,7 @@ def test_bigquery_arrow_reader_passes_stream_name_to_storage_client(
     assert storage_reader.stream_names == [stream_name]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["initial", "midstream"])
 @pytest.mark.parametrize(
     "failure_type", [DeadlineExceeded, ServiceUnavailable, Unknown]
@@ -989,6 +1001,7 @@ def test_bigquery_read_recovery_preserves_rows_and_operation_budget(
     assert "retrying from row offset" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("overrun", [False, True])
 def test_bigquery_progressing_stream_uses_remaining_budget(
     overrun: bool, monkeypatch: pytest.MonkeyPatch
@@ -1047,6 +1060,7 @@ def test_bigquery_progressing_stream_uses_remaining_budget(
     assert timeouts == [110]
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_repeated_read_failures_do_not_extend_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1105,6 +1119,7 @@ def test_bigquery_repeated_read_failures_do_not_extend_the_deadline(
     assert calls[-1] == 180
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_upload_retry_rewinds_and_resolves_the_same_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1163,6 +1178,7 @@ def test_bigquery_upload_retry_rewinds_and_resolves_the_same_job(
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("boundary", ["initial", "midstream"])
 def test_bigquery_native_read_deadline_stops_stalls_and_allows_next_operation(
     boundary: str,
@@ -1267,6 +1283,7 @@ def test_bigquery_native_read_deadline_stops_stalls_and_allows_next_operation(
             server.stop(grace=None).wait(timeout=2)
 
 
+@pytest.mark.windows_compatible
 def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:
     """Map canonical Arrow primitives and repeated strings without inference."""
     data = pa.table(
@@ -1292,6 +1309,7 @@ def test_arrow_schema_mapping_is_explicit_and_preserves_logical_types() -> None:
     ]
 
 
+@pytest.mark.windows_compatible
 def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     """Qualify view definitions while retaining portable shipped SQL files."""
     backend = _backend()
@@ -1315,6 +1333,7 @@ def test_view_sql_uses_fully_qualified_bigquery_relations() -> None:
     assert f"JOIN `{table_prefix}.report_daily_usage`" in qualified_reports
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_classifies_transient_publication_failures() -> None:
 
     backend = _backend()
@@ -1322,6 +1341,7 @@ def test_bigquery_classifies_transient_publication_failures() -> None:
     assert not backend.is_retryable_error(BadRequest("bad schema"))
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
     """Query regional job metadata for running transactions affecting this dataset."""
     client = _TransactionClient()
@@ -1345,6 +1365,7 @@ def test_bigquery_inspects_running_dataset_transaction_jobs() -> None:
     assert client.statement.endswith("LIMIT 2")
 
 
+@pytest.mark.windows_compatible
 def test_publication_appends_to_bronze_without_queries_or_stages(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -1375,6 +1396,7 @@ def test_publication_appends_to_bronze_without_queries_or_stages(
     )
 
 
+@pytest.mark.windows_compatible
 def test_partial_publication_replays_event_ids_and_withholds_coverage(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
@@ -1410,6 +1432,7 @@ def test_partial_publication_replays_event_ids_and_withholds_coverage(
     assert first == dict(calls[len(facts) : -1])
 
 
+@pytest.mark.windows_compatible
 def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
     """Validate an initialized warehouse without schema or data queries."""
 
@@ -1439,6 +1462,7 @@ def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
     assert client.loads == []
 
 
+@pytest.mark.windows_compatible
 def test_canonical_required_fields_survive_bigquery_schema_mapping() -> None:
     """Never relax warehouse keys or event identities during a load."""
     for schema in CANONICAL_TABLE_SCHEMAS.values():
@@ -1527,6 +1551,7 @@ class _InitClient(_BatchClient):
         return _Job()
 
 
+@pytest.mark.windows_compatible
 def test_init_replays_an_interruption_without_recreating_tables() -> None:
     """Block incomplete opens, resume initialization, and clear inherited expiry."""
     client = _InitClient()
@@ -1553,6 +1578,7 @@ def test_init_replays_an_interruption_without_recreating_tables() -> None:
             assert table.time_partitioning.expiration_ms == expected
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("version", "hash_value", "message"),
     [
@@ -1583,6 +1609,7 @@ def test_preflight_rejects_unsupported_markers_without_schema_jobs(
     assert client.queries == []
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("message", "exception_type"),
     [
@@ -1673,6 +1700,7 @@ def test_restore_translates_emptiness_errors_and_cleans_stages(
         assert raised.value is failure
 
 
+@pytest.mark.windows_compatible
 def test_nightly_schedule_create_reuse_and_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1734,6 +1762,7 @@ def test_nightly_schedule_create_reuse_and_update(
         install_compaction(backend)
 
 
+@pytest.mark.windows_compatible
 def test_restore_wait_observes_terminal_job_before_allowing_stage_cleanup() -> None:
     """Cancellation acknowledgement alone does not establish job termination."""
     backend = _backend()
@@ -1756,6 +1785,7 @@ def test_restore_wait_observes_terminal_job_before_allowing_stage_cleanup() -> N
     assert job.reload.call_args.kwargs["timeout"] <= 60
 
 
+@pytest.mark.windows_compatible
 def test_unsettled_restore_commit_preserves_owned_stage(
     tmp_path: object,
     collection_bundle: CollectionBundle,
@@ -1799,6 +1829,7 @@ def test_unsettled_restore_commit_preserves_owned_stage(
     client.delete_table.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 def test_absent_receipt_with_active_job_is_unknown_without_surviving_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1827,6 +1858,7 @@ def test_absent_receipt_with_active_job_is_unknown_without_surviving_stages(
     client.list_tables.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 def test_cleanup_drains_active_restore_even_when_stages_are_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1863,6 +1895,7 @@ def test_cleanup_drains_active_restore_even_when_stages_are_missing(
     client.delete_table.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("qualified", [False, True])
 def test_manual_compaction_is_visible_without_a_transfer_schedule(
     monkeypatch: pytest.MonkeyPatch,
@@ -1913,6 +1946,7 @@ def test_manual_compaction_is_visible_without_a_transfer_schedule(
     assert not enabled and "manual-compaction" in detail
 
 
+@pytest.mark.windows_compatible
 def test_restore_requires_project_wide_job_visibility_before_deleting_stages() -> None:
     """Permission failure cannot be interpreted as an idle project."""
     from google.api_core.exceptions import Forbidden
@@ -1926,6 +1960,7 @@ def test_restore_requires_project_wide_job_visibility_before_deleting_stages() -
     client.delete_table.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 def test_recovery_schedule_pause_waits_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1986,6 +2021,7 @@ def test_recovery_schedule_pause_waits_and_fails_closed(
         module.pause_compaction(backend, timeout=1.0)
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_snapshot_stream_handles_empty_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2049,6 +2085,7 @@ def _views() -> dict[str, str]:
     }
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "relation",
     (
@@ -2079,6 +2116,7 @@ def test_pinned_diagnostics_expand_every_installed_view_input(relation: str) -> 
     assert "@doctor_read_at" in sql
 
 
+@pytest.mark.windows_compatible
 def test_pinned_query_distinguishes_cte_from_same_named_physical_table() -> None:
     """Only the CTE's actual raw-table input receives time travel."""
     sql = _pinned_query(
@@ -2092,6 +2130,7 @@ def test_pinned_query_distinguishes_cte_from_same_named_physical_table() -> None
     assert inputs["raw_daily_stats"].args.get("version") is not None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "sql",
     [
@@ -2106,6 +2145,7 @@ def test_pinned_query_fails_closed(sql: str) -> None:
         _pinned_query(sql, {}, "usagebassoon-test.usagebassoon_it")
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_read_session_uses_first_server_timestamp_without_leaking_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2144,6 +2184,7 @@ def test_bigquery_read_session_uses_first_server_timestamp_without_leaking_scope
     assert "FOR SYSTEM_TIME" not in client.query.call_args.args[0]
 
 
+@pytest.mark.windows_compatible
 def test_cleanup_waits_for_background_job_before_deleting_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2165,6 +2206,7 @@ def test_cleanup_waits_for_background_job_before_deleting_tables(
     )
 
 
+@pytest.mark.windows_compatible
 def test_cleanup_timeout_leaves_schema_intact(monkeypatch: pytest.MonkeyPatch) -> None:
     """Failure to establish quiescence must never drop or truncate tables."""
     client = MagicMock(spec=bigquery.Client)
@@ -2182,6 +2224,7 @@ def test_cleanup_timeout_leaves_schema_intact(monkeypatch: pytest.MonkeyPatch) -
     client.delete_table.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 def test_schedule_drain_disables_launches_and_waits_for_pending_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2209,6 +2252,7 @@ def test_schedule_drain_disables_launches_and_waits_for_pending_runs(
     assert config.disabled
 
 
+@pytest.mark.windows_compatible
 def test_doctor_snapshot_failure_never_falls_back_to_live_reads() -> None:
     """Report initialization failure instead of silently weakening consistency."""
     backend = MagicMock(spec=BigQueryBackend)
@@ -2221,6 +2265,7 @@ def test_doctor_snapshot_failure_never_falls_back_to_live_reads() -> None:
     backend.query.assert_not_called()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("action", ["stages", "receipt", "cleanup"])
 @pytest.mark.parametrize(
     ("seconds", "parent_seconds"), [(90.0, None), (10.0, None), (90.0, 10.0)]
@@ -2269,6 +2314,7 @@ def test_restore_inspection_respects_the_operation_deadline(
     assert current_deadline() is None
 
 
+@pytest.mark.windows_compatible
 def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2325,6 +2371,7 @@ def test_restore_cleanup_discards_nonexpired_owned_stages_after_job_drain(
     assert client.delete_table.call_args.args[0] == table.reference
 
 
+@pytest.mark.windows_compatible
 def test_recovery_schedule_pagination_reapplies_remaining_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

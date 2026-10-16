@@ -49,7 +49,7 @@
       "properties": {
         "bin": {
           "$ref": "#/$defs/nonEmptyString",
-          "description": "Command prefix for running tokscale, including any runner arguments (for example, `npx tokscale@latest`, `bunx tokscale@latest`, or `deno x npm:tokscale@latest`). This setting overrides the `TOKSCALE_BIN` environment variable."
+          "description": "Executable path or command prefix for running tokscale, including any runner arguments (for example, `npx tokscale@latest`, `bunx tokscale@latest`, or `deno x npm:tokscale@latest`). This setting overrides the `TOKSCALE_BIN` environment variable."
         },
         "env": {
           "type": "array",

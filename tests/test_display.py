@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from usagebassoon.display import sanitize_display
 
 
+@pytest.mark.windows_compatible
 def test_display_sanitizer_escapes_terminal_and_bidi_controls() -> None:
     """Keep ordinary Unicode while neutralizing terminal control sequences."""
     value = "model\x1b[31mred\x1b[0m\u202e.txt\nΩ"

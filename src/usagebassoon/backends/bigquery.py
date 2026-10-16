@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 import time
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,7 +24,7 @@ from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
-from typing import BinaryIO, cast, override
+from typing import IO, cast, override
 from uuid import uuid4
 
 import pyarrow as pa
@@ -76,6 +78,7 @@ from usagebassoon.deadlines import (
 from usagebassoon.deadlines import (
     operation as operation_budget,
 )
+from usagebassoon.privacy import google_doctor_principal
 from usagebassoon.schema_assets import (
     SCHEMA_VERSION,
     pending_migrations,
@@ -357,6 +360,17 @@ class BigQueryBackend(AbstractStorageBackend):
             raise ValueError("timeout_seconds must be positive")
         if credentials is not None and credentials_file is not None:
             raise ValueError("credentials and credentials_file cannot be combined")
+        self._doctor_auth_source = (
+            "injected client"
+            if client is not None
+            else "configured service-account credentials file"
+            if credentials_file is not None
+            else "explicit credentials"
+            if credentials is not None
+            else "ADC from a credentials file"
+            if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            else "ADC"
+        )
         with operation_budget(timeout_seconds):
             resolved_credentials = credentials
             if credentials_file is not None:
@@ -398,6 +412,10 @@ class BigQueryBackend(AbstractStorageBackend):
                 raise RuntimeError(
                     "BigQuery authentication failed; configure ADC or credentials_file"
                 ) from error
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Return a safe-to-render authentication source and effective principal."""
+        return self._doctor_auth_source, google_doctor_principal(self._credentials)
 
     @contextmanager
     @override
@@ -1538,7 +1556,7 @@ class BigQueryBackend(AbstractStorageBackend):
     @bounded
     def _submit_load(
         self,
-        payload: BinaryIO,
+        payload: IO[bytes],
         destination: str,
         *,
         job_config: bigquery.LoadJobConfig,
@@ -1587,7 +1605,9 @@ class BigQueryBackend(AbstractStorageBackend):
         """Load canonical Arrow data through an explicit Parquet payload."""
         parquet_options = bigquery.ParquetOptions()
         parquet_options.enable_list_inference = True
-        with TemporaryFile(mode="w+b") as payload:
+        with TemporaryFile(mode="w+b") as temporary:
+            # Windows TemporaryFile wraps a named file; upload its binary stream.
+            payload = temporary.file if sys.platform == "win32" else temporary
             pq.write_table(data, payload)
             payload.seek(0)
             self._wait_for_job(

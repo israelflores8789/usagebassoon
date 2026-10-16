@@ -595,6 +595,10 @@ class _DuckDBStorage(AbstractStorageBackend):
 class DuckDBBackend(_DuckDBStorage):
     """StorageBackend backed by a local DuckDB database."""
 
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Describe local filesystem access without exposing the OS identity."""
+        return "local file permissions", "not applicable"
+
     @contextmanager
     @override
     def consistent_read(self) -> Generator[StorageBackend]:

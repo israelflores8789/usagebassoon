@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 
+from usagebassoon.collection_policy import apply_collection_policy
 from usagebassoon.drift import SchemaDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS
@@ -126,29 +127,34 @@ def _price_version_rows(
     *,
     freshness_at: datetime,
 ) -> ColumnarData:
-    """Build rates associated with their actual UTC observation day."""
+    """Build observed price versions with UsageBassoon's model policy applied."""
     records: list[dict[str, object]] = []
     for day in sorted(pricing_by_day):
         for model in sorted(pricing_by_day[day]):
             pricing = pricing_by_day[day][model]
             records.append(
-                {
-                    "source_id": source_id,
-                    "day": day,
-                    "model": pricing.model_id,
-                    "source": pricing.source,
-                    "matched_key": pricing.matched_key,
-                    "match_kind": pricing.resolution.kind,
-                    "price_input_per_token": pricing.pricing.input_cost_per_token,
-                    "price_output_per_token": pricing.pricing.output_cost_per_token,
-                    "price_cache_read_per_token": (
-                        pricing.pricing.cache_read_input_token_cost
-                    ),
-                    "price_cache_write_per_token": (
-                        pricing.pricing.cache_write_input_token_cost
-                    ),
-                    "collected_at": freshness_at,
-                }
+                apply_collection_policy(
+                    "price_versions",
+                    {
+                        "source_id": source_id,
+                        "day": day,
+                        "model": pricing.model_id,
+                        "source": pricing.source,
+                        "matched_key": pricing.matched_key,
+                        "match_kind": pricing.resolution.kind,
+                        "price_input_per_token": (pricing.pricing.input_cost_per_token),
+                        "price_output_per_token": (
+                            pricing.pricing.output_cost_per_token
+                        ),
+                        "price_cache_read_per_token": (
+                            pricing.pricing.cache_read_input_token_cost
+                        ),
+                        "price_cache_write_per_token": (
+                            pricing.pricing.cache_write_input_token_cost
+                        ),
+                        "collected_at": freshness_at,
+                    },
+                )
             )
     return _col_major(records) if records else {}
 

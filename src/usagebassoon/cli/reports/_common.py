@@ -85,6 +85,7 @@ class ReportFilters:
         model: Exact model filter.
         workspace: Exact workspace filter.
         tag: Effective source-aware curation tag filter.
+        exclude_models: Exact model filters to omit from report results.
     """
 
     source: str | None = None
@@ -92,6 +93,7 @@ class ReportFilters:
     model: str | None = None
     workspace: str | None = None
     tag: str | None = None
+    exclude_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,13 @@ def report_where(
             column = "source_id" if name == "source" else name
             conditions.append(f"{alias}.{column} = :{name}")
             parameters[name] = value
+    if filters.exclude_models:
+        placeholders: list[str] = []
+        for index, excluded_model in enumerate(filters.exclude_models):
+            parameter = f"exclude_model_{index}"
+            placeholders.append(f":{parameter}")
+            parameters[parameter] = excluded_model
+        conditions.append(f"{alias}.model NOT IN ({', '.join(placeholders)})")
     if filters.tag is not None:
         conditions.append(
             "EXISTS ("
@@ -783,6 +792,7 @@ def _matches(fact: _SampleUsage, filters: ReportFilters) -> bool:
         (filters.source is None or fact.source_id == filters.source)
         and (filters.client is None or fact.client == filters.client)
         and (filters.model is None or fact.model == filters.model)
+        and (not filters.exclude_models or fact.model not in filters.exclude_models)
         and (filters.workspace is None or fact.workspace == filters.workspace)
         and (filters.tag is None or filters.tag in fact.tags)
     )

@@ -147,10 +147,11 @@ def graph(
         typer.Option("--days", min=1, max=31, help="Trailing calendar days to show."),
     ] = None,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     metric: Annotated[
         str,
@@ -167,6 +168,12 @@ def graph(
     ] = None,
     model: Annotated[
         str | None, typer.Option("--model", help="Filter by exact model.")
+    ] = None,
+    exclude_model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-model", help="Exclude an exact model; may be repeated."
+        ),
     ] = None,
     workspace: Annotated[
         str | None, typer.Option("--workspace", help="Filter by exact workspace.")
@@ -210,6 +217,7 @@ def graph(
         source=source,
         client=client,
         model=model,
+        exclude_models=tuple(exclude_model or ()),
         workspace=workspace,
         tag=tag,
     )

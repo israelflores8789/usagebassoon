@@ -12,6 +12,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-15
+
+### Added
+
+- Added scoped subprocess management for tokscale collection and supervised resources, using POSIX process groups and per-invocation Windows Job Objects.
+- Added Windows foreground worker operation under an external process supervisor.
+- Added repeatable `--exclude-model` options to activity, daily, graph, models, sessions, and summary reports.
+- Doctor output now reports backend and snapshot-bucket authentication sources and available principals for easier debugging. The default output preserves safe authentication labels and obfuscates user email handles and non-public email domains for privacy.
+
+### Changed
+
+- Windows detached worker startup now reports that it is unsupported and directs users to `bassoon schedule worker --foreground`; native Windows scheduling remains unsupported at this time. *Consider contributing!*
+- Doctor diagnostics now preserve filesystem path context and default application directories for debugging. It still replaces recognized user and project directory names with `<user>` and `<project>`, but no longer masks entire paths. It also detects GCP service-account project IDs and masks as `<project-id>`.
+- Development dependencies now include `rust-just>=1.58.0`, and the Just configuration enables the script recipes used for Windows checks.
+- `codex-auto-review` is considered *free* and does not count toward reported costs; however, token usage from `codex-auto-review` is still persisted and user-configured custom pricing in Tokscale is honored. See issue #4.
+- `bassoon init` now includes the config schema URL and a warning above the source ID in newly generated config files, with spacing that clearly associates the warning with the source ID.
+
+### Fixed
+
+- Collection now enforces and verifies UTC day boundaries in every temporary tokscale profile, preserving unrelated valid settings, custom pricing, and cached history across scheduled runs. Missing or unusable settings recover with UTC enforced; malformed, unreadable, or rejected settings are logged without exposing their contents.
+- Session labels now use the last eight characters of the complete session ID to distinguish sessions with shared ID prefixes, including compound Codex IDs.
+- Fixed credential redaction to preserve diagnostic prose and nonsecret environment values, with extensible name allowlists and denylists and scoped masking of unlabelled credential values. Updated the relative doctor configuration-path test to use a recognizable project workspace.
+- Updated doctor path assertions, restore warning coverage, and the SQL parity query inventory to match current behavior while preserving Windows compatibility and isolating restore tests from user configuration.
+- Fixed doctor collection health warnings to clear after a source's later successful run while retaining warnings for failed or partial targets that remain unresolved.
+- Fixed Windows tokscale executable discovery and command startup, including `.cmd` shims and the child `SystemRoot` environment.
+- Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.
+- Documented the `storage.buckets.get` permission required for GCS lifecycle inspection by `bassoon doctor`.
+- Restore now displays the verified snapshot, destination, and source-identity advice before final confirmation, with progress indicators stopped during prompts. Optional stage cleanup, destination checks, and restoration run only after approval; declining either prompt leaves destination data untouched and removes temporary snapshot files.
+- Newly generated configuration files now use LF line endings on Windows.
+- Local snapshot buckets now use a consistent Windows path namespace during concurrent object creation, preventing false path-escape errors while preserving existing catalog lock identities.
+
 ## [1.0.0] - 2026-10-08
 
 ### Added

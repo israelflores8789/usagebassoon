@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,6 +31,7 @@ from usagebassoon.curation import (
     set_note,
 )
 from usagebassoon.display import sanitize_display
+from usagebassoon.process import split_command
 from usagebassoon.storage_model import normalize_note_id
 
 note_app = typer.Typer(help="Manage user-owned session notes.", no_args_is_help=True)
@@ -241,7 +241,7 @@ def _editor_command() -> list[str]:
         raise typer.BadParameter(
             "set VISUAL or EDITOR to edit notes, or use 'bassoon note set'"
         )
-    command = shlex.split(configured)
+    command = list(split_command(configured, windows=os.name == "nt"))
     if not command:
         raise typer.BadParameter("VISUAL or EDITOR must name an editor command")
     return command

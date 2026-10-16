@@ -157,62 +157,67 @@ def _posix_colors(
     console: Console, *, trace: list[str] | None = None, ansi_index: int = 5
 ) -> TerminalColors | None:
     """Query an idle terminal, restoring input attributes even after a timeout."""
-    import select
-    import termios
+    if sys.platform != "win32":
+        import select
+        import termios
 
-    descriptor = sys.stdin.fileno()
-    output = console.file.fileno()
-    if not os.isatty(descriptor) or not os.isatty(output):
-        if trace is not None:
-            trace.append("Skipped: input or output is not a terminal.")
-        return None
-    # Do not consume input that was already waiting before discovery.
-    if select.select([descriptor], [], [], 0)[0]:
-        if trace is not None:
-            trace.append("Skipped: terminal input was already pending.")
-        return None
-    try:
-        original = termios.tcgetattr(descriptor)
-    except termios.error:
-        _LOG.debug("terminal input settings unavailable for theme probe", exc_info=True)
-        if trace is not None:
-            trace.append("Could not read terminal input settings.")
-        return None
-    modified = list(original)
-    modified[3] &= ~(termios.ICANON | termios.ECHO)
-    controls = list(original[6])
-    controls[termios.VMIN] = 0
-    controls[termios.VTIME] = 0
-    modified[6] = controls
-
-    def write(query: str) -> None:
-        """Send only read-only OSC requests through the chart's output terminal."""
-        console.file.write(query)
-        console.file.flush()
-
-    def read(timeout: float) -> str:
-        """Read available replies without extending the probe deadline."""
-        if not select.select([descriptor], [], [], timeout)[0]:
-            return ""
-        return os.read(descriptor, 1024).decode("ascii", errors="replace")
-
-    try:
-        termios.tcsetattr(descriptor, termios.TCSANOW, modified)
+        descriptor = sys.stdin.fileno()
+        output = console.file.fileno()
+        if not os.isatty(descriptor) or not os.isatty(output):
+            if trace is not None:
+                trace.append("Skipped: input or output is not a terminal.")
+            return None
+        # Do not consume input that was already waiting before discovery.
         if select.select([descriptor], [], [], 0)[0]:
             if trace is not None:
-                trace.append("Skipped: terminal input was pending after mode change.")
+                trace.append("Skipped: terminal input was already pending.")
             return None
-        if trace is not None:
-            return _probe_colors(write, read, trace=trace, ansi_index=ansi_index)
-        return _probe_colors(write, read, ansi_index=ansi_index)
-    except termios.error:
-        _LOG.debug("terminal theme probe unavailable", exc_info=True)
-        return None
-    finally:
         try:
-            termios.tcsetattr(descriptor, termios.TCSANOW, original)
+            original = termios.tcgetattr(descriptor)
         except termios.error:
-            _LOG.warning("could not restore terminal input settings", exc_info=True)
+            _LOG.debug(
+                "terminal input settings unavailable for theme probe", exc_info=True
+            )
+            if trace is not None:
+                trace.append("Could not read terminal input settings.")
+            return None
+        modified = list(original)
+        modified[3] &= ~(termios.ICANON | termios.ECHO)
+        controls = list(original[6])
+        controls[termios.VMIN] = 0
+        controls[termios.VTIME] = 0
+        modified[6] = controls
+
+        def write(query: str) -> None:
+            """Send only read-only OSC requests through the chart's output terminal."""
+            console.file.write(query)
+            console.file.flush()
+
+        def read(timeout: float) -> str:
+            """Read available replies without extending the probe deadline."""
+            if not select.select([descriptor], [], [], timeout)[0]:
+                return ""
+            return os.read(descriptor, 1024).decode("ascii", errors="replace")
+
+        try:
+            termios.tcsetattr(descriptor, termios.TCSANOW, modified)
+            if select.select([descriptor], [], [], 0)[0]:
+                if trace is not None:
+                    trace.append(
+                        "Skipped: terminal input was pending after mode change."
+                    )
+                return None
+            if trace is not None:
+                return _probe_colors(write, read, trace=trace, ansi_index=ansi_index)
+            return _probe_colors(write, read, ansi_index=ansi_index)
+        except termios.error:
+            _LOG.debug("terminal theme probe unavailable", exc_info=True)
+            return None
+        finally:
+            try:
+                termios.tcsetattr(descriptor, termios.TCSANOW, original)
+            except termios.error:
+                _LOG.warning("could not restore terminal input settings", exc_info=True)
 
 
 def _windows_query_colors(

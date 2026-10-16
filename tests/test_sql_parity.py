@@ -147,6 +147,8 @@ def test_named_query_inventory_and_native_asts_match() -> None:
     names = set(_query_templates("duckdb"))
     assert names == set(_query_templates("bigquery"))
     assert names == {
+        "doctor_unresolved_collection_runs",
+        "doctor_unresolved_collection_targets",
         "report_daily",
         "report_models",
         "report_sessions",
@@ -165,7 +167,7 @@ def test_named_query_inventory_and_native_asts_match() -> None:
             sql = template.format(
                 where="WHERE facts.model = :model",
                 ordering="activity_day DESC NULLS LAST",
-                limit="LIMIT 2",
+                limit="2" if name.startswith("doctor_") else "LIMIT 2",
             )
             parsed = sqlglot.parse(sql, read=dialect)
             assert len(parsed) == 1 and isinstance(parsed[0], exp.Select)

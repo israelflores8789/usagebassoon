@@ -50,7 +50,11 @@ def main(
     """Run the UsageBassoon command-line interface."""
 
 
-app.command(name="doctor")(doctor)
+app.command(
+    name="doctor",
+    help="For personal debugging, `--raw` might be helpful. "
+    "*Never* use `--raw` when sharing doctor output.",
+)(doctor)
 app.add_typer(collect_app, name="collect")
 app.command(name="export")(export)
 app.command(name="init")(init)

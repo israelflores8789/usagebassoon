@@ -46,7 +46,20 @@ _LOG = logging.getLogger("usagebassoon")
 
 def snapshot_location(selection: str) -> str:
     """Normalize archive roots and snapshot paths without opening any provider."""
-    return bucket_uri(selection).removesuffix("/manifest.json")
+    location = bucket_uri(selection)
+    if "://" not in location:
+        path = Path(location)
+        return str(path.parent) if path.name == "manifest.json" else location
+    return location.removesuffix("/manifest.json")
+
+
+def _split_location(location: str) -> tuple[str, str]:
+    """Split a local path or portable URI using either platform separator."""
+    if "://" not in location:
+        path = Path(location)
+        return str(path.parent), path.name
+    parent, leaf = location.rsplit("/", 1)
+    return parent or "/", leaf
 
 
 def _warning(callback: Callable[[str], None] | None, message: str) -> None:
@@ -89,8 +102,9 @@ class PreparedSnapshot:
         if table not in self.files:
             return
         schema = CANONICAL_TABLE_SCHEMAS[table]
-        for batch in pq.ParquetFile(self.files[table]).iter_batches(batch_size=65536):
-            yield batch.cast(schema)
+        with pq.ParquetFile(self.files[table]) as parquet:
+            for batch in parquet.iter_batches(batch_size=65536):
+                yield batch.cast(schema)
 
 
 class SnapshotReader:
@@ -128,6 +142,7 @@ class SnapshotReader:
         if selection != "latest":
             if (
                 "/" in selection
+                or Path(selection).is_absolute()
                 or selection.startswith((".", "~"))
                 or Path(selection).exists()
             ):
@@ -137,9 +152,7 @@ class SnapshotReader:
                     obj.name == "manifest.json" for obj in bucket.list("manifest.json")
                 )
                 if direct:
-                    parent, leaf = (
-                        location.rsplit("/", 1) if "/" in location else (".", location)
-                    )
+                    parent, leaf = _split_location(location)
                     exact = snapshot_id(leaf)
                     buckets = (self.resolver(parent),)
                 else:
@@ -332,9 +345,7 @@ class SnapshotReader:
             or Path(selection).exists()
         ):
             location = snapshot_location(selection)
-            parent, leaf = (
-                location.rsplit("/", 1) if "/" in location else (".", location)
-            )
+            parent, leaf = _split_location(location)
             identifier = snapshot_id(leaf)
             buckets = (self.resolver(parent),)
         else:
@@ -421,27 +432,28 @@ class SnapshotReader:
                     raise ValueError(
                         f"snapshot object SHA-256 or size does not match: {name}"
                     )
-                parquet = pq.ParquetFile(path)
-                if parquet.metadata.num_rows != rows or not parquet.schema_arrow.equals(
-                    schema, check_metadata=False
-                ):
-                    raise ValueError(
-                        f"snapshot table {table} row count or schema does not match"
-                    )
-                for batch in parquet.iter_batches(batch_size=65536):
-                    remaining_seconds()
-                    batch.validate(full=True)
-                    for field in schema:
-                        if (
-                            not field.nullable
-                            and batch.column(
-                                batch.schema.get_field_index(field.name)
-                            ).null_count
-                        ):
-                            raise ValueError(
-                                "snapshot has null required field: "
-                                f"{table}.{field.name}"
-                            )
+                with pq.ParquetFile(path) as parquet:
+                    if (
+                        parquet.metadata.num_rows != rows
+                        or not parquet.schema_arrow.equals(schema, check_metadata=False)
+                    ):
+                        raise ValueError(
+                            f"snapshot table {table} row count or schema does not match"
+                        )
+                    for batch in parquet.iter_batches(batch_size=65536):
+                        remaining_seconds()
+                        batch.validate(full=True)
+                        for field in schema:
+                            if (
+                                not field.nullable
+                                and batch.column(
+                                    batch.schema.get_field_index(field.name)
+                                ).null_count
+                            ):
+                                raise ValueError(
+                                    "snapshot has null required field: "
+                                    f"{table}.{field.name}"
+                                )
                 files[table] = path
         steps = transformation_path(version) if transform else ()
         for step in steps:
@@ -474,16 +486,18 @@ class SnapshotReader:
             )
         counts: dict[str, int] = {}
         for table, path in files.items():
-            parquet = pq.ParquetFile(path)
-            schema = contract[table]
-            if not parquet.schema_arrow.equals(schema, check_metadata=False):
-                raise ValueError(f"invalid transformation schema: {table}")
-            for batch in parquet.iter_batches(batch_size=65536):
-                batch.validate(full=True)
-                for index, field in enumerate(schema):
-                    if not field.nullable and batch.column(index).null_count:
-                        raise ValueError(f"null required field: {table}.{field.name}")
-            counts[table] = parquet.metadata.num_rows
+            with pq.ParquetFile(path) as parquet:
+                schema = contract[table]
+                if not parquet.schema_arrow.equals(schema, check_metadata=False):
+                    raise ValueError(f"invalid transformation schema: {table}")
+                for batch in parquet.iter_batches(batch_size=65536):
+                    batch.validate(full=True)
+                    for index, field in enumerate(schema):
+                        if not field.nullable and batch.column(index).null_count:
+                            raise ValueError(
+                                f"null required field: {table}.{field.name}"
+                            )
+                counts[table] = parquet.metadata.num_rows
         return counts
 
     @contextmanager

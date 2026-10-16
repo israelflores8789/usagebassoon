@@ -178,9 +178,7 @@ def _missing_scheduler_message(scheduler: str) -> str:
     """Return the actionable message for an unavailable native scheduler."""
     return (
         f"Warning: {scheduler} was not found or is unavailable. If UsageBassoon is "
-        "running in a container, consider MotherDuck or BigQuery for data "
-        "persistence and GCS for snapshots. Run `bassoon schedule worker "
-        "--foreground` as the container's main process."
+        "running in a container, use `bassoon schedule worker`."
     )
 
 
@@ -500,7 +498,11 @@ def _install_systemd(
         if loginctl is None:
             warnings.append("loginctl was not found; user lingering was not enabled")
         else:
-            user = os.environ.get("USER") or str(os.getuid())
+            user = os.environ.get("USER")
+            if not user:
+                if not hasattr(os, "getuid"):
+                    raise SchedulingError("systemd requires a POSIX user identity")
+                user = str(os.getuid())
             result = _run([loginctl, "enable-linger", user], check=False)
             if result.returncode != 0:
                 detail = result.stderr.strip() or "permission was denied"
@@ -554,6 +556,8 @@ def _launchd_plist_bytes(
 
 def _launch_domain() -> str:
     """Return the current user's launchd GUI domain."""
+    if not hasattr(os, "getuid"):
+        raise SchedulingError("launchd requires a POSIX user identity")
     return f"gui/{os.getuid()}"
 
 
@@ -813,6 +817,11 @@ def start_worker(
     Raises:
         SchedulingError: If a worker is already running or cannot be started.
     """
+    if os.name == "nt":
+        raise SchedulingError(
+            "detached schedule workers are not supported on Windows; "
+            "run `bassoon schedule worker --foreground` under a process supervisor"
+        )
     configuration = _worker_configuration(
         config_path, schedule_interval, snapshot_schedule_interval
     )
@@ -837,6 +846,7 @@ def start_worker(
         if configuration.logging.disable
         else _worker_log_path(configuration)
     ).open("a", encoding="utf-8")
+    process: subprocess.Popen[bytes] | None = None
     try:
         try:
             process = subprocess.Popen(
@@ -854,15 +864,17 @@ def start_worker(
             ) from error
     finally:
         log_handle.close()
+    assert process is not None
+    worker_process = process
     try:
         _write_atomic(
             existing.pid_path,
-            f"{process.pid}\n".encode(),
+            f"{worker_process.pid}\n".encode(),
             mode=0o600,
         )
     except OSError as error:
         try:
-            process.terminate()
+            worker_process.terminate()
         except ProcessLookupError:
             pass
         except OSError:
