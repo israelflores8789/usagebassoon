@@ -3,7 +3,7 @@
 # UsageBassoon justfile recipes
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
-set unstable := true
+set unstable
 
 pytest := "uv run pytest"
 src_dir := "src"
@@ -61,17 +61,27 @@ test-unit *args:
         -m "not (bigquery_live or gcs_live or motherduck_live or sql_parity)" {{ args }}
 
 # Run only explicitly classified Windows smoke and cross-platform tests.
+[env("UV_CACHE_DIR", justfile_directory() / ".test_logs/windows/uv-cache")]
 [positional-arguments]
 [script("uv", "run", "python")]
 test-windows *args:
     import os
     import subprocess
     import sys
+    from pathlib import Path
     from tempfile import TemporaryDirectory
 
     markers = "(windows_smoke or windows_compatible) and not (bigquery_live or gcs_live or motherduck_live or sql_parity)"
-    with TemporaryDirectory(prefix="usagebassoon-test-logs-") as directory:
-        environment = dict(os.environ, USAGEBASSOON_LOG_DIRECTORY=directory)
+    temporary_root = Path(os.environ["UV_CACHE_DIR"]).parent / "temp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="usagebassoon-test-", dir=temporary_root) as directory:
+        environment = dict(
+            os.environ,
+            TEMP=directory,
+            TMP=directory,
+            TMPDIR=directory,
+            USAGEBASSOON_LOG_DIRECTORY=str(Path(directory) / "logs"),
+        )
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-v", "-s", "-m", markers, *sys.argv[1:]],
             env=environment,

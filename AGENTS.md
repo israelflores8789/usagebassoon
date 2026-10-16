@@ -128,8 +128,10 @@ cli/doctor.py → config.py           parse and validate configuration
 
 Run all project tasks via `just` from the repository root. Use `just --list` to inspect available recipes.
 
+The test suite is designed primarily for POSIX, which is the authoritative test environment. Windows validation is supplemental and runs Windows-specific `windows_smoke` tests together with cross-platform tests explicitly classified as `windows_compatible`.
+
 - USE `just install-dev` to synchronize all uv dependency groups.
-- USE `just test` to run the test suite; pass pytest arguments with `just test <args>`. The recipe sets `USAGEBASSOON_LOG_DIRECTORY` to a temporary `/tmp` directory and removes it afterward, so tests work in restricted environments.
+- USE `just test` to run the test suite; pass pytest arguments with `just test <args>`. The recipe sets `USAGEBASSOON_LOG_DIRECTORY` to a temporary `/tmp` directory and removes it afterward, so tests work in restricted environments. **WHEN in a Windows environment**, USE `just test-windows`; do NOT use `just test` in a Windows environment. `just test-windows` sets uv's cache to `.test_logs/windows/uv-cache` before starting uv and uses disposable workspace-local temporary and log directories for sandbox compatibility. IMPORTANT: Writable cache and temporary directories do not grant Windows junction permissions. If the sandbox denies junction creation (`mklink /J` reports `Access is denied`), use approved native Windows execution outside the sandbox for affected tests; do not suppress the failures or use WSL.
 - USE `just test-bq-live <test-name> <reset>` for `bigquery_live`; the default module is `tests/test_backend_bigquery_live.py`, and individual test selectors are accepted. The recipe sets `USAGEBASSOON_BIGQUERY_LIVE=1`; `<reset>` defaults to `0`, and `1` enables reset. Inspect `.test_logs/pytest-bq-live.log` after timeouts; it includes a UTC start timestamp and partial output. Do NOT use `just test` or `uv run pytest` for these live tests.
 - USE `just test-md-live <test-name>` to run the `motherduck_live` test; this recipe always resets the dedicated integration database. Logs are output to `.test_logs/pytest-md-live.log`.
 - USE `just test-gcs-live <test-name>` for `gcs_live`; the default module is `tests/test_bucket_gcs_live.py`, and individual test selectors are accepted. The recipe sets `USAGEBASSOON_GCS_LIVE=1`. Inspect `.test_logs/pytest-gcs-live.log` after timeouts; it includes a UTC start timestamp and partial output. Do NOT use `just test` or `uv run pytest` for these live tests.
@@ -167,6 +169,8 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - EVERY change to the `StorageBackend` or `SnapshotBucket` protocol MUST update and verify all current backend or bucket implementations, respectively, in the same change. Explicitly implement supported behavior or documented inapplicability for each provider; do not rely on an inherited default to silently cover an unreviewed provider. Shared orchestration MUST select behavior through protocol operations or capabilities, never provider-name selectors. Future providers must satisfy the complete contract.
 - ALWAYS log unexpected non-fatal exceptions where they are handled, including operation context and traceback; respect configured logging disablement and **never** log sensitive data; ALWAYS redact or obfuscate sensitive data according to privacy and sharing policy.
 - ALWAYS handle operational exceptions gracefully: log the failure, mark the affected operation as failed, clean up safely, and let scheduled workers continue independent work and future cycles. Configuration errors are fatal; other failures should stop the worker only when continuing could corrupt data or lose history. Never report failed work as successful or let cleanup errors hide the original failure.
+- Windows compatibility tests MUST use native Windows Python, not Linux Python under WSL.
+- Mark cross-platform tests that work on *both* POSIX and Windows with `@pytest.mark.windows_compatible`. Mark Windows-specific tests with `@pytest.mark.windows_smoke` and skip them on non-Windows hosts. Do NOT mark Windows-specific tests as `windows_compatible`.
 
 ### Prohibitions
 
@@ -177,6 +181,7 @@ The following actions are **prohibited** and are reserved exclusively for the us
 - NEVER attempt to publish to PyPI or invoke any publishing command; consequently, NEVER use `just publish` or `just release`.
 - NEVER attempt to perform a release to GitHub or invoke any release command.
 - NEVER attempt to push git changes to GitHub.
+- NEVER use WSL unless explicitly authorized by the USER.
 
 ### Persistence rules
 

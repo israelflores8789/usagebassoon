@@ -920,6 +920,34 @@ def test_local_catalog_claim_has_one_winner_under_race(
     assert sum(winners) == 1
 
 
+@pytest.mark.windows_smoke
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path namespaces")
+def test_local_bucket_accepts_extended_windows_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confine objects when Windows retains its extended path prefix."""
+    archive = LocalSnapshotBucket(str(tmp_path / "archive"))
+    resolve = Path.resolve
+
+    def resolve_extended(path: Path, strict: bool = False) -> Path:
+        """Simulate the extended spelling returned during directory creation."""
+        resolved = resolve(path, strict=strict)
+        spelling = str(resolved)
+        return (
+            resolved if spelling.startswith("\\\\?\\") else Path("\\\\?\\" + spelling)
+        )
+
+    monkeypatch.setattr(Path, "resolve", resolve_extended)
+    written = archive.write_json_cas(
+        "catalog.json", {"owner": "first"}, expected_version=None
+    )
+    assert archive.read_json("catalog.json") == ({"owner": "first"}, written.version)
+    assert [item.name for item in archive.list("")] == ["catalog.json"]
+    identity = os.path.normcase(str(tmp_path / "archive" / "catalog.json"))
+    stripe = sha256(identity.encode()).hexdigest()[:2]
+    assert (tmp_path / "archive" / f".snapshot-lock-{stripe}").is_file()
+
+
 @pytest.mark.windows_compatible
 def test_portable_copy_recovers_without_catalog_and_preserves_pin(
     tmp_path: Path,

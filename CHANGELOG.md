@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Windows tokscale path configuration and diagnostic redaction for backslash-containing paths.
 - Documented the `storage.buckets.get` permission required for GCS lifecycle inspection by `bassoon doctor`.
 - Restore now displays the verified snapshot, destination, and source-identity advice before final confirmation, with progress indicators stopped during prompts. Optional stage cleanup, destination checks, and restoration run only after approval; declining either prompt leaves destination data untouched and removes temporary snapshot files.
+- Newly generated configuration files now use LF line endings on Windows.
+- Local snapshot buckets now use a consistent Windows path namespace during concurrent object creation, preventing false path-escape errors while preserving existing catalog lock identities.
 
 ## [1.0.0] - 2026-10-08
 

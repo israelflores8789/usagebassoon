@@ -149,6 +149,15 @@ class LocalSnapshotBucket:
         """Create a bucket rooted at a filesystem path or ``file://`` URI."""
         self.uri = uri.rstrip("/")
         self._root = Path(self.uri.removeprefix("file://")).expanduser().resolve()
+        if os.name == "nt":
+            # Keep missing and concurrently created objects in one namespace.
+            spelling = str(self._root)
+            if len(self._root.drive) == 2 and self._root.drive.endswith(":"):
+                self._root = Path("\\\\?\\" + spelling)
+            elif spelling.startswith("\\\\") and not spelling.startswith(
+                ("\\\\?\\", "\\\\.\\")
+            ):
+                self._root = Path("\\\\?\\UNC\\" + spelling[2:])
 
     def doctor_authentication(self) -> tuple[str, str]:
         """Describe local filesystem access without exposing the OS identity."""
@@ -182,6 +191,11 @@ class LocalSnapshotBucket:
         """Use bounded, stable lock stripes that survive snapshot deletion."""
         durable_directory(self._root)
         identity = os.path.normcase(str(self._path(relative_name)))
+        # Preserve existing lock stripes across equivalent Windows spellings.
+        if identity.startswith("\\\\?\\unc\\"):
+            identity = "\\\\" + identity[8:]
+        elif identity.startswith("\\\\?\\") and identity[5:7] == ":\\":
+            identity = identity[4:]
         stripe = hashlib.sha256(identity.encode()).hexdigest()[:2]
         return self._root / f".snapshot-lock-{stripe}"
 

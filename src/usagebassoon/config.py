@@ -169,7 +169,7 @@ def write_initial_config(path: Path) -> bool:
         )
         temporary = Path(temporary_name)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())

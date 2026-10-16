@@ -75,7 +75,10 @@ def test_windows_cli_help_and_doctor_render(tmp_path: Path) -> None:
 
 @pytest.mark.windows_smoke
 @_WINDOWS_ONLY
-def test_windows_command_timeout_kills_cmd_descendants_only(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", [0.0, 0.6])
+def test_windows_command_timeout_kills_cmd_descendants_only(
+    tmp_path: Path, startup_delay: float
+) -> None:
     """Contain a space-named .cmd wrapper and its child without killing a peer."""
     config_path = _configuration(tmp_path)
     configuration = ConfigurationManager(config_path).load()
@@ -88,20 +91,26 @@ def test_windows_command_timeout_kills_cmd_descendants_only(tmp_path: Path) -> N
     child_pid_file = tmp_path / "child pid.txt"
     child_root_file = tmp_path / "child root.txt"
     child_finished_file = tmp_path / "child finished.txt"
+    child_release_file = tmp_path / "child release.txt"
     child_script.write_text(
         "from pathlib import Path\n"
         "import os, sys, time\n"
-        "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        f"time.sleep({startup_delay})\n"
         "Path(sys.argv[2]).write_text(os.environ.get('SystemRoot', ''))\n"
+        "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "while not Path(sys.argv[4]).is_file():\n"
+        "    time.sleep(0.01)\n"
         "time.sleep(1.5)\n"
         "Path(sys.argv[3]).write_text('finished')\n",
         encoding="utf-8",
     )
     wrapper = tmp_path / "fake tokscale wrapper.cmd"
     wrapper.write_text(
-        f'@echo off\r\n"{sys.executable}" "{child_script}" '
-        f'"{child_pid_file}" "{child_root_file}" "{child_finished_file}"\r\n',
+        f'@echo off\n"{sys.executable}" "{child_script}" '
+        f'"{child_pid_file}" "{child_root_file}" "{child_finished_file}" '
+        f'"{child_release_file}"\n',
         encoding="utf-8",
+        newline="\n",
     )
 
     unrelated = subprocess.Popen(
@@ -111,9 +120,15 @@ def test_windows_command_timeout_kills_cmd_descendants_only(tmp_path: Path) -> N
         stderr=subprocess.DEVNULL,
     )
     process = None
-    started = time.monotonic()
     try:
         process = _start_tokscale_process((str(wrapper),), environment)
+        ready_deadline = time.monotonic() + 10
+        while not child_pid_file.is_file():
+            assert process.poll() is None, "wrapper exited before child readiness"
+            assert time.monotonic() < ready_deadline, "child did not become ready"
+            time.sleep(0.01)
+        started = time.monotonic()
+        child_release_file.write_text("ready", encoding="utf-8")
         with pytest.raises(RuntimeError, match="tokscale exceeded"):
             _capture_process(
                 process,
@@ -129,9 +144,12 @@ def test_windows_command_timeout_kills_cmd_descendants_only(tmp_path: Path) -> N
         time.sleep(1.7)
         assert not child_finished_file.exists()
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
+        if process is not None:
+            process.close()
             process.wait(timeout=3)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
         if unrelated.poll() is None:
             unrelated.terminate()
             try:
