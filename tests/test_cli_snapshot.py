@@ -75,8 +75,13 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
 @pytest.mark.windows_compatible
 def test_snapshot_management_and_audit_aliases_share_structured_results(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Use one shared integrity handler without requiring a destination config."""
+    from collections.abc import Sequence
+
+    from usagebassoon.snapshot.reader import Candidate, PreparedSnapshot, SnapshotReader
+
     backend = DuckDBBackend(":memory:")
     backend.apply_ddl()
     store = SnapshotStore(str(tmp_path / "archive"))
@@ -134,6 +139,67 @@ def test_snapshot_management_and_audit_aliases_share_structured_results(
             "backend_schema_hash",
         )
     )
+    downloads: list[str] = []
+    selections: list[str] = []
+    original_download = SnapshotReader.download
+    original_copy = store.copy
+    destination = tmp_path / "copied"
+
+    def track_download(
+        self: SnapshotReader,
+        candidate: Candidate,
+        directory: Path,
+        tables: Sequence[str],
+        *,
+        allow_staging: bool = False,
+        transform: bool = True,
+    ) -> PreparedSnapshot:
+        """Observe complete source and destination validation passes."""
+        downloads.append(candidate.uri)
+        return original_download(
+            self,
+            candidate,
+            directory,
+            tables,
+            allow_staging=allow_staging,
+            transform=transform,
+        )
+
+    def copy_exact(selection: str, target: str) -> str:
+        """Keep the confirmed source stable through the archiver handoff."""
+        selections.append(selection)
+        return original_copy(selection, target)
+
+    def configured_archiver(_config: Path | None) -> SnapshotStore:
+        """Expose the source archive for automatic latest selection."""
+        return store
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SnapshotReader, "download", track_download)
+        declined = runner.invoke(
+            app,
+            [
+                "snapshot",
+                "copy",
+                str(destination),
+                "--from-snapshot",
+                uri,
+                "--config",
+                str(tmp_path / "lost.toml"),
+            ],
+            input="n\n",
+        )
+        assert declined.exit_code != 0
+        assert downloads == []
+        assert not destination.exists()
+        patch.setattr("usagebassoon.cli.snapshot.read_archiver", configured_archiver)
+        patch.setattr(store, "copy", copy_exact)
+        copied = runner.invoke(app, ["snapshot", "copy", str(destination)])
+        assert copied.exit_code == 0, plain_cli_output(copied.output)
+        assert selections == [uri]
+        assert downloads == [uri, f"{destination}/{Path(uri).name}"]
+        assert (destination / Path(uri).name / "COMPLETE").is_file()
+
     refused = runner.invoke(
         app,
         ["snapshot", "delete", uri, "--config", str(tmp_path / "lost.toml")],

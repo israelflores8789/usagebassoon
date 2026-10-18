@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated
 
@@ -15,7 +16,13 @@ from usagebassoon.audit import audit_runs, audit_sources
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._output import output_console, render_records
 from usagebassoon.cli._utils import configured_backend
-from usagebassoon.cli.snapshot import audit_snapshot, notice, read_archiver
+from usagebassoon.cli.snapshot import (
+    audit_snapshot,
+    confirm_location,
+    read_archiver,
+    snapshot_progress,
+)
+from usagebassoon.cli.spinner import delayed_spinner
 from usagebassoon.display import sanitize_display
 from usagebassoon.storage_model import SNAPSHOT_TABLES
 
@@ -42,25 +49,29 @@ def _audit(
         if selection is not None:
             tables = SNAPSHOT_TABLES if sources else ("collection_ledger",)
             archiver = read_archiver(config)
-            with archiver.reader.prepare(
-                selection, tables=tables, warning=notice
-            ) as prepared:
-                from usagebassoon.cli.snapshot import confirm_location
-
+            with ExitStack() as stack:
+                with snapshot_progress() as warning:
+                    prepared = stack.enter_context(
+                        archiver.reader.prepare(
+                            selection, tables=tables, warning=warning
+                        )
+                    )
                 confirm_location(archiver, prepared.candidate.uri)
-                rows = (
-                    audit_sources(prepared=prepared)
-                    if sources
-                    else audit_runs(prepared=prepared, limit=limit)
-                )
+                with delayed_spinner():
+                    rows = (
+                        audit_sources(prepared=prepared)
+                        if sources
+                        else audit_runs(prepared=prepared, limit=limit)
+                    )
         else:
-            _, backend = configured_backend(config)
+            configuration, backend = configured_backend(config)
             try:
-                rows = (
-                    audit_sources(backend)
-                    if sources
-                    else audit_runs(backend, limit=limit)
-                )
+                with delayed_spinner(configuration):
+                    rows = (
+                        audit_sources(backend)
+                        if sources
+                        else audit_runs(backend, limit=limit)
+                    )
             finally:
                 close_backend(backend, context="auditing collection history")
         if not sources and not json_output and not csv_output:

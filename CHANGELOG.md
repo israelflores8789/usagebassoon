@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Windows foreground worker operation under an external process supervisor.
 - Added repeatable `--exclude-model` options to activity, daily, graph, models, sessions, and summary reports.
 - Doctor output now reports backend and snapshot-bucket authentication sources and available principals for easier debugging. The default output preserves safe authentication labels and obfuscates user email handles and non-public email domains for privacy.
+- Added delayed spinners to `bassoon snapshot list`, `inspect`, `audit`, `repair`, `delete`, and `copy`, plus `bassoon audit runs` and `sources`, for operations taking longer than 200 milliseconds. Spinners stop before prompts and structured output.
 
 ### Changed
 
@@ -42,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restore now displays the verified snapshot, destination, and source-identity advice before final confirmation, with progress indicators stopped during prompts. Optional stage cleanup, destination checks, and restoration run only after approval; declining either prompt leaves destination data untouched and removes temporary snapshot files.
 - Newly generated configuration files now use LF line endings on Windows.
 - Local snapshot buckets now use a consistent Windows path namespace during concurrent object creation, preventing false path-escape errors while preserving existing catalog lock identities.
+- Snapshot copying now resolves and confirms the exact source using metadata, leaving the full download and integrity validation to `SnapshotArchiver.copy` and avoiding a duplicate source download.
 
 ## [1.0.0] - 2026-10-08
 

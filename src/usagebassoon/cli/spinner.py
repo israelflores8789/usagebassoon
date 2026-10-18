@@ -11,6 +11,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from functools import lru_cache
 from io import TextIOBase
+from logging import getLogger
+from threading import Event, Thread
 from typing import TextIO, cast, override
 
 from rich.color import Color, ColorSystem
@@ -27,6 +29,8 @@ from usagebassoon.cli._colorterm import (
     themed_console,
 )
 from usagebassoon.config import UsageBassoonConfig
+
+_LOG = getLogger("usagebassoon")
 
 MESSAGES: tuple[str, ...] = (
     "Cogitating...",
@@ -181,3 +185,44 @@ def spinner(configuration: UsageBassoonConfig | None = None) -> Generator[None]:
         stream = cast(TextIO, _ThemedStream(stream, style, system))
     with yaspin(template, text=message, stream=stream):
         yield
+
+
+@contextmanager
+def delayed_spinner(
+    configuration: UsageBassoonConfig | None = None,
+    *,
+    delay_seconds: float = 0.2,
+) -> Generator[None]:
+    """Show a spinner only when an interactive operation exceeds a short delay.
+
+    Args:
+        configuration: Loaded settings, or None to use the Pong default.
+        delay_seconds: Time to wait before showing the spinner.
+
+    Yields:
+        Control to the operation, clearing the indicator on every exit.
+    """
+    if delay_seconds < 0:
+        raise ValueError("spinner delay must not be negative")
+
+    finished = Event()
+
+    def show_after_delay() -> None:
+        if finished.wait(delay_seconds):
+            return
+        try:
+            with spinner(configuration):
+                finished.wait()
+        except Exception:
+            _LOG.warning("Delayed CLI spinner failed", exc_info=True)
+
+    thread = Thread(
+        target=show_after_delay,
+        name="usagebassoon-delayed-spinner",
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        thread.join()

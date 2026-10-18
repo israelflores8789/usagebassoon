@@ -184,6 +184,11 @@ def test_real_animation_stops_on_failure(
         raise error("operation interrupted")
     assert set(threading.enumerate()) <= threads_before
     assert "\x1b[38;2;12;34;56m" in terminal.getvalue()
+    terminal.frame_written.clear()
+    with pytest.raises(error), spinner_module.delayed_spinner(delay_seconds=0.01):
+        assert terminal.frame_written.wait(timeout=2)
+        raise error("delayed operation interrupted")
+    assert set(threading.enumerate()) <= threads_before
 
 
 @pytest.mark.windows_compatible
