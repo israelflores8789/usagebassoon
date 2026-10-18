@@ -79,7 +79,7 @@ usagebassoon/
 │   ├── collector.py        # tokscale subprocess management
 │   ├── orchestrator.py     # Top-level data shuttler
 │   ├── ingest.py           # Contract validation and parsing coordinator
-│   ├── contracts.py        # Raw payload validation and schema-drift detection
+│   ├── contracts.py        # Raw payload validation and payload-drift detection
 │   ├── normalizer.py       # Parsed payload to canonical Arrow-table normalization
 │   ├── persistence.py      # Normalized batch publication to data warehouses
 │   ├── storage_model.py    # Shared logical keys and observation tie-break rules
@@ -177,7 +177,7 @@ flowchart TD
       WAREHOUSE --> OUT[CLI reports, query, export,<br/>Python API]
 ```
 
-Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as schema-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
+Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as payload-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
 
 `normalizer.py` computes canonical derived columns and produces Arrow tables, and it assigns each observation row a stable `event_id` before any persistence retry.
 
@@ -207,7 +207,7 @@ The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.m
   - `tokscale pricing` provides observed model rates
 - **Monotonicity.** Token usage is *never* deleted once persisted and can *never* be reduced, only increase. This rule does not bear on costs which are *calculated* values *from* token usage data.
 - **Tolerant Collection Payload.** UsageBassoon prioritizes token usage persistence and tolerates payloads that can be gathered later in the event of an error. Mandatory canonical commands include `tokscale models` and `tokscale graph`.
-- **Tolerant Schema Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "schema drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
+- **Tolerant Payload Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "payload drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
 - **Protect Privacy by Default.** UsageBassoon attempts to protect sensitive user data by offering means to obfuscate. UsageBassoon also automatically obfuscates commands likely to be shared publicly (e.g. `bassoon doctor` and `bassoon export`). *Never* place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
 

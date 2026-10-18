@@ -42,7 +42,7 @@ CREATE TABLE collection_ledger (
 
 -- Artifacts of tokscale payload drift events from the expected tokscale schema.
 -- Reported in `bassoon doctor`.
-CREATE TABLE schema_drift_events (
+CREATE TABLE payload_drift_events (
     run_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,

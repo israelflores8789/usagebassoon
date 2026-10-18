@@ -549,7 +549,7 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
             "price_versions",
             "tags",
             "notes",
-            "schema_drift_events",
+            "payload_drift_events",
             "reconciliation_issues",
             "collection_ledger",
         ):

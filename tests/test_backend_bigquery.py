@@ -2094,7 +2094,7 @@ def _views() -> dict[str, str]:
     "relation",
     (
         *REQUIRED_RELATIONS,
-        "open_schema_drift_events",
+        "open_payload_drift_events",
         "open_reconciliation_issues",
         "compaction_backlog",
     ),

@@ -88,7 +88,7 @@ ORDER BY {ordering}, last_active DESC NULLS LAST, source_id, client, session_id,
 -- name: doctor_unresolved_collection_runs
 SELECT run_id, finished_at, status
 FROM collection_runs AS failed_run
-WHERE failed_run.status IN ('failed', 'partial', 'schema_drift')
+WHERE failed_run.status IN ('failed', 'partial', 'payload_drift')
     AND NOT EXISTS (
         SELECT 1
         FROM collection_runs AS successful_run

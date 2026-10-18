@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bassoon init` now includes the config schema URL and a warning above the source ID in newly generated config files, with spacing that clearly associates the warning with the source ID.
 - Doctor groups snapshot authentication under `snapshot` and names the recovery freshness check `snapshot_freshness`.
 - Doctor lists only enabled snapshot destinations and applies its usual path obfuscation to local database paths.
+- Renamed `schema_drift_events` to `payload_drift_events` and aligned related views, Python symbols, collection statuses, and doctor diagnostics with payload-drift terminology to distinguish tokscale payload drift from UsageBassoon's internal schemas.
 
 ### Fixed
 

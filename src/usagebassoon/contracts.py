@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""contracts.py — Versioned ingest contracts and tolerant schema-drift detection."""
+"""contracts.py — Versioned ingest contracts and tolerant payload-drift detection."""
 
 from __future__ import annotations
 

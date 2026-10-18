@@ -20,7 +20,7 @@ import pyarrow as pa
 from usagebassoon import ingest, reconcile
 from usagebassoon.backends.base import ActiveTransaction, StorageBackend
 from usagebassoon.buckets.factory import SnapshotBucketRegistry, bucket_label
-from usagebassoon.drift import SchemaDriftRecord, format_drift
+from usagebassoon.drift import PayloadDriftRecord, format_drift
 from usagebassoon.schema_assets import SCHEMA_VERSION, query_sql, schema_hash
 from usagebassoon.snapshot.format import FORMAT_VERSION
 
@@ -34,7 +34,7 @@ _LOG = logging.getLogger("usagebassoon")
 
 REQUIRED_RELATIONS: tuple[str, ...] = (
     "collection_runs",
-    "schema_drift_events",
+    "payload_drift_events",
     "sessions",
     "session_model_stats",
     "daily_stats",
@@ -436,15 +436,15 @@ def _read_value[T](result: ReadResult[T]) -> T:
     return cast(T, value)
 
 
-def unresolved_schema_drift(
+def unresolved_payload_drift(
     backend: StorageBackend,
     *,
     limit: int = 20,
-) -> tuple[SchemaDriftRecord, ...]:
-    """Load unresolved current schema-drift events from a backend.
+) -> tuple[PayloadDriftRecord, ...]:
+    """Load unresolved current payload-drift events from a backend.
 
     Args:
-        backend: Backend containing current schema-drift events.
+        backend: Backend containing current payload-drift events.
         limit: Maximum number of newest events to load.
 
     Returns:
@@ -460,11 +460,11 @@ def unresolved_schema_drift(
         backend,
         "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
         "contract_tokscale_ver, created_at, collected_at, "
-        "observation_count FROM open_schema_drift_events "
+        "observation_count FROM open_payload_drift_events "
         f"ORDER BY collected_at DESC LIMIT {limit}",
     )
     return tuple(
-        SchemaDriftRecord(
+        PayloadDriftRecord(
             domain=_as_required_string(_row_value(row, "domain")),
             tokscale_ver=_as_required_string(_row_value(row, "tokscale_ver")),
             drift_key=_as_required_string(_row_value(row, "drift_key")),
@@ -528,7 +528,7 @@ def ingest_issues(
         limit: Maximum number of unresolved runs to load.
 
     Returns:
-        Unresolved failed, partial, or schema-drift runs, newest first.
+        Unresolved failed, partial, or payload-drift runs, newest first.
 
     Raises:
         ValueError: If ``limit`` is not positive.
@@ -805,7 +805,7 @@ def run_doctor(
 
         transactions_result: ReadResult[tuple[ActiveTransaction, ...]] | None = None
         backlog_result: ReadResult[pa.Table | None] | None = None
-        drift_result: ReadResult[tuple[SchemaDriftRecord, ...]] | None = None
+        drift_result: ReadResult[tuple[PayloadDriftRecord, ...]] | None = None
         ingest_result: ReadResult[tuple[str, ...]] | None = None
         reconciliation_result: (
             ReadResult[tuple[reconcile.ReconciliationIssueRecord, ...]] | None
@@ -819,7 +819,8 @@ def run_doctor(
                     _capture_read, backend.compaction_backlog
                 )
                 drift_future = executor.submit(
-                    _capture_read, lambda: unresolved_schema_drift(backend, limit=limit)
+                    _capture_read,
+                    lambda: unresolved_payload_drift(backend, limit=limit),
                 )
                 ingest_future = executor.submit(
                     _capture_read, lambda: _collection_issues(backend, limit=limit)
@@ -839,7 +840,7 @@ def run_doctor(
             )
             backlog_result = _capture_read(backend.compaction_backlog)
             drift_result = _capture_read(
-                lambda: unresolved_schema_drift(backend, limit=limit)
+                lambda: unresolved_payload_drift(backend, limit=limit)
             )
             ingest_result = _capture_read(
                 lambda: _collection_issues(backend, limit=limit)
@@ -913,10 +914,10 @@ def run_doctor(
         try:
             drift = _read_value(drift_result)
         except Exception as error:
-            active_logger.exception("doctor schema-drift inspection failed")
+            active_logger.exception("doctor payload-drift inspection failed")
             checks.append(
                 DoctorCheck(
-                    "schema_drift",
+                    "payload_drift",
                     "error",
                     f"could not read drift log: {error}",
                 )
@@ -927,7 +928,7 @@ def run_doctor(
                 details += (f"report unexpected drift: {DRIFT_ISSUE_URL}",)
             checks.append(
                 DoctorCheck(
-                    "schema_drift",
+                    "payload_drift",
                     "warning" if drift else "ok",
                     (
                         f"{len(drift)} unresolved event(s)"

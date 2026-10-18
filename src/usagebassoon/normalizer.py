@@ -13,7 +13,7 @@ from uuid import uuid4
 import pyarrow as pa
 
 from usagebassoon.collection_policy import apply_collection_policy
-from usagebassoon.drift import SchemaDriftIdentity, drift_identity
+from usagebassoon.drift import PayloadDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.system_metadata import InvokeMethod, capture_system_metadata
@@ -165,7 +165,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
     if bundle.drift_fatal:
         status = "failed"
     elif bundle.contract_drift:
-        status = "schema_drift"
+        status = "payload_drift"
     elif (
         any(status.status != "complete" for status in bundle.ingest_status)
         or not bundle.reconciliation.ok
@@ -261,7 +261,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             for check, key in bundle.reconciliation.resolved
         ]
         tables["reconciliation_issues"] = _col_major(issue_rows)
-    event_rows: dict[SchemaDriftIdentity, dict[str, object]] = {}
+    event_rows: dict[PayloadDriftIdentity, dict[str, object]] = {}
     tokscale_ver = bundle.graph.meta.version
     for drift in bundle.contract_drift:
         identity = (drift.domain, tokscale_ver, drift.drift_key)
@@ -286,7 +286,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             row["detail"] = drift.detail
             row["contract_tokscale_ver"] = drift.contract_tokscale_ver
             row["observation_count"] = cast(int, row["observation_count"]) + 1
-    for state in bundle.resolved_schema_drift:
+    for state in bundle.resolved_payload_drift:
         identity = drift_identity(state)
         event_rows[identity] = {
             "run_id": bundle.run_id,
@@ -304,7 +304,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             "observation_count": 0,
         }
     if event_rows:
-        tables["schema_drift_events"] = _col_major(list(event_rows.values()))
+        tables["payload_drift_events"] = _col_major(list(event_rows.values()))
     return tables
 
 

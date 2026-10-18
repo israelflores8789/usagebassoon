@@ -36,11 +36,11 @@ usagebassoon/
 │   │   └── restore.py        # Provider-neutral recovery coordination
 │   ├── collector.py          # tokscale subprocess acquisition and RawCollection
 │   ├── config.py             # Configuration parsing, validation, intervals, and writing
-│   ├── contracts.py          # Contract validation and schema drift detection
+│   ├── contracts.py          # Contract validation and payload drift detection
 │   ├── curation.py           # User-owned tags and notes
 │   ├── diagnostics.py        # Doctor checks and read-only diagnostic queries
 │   ├── display.py            # Safe terminal rendering of untrusted values
-│   ├── drift.py              # Persisted schema drift records and formatting
+│   ├── drift.py              # Persisted payload drift records and formatting
 │   ├── frames.py             # Arrow query results to pandas or Polars DataFrames
 │   ├── ingest.py             # Validated plans, collection bundles, and ingest records
 │   ├── json_types.py         # Recursive JSON value types
@@ -93,7 +93,7 @@ scheduling.py / CLI
 
 `orchestrator.py` owns the collection sequence and passes results between stages. `collector.py` owns `tokscale` command resolution, subprocess execution, and raw payload acquisition; `RawCollection` contains source payloads only. The collector does not validate contracts, parse payloads, or persist data.
 
-`ingest.py` owns validation and parsing coordination. It produces `GraphPlan` and `ModelsPlan` to guide further collection, constructs `IngestEvidence` from acquisition outcomes and prior status, and builds `CollectionBundle`. `contracts.py` detects contract violations and schema drift; `parsers/` converts validated payloads into typed data. Ingest decides which report and pricing failures can be tolerated while preserving valid token facts. Graph and models remain required.
+`ingest.py` owns validation and parsing coordination. It produces `GraphPlan` and `ModelsPlan` to guide further collection, constructs `IngestEvidence` from acquisition outcomes and prior status, and builds `CollectionBundle`. `contracts.py` detects contract violations and payload drift; `parsers/` converts validated payloads into typed data. Ingest decides which report and pricing failures can be tolerated while preserving valid token facts. Graph and models remain required.
 
 `normalizer.py` owns `NormalizedBundle` and converts `CollectionBundle` into canonical Arrow tables, including derived columns. It does not execute backend transactions. `persistence.py` reads collection planning state through one preflight view, assembles batches, and handles bounded retries. `collection_lock.py` excludes simultaneous local DuckDB collectors; remote collectors publish independently. `backends/base.py` defines `StorageBackend` and `AbstractStorageBackend`; implementations execute native publication and restore operations. SQL DDL and views remain dialect-specific under `sql/`.
 
@@ -122,7 +122,7 @@ cli/doctor.py → config.py           parse and validate configuration
               → cli/doctor.py       render checks and exit status
 ```
 
-`diagnostics.py` owns doctor-specific backend queries for collection runs, reconciliation issues, and unresolved schema drift, along with health-check coordination and `DoctorReport`. The query results use `IngestIssue` from `ingest.py`, `ReconciliationIssueRecord` from `reconcile.py`, and `SchemaDriftRecord` from `drift.py`. `ingest.py` and `reconcile.py` operate on data passed through the collection pipeline; `persistence.py` handles collection state reads and batch persistence. Diagnostic queries use the backend opened by `cli/doctor.py`.
+`diagnostics.py` owns doctor-specific backend queries for collection runs, reconciliation issues, and unresolved payload drift, along with health-check coordination and `DoctorReport`. The query results use `IngestIssue` from `ingest.py`, `ReconciliationIssueRecord` from `reconcile.py`, and `PayloadDriftRecord` from `drift.py`. `ingest.py` and `reconcile.py` operate on data passed through the collection pipeline; `persistence.py` handles collection state reads and batch persistence. Diagnostic queries use the backend opened by `cli/doctor.py`.
 
 ## Commands
 
@@ -298,7 +298,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 
 - **Append-and-compact publication policy:** Partial publication across tables is tolerated. Retryable backend publication failures, including partial BigQuery publication, use bounded exponential backoff with jitter in `persistence.py`, preserving the batch's `run_id` and row `event_id` values across retries. Publish `collection_ledger` after fact and debug loads succeed: preflight uses completed outcomes to skip historical work. Ledger failure may cause harmless replay. Never gate facts or compaction on ledger presence, or publish completion earlier without separating client outcomes from the preflight completion signal.
 
-- **Diagnostic freshness:** Doctor reads unresolved drift and reconciliation through `open_schema_drift_events` and `open_reconciliation_issues`, filtering by latest `collected_at` within 90 days. DuckDB/MotherDuck physical pruning remains opportunistic; no background expiry worker is required.
+- **Diagnostic freshness:** Doctor reads unresolved drift and reconciliation through `open_payload_drift_events` and `open_reconciliation_issues`, filtering by latest `collected_at` within 90 days. DuckDB/MotherDuck physical pruning remains opportunistic; no background expiry worker is required.
 
 - **Same-source concurrency:** DuckDB collection uses a local OS lock; MotherDuck transaction conflicts retry with bounded jitter and a warning. Append-and-compact accepts independent remote appends under the publication contract above. Same-key curation follows the shared observation ordering; do not add application-level leases or fencing to these writes. Snapshot catalog reservations are a separate requirement.
 
@@ -323,7 +323,7 @@ The following are out-of-scope and/or antithetical to the design goals:
 - **Data ingest pipeline:** `bassoon collect`:
   1. Resolve tokscale (`TOKSCALE_BIN`, else `tokscale` on PATH, else `bunx tokscale@latest`). Record version from graph payload meta.
   2. Run `graph`, use its contribution dates to select daily models work, run date-filtered `models` per required day, then fetch prices for each model used on those days and `report --no-summarize`.
-  3. Validate against the schema contract with pydantic strict mode. Invalid required graph/models fields *abort* usage publication; report/pricing validation failures follow the per-day/per-model tolerance above. Unknown fields, type changes, and changed cardinalities produce **drift events** — appended to ephemeral `schema_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them.
+  3. Validate against the schema contract with pydantic strict mode. Invalid required graph/models fields *abort* usage publication; report/pricing validation failures follow the per-day/per-model tolerance above. Unknown fields, type changes, and changed cardinalities produce **drift events** — appended to ephemeral `payload_drift_events` by source, command domain, Tokscale version, and drift key, surfaced in output, and surfaced on the next `bassoon doctor` until a complete clean validation resolves them.
   4. Normalize to Arrow tables, compute derived columns, and assign the stable collection and observation IDs described above.
   5. Publish through the selected persistence architecture, following its publication and retry rules above.
   6. Collection does not trigger archival. Independent snapshot jobs check scheduled/weekly obligations through `SnapshotArchiver` without waiting for collection or requiring tokscale.
@@ -368,13 +368,13 @@ The following are out-of-scope and/or antithetical to the design goals:
   - Every publicly released format/data contract retains a tested recovery path. Register immutable format readers, historical Arrow contracts, contiguous forward file transformations, and semantic validators in `snapshot/format.py`. Independently validate every intermediate schema and required field in isolated candidate directories. Expose verified raw provenance even when compatibility is unsupported. Preserve source/event identity and original archives. Removed direct readers need a documented tested conversion path; historical released packages are an emergency fallback.
   - Physical backend SQL migrations remain separate in `schema_assets.py`: registered native assets and previous/target hashes for every dialect, contiguous steps, ledger recording, and no baseline-DDL fallback. Automatic upgrades preserve deliberate maintenance pauses. Prerelease refactors replace the baseline and reset disposable test resources; do not invent legacy conversions before public contracts exist.
 
-- **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `schema_drift_events` rows and a user-facing warning and asks for a bug report:
+- **Schema contracts:** Each tokscale payload kind has a versioned contract — the expected field names, types, and cardinalities, pinned against a tokscale version. The contract lives in `src/usagebassoon/contracts/{models,graph,pricing,report}.json`, generated from golden fixtures and asserted in tests. Deviation produces `payload_drift_events` rows and a user-facing warning and asks for a bug report:
 
   - Contract requiredness describes what UsageBassoon needs from a payload to execute ingestion, not every field present in a golden fixture. Mark unused graph aggregates and capture metadata optional when their absence does not affect ingestion; their omission should not produce missing-field drift or fail collection. Optional fields that are present with an unexpected type still produce non-fatal type-change drift; omit a field from the contract entirely only when its type drift should not be monitored.
 
 ```
 $ bassoon collect
-⚠ schema drift detected (tokscale 4.18.1 vs contract 4.18.0):
+⚠ payload drift detected (tokscale 4.18.1 vs contract 4.18.0):
     models: unknown field 'entries[].performance.gpu_util'
     pricing: field 'resolution.priceConsensus' changed type (number → object)
   → collection <status>.
@@ -444,7 +444,7 @@ The installed command is `bassoon`. The commands below are implemented.
 | `bassoon snapshot [list/inspect/audit/pin/delete/copy/repair/policy]` | pinned manual capture or protected archive management |
 | `bassoon export <relation> <path>` | export a supported table/view to parquet/csv/json; obfuscated by default; `--raw` for raw data |
 | `bassoon audit runs/sources/restores/snapshot(s)` | run/source evidence, owned restore stages, or shared snapshot integrity audit |
-| `bassoon doctor` | credentials, connectivity, reconciliation, unresolved schema_drift, with issue link |
+| `bassoon doctor` | credentials, connectivity, reconciliation, unresolved payload_drift, with issue link |
 | `bassoon schedule install/status/start/stop/logs/remove/worker` | install or manage native scheduling, or run the container worker |
 
 ### Privacy and sharing policy

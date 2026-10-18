@@ -34,7 +34,7 @@ from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.collection_lock import collection_lock
 from usagebassoon.collector import RawCollection, _tokscale_uses_utc
 from usagebassoon.config import LoggingConfig, UsageBassoonConfig
-from usagebassoon.drift import SchemaDriftState
+from usagebassoon.drift import PayloadDriftState
 from usagebassoon.ingest import (
     CollectionBundle,
     IngestStatus,
@@ -884,7 +884,7 @@ def test_graph_candidates_skip_completed_statuses_and_refresh_today(
         dict[date, set[str]],
         dict[date, set[str]],
         frozenset[tuple[str, str]],
-        tuple[SchemaDriftState, ...],
+        tuple[PayloadDriftState, ...],
         ReportInventory,
         pa.Table,
     ]:
@@ -1028,7 +1028,7 @@ def test_overlap_always_includes_three_past_graph_usage_days(
         dict[date, set[str]],
         dict[date, set[str]],
         frozenset[tuple[str, str]],
-        tuple[SchemaDriftState, ...],
+        tuple[PayloadDriftState, ...],
         ReportInventory,
         pa.Table,
     ]:

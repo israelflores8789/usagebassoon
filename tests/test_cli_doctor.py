@@ -108,7 +108,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     config, backend = _configured_store(tmp_path)
     observed = datetime.now(UTC)
     backend.append(
-        "schema_drift_events",
+        "payload_drift_events",
         observations(
             pa.table(
                 {
@@ -142,7 +142,7 @@ def test_doctor_strict_fails_when_unresolved_drift_is_present(
     strict = runner.invoke(app, ["doctor", "--strict", "--config", str(config)])
 
     assert regular.exit_code == 0
-    assert "WARNING schema_drift" in plain_cli_output(regular.output)
+    assert "WARNING payload_drift" in plain_cli_output(regular.output)
     assert strict.exit_code == 1
 
 
