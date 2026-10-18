@@ -25,6 +25,7 @@ from usagebassoon.config import (
 from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
 
 
+@pytest.mark.windows_compatible
 def test_missing_source_identity_is_repaired_atomically_without_reformatting(
     tmp_path: Path,
 ) -> None:
@@ -37,19 +38,20 @@ def test_missing_source_identity_is_repaired_atomically_without_reformatting(
         "[snapshots]\n"
         "max_snapshots = 8\n"
     )
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     with ThreadPoolExecutor(max_workers=3) as executor:
         created = list(executor.map(write_initial_config, [path] * 3))
     assert created == [False, False, False]
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     parsed = tomllib.loads(text)
     assert str(UUID(parsed["source_id"])) == parsed["source_id"]
     assert text.endswith(content)
     assert parsed["snapshots"]["max_snapshots"] == 8
     assert write_initial_config(path) is False
-    assert path.read_text() == text
+    assert path.read_text(encoding="utf-8") == text
 
 
+@pytest.mark.windows_compatible
 def test_recovery_init_rejects_data_and_leaves_configuration_identity_intact(
     tmp_path: Path,
 ) -> None:
@@ -59,8 +61,9 @@ def test_recovery_init_rejects_data_and_leaves_configuration_identity_intact(
     source = "11111111-1111-4111-8111-111111111111"
     path.write_text(
         f'source_id = "{source}"\n'
-        f'backend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -70,9 +73,10 @@ def test_recovery_init_rejects_data_and_leaves_configuration_identity_intact(
     result = CliRunner().invoke(app, ["init", "--restore", "--config", str(path)])
     assert result.exit_code != 0
     assert "restore requires an empty warehouse" in plain_cli_output(result.output)
-    assert tomllib.loads(path.read_text())["source_id"] == source
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["source_id"] == source
 
 
+@pytest.mark.windows_compatible
 def test_init_creates_source_config_and_local_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -90,6 +94,11 @@ def test_init_creates_source_config_and_local_schema(
     original = config_path.read_bytes()
     assert set(tomllib.loads(original.decode())) == {"source_id", "backend", "spinner"}
     configuration = ConfigurationManager(config_path).load()
+    assert original.decode().startswith(
+        "#:schema https://raw.githubusercontent.com/israelflores8789/usagebassoon/main/config.schema.json\n\n"
+        "# Do not modify this source ID unless you know what you are doing.\n"
+        f'source_id = "{configuration.source_id}"\n\n'
+    )
     assert UUID(configuration.source_id)
     assert configuration.backend == "duckdb"
     assert configuration.spinner == "pong"
@@ -110,6 +119,7 @@ def test_init_creates_source_config_and_local_schema(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
     """Reuse a configured source and database without overwriting either one."""
     config_path = tmp_path / "config.toml"
@@ -118,7 +128,8 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
     config_path.write_text(
         f'source_id = "{source_id}"\n'
         'backend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
@@ -133,6 +144,7 @@ def test_init_preserves_an_existing_configuration(tmp_path: Path) -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -145,7 +157,10 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         'backend.provider = "unsupported"\n'
         'backend.duckdb.database = "usagebassoon"\n'
-        f'\n[logging]\ndirectory = "{log_directory}"\n'
+        "\n"
+        "[logging]\n"
+        f"directory = '{log_directory}'\n",
+        encoding="utf-8",
     )
 
     result = CliRunner().invoke(app, ["init", "--config", str(config_path)])
@@ -153,4 +168,4 @@ def test_init_formats_invalid_existing_configuration_as_a_cli_error(
     assert result.exit_code != 0
     assert "backend.provider must be one of" in plain_cli_output(result.output)
     log_path = log_directory / "usagebassoon.log"
-    assert "backend.provider must be one of" in log_path.read_text()
+    assert "backend.provider must be one of" in log_path.read_text(encoding="utf-8")

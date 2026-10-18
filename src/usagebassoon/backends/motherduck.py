@@ -163,6 +163,13 @@ def _preflight(resource: _NativeResource, _argument: None) -> None:
     resource.backend.preflight()
 
 
+def _schema_metadata(
+    resource: _NativeResource, _argument: None
+) -> tuple[int, str] | None:
+    """Inspect native schema provenance without applying upgrades."""
+    return resource.backend.schema_metadata()
+
+
 def _persist_batch(
     resource: _NativeResource, batch: PersistenceBatch
 ) -> BatchPersistResult:
@@ -250,12 +257,19 @@ class MotherDuckBackend(AbstractStorageBackend):
             )
         self.database = database
         self.timeout_seconds = timeout_seconds
+        self._doctor_auth_source = (
+            "explicit token" if token else "MOTHERDUCK_TOKEN (environment)"
+        )
         with operation(timeout_seconds):
             self._resource = SupervisedResource(
                 _resource_factory(database, resolved, timeout_seconds),
                 interrupt=_interrupt_resource,
                 close=_close_resource,
             )
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Report the token source without inspecting or exposing the token."""
+        return self._doctor_auth_source, "unavailable (token identity is not exposed)"
 
     def _call[A, T](
         self,
@@ -287,6 +301,11 @@ class MotherDuckBackend(AbstractStorageBackend):
     def preflight(self) -> None:
         """Inspect schema readiness on the existing child-owned connection."""
         self._call(_preflight, None)
+
+    @override
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Read the native schema marker through the supervised connection."""
+        return self._call(_schema_metadata, None)
 
     @override
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
@@ -342,16 +361,20 @@ class MotherDuckBackend(AbstractStorageBackend):
         self, kind: _ScopeKind, tables: tuple[str, ...] = ()
     ) -> Generator[datetime | None]:
         """Keep a native context open until the matching parent scope finishes."""
-        stamp = self._call(_begin_scope, (kind, tables))
+        begun = False
         try:
+            stamp = self._call(_begin_scope, (kind, tables))
+            begun = True
             yield stamp
             self._call(_end_scope, None)
         except BaseException as error:
-            try:
-                with cleanup_budget():
-                    self._call(_end_scope, error)
-            except Exception:
-                _LOG.exception("could not unwind failed MotherDuck %s scope", kind)
+            # Scope setup can finish in the child just as its deadline expires.
+            if begun or isinstance(error, OperationTimeout):
+                try:
+                    with cleanup_budget():
+                        self._call(_end_scope, error)
+                except Exception:
+                    _LOG.exception("could not unwind failed MotherDuck %s scope", kind)
             raise
 
     @contextmanager
@@ -609,6 +632,12 @@ class _NativeMotherDuck(_DuckDBStorage):
     def preflight(self) -> None:
         """Share one deadline across the complete preflight operation."""
         return super().preflight()
+
+    @override
+    @_interruptible
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Bound inspection of the persisted MotherDuck schema marker."""
+        return super().schema_metadata()
 
     @override
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:

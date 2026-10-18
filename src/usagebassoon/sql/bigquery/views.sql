@@ -51,30 +51,30 @@ FROM (SELECT * FROM notes UNION ALL SELECT * FROM raw_notes) AS observations
 WHERE observation_rank = 1 AND op = 'upsert';
 
 CREATE OR REPLACE VIEW current_collection_ledger AS
-SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status
+SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, usagebassoon_ver, status
 FROM (
 SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, run_id, day, domain ORDER BY collected_at DESC, finished_at DESC NULLS LAST, event_id DESC) AS observation_rank
 FROM (SELECT * FROM collection_ledger) AS observations
 ) AS ranked
 WHERE observation_rank = 1;
 
-CREATE OR REPLACE VIEW schema_drift_events AS
+CREATE OR REPLACE VIEW payload_drift_events AS
 SELECT run_id, event_id, source_id, domain, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, created_at, collected_at, resolved, observation_count FROM (
 SELECT events.*, ROW_NUMBER() OVER (PARTITION BY source_id, event_id ORDER BY collected_at DESC, resolved DESC, event_id DESC) AS replay_rank
-FROM raw_schema_drift_events AS events
+FROM raw_payload_drift_events AS events
 ) AS replays WHERE replay_rank = 1;
 
-CREATE OR REPLACE VIEW replay_schema_drift_events AS
+CREATE OR REPLACE VIEW replay_payload_drift_events AS
 SELECT run_id, event_id, source_id, domain, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, created_at, collected_at, resolved, observation_count FROM (
 SELECT events.*, ROW_NUMBER() OVER (PARTITION BY source_id, event_id ORDER BY collected_at DESC, resolved DESC, event_id DESC) AS replay_rank
-FROM raw_schema_drift_events AS events
+FROM raw_payload_drift_events AS events
 ) AS replays WHERE replay_rank = 1;
 
-CREATE OR REPLACE VIEW current_schema_drift_events AS
+CREATE OR REPLACE VIEW current_payload_drift_events AS
 SELECT run_id, event_id, source_id, domain, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, first_detection AS created_at, collected_at, resolved, CAST(sightings AS INT64) AS observation_count
 FROM (
 SELECT observations.*, ROW_NUMBER() OVER (PARTITION BY source_id, domain, tokscale_ver, drift_key ORDER BY collected_at DESC, resolved DESC, event_id DESC) AS observation_rank, MIN(created_at) OVER (PARTITION BY source_id, domain, tokscale_ver, drift_key) AS first_detection, SUM(observation_count) OVER (PARTITION BY source_id, domain, tokscale_ver, drift_key) AS sightings
-FROM (SELECT * FROM replay_schema_drift_events) AS observations
+FROM (SELECT * FROM replay_payload_drift_events) AS observations
 ) AS ranked
 WHERE observation_rank = 1;
 
@@ -99,8 +99,8 @@ FROM (SELECT * FROM replay_reconciliation_issues) AS observations
 WHERE observation_rank = 1;
 
 -- Doctor freshness is enforced at read time, independent of physical pruning.
-CREATE OR REPLACE VIEW open_schema_drift_events AS
-SELECT * FROM current_schema_drift_events
+CREATE OR REPLACE VIEW open_payload_drift_events AS
+SELECT * FROM current_payload_drift_events
 WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
 
 CREATE OR REPLACE VIEW open_reconciliation_issues AS
@@ -108,7 +108,7 @@ SELECT * FROM current_reconciliation_issues
 WHERE resolved = FALSE AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
 
 CREATE OR REPLACE VIEW collection_runs AS
-SELECT event_id, run_id, day, domain, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status
+SELECT event_id, run_id, day, domain, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, usagebassoon_ver, status
 FROM current_collection_ledger WHERE domain = 'collection';
 
 -- One source summary combines all canonical domains and one latest metadata row.
@@ -120,7 +120,7 @@ WITH sources AS (
     UNION DISTINCT SELECT source_id FROM current_tags
     UNION DISTINCT SELECT source_id FROM current_notes
     UNION DISTINCT SELECT source_id FROM current_collection_ledger
-    UNION DISTINCT SELECT source_id FROM current_schema_drift_events
+    UNION DISTINCT SELECT source_id FROM current_payload_drift_events
     UNION DISTINCT SELECT source_id FROM current_reconciliation_issues
 ), totals AS (
     SELECT source_id,
@@ -151,7 +151,7 @@ LEFT JOIN totals ON sources.source_id = totals.source_id
 LEFT JOIN latest ON sources.source_id = latest.source_id;
 
 CREATE OR REPLACE VIEW collection_status AS
-SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, status FROM (
+SELECT event_id, run_id, day, domain, expected_count, succeeded_count, failure_code, collected_at, source_id, started_at, finished_at, host, os_name, os_version, architecture, cpu_model, cpu_count, memory_bytes, invoke_method, tokscale_ver, usagebassoon_ver, status FROM (
 SELECT current_collection_ledger.*, ROW_NUMBER() OVER (
     PARTITION BY source_id, day, domain
     ORDER BY collected_at DESC, finished_at DESC NULLS LAST, event_id DESC
@@ -426,7 +426,7 @@ SELECT DISTINCT 'issues' AS record_kind, source_id, CAST(NULL AS DATE) AS day, C
 FROM current_reconciliation_issues WHERE resolved = FALSE
 UNION ALL
 SELECT DISTINCT 'drift' AS record_kind, source_id, CAST(NULL AS DATE) AS day, domain, CAST(NULL AS STRING) AS status, CAST(NULL AS INT64) AS expected_count, CAST(NULL AS INT64) AS succeeded_count, CAST(NULL AS STRING) AS run_id, CAST(NULL AS STRING) AS failure_code, CAST(NULL AS STRING) AS model, CAST(NULL AS STRING) AS check_name, CAST(NULL AS STRING) AS issue_key, tokscale_ver, drift_key, drift_kind, path, detail, contract_tokscale_ver, created_at, observation_count, CAST(NULL AS STRING) AS client, CAST(NULL AS STRING) AS session_id, CAST(NULL AS INT64) AS input_tokens, CAST(NULL AS INT64) AS output_tokens, CAST(NULL AS INT64) AS cache_read, CAST(NULL AS INT64) AS cache_write, CAST(NULL AS INT64) AS reasoning, CAST(NULL AS INT64) AS total_tokens, CAST(NULL AS STRING) AS event_id, CAST(NULL AS TIMESTAMP) AS collected_at
-FROM current_schema_drift_events WHERE resolved = FALSE
+FROM current_payload_drift_events WHERE resolved = FALSE
 UNION ALL
 SELECT DISTINCT 'sessions' AS record_kind, records.source_id, CAST(NULL AS DATE) AS day, CAST(NULL AS STRING) AS domain, CAST(NULL AS STRING) AS status, CAST(NULL AS INT64) AS expected_count, CAST(NULL AS INT64) AS succeeded_count, CAST(NULL AS STRING) AS run_id, CAST(NULL AS STRING) AS failure_code, CAST(NULL AS STRING) AS model, CAST(NULL AS STRING) AS check_name, CAST(NULL AS STRING) AS issue_key, CAST(NULL AS STRING) AS tokscale_ver, CAST(NULL AS STRING) AS drift_key, CAST(NULL AS STRING) AS drift_kind, CAST(NULL AS STRING) AS path, CAST(NULL AS STRING) AS detail, CAST(NULL AS STRING) AS contract_tokscale_ver, records.created_at, CAST(NULL AS INT64) AS observation_count, records.client, records.session_id, CAST(NULL AS INT64) AS input_tokens, CAST(NULL AS INT64) AS output_tokens, CAST(NULL AS INT64) AS cache_read, CAST(NULL AS INT64) AS cache_write, CAST(NULL AS INT64) AS reasoning, CAST(NULL AS INT64) AS total_tokens, CAST(NULL AS STRING) AS event_id, CAST(NULL AS TIMESTAMP) AS collected_at
 FROM current_sessions AS records

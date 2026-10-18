@@ -161,6 +161,17 @@ class _DuckDBStorage(AbstractStorageBackend):
                 )
 
     @override
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Inspect the persisted DuckDB marker without applying schema upgrades."""
+        try:
+            row = self._execute(
+                "SELECT version, schema_hash FROM schema_marker"
+            ).fetchone()
+        except duckdb.CatalogException:
+            return None
+        return (int(row[0]), str(row[1])) if row is not None else None
+
+    @override
     def is_retryable_error(self, error: Exception) -> bool:
         """Retry concurrent row and catalog transaction conflicts."""
         return isinstance(error, duckdb.TransactionException) and (
@@ -594,6 +605,10 @@ class _DuckDBStorage(AbstractStorageBackend):
 
 class DuckDBBackend(_DuckDBStorage):
     """StorageBackend backed by a local DuckDB database."""
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Describe local filesystem access without exposing the OS identity."""
+        return "local file permissions", "not applicable"
 
     @contextmanager
     @override

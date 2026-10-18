@@ -142,7 +142,7 @@ def seed_recovery_data(
         ),
     )
     backend.append(
-        "schema_drift_events",
+        "payload_drift_events",
         pa.Table.from_pylist(
             [
                 {
@@ -157,7 +157,7 @@ def seed_recovery_data(
                     "detail": "recovery evidence",
                 }
             ],
-            schema=CANONICAL_TABLE_SCHEMAS["schema_drift_events"],
+            schema=CANONICAL_TABLE_SCHEMAS["payload_drift_events"],
         ),
     )
     expected: dict[str, list[dict[str, object]]] = {}

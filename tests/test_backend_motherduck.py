@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import time
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -34,6 +33,13 @@ from usagebassoon.backends.motherduck import (
 from usagebassoon.config import MotherDuckConfig, UsageBassoonConfig
 from usagebassoon.deadlines import OperationTimeout, ResourceUnavailable
 from usagebassoon.ingest import CollectionBundle
+from usagebassoon.process import ManagedProcess
+from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
+
+# Include native-driver startup in the bounded Windows operation allowance.
+_OPERATION_TIMEOUT = 10.0 if os.name == "nt" else 2.0
+# Forced termination and durable catalog cleanup share this allowance.
+_CLEANUP_SECONDS = 2.0 if os.name == "nt" else 0.5
 
 
 class _UnresponsiveBackend(_NativeMotherDuck):
@@ -172,6 +178,7 @@ def _blocked_interrupt(resource: _NativeResource) -> None:
     time.sleep(120)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("phase", ["open", "query", "close", "exit", "interrupt"])
 def test_proxy_kills_stalled_resource_and_invalidates_old_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
@@ -189,25 +196,30 @@ def test_proxy_kills_stalled_resource_and_invalidates_old_connection(
         monkeypatch.setattr(
             "usagebassoon.backends.motherduck._interrupt_resource", _blocked_interrupt
         )
-    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.5)
-    processes: list[subprocess.Popen[bytes]] = []
-    original = subprocess.Popen
+    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", _CLEANUP_SECONDS)
+    processes: list[ManagedProcess] = []
+    original = deadlines.start_process
 
     def launch(
         args: Sequence[str], *, stdin: int, stdout: int, bufsize: int
-    ) -> subprocess.Popen[bytes]:
+    ) -> ManagedProcess:
         process = original(args, stdin=stdin, stdout=stdout, bufsize=bufsize)
         processes.append(process)
         return process
 
-    monkeypatch.setattr(deadlines.subprocess, "Popen", launch)
+    monkeypatch.setattr(deadlines, "start_process", launch)
     backend: MotherDuckBackend | None = None
     started = time.monotonic()
     with pytest.raises(ResourceUnavailable):
-        backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+        backend = MotherDuckBackend(
+            "usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT
+        )
+        # Constructor startup has its own deadline; measure the requested phase.
+        started = time.monotonic()
         backend.query("SELECT 42 AS value")
         backend.close()
-    assert time.monotonic() - started < 4
+    allowance = _OPERATION_TIMEOUT + max(2.0, _CLEANUP_SECONDS + 1.0)
+    assert time.monotonic() - started < allowance
     assert processes[0].returncode is not None
     assert int(marker.read_text()) != os.getpid()
     if phase == "interrupt":
@@ -221,13 +233,14 @@ def test_proxy_kills_stalled_resource_and_invalidates_old_connection(
         monkeypatch.undo()
         _install_factory(monkeypatch, database, "query", marker)
     monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 2.0)
-    following = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+    following = MotherDuckBackend("usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT)
     try:
         assert following.query("SELECT 42 AS value").to_pylist() == [{"value": 42}]
     finally:
         following.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("kind", ["transaction", "snapshot"])
 def test_proxy_scope_shares_deadline_and_releases_same_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
@@ -238,7 +251,7 @@ def test_proxy_scope_shares_deadline_and_releases_same_connection(
     database = tmp_path / "native.duckdb"
     _seed(database)
     _install_factory(monkeypatch, database, "steps", tmp_path / "unused")
-    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT)
     process = backend._resource._process
     backend.query("CREATE TABLE changes (value INTEGER)")
     try:
@@ -262,6 +275,7 @@ def test_proxy_scope_shares_deadline_and_releases_same_connection(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("phase", ["conflict", "write", "commit"])
 def test_proxy_persistence_preserves_batch_ids_and_resolves_uncertain_commit(
     collection_bundle: CollectionBundle,
@@ -279,12 +293,14 @@ def test_proxy_persistence_preserves_batch_ids_and_resolves_uncertain_commit(
     _seed(database)
     records = tmp_path / "attempts.jsonl"
     _install_factory(monkeypatch, database, phase, tmp_path / "blocked", records)
-    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.5)
+    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", _CLEANUP_SECONDS)
     config = UsageBassoonConfig(
         tmp_path / "config.toml",
         collection_bundle.source_id,
         "motherduck",
-        motherduck=MotherDuckConfig("usagebassoon_it", timeout_seconds=2),
+        motherduck=MotherDuckConfig(
+            "usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT
+        ),
         collection=CollectionConfig(max_retries=1),
     )
     bundle = normalize(collection_bundle)
@@ -308,6 +324,7 @@ def test_proxy_persistence_preserves_batch_ids_and_resolves_uncertain_commit(
         check.close()
 
 
+@pytest.mark.windows_compatible
 def test_proxy_capture_releases_failed_snapshot_and_streams_next_attempt(
     collection_bundle: CollectionBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -323,23 +340,27 @@ def test_proxy_capture_releases_failed_snapshot_and_streams_next_attempt(
     persist_run(seed, normalize(collection_bundle))
     seed.close()
     _install_factory(monkeypatch, database, "capture", tmp_path / "blocked")
-    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.5)
-    store = SnapshotArchiver(str(tmp_path / "archive"), timeout_seconds=2)
-    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", _CLEANUP_SECONDS)
+    store = SnapshotArchiver(
+        str(tmp_path / "archive"), timeout_seconds=_OPERATION_TIMEOUT
+    )
+    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT)
     try:
         with pytest.raises(ResourceUnavailable):
             store.write(backend, run_id="failed", manual=True)
         assert store.list_snapshots() == []
     finally:
         backend.close()
-    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+    backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT)
     try:
+        assert backend.schema_metadata() == (SCHEMA_VERSION, schema_hash("duckdb"))
         assert store.write(backend, run_id="next", manual=True) is not None
         assert len(store.list_snapshots()) == 1
     finally:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("phase", ["restore", "restore_commit"])
 def test_proxy_restore_replays_verified_files_and_inspects_atomic_receipt(
     collection_bundle: CollectionBundle,
@@ -365,22 +386,26 @@ def test_proxy_restore_replays_verified_files_and_inspects_atomic_receipt(
     database = tmp_path / "destination.duckdb"
     _seed(database)
     _install_factory(monkeypatch, database, phase, tmp_path / "blocked")
-    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", 0.5)
-    destination = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+    monkeypatch.setattr(deadlines, "CLEANUP_SECONDS", _CLEANUP_SECONDS)
+    destination = MotherDuckBackend(
+        "usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT
+    )
     with store.reader.prepare(uri) as prepared:
         try:
             with (
                 pytest.raises(
                     RuntimeError, match="completion could not be determined"
                 ) as failed,
-                deadlines.operation(2),
+                deadlines.operation(_OPERATION_TIMEOUT),
             ):
                 restore_prepared(destination, prepared)
             assert isinstance(failed.value.__cause__, OperationTimeout)
         finally:
             destination.close()
         assert all(path.exists() for path in prepared.files.values())
-        destination = MotherDuckBackend("usagebassoon_it", timeout_seconds=2)
+        destination = MotherDuckBackend(
+            "usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT
+        )
         try:
             rows = restore_prepared(destination, prepared)
             receipt = restore_operation_id(prepared)
@@ -405,6 +430,7 @@ def _native_motherduck(timeout_seconds: float = 120.0) -> _NativeMotherDuck:
     return backend
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("interrupt_attach", [False, True])
 def test_motherduck_startup_attaches_through_owned_native_handle(
     monkeypatch: pytest.MonkeyPatch,
@@ -459,6 +485,7 @@ def test_motherduck_startup_attaches_through_owned_native_handle(
         assert handle.closed
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("failure", ["timeout", "sql"])
 def test_native_motherduck_rolls_back_and_reuses_connection(failure: str) -> None:
     """Interrupt native work and preserve ordinary error recovery on the same handle."""
@@ -487,6 +514,7 @@ def test_native_motherduck_rolls_back_and_reuses_connection(failure: str) -> Non
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_native_motherduck_preserves_persistence_snapshot_and_restore(
     tmp_path: Path,
     collection_bundle: CollectionBundle,
@@ -501,6 +529,7 @@ def test_native_motherduck_preserves_persistence_snapshot_and_restore(
     backend = _native_motherduck()
     try:
         backend.apply_ddl()
+        assert backend.schema_metadata() == (SCHEMA_VERSION, schema_hash("duckdb"))
         persist_run(backend, bundle)
         assert backend.has_committed_run(bundle.run_id)
         uri = store.write(backend, run_id=bundle.run_id, manual=True)
@@ -517,6 +546,7 @@ def test_native_motherduck_preserves_persistence_snapshot_and_restore(
         destination.close()
 
 
+@pytest.mark.windows_compatible
 def test_native_motherduck_stops_expired_batch_before_commit(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
@@ -551,6 +581,7 @@ def test_native_motherduck_stops_expired_batch_before_commit(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_native_motherduck_lost_commit_reply_does_not_republish(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
@@ -584,6 +615,7 @@ def test_native_motherduck_lost_commit_reply_does_not_republish(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_motherduck_rejects_invalid_database_name() -> None:
     """Assert MotherDuck rejects empty and already-prefixed database names."""
     with pytest.raises(ValueError, match="database name"):
@@ -592,6 +624,7 @@ def test_motherduck_rejects_invalid_database_name() -> None:
         MotherDuckBackend("md:usagebassoon")
 
 
+@pytest.mark.windows_compatible
 def test_motherduck_requires_token_before_connecting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

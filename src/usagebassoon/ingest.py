@@ -20,7 +20,7 @@ from usagebassoon.contracts import (
     load_shipped_contracts,
     validate_payloads,
 )
-from usagebassoon.drift import SchemaDriftState, drift_identity
+from usagebassoon.drift import PayloadDriftState, drift_identity
 from usagebassoon.json_types import JsonArray, JsonObject
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.parsers.daily import DailyModelsPayload, parse_daily
@@ -117,7 +117,7 @@ class IngestEvidence:
     pricing_fetch_failures: Mapping[date, frozenset[str]]
     prior_statuses: Mapping[IngestTarget, IngestStatus]
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset()
-    prior_schema_drift: tuple[SchemaDriftState, ...] = ()
+    prior_payload_drift: tuple[PayloadDriftState, ...] = ()
     models_failures: Mapping[date, str] = field(default_factory=dict)
     report_inventory: bool = False
     expected_sessions: frozenset[SessionIdentity] = frozenset()
@@ -139,7 +139,7 @@ class CollectionBundle:
     ingest_status: tuple[IngestStatus, ...]
     reconciliation: ReconciliationResult
     contract_drift: tuple[ContractDrift, ...] = ()
-    resolved_schema_drift: tuple[SchemaDriftState, ...] = ()
+    resolved_payload_drift: tuple[PayloadDriftState, ...] = ()
     fetch_summary: dict[str, int] | None = None
     drift_fatal: bool = False
     system_metadata: SystemMetadata | None = None
@@ -230,7 +230,7 @@ def build_ingest_evidence(
     pricing_fetch_failures: Mapping[date, frozenset[str]],
     prior_statuses: Mapping[IngestTarget, IngestStatus],
     prior_reconciliation_issues: frozenset[ReconciliationIdentity] = frozenset(),
-    prior_schema_drift: tuple[SchemaDriftState, ...] = (),
+    prior_payload_drift: tuple[PayloadDriftState, ...] = (),
     report_days: frozenset[date] | None = None,
     report_inventory: bool = False,
     expected_sessions: frozenset[SessionIdentity] = frozenset(),
@@ -256,7 +256,7 @@ def build_ingest_evidence(
         pricing_fetch_failures=pricing_fetch_failures,
         prior_statuses=prior_statuses,
         prior_reconciliation_issues=prior_reconciliation_issues,
-        prior_schema_drift=prior_schema_drift,
+        prior_payload_drift=prior_payload_drift,
         models_failures=models_plan.failures,
         report_inventory=report_inventory,
         expected_sessions=expected_sessions,
@@ -575,9 +575,9 @@ def build_collection_bundle(
     active_drift = {
         (event.domain, tokscale_ver, event.drift_key) for event in drift_events
     }
-    resolved_schema_drift = tuple(
+    resolved_payload_drift = tuple(
         state
-        for state in evidence.prior_schema_drift
+        for state in evidence.prior_payload_drift
         if state.tokscale_ver == tokscale_ver
         and state.domain in complete_domains
         and drift_identity(state) not in active_drift
@@ -599,7 +599,7 @@ def build_collection_bundle(
         ingest_status=tuple(statuses),
         reconciliation=reconciliation,
         contract_drift=tuple(drift_events),
-        resolved_schema_drift=resolved_schema_drift,
+        resolved_payload_drift=resolved_payload_drift,
         fetch_summary={
             "rows_in": sum(len(payload.entries) for payload in daily_models.values())
             + len(report_rows)

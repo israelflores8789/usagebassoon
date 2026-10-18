@@ -14,6 +14,7 @@ from usagebassoon.config import ConfigurationError, ConfigurationManager
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.windows_compatible
 def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> None:
     """Load explicit tokscale environment and BigQuery cost controls."""
     path = tmp_path / "config.toml"
@@ -46,6 +47,7 @@ def test_security_configuration_is_loaded_with_safe_defaults(tmp_path: Path) -> 
     assert configuration.bigquery.timeout_seconds == 180.0
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "table, message",
     [

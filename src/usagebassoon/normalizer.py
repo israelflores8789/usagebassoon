@@ -12,10 +12,12 @@ from uuid import uuid4
 
 import pyarrow as pa
 
-from usagebassoon.drift import SchemaDriftIdentity, drift_identity
+from usagebassoon.collection_policy import apply_collection_policy
+from usagebassoon.drift import PayloadDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.system_metadata import InvokeMethod, capture_system_metadata
+from usagebassoon.version import __version__
 
 if TYPE_CHECKING:
     from usagebassoon.ingest import CollectionBundle
@@ -126,29 +128,34 @@ def _price_version_rows(
     *,
     freshness_at: datetime,
 ) -> ColumnarData:
-    """Build rates associated with their actual UTC observation day."""
+    """Build observed price versions with UsageBassoon's model policy applied."""
     records: list[dict[str, object]] = []
     for day in sorted(pricing_by_day):
         for model in sorted(pricing_by_day[day]):
             pricing = pricing_by_day[day][model]
             records.append(
-                {
-                    "source_id": source_id,
-                    "day": day,
-                    "model": pricing.model_id,
-                    "source": pricing.source,
-                    "matched_key": pricing.matched_key,
-                    "match_kind": pricing.resolution.kind,
-                    "price_input_per_token": pricing.pricing.input_cost_per_token,
-                    "price_output_per_token": pricing.pricing.output_cost_per_token,
-                    "price_cache_read_per_token": (
-                        pricing.pricing.cache_read_input_token_cost
-                    ),
-                    "price_cache_write_per_token": (
-                        pricing.pricing.cache_write_input_token_cost
-                    ),
-                    "collected_at": freshness_at,
-                }
+                apply_collection_policy(
+                    "price_versions",
+                    {
+                        "source_id": source_id,
+                        "day": day,
+                        "model": pricing.model_id,
+                        "source": pricing.source,
+                        "matched_key": pricing.matched_key,
+                        "match_kind": pricing.resolution.kind,
+                        "price_input_per_token": (pricing.pricing.input_cost_per_token),
+                        "price_output_per_token": (
+                            pricing.pricing.output_cost_per_token
+                        ),
+                        "price_cache_read_per_token": (
+                            pricing.pricing.cache_read_input_token_cost
+                        ),
+                        "price_cache_write_per_token": (
+                            pricing.pricing.cache_write_input_token_cost
+                        ),
+                        "collected_at": freshness_at,
+                    },
+                )
             )
     return _col_major(records) if records else {}
 
@@ -158,7 +165,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
     if bundle.drift_fatal:
         status = "failed"
     elif bundle.contract_drift:
-        status = "schema_drift"
+        status = "payload_drift"
     elif (
         any(status.status != "complete" for status in bundle.ingest_status)
         or not bundle.reconciliation.ok
@@ -193,6 +200,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             ],
             "invoke_method": [bundle.invoke_method.value],
             "tokscale_ver": [bundle.graph.meta.version],
+            "usagebassoon_ver": [__version__],
             "status": [status],
             "day": [bundle.started_at.date()],
             "domain": ["collection"],
@@ -253,7 +261,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             for check, key in bundle.reconciliation.resolved
         ]
         tables["reconciliation_issues"] = _col_major(issue_rows)
-    event_rows: dict[SchemaDriftIdentity, dict[str, object]] = {}
+    event_rows: dict[PayloadDriftIdentity, dict[str, object]] = {}
     tokscale_ver = bundle.graph.meta.version
     for drift in bundle.contract_drift:
         identity = (drift.domain, tokscale_ver, drift.drift_key)
@@ -278,7 +286,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             row["detail"] = drift.detail
             row["contract_tokscale_ver"] = drift.contract_tokscale_ver
             row["observation_count"] = cast(int, row["observation_count"]) + 1
-    for state in bundle.resolved_schema_drift:
+    for state in bundle.resolved_payload_drift:
         identity = drift_identity(state)
         event_rows[identity] = {
             "run_id": bundle.run_id,
@@ -296,7 +304,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             "observation_count": 0,
         }
     if event_rows:
-        tables["schema_drift_events"] = _col_major(list(event_rows.values()))
+        tables["payload_drift_events"] = _col_major(list(event_rows.values()))
     return tables
 
 
@@ -352,6 +360,7 @@ def failed_collection(
     row = {
         **asdict(capture_system_metadata()),
         "invoke_method": InvokeMethod(invoke_method).value,
+        "usagebassoon_ver": __version__,
         "event_id": str(uuid4()),
         "run_id": run_id,
         "source_id": source_id,

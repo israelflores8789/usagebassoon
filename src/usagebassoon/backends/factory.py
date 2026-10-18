@@ -79,9 +79,13 @@ class StorageBackendRegistry:
         self._factories[provider] = factory
 
     def open(
-        self, config: UsageBassoonConfig, *, initialize: bool = False
+        self,
+        config: UsageBassoonConfig,
+        *,
+        initialize: bool = False,
+        inspect: bool = False,
     ) -> StorageBackend:
-        """Open a provider and require readiness except for explicit provisioning."""
+        """Require readiness except for explicit provisioning or diagnostics."""
         factory = self._factories.get(config.backend)
         if factory is None:
             raise ValueError(
@@ -91,7 +95,7 @@ class StorageBackendRegistry:
         try:
             with operation(config.backend_timeout_seconds):
                 backend = factory(config)
-                if not initialize:
+                if not initialize and not inspect:
                     backend.preflight()
                 return backend
         except BaseException:
@@ -105,6 +109,7 @@ def open_backend(
     config: UsageBassoonConfig,
     *,
     initialize: bool = False,
+    inspect: bool = False,
     registry: StorageBackendRegistry | None = None,
 ) -> StorageBackend:
     """Open a caller-owned backend through registered provider construction.
@@ -112,6 +117,7 @@ def open_backend(
     Args:
         config: Validated settings, including provider authentication and limits.
         initialize: Skip schema preflight only for explicit provisioning.
+        inspect: Skip schema preflight for read-only diagnostic inspection.
         registry: Optional provider constructors for a library integration.
 
     Returns:
@@ -120,4 +126,6 @@ def open_backend(
     Raises:
         ValueError: If the provider is unsupported or its settings are absent.
     """
-    return (registry or StorageBackendRegistry()).open(config, initialize=initialize)
+    return (registry or StorageBackendRegistry()).open(
+        config, initialize=initialize, inspect=inspect
+    )

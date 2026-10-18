@@ -26,9 +26,10 @@ from usagebassoon.config import (
 from usagebassoon.diagnostics import (
     DoctorCheck,
     DoctorReport,
+    backend_authentication_check,
     maintenance_health,
     run_doctor,
-    snapshot_health,
+    snapshot_checks,
 )
 from usagebassoon.display import sanitize_display
 from usagebassoon.logger import LOGGER_NAME
@@ -111,7 +112,7 @@ def doctor(
         typer.Option(
             "--limit",
             min=1,
-            help="Maximum unresolved drift and recent run records to display.",
+            help="Maximum unresolved drift and collection records to display.",
         ),
     ] = 20,
     raw: Annotated[
@@ -159,7 +160,7 @@ def doctor(
             logger.exception("could not configure doctor logging")
         try:
             with spinner(configuration):
-                opened = open_backend(configuration)
+                opened = open_backend(configuration, inspect=True)
         except Exception as error:
             logger.exception("could not open the configured backend")
             connection_error = str(error)
@@ -185,13 +186,23 @@ def doctor(
             limit=limit,
             logger=logger,
         )
+        authentication_check = backend_authentication_check(configuration, opened)
+        checks = list(report.checks)
+        backend_check_index = next(
+            (index for index, check in enumerate(checks) if check.name == "backend"),
+            None,
+        )
+        checks.insert(
+            backend_check_index + 1 if backend_check_index is not None else len(checks),
+            authentication_check,
+        )
         report = DoctorReport(
             (
                 DoctorCheck("usagebassoon", "ok", f"version {__version__}"),
                 tokscale_check,
-                *report.checks,
+                *checks,
                 maintenance_health(opened),
-                snapshot_health(configuration),
+                *snapshot_checks(configuration),
                 schedule_doctor_check(configuration),
             )
         )

@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import NoReturn, override
 
 import pytest
@@ -19,7 +22,11 @@ from typer.testing import CliRunner
 
 from tests._cli import plain_cli_output
 from usagebassoon.cli.app import app
-from usagebassoon.collector import preflight_tokscale, resolve_tokscale_command
+from usagebassoon.collector import (
+    _split_tokscale_command,
+    preflight_tokscale,
+    resolve_tokscale_command,
+)
 from usagebassoon.config import ConfigurationManager, LoggingConfig, UsageBassoonConfig
 from usagebassoon.persistence import PersistSummary
 from usagebassoon.scheduling import (
@@ -58,12 +65,14 @@ def _configuration(
     return ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 def test_systemd_time_span_supports_arbitrary_valid_intervals() -> None:
     """Translate configured minute/hour intervals to systemd seconds."""
     assert _systemd_time_span("15m") == "900s"
     assert _systemd_time_span("2h") == "7200s"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("platform", "invoke_method"),
     [("linux", InvokeMethod.SYSTEMD), ("darwin", InvokeMethod.LAUNCHD)],
@@ -114,31 +123,98 @@ def test_native_collection_artifacts_pass_invocation_method_to_cli(
     assert "Collected run native-run" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preflight_honors_configured_package_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Probe configured npm/deno-style commands without assuming Bun."""
     configuration = _configuration(tmp_path, tokscale_bin="npx tokscale@latest")
+    resolved_npx = r"C:\Program Files\nodejs\npx.cmd"
     calls: list[list[str]] = []
+
+    def which(command: str) -> str | None:
+        return resolved_npx if command == "npx" else None
 
     popen = subprocess.Popen
 
-    def fake_popen(command: list[str], **_: object) -> subprocess.Popen[bytes]:
-        calls.append(command)
+    def fake_start_process(
+        command: Sequence[str], environment: Mapping[str, str]
+    ) -> subprocess.Popen[bytes]:
+        """Record tokscale argv while returning a harmless completed process."""
+        del environment
+        calls.append(list(command))
         return popen(
             [sys.executable, "-c", "print('tokscale 4.18.0')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
-    monkeypatch.setattr("usagebassoon.collector.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "usagebassoon.collector._start_tokscale_process", fake_start_process
+    )
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
 
-    assert resolve_tokscale_command(configuration) == ("npx", "tokscale@latest")
-    assert preflight_tokscale(configuration) == (("npx", "tokscale@latest"), "4.18.0")
-    assert calls == [["npx", "tokscale@latest", "--version"]]
+    expected = (resolved_npx, "tokscale@latest")
+    assert resolve_tokscale_command(configuration) == expected
+    assert preflight_tokscale(configuration) == (expected, "4.18.0")
+    assert calls == [[resolved_npx, "tokscale@latest", "--version"]]
 
 
+@pytest.mark.windows_compatible
+def test_default_tokscale_uses_the_resolved_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the concrete PATH result for a globally installed Windows shim."""
+    configuration = _configuration(tmp_path)
+    resolved_tokscale = r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd"
+
+    def which(command: str) -> str | None:
+        return resolved_tokscale if command == "tokscale" else None
+
+    monkeypatch.delenv("TOKSCALE_BIN", raising=False)
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
+
+    assert resolve_tokscale_command(configuration) == (resolved_tokscale,)
+
+
+@pytest.mark.windows_compatible
+def test_tokscale_path_preserves_backslashes_and_spaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a configured absolute Windows executable path as one token."""
+    path = r"C:\Program Files\UsageBassoon Tools\tokscale.cmd"
+    configuration = UsageBassoonConfig(
+        path=tmp_path / "config.toml",
+        source_id=SOURCE_ID,
+        backend="duckdb",
+        local_database=Path(":memory:"),
+        tokscale_bin=path,
+    )
+
+    def which(_command: str) -> str | None:
+        return None
+
+    monkeypatch.setattr("usagebassoon.collector.shutil.which", which)
+
+    assert resolve_tokscale_command(configuration) == (path,)
+
+
+@pytest.mark.windows_compatible
+def test_windows_command_parser_preserves_quoted_path_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep backslashes and spaces in a quoted Windows command path."""
+    monkeypatch.setattr("usagebassoon.collector.os", SimpleNamespace(name="nt"))
+
+    assert _split_tokscale_command(
+        r'"C:\Program Files\nodejs\npx.cmd" tokscale@latest'
+    ) == (r"C:\Program Files\nodejs\npx.cmd", "tokscale@latest")
+
+
+@pytest.mark.windows_compatible
 def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:
     """Include the installed version in both status presentation formats."""
     from usagebassoon.scheduling import human_status, status_json
@@ -160,6 +236,7 @@ def test_schedule_status_includes_usagebassoon_version(tmp_path: Path) -> None:
     assert json.loads(status_json(status))["usagebassoon_version"] == __version__
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_preflight_reports_missing_default_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,6 +257,7 @@ def test_tokscale_preflight_reports_missing_default_install(
         preflight_tokscale(configuration)
 
 
+@pytest.mark.windows_compatible
 def test_doctor_surfaces_missing_native_scheduler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -204,6 +282,7 @@ def test_doctor_surfaces_missing_native_scheduler(
     assert "bassoon schedule worker" in check.message
 
 
+@pytest.mark.windows_smoke
 def test_worker_interval_is_persisted_before_the_first_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -242,6 +321,21 @@ def test_worker_interval_is_persisted_before_the_first_cycle(
     )
 
 
+@pytest.mark.windows_smoke
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows")
+def test_windows_detached_worker_reports_foreground_guidance(tmp_path: Path) -> None:
+    """Explain that Windows workers run in the foreground under a supervisor."""
+    result = CliRunner().invoke(
+        app,
+        ["schedule", "worker", "--config", str(tmp_path / "config.toml")],
+    )
+    output = plain_cli_output(result.output)
+    assert result.exit_code == 1
+    assert "detached schedule workers are not supported on Windows" in output
+    assert "--foreground" in output
+
+
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("change", ["edited", "replaced", "invalid", "deleted", "none"])
 def test_worker_keeps_startup_configuration_until_restart(
     tmp_path: Path,
@@ -327,6 +421,7 @@ def test_worker_keeps_startup_configuration_until_restart(
         assert "22222222-2222-4222-8222-222222222222" not in stderr
 
 
+@pytest.mark.windows_compatible
 def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     """Report unsupported day-granularity worker intervals before startup."""
     configuration = _configuration(tmp_path)
@@ -336,6 +431,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
         [
             "schedule",
             "worker",
+            "--foreground",
             "--config",
             str(configuration.path),
             "--collect-interval",
@@ -347,6 +443,7 @@ def test_worker_rejects_invalid_interval_argument(tmp_path: Path) -> None:
     assert "minutes or hours" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("collect_flag", "snapshot_flag"),
     [("--collect-interval", "--snapshot-interval"), ("-c", "-s")],
@@ -401,6 +498,7 @@ def test_worker_cli_starts_detached_process_and_reports_pid(
     assert str(started.log_path) in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("collect_flag", ["--collect-interval", "-c"])
 def test_schedule_install_persists_explicit_interval(
     tmp_path: Path,
@@ -457,6 +555,7 @@ def test_schedule_install_persists_explicit_interval(
     )
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_worker_runs_while_collection_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -518,6 +617,7 @@ def test_snapshot_worker_runs_while_collection_is_blocked(
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.windows_compatible
 def test_native_snapshot_artifacts_have_independent_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
@@ -546,6 +646,7 @@ def test_native_snapshot_artifacts_have_independent_cadence(
     monkeypatch.setattr(module, "_systemd_unit_dir", lambda: tmp_path)
     monkeypatch.setattr(module, "_snapshot_plist", lambda: tmp_path / "snapshot.plist")
     monkeypatch.setattr(module, "_resolve_bassoon", lambda: "/usr/bin/bassoon")
+    monkeypatch.setattr(module.os, "getuid", lambda: 501, raising=False)
     calls: list[list[str]] = []
 
     def run(
@@ -567,6 +668,7 @@ def test_native_snapshot_artifacts_have_independent_cadence(
         assert "--automatic" in payload["ProgramArguments"]
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("disabled_weekly", [False, True])
 def test_snapshot_schedule_defaults_and_disable_flags(
     tmp_path: Path, disabled_weekly: bool
@@ -595,6 +697,7 @@ def test_snapshot_schedule_defaults_and_disable_flags(
     assert snapshot_schedule_seconds(disabled) is None
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("snapshot_flag", ["--snapshot-interval", "-s"])
 def test_schedule_install_persists_independent_snapshot_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_flag: str
@@ -642,6 +745,7 @@ def test_schedule_install_persists_independent_snapshot_interval(
     assert ConfigurationManager(config.path).load() == observed[0]
 
 
+@pytest.mark.windows_compatible
 def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     """Validate and persist both independent schedules before worker startup."""
     from usagebassoon.scheduling import _worker_configuration
@@ -653,12 +757,15 @@ def test_worker_persists_both_intervals(tmp_path: Path) -> None:
     assert ConfigurationManager(config.path).load() == loaded
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("role", "failure_kind"),
     [
         ("collection", "error"),
         ("collection", "busy"),
         ("collection", "timeout"),
+        ("collection", "settings-write"),
+        ("collection", "settings-rejected"),
         ("snapshot", "error"),
     ],
 )
@@ -672,6 +779,7 @@ def test_worker_continues_after_an_operational_cycle_failure(
 ) -> None:
     """Failed cycles remain observable and do not prevent the next scheduled run."""
     import usagebassoon.scheduling as module
+    from usagebassoon import collector as subprocess_collector
     from usagebassoon.collection_lock import CollectionBusy, collection_lock
     from usagebassoon.collector import _json_command
 
@@ -684,6 +792,42 @@ def test_worker_continues_after_an_operational_cycle_failure(
         if failure_kind == "busy"
         else OSError("cycle unavailable")
     )
+    if failure_kind in {"settings-write", "settings-rejected"}:
+        original = tmp_path / "user-profile"
+        original.mkdir()
+        monkeypatch.setenv("TOKSCALE_CONFIG_DIR", str(original))
+        monkeypatch.setattr(
+            subprocess_collector,
+            "default_tokscale_directory",
+            lambda: tmp_path / "tokscale-data",
+        )
+
+        def uses_utc(_config: UsageBassoonConfig, _environment: object) -> bool:
+            """Exercise recovery after a first-cycle write or UTC rejection."""
+            return failure_kind != "settings-rejected" or len(attempts) != 1
+
+        monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", uses_utc)
+        write_text = Path.write_text
+
+        def write_settings(
+            path: Path,
+            data: str,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+        ) -> int:
+            """Fail only the first cycle's private UTC-settings write."""
+            if (
+                failure_kind == "settings-write"
+                and path.name == "settings.json"
+                and len(attempts) == 1
+            ):
+                raise failure
+            return write_text(
+                path, data, encoding=encoding, errors=errors, newline=newline
+            )
+
+        monkeypatch.setattr(Path, "write_text", write_settings)
 
     class StopAfterTwoCycles(Event):
         """Advance two cycles without sleeping or leaving a worker running."""
@@ -698,6 +842,20 @@ def test_worker_continues_after_an_operational_cycle_failure(
     def cycle(configuration: UsageBassoonConfig) -> None:
         nonlocal failure
         attempts.append(configuration)
+        if failure_kind in {"settings-write", "settings-rejected"}:
+            try:
+                with subprocess_collector.tokscale_profile(configuration) as profile:
+                    settings = (
+                        Path(profile.environment["TOKSCALE_CONFIG_DIR"])
+                        / "settings.json"
+                    )
+                    assert json.loads(settings.read_text()) == {
+                        "scanner": {"bucketTimezone": "UTC"}
+                    }
+            except RuntimeError as error:
+                failure = error
+                raise
+            return
         if failure_kind == "timeout":
             command = (
                 "import time; time.sleep(8)" if len(attempts) == 1 else "print('{}')"
@@ -755,6 +913,7 @@ def test_worker_continues_after_an_operational_cycle_failure(
         assert records[0].exc_info[1] is failure
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("origin", ["child", "backend"])
 @pytest.mark.parametrize("disabled", [False, True])
 def test_worker_failure_outputs_protect_active_credentials(
@@ -768,6 +927,7 @@ def test_worker_failure_outputs_protect_active_credentials(
     from dataclasses import replace
     from sys import executable
 
+    import usagebassoon.privacy as privacy
     import usagebassoon.scheduling as module
     from usagebassoon.collector import _json_command
     from usagebassoon.logger import LOG_DIRECTORY_ENV_VAR
@@ -775,6 +935,11 @@ def test_worker_failure_outputs_protect_active_credentials(
     monkeypatch.setenv(LOG_DIRECTORY_ENV_VAR, str(tmp_path / "logs"))
     monkeypatch.setenv("MOTHERDUCK_TOKEN", "unlabeled-backend-credential")
     monkeypatch.setenv("CUSTOM_INPUT", "unlabeled-child-credential")
+    monkeypatch.setattr(
+        privacy,
+        "_CREDENTIAL_NAME_DENYLIST",
+        privacy._CREDENTIAL_NAME_DENYLIST | {"CUSTOM_INPUT"},
+    )
     config = replace(
         _configuration(tmp_path),
         tokscale_env=("CUSTOM_INPUT",),
@@ -856,6 +1021,7 @@ def test_worker_failure_outputs_protect_active_credentials(
         assert "collection publication failed" in log
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("content", ["not-a-pid", "0", "-1"])
 def test_invalid_worker_pid_state_blocks_worker_control(
     tmp_path: Path,
@@ -871,6 +1037,7 @@ def test_invalid_worker_pid_state_blocks_worker_control(
         _read_worker_pid(path)
 
 
+@pytest.mark.windows_compatible
 def test_unreadable_worker_pid_state_is_not_absence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -888,6 +1055,7 @@ def test_unreadable_worker_pid_state_is_not_absence(
     assert isinstance(caught.value.__cause__, PermissionError)
 
 
+@pytest.mark.windows_compatible
 def test_healthy_collection_does_not_mask_an_inactive_snapshot_schedule(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

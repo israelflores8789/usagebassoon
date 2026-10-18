@@ -158,7 +158,10 @@ def write_initial_config(path: Path) -> bool:
             sync_directory(path.parent)
             return False
         content = (
-            f'source_id = "{uuid4()}"\nspinner = "pong"\n'
+            "#:schema https://raw.githubusercontent.com/israelflores8789/usagebassoon/main/config.schema.json\n\n"
+            "# Do not modify this source ID unless you know what you are doing.\n"
+            f'source_id = "{uuid4()}"\n\n'
+            'spinner = "pong"\n'
             '\n[backend]\nprovider = "duckdb"\n'
         )
         descriptor, temporary_name = tempfile.mkstemp(
@@ -166,7 +169,7 @@ def write_initial_config(path: Path) -> bool:
         )
         temporary = Path(temporary_name)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -998,7 +1001,7 @@ def _configuration_error_with_log(
             )
 
     if log_config.disable:
-        from .logger import configure
+        from usagebassoon.logger import configure
 
         configure(log_config)
         return error
@@ -1125,7 +1128,7 @@ class ConfigurationManager:
             )
         except ConfigurationError as error:
             raise _configuration_error_with_log(path, error, decoded) from error
-        from .logger import configure
+        from usagebassoon.logger import configure
 
         configure(configuration)
         return configuration

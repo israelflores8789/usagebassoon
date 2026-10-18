@@ -10,6 +10,7 @@ collection granularity.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -47,6 +48,21 @@ EXPECTED_TOKSCALE_VERSION = "4.18.0"
 FIXTURES = Path(__file__).parent / "fixtures" / f"tokscale-{EXPECTED_TOKSCALE_VERSION}"
 FIXTURE_PREFIX = f"golden-{EXPECTED_GOLDEN_DATE}-tokscale-{EXPECTED_TOKSCALE_VERSION}"
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def isolate_windows_known_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep Windows default application files inside each test's temporary root."""
+    if sys.platform == "win32":
+        import platformdirs.windows
+
+        def known_folder(_folder: str) -> str:
+            """Replace the Windows shell lookup that ignores HOME and XDG settings."""
+            return str(tmp_path)
+
+        monkeypatch.setattr(platformdirs.windows, "get_win_folder", known_folder)
 
 
 def _load(name: str) -> JsonValue:

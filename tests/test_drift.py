@@ -22,22 +22,23 @@ from usagebassoon.diagnostics import (
     format_checks,
     ingest_issues,
     run_doctor,
-    unresolved_schema_drift,
+    unresolved_payload_drift,
 )
-from usagebassoon.drift import SchemaDriftState
+from usagebassoon.drift import PayloadDriftState
 from usagebassoon.persistence import load_ingest_status
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
-def test_unresolved_schema_drift_returns_newest_events_first() -> None:
+@pytest.mark.windows_compatible
+def test_unresolved_payload_drift_returns_newest_events_first() -> None:
     """Filter resolved events and order remaining diagnostic records by freshness."""
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
         now = datetime.now(UTC)
         backend.append(
-            "schema_drift_events",
+            "payload_drift_events",
             observations(
                 pa.table(
                     {
@@ -66,7 +67,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
                 )
             ),
         )
-        records = unresolved_schema_drift(backend)
+        records = unresolved_payload_drift(backend)
         assert [record.domain for record in records] == ["report", "pricing"]
         assert records[1].drift_kind == "type_change"
         assert records[1].observation_count == 3
@@ -74,6 +75,7 @@ def test_unresolved_schema_drift_returns_newest_events_first() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
     """Report drift and run issues while leaving persisted rows unchanged."""
     backend = DuckDBBackend(":memory:")
@@ -82,7 +84,7 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
         run_id = str(uuid4())
         now = datetime.now(UTC)
         backend.append(
-            "schema_drift_events",
+            "payload_drift_events",
             observations(
                 pa.table(
                     {
@@ -114,14 +116,14 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
                         "finished_at": [now],
                         "host": ["pytest"],
                         "tokscale_ver": ["4.18.0"],
-                        "status": ["schema_drift"],
+                        "status": ["payload_drift"],
                     }
                 )
             ),
         )
         before = {
             table: backend.query(f"SELECT * FROM {table} ORDER BY event_id").to_pylist()
-            for table in ("schema_drift_events", "collection_ledger")
+            for table in ("payload_drift_events", "collection_ledger")
         }
         report = run_doctor(
             backend,
@@ -136,17 +138,18 @@ def test_run_doctor_reports_unresolved_state_without_mutating_backend() -> None:
         assert report.status == "warning"
         assert not report.errors
         assert {check.name for check in report.warnings} == {
-            "schema_drift",
+            "payload_drift",
             "collection_runs",
         }
         assert backend.query(
-            "SELECT count(*) AS count FROM current_schema_drift_events"
+            "SELECT count(*) AS count FROM current_payload_drift_events"
         ).to_pylist() == [{"count": 1}]
         assert format_checks(report.checks)[0].startswith("OK configuration:")
     finally:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -> None:
     """Load persisted event identity and first-detection metadata for rechecks."""
     database = tmp_path / "drift.duckdb"
@@ -156,7 +159,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
     try:
         backend.apply_ddl()
         backend.append(
-            "schema_drift_events",
+            "payload_drift_events",
             observations(
                 pa.table(
                     {
@@ -186,13 +189,13 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
         local_database=database,
     )
 
-    statuses, models, prices, reconciliation, schema_drift, _inventory, _daily = (
+    statuses, models, prices, reconciliation, payload_drift, _inventory, _daily = (
         load_ingest_status(config)
     )
 
     assert (statuses, models, prices, reconciliation) == ({}, {}, {}, frozenset())
-    assert schema_drift == (
-        SchemaDriftState(
+    assert payload_drift == (
+        PayloadDriftState(
             domain="models",
             tokscale_ver="4.18.1",
             drift_key="unknown_field:future",
@@ -206,6 +209,7 @@ def test_load_collection_status_returns_unresolved_drift_state(tmp_path: Path) -
     )
 
 
+@pytest.mark.windows_compatible
 def test_run_doctor_reports_active_bigquery_transactions() -> None:
     """Surface active warehouse transactions in BigQuery diagnostics."""
 
@@ -236,6 +240,7 @@ def test_run_doctor_reports_active_bigquery_transactions() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_ingest_issues_rejects_non_positive_limit() -> None:
     """Reject invalid diagnostic limits before issuing SQL."""
     backend = MagicMock(spec=StorageBackend)
@@ -244,7 +249,8 @@ def test_ingest_issues_rejects_non_positive_limit() -> None:
     backend.query.assert_not_called()
 
 
-@pytest.mark.parametrize("table", ["schema_drift_events", "reconciliation_issues"])
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize("table", ["payload_drift_events", "reconciliation_issues"])
 def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
     table: str,
 ) -> None:
@@ -267,8 +273,8 @@ def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
         )
         backend.append(table, pa.Table.from_pylist([row], schema=schema))
         read = (
-            unresolved_schema_drift
-            if table == "schema_drift_events"
+            unresolved_payload_drift
+            if table == "payload_drift_events"
             else reconciliation_issues
         )
         assert read(backend) == ()
@@ -289,6 +295,7 @@ def test_doctor_hides_stale_events_without_pruning_and_allows_fresh_sightings(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("workers", [1, 2])
 def test_doctor_uses_backend_capabilities_without_provider_selectors(
     workers: int,
@@ -328,7 +335,7 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
                     self.overlap.set()
             try:
                 assert self.overlap.wait(5), "diagnostic queries did not overlap"
-                if "open_schema_drift_events" in sql:
+                if "open_payload_drift_events" in sql:
                     raise RuntimeError("drift read failed")
                 return pa.table({})
             finally:
@@ -359,13 +366,14 @@ def test_doctor_uses_backend_capabilities_without_provider_selectors(
         assert backend.peak == workers
         assert checks["compaction"].status == "error"
         assert len(checks["compaction"].details) == 1
-        assert checks["schema_drift"].status == "error"
+        assert checks["payload_drift"].status == "error"
         assert checks["collection_runs"].status == "ok"
         assert checks["reconciliation"].status == "ok"
     finally:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_doctor_schema_fallback_identifies_missing_relation_for_any_backend() -> None:
     """Keep precise schema errors when the shared combined probe fails."""
     backend = DuckDBBackend(":memory:")

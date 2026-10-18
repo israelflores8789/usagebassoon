@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
 
@@ -35,6 +35,7 @@ LOCAL_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 REMOTE_SOURCE_ID = "22222222-2222-4222-8222-222222222222"
 
 
+@pytest.mark.windows_compatible
 def test_gemini_flash_model_labels_preserve_the_version_when_width_allows() -> None:
     """Keep Gemini Flash versions identifiable in the bounded session table."""
     assert _model_label("gemini-3.8-flash", True, 100) == "ge…3.8-flash"
@@ -56,8 +57,9 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
         f'source_id = "{LOCAL_SOURCE_ID}"\n'
-        f'backend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -179,6 +181,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     return config, backend
 
 
+@pytest.mark.windows_compatible
 def test_report_group_lists_supported_commands() -> None:
     """Expose the supported terminal reports in group help."""
     result = CliRunner().invoke(app, ["report", "--help"])
@@ -189,6 +192,7 @@ def test_report_group_lists_supported_commands() -> None:
         assert command in commands
 
 
+@pytest.mark.windows_compatible
 def test_daily_report_filters_local_tagged_usage(tmp_path: Path) -> None:
     """Aggregate only the configured source's effective-tag usage by day."""
     config, backend = _configured_store(tmp_path)
@@ -220,6 +224,7 @@ def test_daily_report_filters_local_tagged_usage(tmp_path: Path) -> None:
     assert "Re-run with --sanitize" not in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
     tmp_path: Path,
 ) -> None:
@@ -257,6 +262,7 @@ def test_daily_report_falls_back_to_tokscale_cost_for_unpriced_usage(
     assert "$6,670.270" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_models_report_weights_timing_after_source_and_tag_filters(
     tmp_path: Path,
 ) -> None:
@@ -305,6 +311,7 @@ def test_models_report_weights_timing_after_source_and_tag_filters(
     assert "109" not in local_tagged_text
 
 
+@pytest.mark.windows_compatible
 def test_models_report_test_mode_uses_daily_fixture_timing() -> None:
     """Show model timing from golden daily fixtures without a configured backend."""
     result = CliRunner().invoke(
@@ -318,6 +325,7 @@ def test_models_report_test_mode_uses_daily_fixture_timing() -> None:
     assert "—" not in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_models_report_excludes_duration_without_timed_tokens(tmp_path: Path) -> None:
     """Keep zero-token timing rows out of the grouped performance rate."""
     config, backend = _configured_store(tmp_path)
@@ -352,6 +360,7 @@ def test_models_report_excludes_duration_without_timed_tokens(tmp_path: Path) ->
     assert "1,000" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_sessions_report_defaults_to_session_and_can_split_models(
     tmp_path: Path,
 ) -> None:
@@ -405,6 +414,7 @@ def test_sessions_report_defaults_to_session_and_can_split_models(
     assert "gpt-mini" in plain_cli_output(model_result.output)
 
 
+@pytest.mark.windows_compatible
 def test_daily_and_models_date_bounds_compose_with_source_and_client(
     tmp_path: Path,
 ) -> None:
@@ -444,6 +454,7 @@ def test_daily_and_models_date_bounds_compose_with_source_and_client(
     assert "1,657" not in models_text
 
 
+@pytest.mark.windows_compatible
 def test_session_date_bounds_select_whole_sessions_and_creation_mode(
     tmp_path: Path,
 ) -> None:
@@ -524,7 +535,8 @@ def test_session_date_bounds_select_whole_sessions_and_creation_mode(
     created_text = plain_cli_output(by_created_at.output)
     assert "Created At" in created_text
     assert "Last Active" not in created_text
-    assert "2026-09-08 08:00" in created_text
+    expected_created = datetime(2026, 9, 8, 8, tzinfo=UTC).astimezone()
+    assert expected_created.strftime("%Y-%m-%d %H:%M") in created_text
     assert "278" in created_text
     assert created_by_model.exit_code == 0
     created_by_model_text = plain_cli_output(created_by_model.output)
@@ -537,6 +549,7 @@ def test_session_date_bounds_select_whole_sessions_and_creation_mode(
     )
 
 
+@pytest.mark.windows_compatible
 def test_session_creation_mode_changes_ordering(tmp_path: Path) -> None:
     """Order complete sessions by the timestamp named in the last column."""
     config, backend = _configured_store(tmp_path)
@@ -568,6 +581,7 @@ def test_session_creation_mode_changes_ordering(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.windows_compatible
 def test_session_values_and_model_counts_remain_whole_at_floor() -> None:
     """Protect numeric values and aggregate-model counts at the minimum width."""
     result = CliRunner().invoke(
@@ -595,6 +609,7 @@ def test_session_values_and_model_counts_remain_whole_at_floor() -> None:
     assert "flash+1" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
     """Render a deterministic, bounded token graph without warehouse access."""
     result = CliRunner().invoke(
@@ -621,6 +636,7 @@ def test_graph_test_mode_needs_no_configuration_and_selects_metric() -> None:
     assert "10" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
     """Render graph currency labels with the same two-decimal precision as Cost."""
     result = CliRunner().invoke(
@@ -642,6 +658,7 @@ def test_cost_graph_uses_two_decimal_y_axis_labels() -> None:
     assert "$6.990" not in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     """Render the newest golden daily totals with their unit and cost formatting."""
     result = CliRunner().invoke(
@@ -663,6 +680,7 @@ def test_report_test_mode_uses_golden_fixture_statistics() -> None:
     assert "$12.58" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:
     """Use explicit numeric ticks rather than uneven categorical auto-ticks."""
     positions = _tick_positions(20, 100)
@@ -671,6 +689,7 @@ def test_graph_ticks_are_uniformly_spaced_for_a_bounded_terminal() -> None:
     assert all(right - left == 2 for left, right in pairwise(positions))
 
 
+@pytest.mark.windows_compatible
 def test_report_test_mode_saves_without_sharing_reminder(tmp_path: Path) -> None:
     """Keep saved deterministic reports suitable for deliberate file sharing."""
     saved = tmp_path / "daily.txt"
@@ -680,10 +699,11 @@ def test_report_test_mode_saves_without_sharing_reminder(tmp_path: Path) -> None
     )
 
     assert result.exit_code == 0
-    assert "Re-run with --sanitize" not in saved.read_text()
-    assert "Daily Token Usage" in saved.read_text()
+    assert "Re-run with --sanitize" not in saved.read_text(encoding="utf-8")
+    assert "Daily Token Usage" in saved.read_text(encoding="utf-8")
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("milliseconds", "expected"),
     [
@@ -701,6 +721,7 @@ def test_session_duration_thresholds(milliseconds: int | None, expected: str) ->
     assert _format_duration(milliseconds) == expected
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("by_model", [False, True])
 def test_session_duration_aggregation_and_sorting(
     tmp_path: Path, by_model: bool
@@ -770,6 +791,7 @@ def test_session_duration_aggregation_and_sorting(
     assert "ses_local_other" not in bounded_text
 
 
+@pytest.mark.windows_compatible
 def test_sessions_reject_width_below_floor() -> None:
     """Fail before opening a backend when session width is below 100."""
     result = CliRunner().invoke(app, ["report", "sessions", "--width", "99"])
@@ -777,6 +799,7 @@ def test_sessions_reject_width_below_floor() -> None:
     assert "at least 100" in plain_cli_output(result.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("width", "metrics", "by_model"),
     [
@@ -854,9 +877,13 @@ def test_session_optional_metric_layout(
         assert "flash+1" in text
     if "--with-performance" in metrics:
         assert "ms/1K" in text
-    assert all(len(line) <= effective_width for line in saved.read_text().splitlines())
+    assert all(
+        len(line) <= effective_width
+        for line in saved.read_text(encoding="utf-8").splitlines()
+    )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("sort", "column"),
     [
@@ -915,6 +942,7 @@ def test_session_sort_orders_metric_before_limit(
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("by_model", [False, True])
 def test_session_performance_weights_only_paired_components(
     tmp_path: Path, by_model: bool
@@ -983,6 +1011,7 @@ def test_session_performance_weights_only_paired_components(
     assert ("01s" if by_model else "01m31s") in text
 
 
+@pytest.mark.windows_compatible
 def test_session_sort_and_performance_options() -> None:
     """Expose sort and performance options while rejecting invalid sort values."""
     runner = CliRunner()
@@ -998,6 +1027,7 @@ def test_session_sort_and_performance_options() -> None:
     )
 
 
+@pytest.mark.windows_compatible
 def test_session_identifiers_expand_client_before_session(tmp_path: Path) -> None:
     """Reveal full identifiers progressively while retaining both ends when cut."""
     config, backend = _configured_store(tmp_path)
@@ -1047,6 +1077,7 @@ def test_session_identifiers_expand_client_before_session(tmp_path: Path) -> Non
         assert len(current[1]) >= len(previous[1])
 
 
+@pytest.mark.windows_compatible
 def test_middle_truncation_counts_terminal_cells() -> None:
     """Keep Unicode identifiers within their allotted terminal cell width."""
     value = "開始ABCDEFGHIJK終了"
@@ -1057,6 +1088,7 @@ def test_middle_truncation_counts_terminal_cells() -> None:
     assert value.startswith(prefix) and value.endswith(suffix)
 
 
+@pytest.mark.windows_compatible
 def test_session_empty_results_support_explicit_widths() -> None:
     """Render an empty bounded session report without losing its message."""
     result = CliRunner().invoke(

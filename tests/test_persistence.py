@@ -17,6 +17,7 @@ from usagebassoon.normalizer import NormalizedBundle, normalize
 from usagebassoon.persistence import PersistSummary, persist_with_retries
 
 
+@pytest.mark.windows_compatible
 def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
     collection_bundle: CollectionBundle,
     tmp_path: Path,
@@ -87,6 +88,7 @@ def test_attempt_deadline_includes_open_and_retries_with_stable_batch(
     assert len({id(scope) for scope in scopes}) == 3
 
 
+@pytest.mark.windows_compatible
 def test_persistence_retries_one_normalized_run_without_recollection(
     collection_bundle: CollectionBundle,
     monkeypatch: pytest.MonkeyPatch,
@@ -166,6 +168,7 @@ def test_persistence_retries_one_normalized_run_without_recollection(
     assert "transient warehouse error" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("failure_mode", "max_retries", "expected_attempts"),
     [

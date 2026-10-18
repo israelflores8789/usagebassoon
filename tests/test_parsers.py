@@ -25,6 +25,7 @@ from usagebassoon.parsers.pricing import PricingRow, parse_pricing
 from usagebassoon.parsers.report import SessionRow, make_session_label, parse_report
 
 
+@pytest.mark.windows_compatible
 def test_models_field_promotion(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:
@@ -45,6 +46,7 @@ def test_models_field_promotion(
     assert 0.0 <= (row.perf_token_coverage or 0.0) <= 1.0
 
 
+@pytest.mark.windows_compatible
 def test_models_merged_clients_nullable(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:
@@ -56,12 +58,14 @@ def test_models_merged_clients_nullable(
     )
 
 
+@pytest.mark.windows_compatible
 def test_models_invalid_payload_type() -> None:
     """Assert non-object payloads are rejected."""
     with pytest.raises(ValueError, match="must be a JSON object"):
         parse_models(["not", "an", "object"])
 
 
+@pytest.mark.windows_compatible
 def test_tokscale_metrics_reject_negative_and_non_finite_values(
     daily_raws: dict[date, JsonObject],
     pricing_raws: dict[str, JsonObject],
@@ -87,6 +91,7 @@ def test_tokscale_metrics_reject_negative_and_non_finite_values(
             parse_pricing(invalid_pricing)
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_attach_requested_days(
     daily_models: dict[date, DailyModelsPayload],
 ) -> None:
@@ -102,6 +107,7 @@ def test_daily_models_attach_requested_days(
     )
 
 
+@pytest.mark.windows_compatible
 def test_daily_models_reuse_the_models_contract(
     daily_raws: dict[date, JsonObject],
 ) -> None:
@@ -111,6 +117,7 @@ def test_daily_models_reuse_the_models_contract(
     assert parse_daily(daily_raws[min(daily_raws)], day=min(daily_raws)).entries
 
 
+@pytest.mark.windows_compatible
 def test_report_rows_and_timestamps(report_rows: list[SessionRow]) -> None:
     """Preserve all golden sessions and parse timestamps as aware UTC values."""
     assert len(report_rows) == EXPECTED_REPORT_ROWS
@@ -120,6 +127,7 @@ def test_report_rows_and_timestamps(report_rows: list[SessionRow]) -> None:
     assert row.created_at.utcoffset() == UTC.utcoffset(row.created_at)
 
 
+@pytest.mark.windows_compatible
 def test_report_no_llm_summary_fields(report_rows: list[SessionRow]) -> None:
     """Assert summary fields never reach the curated layer."""
     excluded = {
@@ -135,6 +143,7 @@ def test_report_no_llm_summary_fields(report_rows: list[SessionRow]) -> None:
         assert excluded.isdisjoint(row.model_fields_set | set(row.model_dump()))
 
 
+@pytest.mark.windows_compatible
 def test_report_duplicate_session_rows_are_merged() -> None:
     """Merge repeated daily report rows using stable session metadata rules."""
     rows = parse_report(
@@ -175,6 +184,7 @@ def test_report_duplicate_session_rows_are_merged() -> None:
     assert rows[0].tokscale_cost_usd == 0.2
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("field", ["workspace", "workspace_label"])
 def test_report_duplicate_stable_metadata_must_match(field: str) -> None:
     """Reject duplicate report rows with conflicting stable metadata."""
@@ -193,12 +203,49 @@ def test_report_duplicate_stable_metadata_must_match(field: str) -> None:
         parse_report([first, duplicate])
 
 
+@pytest.mark.windows_compatible
 def test_session_label_unique(report_rows: list[SessionRow]) -> None:
-    """Assert deterministic labels are unique across all fixture sessions."""
+    """Distinguish shared prefixes and compound IDs with eight-character suffixes."""
     labels = [make_session_label(r) for r in report_rows]
+    for client, session_id, suffix in (
+        (
+            "codex",
+            "rollout-2026-10-13T01-58-47-01234567-89ab-7cde-8fab-0123456789ab",
+            "456789ab",
+        ),
+        (
+            "codex",
+            "rollout-2026-10-13T01-59-03-01234567-89ab-7cde-8fab-01234567cdef",
+            "4567cdef",
+        ),
+        (
+            "codex",
+            "rollout-2026-10-13T03-51-50-01234567-89ab-7cde-8fab-0123456789ab"
+            "_01234567-89ab-7cde-8fab-0123feedface",
+            "feedface",
+        ),
+        ("opencode", "ses_sharedprefix1234abcdefgh", "abcdefgh"),
+        ("opencode", "ses_sharedprefix1234ijklmnop", "ijklmnop"),
+    ):
+        row = SessionRow.model_validate(
+            {
+                "client": client,
+                "session_id": session_id,
+                "workspace_label": "project",
+                "created_at": "2026-10-13T00:00:00Z",
+            }
+        )
+        label = make_session_label(row)
+        assert label == f"project · 2026-10-13 · {suffix}"
+        labels.append(label)
     assert len(set(labels)) == len(labels)
+    assert (
+        make_session_label(SessionRow(client="codex", session_id="tiny"))
+        == "session · unknown-date · tiny"
+    )
 
 
+@pytest.mark.windows_compatible
 def test_graph_shape(graph_payload: GraphPayload) -> None:
     """Assert the graph payload carries the expected fixture shape."""
     assert len(graph_payload.contributions) == EXPECTED_DAYS
@@ -209,6 +256,7 @@ def test_graph_shape(graph_payload: GraphPayload) -> None:
     assert graph_payload.contributions[0].date == date(2026, 8, 22)
 
 
+@pytest.mark.windows_compatible
 def test_graph_duplicate_dates_rejected(graph_raw: JsonObject) -> None:
     """Assert duplicate contribution dates are rejected."""
     dup = dict(graph_raw)
@@ -219,6 +267,7 @@ def test_graph_duplicate_dates_rejected(graph_raw: JsonObject) -> None:
         parse_graph(dup)
 
 
+@pytest.mark.windows_compatible
 def test_pricing_shape(pricing_rows: dict[str, PricingRow]) -> None:
     """Assert the pricing fixture carries provenance and nullable rates."""
     pricing_row = pricing_rows["gemini-3.8-flash"]
@@ -238,6 +287,7 @@ def test_pricing_shape(pricing_rows: dict[str, PricingRow]) -> None:
         assert parse_pricing(payload).source == source
 
 
+@pytest.mark.windows_compatible
 def test_pricing_cache_creation_is_retained(
     pricing_rows: dict[str, PricingRow],
 ) -> None:
@@ -247,6 +297,7 @@ def test_pricing_cache_creation_is_retained(
     assert pricing_rows["gemini-3.8-flash"].pricing.cache_write_input_token_cost is None
 
 
+@pytest.mark.windows_compatible
 def test_pricing_captures_cover_used_models(
     daily_models: dict[date, DailyModelsPayload],
     pricing_raws: dict[str, JsonObject],

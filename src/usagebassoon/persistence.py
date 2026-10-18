@@ -23,7 +23,7 @@ from usagebassoon.backends.base import (
 from usagebassoon.backends.factory import open_backend
 from usagebassoon.config import UsageBassoonConfig
 from usagebassoon.deadlines import OperationTimeout, operation
-from usagebassoon.drift import SchemaDriftState
+from usagebassoon.drift import PayloadDriftState
 from usagebassoon.ingest import IngestStatus, IngestTarget, ReportInventory
 from usagebassoon.logger import LOGGER_NAME
 from usagebassoon.normalizer import NormalizedBundle
@@ -74,7 +74,7 @@ def load_ingest_status(
     dict[date, set[str]],
     dict[date, set[str]],
     frozenset[ReconciliationIdentity],
-    tuple[SchemaDriftState, ...],
+    tuple[PayloadDriftState, ...],
     ReportInventory,
     pa.Table,
 ]:
@@ -140,7 +140,7 @@ def load_ingest_status(
                 raise RuntimeError("reconciliation_issues contains an invalid identity")
             issue_identities.add((check_name, issue_key))
         drift_rows = [row for row in planning if row["record_kind"] == "drift"]
-        schema_drift: list[SchemaDriftState] = []
+        payload_drift: list[PayloadDriftState] = []
         for row in drift_rows:
             domain = row["domain"]
             tokscale_ver = row["tokscale_ver"]
@@ -162,9 +162,9 @@ def load_ingest_status(
                 or not isinstance(created_at, datetime)
                 or not isinstance(observation_count, int)
             ):
-                raise RuntimeError("schema_drift_events contains an invalid row")
-            schema_drift.append(
-                SchemaDriftState(
+                raise RuntimeError("payload_drift_events contains an invalid row")
+            payload_drift.append(
+                PayloadDriftState(
                     domain=domain,
                     tokscale_ver=tokscale_ver,
                     drift_key=drift_key,
@@ -196,7 +196,7 @@ def load_ingest_status(
             models_by_day,
             prices_by_day,
             frozenset(issue_identities),
-            tuple(schema_drift),
+            tuple(payload_drift),
             ReportInventory(inventory.sessions, frozenset(missing)),
             pa.Table.from_pylist(
                 [row for row in planning if row["record_kind"] == "models"],

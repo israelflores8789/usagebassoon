@@ -120,6 +120,7 @@ bunx tokscale@4.18.0 --version
 
 > [!NOTE]
 > You can set `[tokscale].bin` in `config.toml` or the `TOKSCALE_BIN` environment variable to choose the command; the configuration value takes precedence. With neither set, UsageBassoon uses a local `tokscale` executable when available, otherwise `bunx tokscale@latest`. Pin the supported release with `bin = "bunx tokscale@4.18.0"`.
+> `bin` also accepts a direct executable path. On Windows, TOML literal strings preserve backslashes as written (`bin = 'C:\Users\you\AppData\Roaming\npm\tokscale.cmd'`); basic double-quoted strings require doubled backslashes (`bin = "C:\\Users\\you\\AppData\\Roaming\\npm\\tokscale.cmd"`).
 
 ### Source identity
 
@@ -138,7 +139,7 @@ bunx tokscale@4.18.0 --version
 
 All report commands support combined `--client`, `--model`, `--workspace`, `--tag`, and `--source` filters; use `--source local` for the configured source only.
 
-All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
+All report commands support inclusive `--since YYYY-MM-DD` and `--until YYYY-MM-DD` (*UTC timezone only supported at this time*) bounds on usage days and can also be combined with all other filters. `report sessions`, including with `--by-model`, filters by the last active timestamp or `--sort created-at`.
 
 `--width 100` is the default bounded layout, but `--width max` disables truncation.
 
@@ -310,7 +311,7 @@ source_id = "018f2d70-0000-4000-8000-000000000000"  # Required; typically genera
 spinner = "pong"                                    # Optional; yaspin animation name, e.g. pong, dots, or line.
 
 [tokscale]                                          # Optional; `bin` overrides `TOKSCALE_BIN` when set.
-bin = "bunx tokscale@latest"                        # Command prefix with runner arguments.
+bin = "bunx tokscale@latest"                        # Executable path or command prefix with runner arguments.
                                                     # Examples: `npx tokscale@latest`,
                                                     #           `bunx tokscale@latest`, or
                                                     #           `deno x npm:tokscale@latest`.
@@ -390,11 +391,13 @@ Snapshot destinations are also independent of your storage backend. For example,
 
 ## Automated Scheduling
 
-`bassoon collect` performs one collection cycle. The `schedule` commands manage repeated collection on macOS (launchd), Linux (systemd), and container environments (worker script). Windows Task Scheduler integration is not supported at this time.
+`bassoon collect` performs one collection cycle. Native schedules are supported on macOS (launchd) and Linux (systemd). A detached `worker` is also supported for POSIX container environments.
+
+Windows native scheduling and the detached worker are *not* supported, but it is possible to run the worker in the foreground.
 
 ```bash
-bassoon schedule install --collect-interval 15m
-# or, for container environments
+bassoon schedule install --collect-interval 15m  # macOS or Linux
+# or, for a detached worker in a POSIX container
 bassoon schedule worker --collect-interval 15m
 
 bassoon schedule status
@@ -411,18 +414,18 @@ Native schedules launch a new `bassoon collect` process for each cycle and reloa
 bassoon schedule worker --interval 15m
 ```
 
-Starts a *detached* self-contained worker and reports its PID and log path, and it's managed in the same way system-native (systemd/launchd) scheduling is managed with `status / logs / stop`.
+Starts a *detached* self-contained worker and reports its PID and log path, and it's managed in the same way system-native (systemd/launchd) scheduling is managed with `status / logs / stop`. Note, detached worker mode is unsupported on Windows.
 
 A worker keeps the configuration loaded at startup for their entire lifetime, including `source_id`, storage backend, logging, and collection interval. Configuration files are *never* hot-swapped. For a detached worker, run `bassoon schedule stop` before editing the your `config.toml`, then run `bassoon schedule worker` to apply the new settings. Restart a foreground worker through its container or process supervisor.
 
 > [!TIP]
-> You can run the worker in the foreground so it remains the container's main process:
+> Run the worker in the foreground using the `--foreground` option. Useful on Windows or if you want the worker as your primary process in a container:
 >
 > ```bash
-> bassoon schedule worker --foreground --interval 15m
+> bassoon schedule worker --foreground --collect-interval 15m
 > ```
->
-> When using UsageBassoon in a container environment, consider a remote data warehouse like MotherDuck or BigQuery. Consider remote object storage like GCS if you want snapshot archives.
+
+When using UsageBassoon in a container environment, consider a remote data warehouse like MotherDuck or BigQuery. Consider remote object storage like GCS if you want snapshot archives.
 
 ## Tags and Notes
 
@@ -601,7 +604,7 @@ Each permission notes where it is granted and which identity needs it. **Setup**
   - `bigquery.tables.get / getData`: inspect table metadata and read schema state, reports, diagnostics, and snapshots. Setup, runtime, restore, and scheduled compaction as applicable.
   - `bigquery.tables.updateData`: append collection and curation data, seed compaction control data, and write restored or compacted state. Setup, runtime writes, restore, and scheduled compaction.
   - `bigquery.tables.create / update`: create tables and views, set schema labels and retention settings, replace view definitions, and apply registered schema migrations. Setup.
-  - `bigquery.tables.list`: discover existing relations during init and check destination contents before restore. Setup and restore.
+  - `bigquery.tables.list`: discover relations during init, read `INFORMATION_SCHEMA.VIEWS` for doctor diagnostics, and check destination contents before restore. Setup, doctor, and restore.
   - `bigquery.tables.create`, `bigquery.tables.delete`: create and remove temporary restore staging tables. Restore; table creation is also used during setup as noted above.
 - **Service account scope**
   - `iam.serviceAccounts.actAs`: attach the service account that runs the compaction schedule, granted on that specific service account. Setup when assigning a service account; also relevant to accessing an existing account-backed schedule for query changes.
@@ -644,11 +647,13 @@ project = "my-gcp-project"
 #### Permissions UsageBassoon may use
 
 - **Cloud Storage, snapshot bucket scope**
-  - `storage.objects.create / get / delete / list`: publish, read, and rotate snapshot archives and their catalogs, read archives for restore, and read lifecycle rules for doctor. Runtime archive writes and retention, and doctor.
+  - `storage.objects.create / get / delete / list`: publish, read, and rotate snapshot archives and their catalogs, and read archives for restore. Runtime archive, retention, and restore.
+  - `storage.buckets.get`: read bucket metadata, including lifecycle rules for `bassoon doctor`. Runtime doctor.
 
 #### Roles that provide them
 
 - `roles/storage.objectUser` on the snapshot bucket for a snapshot writer: object create, get, list, and delete.
+- `roles/storage.bucketViewer` (Beta) on the snapshot bucket for `bassoon doctor`: read bucket metadata, including lifecycle rules.
 
 See Google's [Cloud Storage IAM roles and permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/storage).
 

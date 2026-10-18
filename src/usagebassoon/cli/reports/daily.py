@@ -55,16 +55,23 @@ def daily(
         typer.Option("--limit", min=1, help="Maximum newest-first dates to display."),
     ] = 16,
     since: Annotated[
-        str | None, typer.Option("--since", help="Inclusive YYYY-MM-DD start.")
+        str | None,
+        typer.Option("--since", help="Inclusive YYYY-MM-DD start (UTC day)."),
     ] = None,
     until: Annotated[
-        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end.")
+        str | None, typer.Option("--until", help="Inclusive YYYY-MM-DD end (UTC day).")
     ] = None,
     client: Annotated[
         str | None, typer.Option("--client", help="Filter by exact client.")
     ] = None,
     model: Annotated[
         str | None, typer.Option("--model", help="Filter by exact model.")
+    ] = None,
+    exclude_model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-model", help="Exclude an exact model; may be repeated."
+        ),
     ] = None,
     workspace: Annotated[
         str | None, typer.Option("--workspace", help="Filter by exact workspace.")
@@ -110,6 +117,7 @@ def daily(
         source=source,
         client=client,
         model=model,
+        exclude_models=tuple(exclude_model or ()),
         workspace=workspace,
         tag=tag,
     )

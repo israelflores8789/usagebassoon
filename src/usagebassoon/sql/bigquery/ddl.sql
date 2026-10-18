@@ -211,7 +211,7 @@ CLUSTER BY source_id
 OPTIONS (partition_expiration_days = 90);
 
 -- Arrival partitions retain historical backfills for a full 90 days.
-CREATE TABLE raw_schema_drift_events (
+CREATE TABLE raw_payload_drift_events (
     run_id STRING NOT NULL,
     event_id STRING NOT NULL,
     source_id STRING NOT NULL,
@@ -270,6 +270,7 @@ CREATE TABLE collection_ledger (
     memory_bytes INT64,
     invoke_method STRING,
     tokscale_ver STRING,
+    usagebassoon_ver STRING,
     status STRING
 )
 PARTITION BY day

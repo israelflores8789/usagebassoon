@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -47,17 +48,16 @@ def _remove_temporary(path: Path) -> None:
 
 def sync_directory(path: Path) -> None:
     """Sync directory entries on platforms that support directory descriptors."""
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
+    if sys.platform != "win32":
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(descriptor)
-        except OSError as error:
-            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                raise
-    finally:
-        os.close(descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                    raise
+        finally:
+            os.close(descriptor)
 
 
 def durable_directory(path: Path) -> None:
@@ -149,6 +149,19 @@ class LocalSnapshotBucket:
         """Create a bucket rooted at a filesystem path or ``file://`` URI."""
         self.uri = uri.rstrip("/")
         self._root = Path(self.uri.removeprefix("file://")).expanduser().resolve()
+        if os.name == "nt":
+            # Keep missing and concurrently created objects in one namespace.
+            spelling = str(self._root)
+            if len(self._root.drive) == 2 and self._root.drive.endswith(":"):
+                self._root = Path("\\\\?\\" + spelling)
+            elif spelling.startswith("\\\\") and not spelling.startswith(
+                ("\\\\?\\", "\\\\.\\")
+            ):
+                self._root = Path("\\\\?\\UNC\\" + spelling[2:])
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Describe local filesystem access without exposing the OS identity."""
+        return "local file permissions", "not applicable"
 
     def _path(self, relative_name: str) -> Path:
         """Resolve one safe snapshot object path below the configured root."""
@@ -165,6 +178,10 @@ class LocalSnapshotBucket:
     @staticmethod
     def _version(stat: os.stat_result) -> str:
         """Identify a physical file revision independently of its content digest."""
+        if os.name == "nt":
+            # Windows exposes creation time through stat() but change time through
+            # fstat(); using it makes a version depend on how the file was opened.
+            return f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
         return (
             f"{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}:"
             f"{stat.st_mtime_ns}:{stat.st_size}"
@@ -174,6 +191,11 @@ class LocalSnapshotBucket:
         """Use bounded, stable lock stripes that survive snapshot deletion."""
         durable_directory(self._root)
         identity = os.path.normcase(str(self._path(relative_name)))
+        # Preserve existing lock stripes across equivalent Windows spellings.
+        if identity.startswith("\\\\?\\unc\\"):
+            identity = "\\\\" + identity[8:]
+        elif identity.startswith("\\\\?\\") and identity[5:7] == ":\\":
+            identity = identity[4:]
         stripe = hashlib.sha256(identity.encode()).hexdigest()[:2]
         return self._root / f".snapshot-lock-{stripe}"
 
@@ -274,10 +296,15 @@ class LocalSnapshotBucket:
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
-            # Hard-link publication is atomic and fails if the identity exists.
+            # Exclusive publication is atomic and preserves immutable object names.
             with _catalog_lock(self._lock(relative_name)):
-                os.link(temporary, target)
-                temporary.unlink()
+                if os.name == "nt":
+                    # Windows rename is atomic and refuses to replace an existing
+                    # destination, even where hard-link creation is unavailable.
+                    temporary.rename(target)
+                else:
+                    os.link(temporary, target)
+                    temporary.unlink()
                 sync_directory(target.parent)
                 checksum, stat = _file_metadata(target)
                 version = self._version(stat)

@@ -21,6 +21,7 @@ from usagebassoon.config import default_snapshot_directory
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("location", ["default", "path", "file_uri"])
 def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     tmp_path: Path,
@@ -42,8 +43,9 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
         snapshot_settings = f"[snapshots.local]\npath = '{value}'\n"
     config.write_text(
         f'source_id = "{SOURCE_ID}"\n'
-        f'backend.provider = "duckdb"\nbackend.duckdb.database = "{database}"\n'
-        + snapshot_settings
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n" + snapshot_settings,
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -70,10 +72,16 @@ def test_snapshot_writes_a_manual_run_manifest_for_an_uncollected_store(
     assert set(manifest["tables"]) == set(SNAPSHOT_TABLES)
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_management_and_audit_aliases_share_structured_results(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Use one shared integrity handler without requiring a destination config."""
+    from collections.abc import Sequence
+
+    from usagebassoon.snapshot.reader import Candidate, PreparedSnapshot, SnapshotReader
+
     backend = DuckDBBackend(":memory:")
     backend.apply_ddl()
     store = SnapshotStore(str(tmp_path / "archive"))
@@ -131,6 +139,67 @@ def test_snapshot_management_and_audit_aliases_share_structured_results(
             "backend_schema_hash",
         )
     )
+    downloads: list[str] = []
+    selections: list[str] = []
+    original_download = SnapshotReader.download
+    original_copy = store.copy
+    destination = tmp_path / "copied"
+
+    def track_download(
+        self: SnapshotReader,
+        candidate: Candidate,
+        directory: Path,
+        tables: Sequence[str],
+        *,
+        allow_staging: bool = False,
+        transform: bool = True,
+    ) -> PreparedSnapshot:
+        """Observe complete source and destination validation passes."""
+        downloads.append(candidate.uri)
+        return original_download(
+            self,
+            candidate,
+            directory,
+            tables,
+            allow_staging=allow_staging,
+            transform=transform,
+        )
+
+    def copy_exact(selection: str, target: str) -> str:
+        """Keep the confirmed source stable through the archiver handoff."""
+        selections.append(selection)
+        return original_copy(selection, target)
+
+    def configured_archiver(_config: Path | None) -> SnapshotStore:
+        """Expose the source archive for automatic latest selection."""
+        return store
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SnapshotReader, "download", track_download)
+        declined = runner.invoke(
+            app,
+            [
+                "snapshot",
+                "copy",
+                str(destination),
+                "--from-snapshot",
+                uri,
+                "--config",
+                str(tmp_path / "lost.toml"),
+            ],
+            input="n\n",
+        )
+        assert declined.exit_code != 0
+        assert downloads == []
+        assert not destination.exists()
+        patch.setattr("usagebassoon.cli.snapshot.read_archiver", configured_archiver)
+        patch.setattr(store, "copy", copy_exact)
+        copied = runner.invoke(app, ["snapshot", "copy", str(destination)])
+        assert copied.exit_code == 0, plain_cli_output(copied.output)
+        assert selections == [uri]
+        assert downloads == [uri, f"{destination}/{Path(uri).name}"]
+        assert (destination / Path(uri).name / "COMPLETE").is_file()
+
     refused = runner.invoke(
         app,
         ["snapshot", "delete", uri, "--config", str(tmp_path / "lost.toml")],
@@ -147,6 +216,7 @@ def test_snapshot_management_and_audit_aliases_share_structured_results(
     assert not (Path(uri) / "COMPLETE").exists()
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_delete_does_not_include_copies_created_during_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,6 +260,7 @@ def test_snapshot_delete_does_not_include_copies_created_during_confirmation(
     assert f"archive/{identifier}/COMPLETE" in cloud.objects
 
 
+@pytest.mark.windows_compatible
 def test_inspect_exposes_verified_producer_metadata_for_unsupported_contract(
     tmp_path: Path,
 ) -> None:
@@ -206,14 +277,15 @@ def test_inspect_exposes_verified_producer_metadata_for_unsupported_contract(
     finally:
         backend.close()
     path = Path(uri) / "manifest.json"
-    manifest = json.loads(path.read_text())
+    manifest = json.loads(path.read_text(encoding="utf-8"))
     manifest["data_schema_version"] = 999
     raw = json.dumps(manifest).encode()
     path.write_bytes(raw)
     (Path(uri) / "COMPLETE").write_text(
         json.dumps(
             {"snapshot_id": Path(uri).name, "manifest_sha256": sha256(raw).hexdigest()}
-        )
+        ),
+        encoding="utf-8",
     )
     result = CliRunner().invoke(
         app,
@@ -235,6 +307,7 @@ def test_inspect_exposes_verified_producer_metadata_for_unsupported_contract(
     assert payload["compatibility"]["supported"] is False
 
 
+@pytest.mark.windows_compatible
 def test_inspect_archive_root_uses_immutables_when_controls_are_corrupt(
     tmp_path: Path,
 ) -> None:
@@ -245,9 +318,9 @@ def test_inspect_archive_root_uses_immutables_when_controls_are_corrupt(
     uri = SnapshotStore(str(root)).write(backend, run_id="inspect", manual=True)
     backend.close()
     assert uri is not None
-    (root / "control.json").write_text("damaged")
-    (root / "catalog.json").write_text("damaged")
-    (Path(uri) / "state.json").write_text("damaged")
+    (root / "control.json").write_text("damaged", encoding="utf-8")
+    (root / "catalog.json").write_text("damaged", encoding="utf-8")
+    (Path(uri) / "state.json").write_text("damaged", encoding="utf-8")
     result = CliRunner().invoke(
         app,
         [
@@ -268,6 +341,7 @@ def test_inspect_archive_root_uses_immutables_when_controls_are_corrupt(
     )
 
 
+@pytest.mark.windows_compatible
 def test_declining_disabled_archive_access_aborts_without_audit_output(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +372,7 @@ def test_declining_disabled_archive_access_aborts_without_audit_output(
     assert (Path(uri) / "COMPLETE").exists()
 
 
+@pytest.mark.windows_compatible
 def test_partial_snapshot_failure_reports_retained_copy_and_exits_unsuccessfully(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -308,9 +383,16 @@ def test_partial_snapshot_failure_reports_retained_copy_and_exits_unsuccessfully
     root = tmp_path / "archive"
     config.write_text(
         f'source_id = "{SOURCE_ID}"\n'
-        f'backend.provider = "duckdb"\nbackend.duckdb.database = "{database}"\n'
-        f'[snapshots.local]\nenable = true\npath = "{root}"\n'
-        '[snapshots.gcs]\nenable = true\nproject = "test"\nuri = "gs://unavailable/archive"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n"
+        "[snapshots.local]\n"
+        "enable = true\n"
+        f"path = '{root}'\n"
+        "[snapshots.gcs]\n"
+        "enable = true\n"
+        'project = "test"\n'
+        'uri = "gs://unavailable/archive"\n',
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()

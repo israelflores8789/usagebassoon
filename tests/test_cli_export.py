@@ -26,6 +26,7 @@ from usagebassoon.storage_model import EVENT_KEYS, STATE_KEYS
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("kind", ["tables", "views"])
 def test_export_lists_targets_without_backend_access(
     kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -47,13 +48,18 @@ def test_export_lists_targets_without_backend_access(
     output = plain_cli_output(result.stdout)
     names = set(STATE_KEYS | EVENT_KEYS) if kind == "tables" else set(PUBLIC_RELATIONS)
     rows = [line.split("│")[1:3] for line in output.splitlines() if "│" in line]
-    listed = {name.strip(): description.strip() for name, description in rows}
+    listed = {
+        name.strip(): description.strip()
+        for name, description in rows
+        if name.strip() != "Target"
+    }
     assert listed == {name: _RELATION_DESCRIPTIONS[name] for name in names}
     manager.assert_not_called()
     backend.assert_not_called()
     assert not result.stderr
 
 
+@pytest.mark.windows_compatible
 def test_export_descriptions_cover_all_targets_and_stay_brief() -> None:
     """Keep target discovery complete and descriptions within ten words."""
     assert (
@@ -62,6 +68,7 @@ def test_export_descriptions_cover_all_targets_and_stay_brief() -> None:
     assert all(1 <= len(text.split()) <= 10 for text in _RELATION_DESCRIPTIONS.values())
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -86,8 +93,10 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -109,6 +118,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     return config, backend
 
 
+@pytest.mark.windows_compatible
 def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None:
     """Make share-safe export the default while preserving an explicit raw path."""
     config, backend = _configured_store(tmp_path)
@@ -143,8 +153,8 @@ def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None
         ],
     )
 
-    sanitized_row = json.loads(sanitized_path.read_text())[0]
-    raw_row = json.loads(raw_path.read_text())[0]
+    sanitized_row = json.loads(sanitized_path.read_text(encoding="utf-8"))[0]
+    raw_row = json.loads(raw_path.read_text(encoding="utf-8"))[0]
     assert sanitized.exit_code == 0
     assert "obfuscated by default" in plain_cli_output(sanitized.stderr)
     assert sanitized_row["client"] == "codex"
@@ -155,6 +165,7 @@ def test_export_obfuscates_by_default_and_can_export_raw(tmp_path: Path) -> None
     assert raw_row["note"] == "Call Ada at example@private.test"
 
 
+@pytest.mark.windows_compatible
 def test_export_supports_csv_and_parquet_and_rejects_unknown_relations(
     tmp_path: Path,
 ) -> None:
@@ -202,13 +213,14 @@ def test_export_supports_csv_and_parquet_and_rejects_unknown_relations(
     )
 
     assert csv_result.exit_code == 0
-    assert "session-alpha" in csv_path.read_text()
+    assert "session-alpha" in csv_path.read_text(encoding="utf-8")
     assert parquet_result.exit_code == 0
     assert pq.read_table(parquet_path).to_pylist()[0]["session_id"] == "ses_private"
     assert invalid.exit_code != 0
     assert "target must be one of" in plain_cli_output(invalid.output)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("target", sorted(STATE_KEYS | EVENT_KEYS))
 def test_export_reads_canonical_views(
     target: str,
@@ -222,7 +234,8 @@ def test_export_reads_canonical_views(
     config.write_text(
         f'source_id = "{SOURCE_ID}"\n'
         f'backend.provider = "duckdb"\n'
-        f'backend.duckdb.database = ":memory:"\n'
+        f'backend.duckdb.database = ":memory:"\n',
+        encoding="utf-8",
     )
     publication = pa.table({"source_id": [SOURCE_ID], "value": ["accepted raw data"]})
     client = MagicMock()

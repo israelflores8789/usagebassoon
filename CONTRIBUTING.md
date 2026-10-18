@@ -79,7 +79,7 @@ usagebassoon/
 │   ├── collector.py        # tokscale subprocess management
 │   ├── orchestrator.py     # Top-level data shuttler
 │   ├── ingest.py           # Contract validation and parsing coordinator
-│   ├── contracts.py        # Raw payload validation and schema-drift detection
+│   ├── contracts.py        # Raw payload validation and payload-drift detection
 │   ├── normalizer.py       # Parsed payload to canonical Arrow-table normalization
 │   ├── persistence.py      # Normalized batch publication to data warehouses
 │   ├── storage_model.py    # Shared logical keys and observation tie-break rules
@@ -177,7 +177,7 @@ flowchart TD
       WAREHOUSE --> OUT[CLI reports, query, export,<br/>Python API]
 ```
 
-Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as schema-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
+Required-field absence from a required payload is a collection error. Unknown fields, changed cardinalities, and compatible additive changes are recorded as payload-drift events and surfaced to users. The tolerant reader continues only where doing so is safe and preserves valid token history.
 
 `normalizer.py` computes canonical derived columns and produces Arrow tables, and it assigns each observation row a stable `event_id` before any persistence retry.
 
@@ -207,7 +207,7 @@ The following are design *constraints*, not optional. See [`AGENTS.md`](AGENTS.m
   - `tokscale pricing` provides observed model rates
 - **Monotonicity.** Token usage is *never* deleted once persisted and can *never* be reduced, only increase. This rule does not bear on costs which are *calculated* values *from* token usage data.
 - **Tolerant Collection Payload.** UsageBassoon prioritizes token usage persistence and tolerates payloads that can be gathered later in the event of an error. Mandatory canonical commands include `tokscale models` and `tokscale graph`.
-- **Tolerant Schema Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "schema drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
+- **Tolerant Payload Drift.** UsageBassoon disciminates Tokscale's JSON payload into required and tolerated fields. Tolerated fields generate "payload drift events" that are surfaced through `bassoon doctor`. UsageBassoon also attempts to reconcile certain fields mathematically to verify consistency. Errors here are generally tolerated but generate "reconciliation issues", also surfaced through `bassoon doctor`.
 - **Declarative Configuration:** One TOML configuration should describe and manage all of UsageBassoon's behavior and support multiple data warehouses and snapshot archive destinations.
 - **Protect Privacy by Default.** UsageBassoon attempts to protect sensitive user data by offering means to obfuscate. UsageBassoon also automatically obfuscates commands likely to be shared publicly (e.g. `bassoon doctor` and `bassoon export`). *Never* place potentially personal information (e.g. session IDs, unsanitized workspace paths, etc) in source control, fixtures, issue reports, or pull requests. *Always* prefer sanitized `bassoon doctor` output for diagnostics and bug reporting, obfuscate raw exports, and keep snapshots private.
 
@@ -385,10 +385,21 @@ The project separates local tests from SQL dialect-parity tests:
 | `just lint`               | Runs Ruff lint and format checks                             |
 | `just typecheck`          | Runs strict Pyrefly checks                                   |
 | `just ci`                 | Runs the project’s standard hermetic CI gate                 |
+| `just test-windows`       | Runs explicitly marked Windows smoke and compatible local tests |
+| `just lint-windows`       | Runs the same Ruff checks through a Windows script recipe    |
+| `just ci-windows`         | Runs Windows tests, Ruff, and native Windows Pyrefly checks  |
 | `just spell`              | Runs the Typos spelling check                                |
 | `just check-dist`         | Builds distributions and validates them with Twine           |
 
 `sql_parity` is a required separate check even when `just test-unit` passes. SQL changes must update both dialects and include parity coverage.
+
+POSIX is the primary environment for the full test suite, dialect parity, and live cloud integrations. Windows is considered a necessary evil ;) and is only run to ensure Windows-specific features and compatible behavior. Both CI workflows also require a Windows runner using `just ci-windows`. Windows tests *exclude all live integration test* (e.g. live BigQuery tests etc.) and dialect parity tests.
+
+While all tests, except for Windows-specific tests, are run in POSIX, we classify Windows-compatible tests with `@pytest.mark.windows_compatible`. Tests marked `@pytest.mark.windows_smoke` are specific to Windows for required Windows runtime checks. We *only* add a skip condition if the test *requires* Windows APIs to function.
+
+Tests requiring POSIX terminal APIs, permission modes, detached descendants, or process timezone switching have explicit platform skips and remain outside the Windows selection. Pure scheduler serialization and mocked service tests can remain Windows-compatible. New unmarked tests will run in the primary POSIX suite until their Windows compatibility is reviewed.
+
+Pyrefly is configured to check the runner's native platform. Keep platform-specific implementations behind explicit platform or capability guards. Do **not** suppress diagnostics or exclude source modules to get test or typechecks to pass the Windows gate.
 
 Use focused tests while developing:
 

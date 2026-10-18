@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
@@ -39,6 +40,13 @@ def isolate_config_error_logs(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / ".local" / "state"))
     monkeypatch.delenv(LOG_DIRECTORY_ENV_VAR, raising=False)
+
+    # Windows platformdirs uses the shell API rather than LOCALAPPDATA.
+    def log_path(_appname: str, *, appauthor: bool) -> Path:
+        assert appauthor is False
+        return tmp_path / "default-logs"
+
+    monkeypatch.setattr(config_module, "user_log_path", log_path)
     logger = logging.getLogger(LOGGER_NAME)
     existing_handlers = tuple(logger.handlers)
     yield
@@ -48,6 +56,7 @@ def isolate_config_error_logs(
             handler.close()
 
 
+@pytest.mark.windows_compatible
 def test_explicit_config_path_has_highest_precedence(tmp_path: Path) -> None:
     """Use --config's path even when the environment points elsewhere."""
     explicit = tmp_path / "explicit.toml"
@@ -68,6 +77,7 @@ def test_explicit_config_path_has_highest_precedence(tmp_path: Path) -> None:
     assert manager.load().local_database == Path(":memory:")
 
 
+@pytest.mark.windows_compatible
 def test_environment_path_precedes_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -84,6 +94,7 @@ def test_environment_path_precedes_default(
     assert manager.load().backend == "duckdb"
 
 
+@pytest.mark.windows_compatible
 def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     """Load subprocess, schedule, and logging defaults without TOML sections."""
     path = tmp_path / "config.toml"
@@ -102,6 +113,39 @@ def test_default_timeouts_and_schedule_are_typed(tmp_path: Path) -> None:
     assert configuration.logging.max_bytes == 5 * 1024 * 1024
 
 
+@pytest.mark.windows_compatible
+@pytest.mark.parametrize(
+    ("toml_value", "expected"),
+    [
+        (
+            r'"C:\\Users\\Alice\\AppData\\Roaming\\npm\\tokscale.cmd"',
+            r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd",
+        ),
+        (
+            r"'C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd'",
+            r"C:\Users\Alice\AppData\Roaming\npm\tokscale.cmd",
+        ),
+    ],
+)
+def test_tokscale_bin_accepts_toml_windows_path_strings(
+    tmp_path: Path,
+    toml_value: str,
+    expected: str,
+) -> None:
+    """Preserve Windows paths in both escaped and literal TOML strings."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'source_id = "11111111-1111-4111-8111-111111111111"\n'
+        'backend.provider = "duckdb"\nbackend.duckdb.database = ":memory:"\n'
+        f"[tokscale]\nbin = {toml_value}\n"
+    )
+
+    configuration = ConfigurationManager(path).load()
+
+    assert configuration.tokscale_bin == expected
+
+
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "provider, default", [("bigquery", 180.0), ("motherduck", 120.0)]
 )
@@ -147,6 +191,7 @@ def test_remote_operation_timeouts_and_snapshot_budget(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("name", ["pong", "dots", "bouncingBall"])
 def test_spinner_configuration(tmp_path: Path, name: str) -> None:
     """Accept yaspin's case-sensitive animation names."""
@@ -158,6 +203,7 @@ def test_spinner_configuration(tmp_path: Path, name: str) -> None:
     assert ConfigurationManager(path).load().spinner == name
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("value", ['"missing"', '"Pong"', '""', "123", "false"])
 def test_invalid_spinner_configuration(tmp_path: Path, value: str) -> None:
     """Reject unsupported names and non-string settings with a config error."""
@@ -170,6 +216,7 @@ def test_invalid_spinner_configuration(tmp_path: Path, value: str) -> None:
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 def test_duckdb_local_database_defaults_when_omitted(tmp_path: Path) -> None:
     """Use the local DuckDB path when a config omits local_database."""
     path = tmp_path / "config.toml"
@@ -184,6 +231,7 @@ def test_duckdb_local_database_defaults_when_omitted(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("backend", "required_section"),
     [("motherduck", "motherduck"), ("bigquery", "bigquery")],
@@ -206,6 +254,7 @@ def test_remote_backend_requires_its_settings(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 def test_backend_defaults_to_duckdb(tmp_path: Path) -> None:
     """Use DuckDB when the backend table is omitted."""
     path = tmp_path / "config.toml"
@@ -214,6 +263,7 @@ def test_backend_defaults_to_duckdb(tmp_path: Path) -> None:
     assert ConfigurationManager(path).load().backend == "duckdb"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("interval", ["1m", "2m", "2.02m"])
 def test_schedule_interval_must_exceed_tokscale_timeout(
     tmp_path: Path, interval: str
@@ -233,6 +283,7 @@ def test_schedule_interval_must_exceed_tokscale_timeout(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -258,6 +309,7 @@ def test_schedule_durations_are_limited_to_minutes_or_hours(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("section", "setting", "expected"),
     [
@@ -297,6 +349,7 @@ def test_duration_units_are_setting_specific(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) -> None:
     """Persist an interval in place without rewriting unrelated TOML values."""
     path = tmp_path / "config.toml"
@@ -315,6 +368,7 @@ def test_update_schedule_interval_preserves_other_configuration(tmp_path: Path) 
     assert ConfigurationManager(path).load().collection.schedule.interval == "30m"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("content", "separator"),
     [
@@ -338,6 +392,7 @@ def test_initial_source_id_preserves_content_and_section_spacing(
     assert path.read_text() == expected
 
 
+@pytest.mark.windows_compatible
 def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
     """Reject an unparsable source namespace before opening a backend."""
     path = tmp_path / "config.toml"
@@ -350,12 +405,15 @@ def test_source_id_must_be_a_uuid(tmp_path: Path) -> None:
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("scope", ["root", "tokscale"])
 def test_unknown_config_keys_fail_and_are_written_to_the_log(
     tmp_path: Path,
     scope: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject unsupported keys and log their location before failing."""
+    monkeypatch.setenv("PGPASSWORD", "root")
     path = tmp_path / "config.toml"
     log_directory = tmp_path / "configured-logs"
     content = (
@@ -365,7 +423,7 @@ def test_unknown_config_keys_fail_and_are_written_to_the_log(
     )
     if scope == "root":
         content += "unexpected_setting = true\n"
-    content += f'\n[logging]\ndirectory = "{log_directory}"\n'
+    content += f"\n[logging]\ndirectory = '{log_directory}'\n"
     if scope == "tokscale":
         content += "\n[tokscale]\nunexpected_setting = true\n"
     path.write_text(content)
@@ -384,6 +442,7 @@ def test_unknown_config_keys_fail_and_are_written_to_the_log(
     assert f"unknown key(s) in {expected_scope}" in log_content
 
 
+@pytest.mark.windows_compatible
 def test_invalid_logging_settings_use_the_default_error_log(
     tmp_path: Path,
 ) -> None:
@@ -398,11 +457,12 @@ def test_invalid_logging_settings_use_the_default_error_log(
     with pytest.raises(ConfigurationError, match=r"logging\.max_files"):
         ConfigurationManager(path).load()
 
-    log_path = tmp_path / ".local/state/usagebassoon/logs/usagebassoon.log"
+    log_path = default_log_directory() / "usagebassoon.log"
     assert log_path.is_file()
     assert "logging.max_files must be a positive integer" in log_path.read_text()
 
 
+@pytest.mark.windows_compatible
 def test_bigquery_credentials_and_operational_settings_are_typed(
     tmp_path: Path,
 ) -> None:
@@ -415,7 +475,7 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
         '[backend.bigquery]\nproject = "usagebassoon-test"\n'
         'dataset = "usagebassoon_it"\n'
         'location = "us-central1"\n'
-        f'credentials_file = "{credentials}"\n'
+        f"credentials_file = '{credentials}'\n"
         "[collection]\nmax_retries = 4\nretry_initial_seconds = 0.5\n"
         "[logging]\nmax_files = 5\nmax_bytes = 4096\n"
     )
@@ -428,6 +488,7 @@ def test_bigquery_credentials_and_operational_settings_are_typed(
     assert (config.logging.max_files, config.logging.max_bytes) == (5, 4096)
 
 
+@pytest.mark.windows_compatible
 def test_snapshot_defaults_and_interval_validation_are_consistent(
     tmp_path: Path,
 ) -> None:
@@ -447,6 +508,7 @@ def test_snapshot_defaults_and_interval_validation_are_consistent(
         ConfigurationManager(invalid).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("platform", "app_name"),
     [("linux", "usagebassoon"), ("darwin", "UsageBassoon"), ("win32", "UsageBassoon")],
@@ -488,13 +550,14 @@ def test_platform_default_directories_use_platformdirs_and_app_name(
     assert all(name == app_name and author is False for _, name, author in calls)
 
 
+@pytest.mark.skipif(
+    config_module.sys.platform != "linux", reason="requires Linux XDG defaults"
+)
 def test_linux_default_paths_follow_xdg_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Honor XDG config, data, and state roots when resolving Linux defaults."""
-    if config_module.sys.platform != "linux":
-        pytest.skip("XDG defaults are Linux-specific in this test")
     config_root = tmp_path / "xdg-config"
     data_root = tmp_path / "xdg-data"
     state_root = tmp_path / "xdg-state"
@@ -510,6 +573,7 @@ def test_linux_default_paths_follow_xdg_environment(
     assert default_log_directory() == state_root / "usagebassoon" / "logs"
 
 
+@pytest.mark.windows_compatible
 def test_gcs_and_local_snapshot_destinations_are_typed(
     tmp_path: Path,
 ) -> None:
@@ -521,9 +585,9 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
         'backend.provider = "duckdb"\nbackend.duckdb.database = ":memory:"\n'
         '[snapshots.gcs]\nenable = true\nuri = "gs://bucket/archive"\n'
         'project = "usagebassoon-test"\n'
-        f'credentials_file = "{credentials}"\n'
+        f"credentials_file = '{credentials}'\n"
         "[snapshots.local]\n"
-        f'path = "{tmp_path / "snapshots"}"\n'
+        f"path = '{tmp_path / 'snapshots'}'\n"
         '[snapshots]\nmax_snapshots = 5\n[snapshots.schedule]\ninterval = "12h"\n'
     )
 
@@ -539,6 +603,7 @@ def test_gcs_and_local_snapshot_destinations_are_typed(
     assert config.snapshots.max_snapshots == 5
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("name", ["STORAGE_EMULATOR_HOST", "API_ENDPOINT_OVERRIDE"])
 @pytest.mark.parametrize(
     "endpoint", ["http://localhost:4443", "https://example.invalid", ""]
@@ -574,6 +639,7 @@ def test_gcs_endpoint_overrides_fail_configuration_validation(
     assert not configuration.snapshots.gcs.enable
 
 
+@pytest.mark.windows_compatible
 def test_namespaced_configuration_defaults(tmp_path: Path) -> None:
     """Keep automatic archives opt-in and retain the twelve-hour cadence."""
     path = tmp_path / "config.toml"
@@ -590,6 +656,7 @@ def test_namespaced_configuration_defaults(tmp_path: Path) -> None:
     assert not config.logging.disable
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "setting",
     [
@@ -609,6 +676,7 @@ def test_enable_and_disable_flags_require_booleans(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("enabled", [False, True])
 def test_snapshot_destination_enablement(tmp_path: Path, enabled: bool) -> None:
     """Disabled GCS requires no credentials or destination settings."""
@@ -623,6 +691,7 @@ def test_snapshot_destination_enablement(tmp_path: Path, enabled: bool) -> None:
     assert config.snapshots.gcs is not None and not config.snapshots.gcs.enable
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("literal", "expected"),
     [
@@ -652,6 +721,7 @@ def test_local_snapshot_paths(tmp_path: Path, literal: str, expected: Path) -> N
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "value",
     [
@@ -676,6 +746,7 @@ def test_local_snapshot_path_requires_a_filesystem_path(
         ConfigurationManager(path).load()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("existing", [True, False])
 def test_update_snapshot_interval_preserves_collection_and_policy(
     tmp_path: Path, existing: bool
@@ -696,9 +767,11 @@ def test_update_snapshot_interval_preserves_collection_and_policy(
     assert config.snapshots.schedule.interval == "2d"
     assert config.snapshots.local.disable_weekly is existing
     assert config.snapshots.local.path == Path("my archive")
-    assert path.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.windows_compatible
 def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
     tmp_path: Path,
 ) -> None:
@@ -709,7 +782,7 @@ def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
         'source_id = "11111111-1111-4111-8111-111111111111"\n'
         "[snapshots.local]\nenable = true\ndisable_weekly = true\n"
         "[snapshots.gcs]\nenable = false\ndisable_weekly = false\n"
-        f'project = "recovery-project"\ncredentials_file = "{credentials}"\n'
+        f"project = 'recovery-project'\ncredentials_file = '{credentials}'\n"
     )
     config = ConfigurationManager(path).load()
     assert config.snapshots.local.disable_weekly
@@ -718,12 +791,13 @@ def test_disabled_cloud_keeps_authentication_and_independent_weekly_settings(
     assert cloud.project == "recovery-project" and cloud.credentials_file == credentials
 
 
+@pytest.mark.windows_compatible
 def test_disabled_logging_applies_to_configuration_errors(tmp_path: Path) -> None:
     """Explicit opt-out prevents error logs even for an invalid configuration."""
     path = tmp_path / "config.toml"
     directory = tmp_path / "disabled-logs"
     path.write_text(
-        f'source_id = "invalid"\n[logging]\ndisable = true\ndirectory = "{directory}"\n'
+        f"source_id = 'invalid'\n[logging]\ndisable = true\ndirectory = '{directory}'\n"
     )
     with pytest.raises(ConfigurationError, match="source_id") as captured:
         ConfigurationManager(path).load()
@@ -731,6 +805,7 @@ def test_disabled_logging_applies_to_configuration_errors(tmp_path: Path) -> Non
     assert not directory.exists()
 
 
+@pytest.mark.windows_compatible
 def test_failed_preflight_preserves_error_when_close_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -777,6 +852,7 @@ def test_failed_preflight_preserves_error_when_close_fails(
         connection.close()
 
 
+@pytest.mark.windows_compatible
 def test_atomic_config_failure_survives_failed_temporary_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -9,9 +9,7 @@ import errno
 import json
 import logging
 import os
-import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -21,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
 from platformdirs import user_config_path
@@ -36,6 +34,12 @@ from usagebassoon.deadlines import limited
 from usagebassoon.display import sanitize_display
 from usagebassoon.json_types import JsonArray, JsonObject, JsonValue
 from usagebassoon.logger import LOGGER_NAME
+from usagebassoon.process import (
+    ManagedProcess,
+    split_command,
+    start_process,
+    terminate_process,
+)
 
 _MODELS_DOMAIN = "models"
 _PRICING_DOMAIN = "pricing"
@@ -49,6 +53,7 @@ _CHILD_ENVIRONMENT_NAMES = frozenset(
         "LANG",
         "LANGUAGE",
         "PATH",
+        "SystemRoot",
         "TMPDIR",
         "TOKSCALE_CONFIG_DIR",
         "TOKSCALE_EXTRA_DIRS",
@@ -253,16 +258,61 @@ def resolve_tokscale_command(config: UsageBassoonConfig) -> tuple[str, ...]:
     """
     override = config.tokscale_bin or os.environ.get("TOKSCALE_BIN")
     if override:
+        executable = shutil.which(override)
+        if executable is not None:
+            return (executable,)
+        if (
+            PureWindowsPath(override).is_absolute()
+            or PurePosixPath(override).is_absolute()
+        ):
+            return (override,)
         try:
-            command = tuple(shlex.split(override))
+            command = _split_tokscale_command(override)
         except ValueError as error:
             raise RuntimeError("TOKSCALE_BIN is not a valid command line") from error
         if not command:
             raise RuntimeError("TOKSCALE_BIN did not contain an executable")
-        return command
-    if shutil.which("tokscale"):
-        return ("tokscale",)
-    return ("bunx", "tokscale@latest")
+        executable = shutil.which(command[0])
+        return (executable or command[0], *command[1:])
+    executable = shutil.which("tokscale")
+    if executable is not None:
+        return (executable,)
+    executable = shutil.which("bunx")
+    return (executable or "bunx", "tokscale@latest")
+
+
+def _split_tokscale_command(command: str) -> tuple[str, ...]:
+    """Split a configured command while preserving Windows path separators.
+
+    Args:
+        command: Executable path or command prefix from configuration.
+
+    Returns:
+        The executable and any command-prefix arguments.
+    """
+    return split_command(command, windows=os.name == "nt")
+
+
+def _start_tokscale_process(
+    command: Sequence[str], environment: Mapping[str, str]
+) -> ManagedProcess:
+    """Start tokscale with its bounded, privacy-filtered child environment.
+
+    Args:
+        command: Executable command and arguments.
+        environment: Explicit environment exposed to the child process.
+
+    Returns:
+        The running tokscale process.
+    """
+    return start_process(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(environment),
+        shell=False,
+    )
 
 
 def _prefix(config: UsageBassoonConfig) -> list[str]:
@@ -285,14 +335,8 @@ def preflight_tokscale(config: UsageBassoonConfig) -> tuple[tuple[str, ...], str
     """
     command = resolve_tokscale_command(config)
     try:
-        process = subprocess.Popen(
-            [*command, "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_child_environment(config),
-            shell=False,
-            start_new_session=os.name == "posix",
+        process = _start_tokscale_process(
+            [*command, "--version"], _child_environment(config)
         )
         stdout, stderr = _capture_process(
             process,
@@ -435,6 +479,83 @@ def _link_tokscale_cache(profile: Path, cache: Path) -> None:
         link.symlink_to(cache, target_is_directory=True)
 
 
+def _prepare_tokscale_settings(source: Path, destination: Path) -> None:
+    """Preserve usable settings and pin UTC in the private collection profile.
+
+    Missing or unusable settings recover to a UTC-only document. Invalid scanner
+    objects are replaced without discarding other top-level settings. The user's
+    original file is never written, and diagnostics omit its contents.
+
+    Args:
+        source: Original settings file to read on this collection run.
+        destination: Private settings file to prepare before any acquisition.
+
+    Raises:
+        OSError: If the private settings file cannot be written.
+    """
+    settings: JsonObject = {}
+    try:
+        value: object = json.loads(source.read_text(encoding="utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("tokscale settings must be an object")
+        settings = cast(JsonObject, value)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError) as error:
+        # Decoding errors can include private input bytes in their exception text.
+        _LOG.warning(
+            "could not reuse tokscale settings (%s); using UTC-only private settings",
+            type(error).__name__,
+            exc_info=(
+                RuntimeError,
+                RuntimeError("original tokscale settings could not be reused"),
+                error.__traceback__,
+            ),
+        )
+    scanner_value = settings.get("scanner")
+    scanner: JsonObject = {}
+    if isinstance(scanner_value, dict):
+        scanner = scanner_value
+    elif "scanner" in settings:
+        _LOG.warning(
+            "invalid tokscale scanner settings; "
+            "replacing only the private scanner object"
+        )
+    scanner["bucketTimezone"] = "UTC"
+    settings["scanner"] = scanner
+    destination.write_text(json.dumps(settings, ensure_ascii=True), encoding="utf-8")
+
+
+def _tokscale_uses_utc(
+    config: UsageBassoonConfig, environment: Mapping[str, str]
+) -> bool:
+    """Check the effective pin without scanning usage or rewriting settings.
+
+    Args:
+        config: Command resolution and subprocess resource bounds.
+        environment: Prepared private profile exposed to tokscale.
+
+    Returns:
+        Whether tokscale successfully loaded the exact UTC pin.
+
+    Raises:
+        OSError: If the subprocess cannot start.
+        RuntimeError: If the bounded configuration read fails.
+    """
+    process = _start_tokscale_process(
+        [*_prefix(config), "--no-spinner", "config", "get", "timezone"], environment
+    )
+    stdout, _stderr = _capture_process(
+        process,
+        timeout_seconds=config.tokscale_timeout_seconds,
+        max_stdout_bytes=min(config.tokscale_max_stdout_bytes, 4096),
+        max_stderr_bytes=config.tokscale_max_stderr_bytes,
+    )
+    if process.returncode:
+        raise RuntimeError("could not verify the private tokscale UTC setting")
+    return stdout.strip() == b"UTC"
+
+
 @contextmanager
 def tokscale_profile(
     config: UsageBassoonConfig,
@@ -452,18 +573,28 @@ def tokscale_profile(
 
     Raises:
         OSError: If configuration, persistent state, or profile cleanup fails.
-        RuntimeError: If the persistent cache cannot be attached.
+        RuntimeError: If UTC cannot be verified or the persistent cache cannot attach.
     """
     environment = _child_environment(config)
     source = _tokscale_config_directory(environment)
     with _tokscale_temporary_directory(prefix="usagebassoon-tokscale-") as profile:
-        for filename in ("settings.json", "custom-pricing.json"):
-            path = source / filename
-            if path.exists():
-                shutil.copyfile(path, profile / filename)
+        _prepare_tokscale_settings(source / "settings.json", profile / "settings.json")
+        environment["TOKSCALE_CONFIG_DIR"] = str(profile)
+        if not _tokscale_uses_utc(config, environment):
+            _LOG.warning(
+                "tokscale rejected the prepared settings; "
+                "retrying with UTC-only private settings"
+            )
+            (profile / "settings.json").write_text(
+                '{"scanner":{"bucketTimezone":"UTC"}}', encoding="utf-8"
+            )
+            if not _tokscale_uses_utc(config, environment):
+                raise RuntimeError("tokscale did not honor the private UTC setting")
+        pricing = source / "custom-pricing.json"
+        if pricing.exists():
+            shutil.copyfile(pricing, profile / "custom-pricing.json")
         cache = _persistent_tokscale_cache(config, source, environment)
         _link_tokscale_cache(profile, cache)
-        environment["TOKSCALE_CONFIG_DIR"] = str(profile)
         target = sha256(
             repr(
                 (
@@ -486,13 +617,10 @@ def tokscale_profile(
         )
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process(process: ManagedProcess | subprocess.Popen[bytes]) -> None:
     """Forcefully terminate a tokscale process group after a hard failure."""
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        terminate_process(process)
     except ProcessLookupError:
         return
     except OSError:
@@ -505,7 +633,7 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _capture_process(
-    process: subprocess.Popen[bytes],
+    process: ManagedProcess | subprocess.Popen[bytes],
     *,
     timeout_seconds: float,
     max_stdout_bytes: int,
@@ -603,6 +731,37 @@ def _capture_process(
             _LOG.exception("could not reap tokscale process %s", process.pid)
             if failure is None:
                 failure = RuntimeError("could not reap tokscale process")
+        if isinstance(process, ManagedProcess):
+            try:
+                process.close()
+            except OSError:
+                _LOG.exception("could not close tokscale process scope %s", process.pid)
+                if failure is None:
+                    failure = RuntimeError("could not close tokscale process scope")
+        if process.poll() is None:
+            try:
+                process.wait(
+                    timeout=max(0.0, (cleanup_deadline or deadline) - time.monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                _LOG.warning(
+                    "tokscale process %s remained alive after scope cleanup",
+                    process.pid,
+                    exc_info=True,
+                )
+                if failure is None:
+                    failure = RuntimeError(
+                        "tokscale process remained alive after cleanup"
+                    )
+            except OSError:
+                _LOG.exception(
+                    "could not reap tokscale process %s after scope cleanup",
+                    process.pid,
+                )
+                if failure is None:
+                    failure = RuntimeError(
+                        "could not reap tokscale process after cleanup"
+                    )
     if failure is not None:
         raise failure
     return bytes(outputs["stdout"]), bytes(outputs["stderr"])
@@ -619,16 +778,9 @@ def _json_command(
     command = [*prefix, "--no-spinner", *arguments]
     command_name = sanitize_display(" ".join(arguments))
     try:
-        process = subprocess.Popen(
+        process = _start_tokscale_process(
             command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(environment)
-            if environment is not None
-            else _child_environment(config),
-            shell=False,
-            start_new_session=True,
+            environment if environment is not None else _child_environment(config),
         )
     except OSError as error:
         _LOG.exception("could not start tokscale %s", command_name)

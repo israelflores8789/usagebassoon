@@ -27,14 +27,19 @@ from tests.conftest import (
     EXPECTED_TOTAL_OUTPUT,
     EXPECTED_TOTAL_REASONING,
 )
-from usagebassoon import system_metadata
+from usagebassoon import collection_policy, system_metadata
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.normalizer import (
+    CANONICAL_TABLE_SCHEMAS,
+    failed_collection,
+    normalize,
+)
 from usagebassoon.persistence import persist_run
 from usagebassoon.system_metadata import InvokeMethod, SystemMetadata
 
 
+@pytest.mark.windows_compatible
 def test_normalize_emits_daily_tables_and_collection_status(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -54,6 +59,33 @@ def test_normalize_emits_daily_tables_and_collection_status(
     )
 
 
+@pytest.mark.windows_compatible
+def test_collection_policy_applies_generic_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apply matching policy overrides and preserve records meeting skip rules."""
+    policy = collection_policy.CollectionPolicy(
+        domain="records",
+        when={"kind": "usage"},
+        overrides={"status": "reviewed"},
+        skip_if={"owner": "protected"},
+    )
+    monkeypatch.setattr(collection_policy, "_COLLECTION_POLICIES", (policy,))
+    record = {"kind": "usage", "owner": "ordinary", "status": "pending"}
+
+    assert collection_policy.apply_collection_policy("records", record) == {
+        "kind": "usage",
+        "owner": "ordinary",
+        "status": "reviewed",
+    }
+    assert collection_policy.apply_collection_policy(
+        "records",
+        {"kind": "usage", "owner": "protected", "status": "pending"},
+    ) == {"kind": "usage", "owner": "protected", "status": "pending"}
+    assert collection_policy.apply_collection_policy("other", record) == record
+
+
+@pytest.mark.windows_compatible
 def test_normalize_preserves_canonical_nullable_types(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -116,6 +148,7 @@ def test_normalize_preserves_canonical_nullable_types(
             backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_current_state_freshness_uses_collection_start(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -126,6 +159,7 @@ def test_current_state_freshness_uses_collection_start(
         }
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("activity_offset_days", [-30, 0, 30, None])
 def test_session_visibility_uses_completion_independently_of_activity(
     collection_bundle: CollectionBundle, activity_offset_days: int | None
@@ -147,6 +181,7 @@ def test_session_visibility_uses_completion_independently_of_activity(
     assert row["collected_at"] == bundle.started_at
 
 
+@pytest.mark.windows_compatible
 def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -223,6 +258,7 @@ def test_persisted_daily_facts_drive_cost_and_all_time_aggregate(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_linux_cpu_model_reads_the_native_description(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -238,6 +274,7 @@ def test_linux_cpu_model_reads_the_native_description(
     assert system_metadata._linux_cpu_model() == "Example CPU"
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("system", "executable", "timeout"),
     [("Darwin", "/usr/sbin/sysctl", 2), ("Windows", "powershell.exe", 5)],
@@ -268,6 +305,7 @@ def test_native_cpu_queries_are_bounded(
     assert system_metadata._cpu_model(system) == "Example CPU"
 
 
+@pytest.mark.windows_compatible
 def test_cpu_probe_failure_preserves_metadata(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -291,6 +329,7 @@ def test_cpu_probe_failure_preserves_metadata(
     assert "platform CPU model capture failed" in caplog.text
 
 
+@pytest.mark.windows_compatible
 def test_collection_run_view_omits_target_counts(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -313,6 +352,7 @@ def test_collection_run_view_omits_target_counts(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_reasoning_uses_the_output_price() -> None:
     """Price every token component exactly, with reasoning at the output rate."""
     from datetime import UTC, date, datetime
@@ -372,6 +412,7 @@ def test_reasoning_uses_the_output_price() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_refreshed_daily_timing_replaces_the_prior_observation(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -421,6 +462,7 @@ def test_refreshed_daily_timing_replaces_the_prior_observation(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_collection_status_is_unchanged_when_no_domains_are_refreshed(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -450,6 +492,7 @@ def test_collection_status_is_unchanged_when_no_domains_are_refreshed(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_older_same_source_run_cannot_regress_completed_status(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -513,6 +556,7 @@ def test_older_same_source_run_cannot_regress_completed_status(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_older_same_source_run_cannot_regress_daily_facts(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -569,10 +613,12 @@ def test_older_same_source_run_cannot_regress_daily_facts(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("invoke_method", list(InvokeMethod))
 def test_persist_run_records_collector_system_metadata(
     collection_bundle: CollectionBundle,
     invoke_method: InvokeMethod,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Record host metadata and the explicit invocation in collection audit views."""
     metadata = SystemMetadata(
@@ -583,6 +629,8 @@ def test_persist_run_records_collector_system_metadata(
         cpu_count=16,
         memory_bytes=68_719_476_736,
     )
+    development_version = "1.2.3.dev4+gabc123.d20261018"
+    monkeypatch.setattr("usagebassoon.normalizer.__version__", development_version)
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
@@ -595,10 +643,14 @@ def test_persist_run_records_collector_system_metadata(
         )
         ledger = normalized.tables["collection_ledger"]
         assert set(ledger.column("invoke_method").to_pylist()) == {invoke_method.value}
+        assert set(ledger.column("usagebassoon_ver").to_pylist()) == {
+            development_version
+        }
         assert "shell" not in ledger.column_names
         persist_run(backend, normalized)
         assert backend.query(
-            "SELECT os_name, architecture, cpu_count, memory_bytes, invoke_method "
+            "SELECT os_name, architecture, cpu_count, memory_bytes, "
+            "invoke_method, usagebassoon_ver "
             "FROM collection_runs"
         ).to_pylist() == [
             {
@@ -607,7 +659,21 @@ def test_persist_run_records_collector_system_metadata(
                 "cpu_count": 16,
                 "memory_bytes": 68_719_476_736,
                 "invoke_method": invoke_method.value,
+                "usagebassoon_ver": development_version,
             }
         ]
+        failure = failed_collection(
+            run_id=str(uuid4()),
+            source_id=collection_bundle.source_id,
+            started_at=collection_bundle.started_at,
+            finished_at=collection_bundle.finished_at,
+            host="collector",
+            error=RuntimeError("acquisition failed"),
+            invoke_method=invoke_method,
+        )
+        persist_run(backend, failure)
+        assert backend.query(
+            "SELECT usagebassoon_ver FROM collection_runs WHERE status = 'failed'"
+        ).to_pylist() == [{"usagebassoon_ver": development_version}]
     finally:
         backend.close()

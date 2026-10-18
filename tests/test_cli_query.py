@@ -27,8 +27,10 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     config = tmp_path / "config.toml"
     database = tmp_path / "usagebassoon.duckdb"
     config.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     backend.apply_ddl()
@@ -74,6 +76,7 @@ def _configured_store(tmp_path: Path) -> tuple[Path, DuckDBBackend]:
     return config, backend
 
 
+@pytest.mark.windows_compatible
 def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> None:
     """Expose raw relation output without accepting arbitrary warehouse SQL."""
     config, backend = _configured_store(tmp_path)
@@ -103,6 +106,7 @@ def test_query_warns_and_rejects_non_allowlisted_relations(tmp_path: Path) -> No
     assert "not supported" in plain_cli_output(rejected.output)
 
 
+@pytest.mark.windows_compatible
 def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
     """Serialize a permitted bounded relation query in every file format."""
     config, backend = _configured_store(tmp_path)
@@ -164,14 +168,15 @@ def test_query_writes_json_csv_and_parquet_formats(tmp_path: Path) -> None:
     )
 
     assert json_result.exit_code == 0
-    created_at = json.loads(json_path.read_text())[0]["created_at"]
-    assert created_at.startswith("2026-09-15T12:00:00")
+    created_at = json.loads(json_path.read_text(encoding="utf-8"))[0]["created_at"]
+    assert datetime.fromisoformat(created_at) == datetime(2026, 9, 15, 12, tzinfo=UTC)
     assert csv_result.exit_code == 0
-    assert "ses_private" in csv_path.read_text()
+    assert "ses_private" in csv_path.read_text(encoding="utf-8")
     assert parquet_result.exit_code == 0
     assert pq.read_table(parquet_path).num_rows == 1
 
 
+@pytest.mark.windows_compatible
 def test_query_requires_output_only_for_file_formats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

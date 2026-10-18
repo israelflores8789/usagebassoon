@@ -85,6 +85,37 @@ FROM (
 ORDER BY {ordering}, last_active DESC NULLS LAST, source_id, client, session_id, model
 {limit};
 
+-- name: doctor_unresolved_collection_runs
+SELECT run_id, finished_at, status
+FROM collection_runs AS failed_run
+WHERE failed_run.status IN ('failed', 'partial', 'payload_drift')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM collection_runs AS successful_run
+        WHERE successful_run.source_id = failed_run.source_id
+            AND successful_run.status = 'ok'
+            AND COALESCE(successful_run.finished_at, successful_run.started_at)
+                > COALESCE(failed_run.finished_at, failed_run.started_at)
+    )
+ORDER BY COALESCE(failed_run.finished_at, failed_run.started_at) DESC NULLS LAST,
+    failed_run.run_id DESC
+LIMIT {limit};
+
+-- name: doctor_unresolved_collection_targets
+SELECT
+    source_id,
+    day,
+    domain,
+    status,
+    expected_count,
+    succeeded_count,
+    run_id,
+    failure_code
+FROM collection_status
+WHERE status NOT IN ('complete', 'provisional')
+ORDER BY collected_at DESC NULLS LAST, day DESC, source_id, domain
+LIMIT {limit};
+
 -- name: report_session_models
 SELECT
     usage.*,

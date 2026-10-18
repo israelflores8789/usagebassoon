@@ -27,6 +27,7 @@ from usagebassoon.normalizer import normalize
 from usagebassoon.persistence import persist_run
 
 
+@pytest.mark.windows_compatible
 def test_effective_tags_inherit_from_client_and_workspace(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -93,6 +94,7 @@ def test_effective_tags_inherit_from_client_and_workspace(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_session_note_is_updatable_without_replacing_its_creation_time(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -145,6 +147,7 @@ def test_session_note_is_updatable_without_replacing_its_creation_time(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_tags_are_global_and_notes_match_source_scoped_sessions(
     collection_bundle: CollectionBundle,
 ) -> None:
@@ -225,6 +228,7 @@ def test_tags_are_global_and_notes_match_source_scoped_sessions(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_tag_assignment_rejects_invalid_scope_targets() -> None:
     """Assert invalid scope combinations fail before reaching a backend."""
     with pytest.raises(ValueError, match="workspace tags require"):
@@ -238,6 +242,7 @@ def test_tag_assignment_rejects_invalid_scope_targets() -> None:
         TagAssignment(scope="session", source_id="source", tag="project-alpha")
 
 
+@pytest.mark.windows_compatible
 def test_tag_rename_leaves_source_when_destination_exists() -> None:
     """Assert an existing destination prevents any rename mutation."""
     backend = DuckDBBackend(":memory:")
@@ -262,6 +267,7 @@ def test_tag_rename_leaves_source_when_destination_exists() -> None:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_curated_remove_requires_the_complete_identity() -> None:
     """Assert curation deletions leave unrelated tags and notes intact."""
     backend = DuckDBBackend(":memory:")

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -15,7 +17,7 @@ from usagebassoon.archiver import SnapshotArchiver
 from usagebassoon.backends.base import close_backend
 from usagebassoon.cli._output import render_records
 from usagebassoon.cli._utils import configured_backend, snapshot_archiver
-from usagebassoon.cli.spinner import spinner
+from usagebassoon.cli.spinner import delayed_spinner, spinner
 from usagebassoon.config import ConfigurationManager
 from usagebassoon.snapshot.catalog import Catalog
 
@@ -32,6 +34,22 @@ def read_archiver(config: Path | None) -> SnapshotArchiver:
 def notice(message: str) -> None:
     """Keep archive warnings and progress separate from structured stdout."""
     typer.echo(message, err=True)
+
+
+@contextmanager
+def snapshot_progress() -> Generator[Callable[[str], None]]:
+    """Show delayed progress and emit buffered archive warnings afterward.
+
+    Yields:
+        A callback for warnings that must appear after the spinner stops.
+    """
+    warnings: list[str] = []
+    try:
+        with delayed_spinner():
+            yield warnings.append
+    finally:
+        for message in warnings:
+            notice(message)
 
 
 def confirm_location(archiver: SnapshotArchiver, selection: str) -> None:
@@ -130,7 +148,8 @@ def list_snapshots(
     """List every available snapshot copy globally by capture time."""
     try:
         archiver = read_archiver(_config(ctx, config))
-        rows = archiver.reader.listing(selection)
+        with delayed_spinner():
+            rows = archiver.reader.listing(selection)
         disabled = next(
             (
                 str(row["uri"])
@@ -175,8 +194,10 @@ def inspect_snapshot(
     try:
         archiver = read_archiver(_config(ctx, config))
         reader = archiver.reader
-        candidates, _ = reader.candidates(selection, recovery=True, warning=notice)
-        manifest = reader.raw_manifest(candidates[0])[0]
+        with snapshot_progress() as warning:
+            candidates, _ = reader.candidates(selection, recovery=True, warning=warning)
+            manifest = reader.raw_manifest(candidates[0])[0]
+            compatibility = reader.compatibility(candidates[0])
         confirm_location(archiver, candidates[0].uri)
         render_records(
             [],
@@ -186,7 +207,7 @@ def inspect_snapshot(
             json_payload={
                 "uri": candidates[0].uri,
                 "manifest": manifest,
-                "compatibility": reader.compatibility(candidates[0]),
+                "compatibility": compatibility,
             },
         )
     except typer.Abort:
@@ -215,7 +236,11 @@ def audit_snapshot(
     """Audit completeness, object integrity, schemas, and recoverability."""
     try:
         archiver = read_archiver(_config(ctx, config))
-        with archiver.reader.prepare(selection, warning=notice) as prepared:
+        with ExitStack() as stack:
+            with snapshot_progress() as warning:
+                prepared = stack.enter_context(
+                    archiver.reader.prepare(selection, warning=warning)
+                )
             confirm_location(archiver, prepared.candidate.uri)
             payload: dict[str, object] = {
                 "id": prepared.candidate.identifier,
@@ -265,15 +290,18 @@ def delete_snapshot(
     """Retire selected copies after displaying their exact locations."""
     archiver = read_archiver(_config(ctx, config))
     try:
-        candidates = archiver.reader.lifecycle_candidates(identifier)
-        for candidate in candidates:
-            state, _ = candidate.bucket.read_json(f"{candidate.identifier}/state.json")
-            notice(
-                f"Delete {candidate.uri}: "
-                f"pinned={state.get('pinned') if state else 'unknown'}, "
-                f"roles={state.get('roles') if state else 'unknown'}, "
-                f"retired={state.get('retired') if state else 'unknown'}"
-            )
+        with snapshot_progress() as warning:
+            candidates = archiver.reader.lifecycle_candidates(identifier)
+            for candidate in candidates:
+                state, _ = candidate.bucket.read_json(
+                    f"{candidate.identifier}/state.json"
+                )
+                warning(
+                    f"Delete {candidate.uri}: "
+                    f"pinned={state.get('pinned') if state else 'unknown'}, "
+                    f"roles={state.get('roles') if state else 'unknown'}, "
+                    f"retired={state.get('retired') if state else 'unknown'}"
+                )
         if (
             typer.prompt(
                 "This permanently removes the selected copies. Type DELETE",
@@ -283,7 +311,8 @@ def delete_snapshot(
             != "DELETE"
         ):
             raise typer.Abort()
-        archiver.delete_candidates(candidates)
+        with delayed_spinner():
+            archiver.delete_candidates(candidates)
     except typer.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:
@@ -309,11 +338,14 @@ def copy_snapshot(
     """Verify and copy a complete snapshot between local and GCS archives."""
     try:
         archiver = read_archiver(_config(ctx, config))
-        with archiver.reader.prepare(
-            selection, warning=notice, transform=False
-        ) as prepared:
-            confirm_location(archiver, prepared.candidate.uri)
-        uri = archiver.copy(selection, destination)
+        with snapshot_progress() as warning:
+            candidates, _ = archiver.reader.candidates(
+                selection, recovery=True, warning=warning
+            )
+            source_uri = candidates[0].uri
+        confirm_location(archiver, source_uri)
+        with delayed_spinner():
+            uri = archiver.copy(source_uri, destination)
     except typer.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:
@@ -331,11 +363,12 @@ def repair_catalog(
     """Reconstruct missing catalogs from audited complete snapshot directories."""
     archiver = read_archiver(_config(ctx, config))
     try:
-        for bucket in archiver.reader.buckets:
-            catalog = Catalog(bucket, archiver.max_snapshots)
-            with catalog.hold():
-                catalog.repair()
-                catalog.cleanup_abandoned()
+        with delayed_spinner():
+            for bucket in archiver.reader.buckets:
+                catalog = Catalog(bucket, archiver.max_snapshots)
+                with catalog.hold():
+                    catalog.repair()
+                    catalog.cleanup_abandoned()
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo("Reconstructed archive catalogs.")

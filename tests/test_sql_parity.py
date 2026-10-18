@@ -80,6 +80,7 @@ def test_logical_gold_and_event_schemas_match() -> None:
     for dialect in (duckdb, bigquery):
         ledger_columns = _columns(dialect["collection_ledger"])
         assert "invoke_method" in ledger_columns
+        assert "usagebassoon_ver" in ledger_columns
         assert "shell" not in ledger_columns
     for table in STATE_KEYS | EVENT_KEYS:
         physical = "raw_" + table if table in DEBUG_TABLES else table
@@ -147,6 +148,8 @@ def test_named_query_inventory_and_native_asts_match() -> None:
     names = set(_query_templates("duckdb"))
     assert names == set(_query_templates("bigquery"))
     assert names == {
+        "doctor_unresolved_collection_runs",
+        "doctor_unresolved_collection_targets",
         "report_daily",
         "report_models",
         "report_sessions",
@@ -165,7 +168,7 @@ def test_named_query_inventory_and_native_asts_match() -> None:
             sql = template.format(
                 where="WHERE facts.model = :model",
                 ordering="activity_day DESC NULLS LAST",
-                limit="LIMIT 2",
+                limit="2" if name.startswith("doctor_") else "LIMIT 2",
             )
             parsed = sqlglot.parse(sql, read=dialect)
             assert len(parsed) == 1 and isinstance(parsed[0], exp.Select)
@@ -546,7 +549,7 @@ def test_logical_ties_beat_uuid_order_in_both_ingestion_models(
             "price_versions",
             "tags",
             "notes",
-            "schema_drift_events",
+            "payload_drift_events",
             "reconciliation_issues",
             "collection_ledger",
         ):

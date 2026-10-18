@@ -34,6 +34,7 @@ from usagebassoon.cli.reports.activity import (
 )
 
 
+@pytest.mark.windows_compatible
 def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
     """Keep CSV and JSON values identical over the default 120-day calendar."""
     runner = CliRunner()
@@ -53,7 +54,9 @@ def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert plain_cli_output(result.stdout) == ""
-    exported = list(csv.DictReader(io.StringIO(destination.read_text())))
+    exported = list(
+        csv.DictReader(io.StringIO(destination.read_text(encoding="utf-8")))
+    )
     for expected, actual in zip(payload["days"], exported, strict=True):
         assert actual["day"] == expected["day"]
         assert int(actual["value"]) == expected["value"]
@@ -69,9 +72,10 @@ def test_defaults_and_export_equivalence(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert plain_cli_output(result.stdout) == ""
-    assert json.loads(json_destination.read_text()) == payload
+    assert json.loads(json_destination.read_text(encoding="utf-8")) == payload
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("bins", [3, 7, 10])
 def test_intensity_bands(bins: int) -> None:
     """Reach every band and preserve missing, zero, and logarithmic values."""
@@ -87,6 +91,7 @@ def test_intensity_bands(bins: int) -> None:
     assert logarithmic >= linear
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "selection",
     [
@@ -102,6 +107,7 @@ def test_invalid_metric_combinations(selection: list[str]) -> None:
         _metrics(selection)
 
 
+@pytest.mark.windows_compatible
 def test_calendar_leap_day_unknown_and_partial_time() -> None:
     """Distinguish missing measurements, no records, future days, and partial time."""
     records: list[ReportRecord] = [
@@ -139,6 +145,7 @@ def test_calendar_leap_day_unknown_and_partial_time() -> None:
         _window(10, start, None, today)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     "options",
     [
@@ -157,6 +164,7 @@ def test_cli_validation(options: list[str]) -> None:
     assert result.exit_code != 0
 
 
+@pytest.mark.windows_compatible
 def test_rich_panels_and_unnumbered_legend() -> None:
     """Retain all weekday rows and colors when wrapping at week boundaries."""
     start, end = date(2024, 2, 28), date(2024, 3, 20)
@@ -198,6 +206,7 @@ def test_rich_panels_and_unnumbered_legend() -> None:
     assert "░░" in text
 
 
+@pytest.mark.windows_compatible
 def test_filtered_backend_duration_and_cost(tmp_path: Path) -> None:
     """Apply all dimensions before totals, preserve time, and avoid tag fanout."""
     config, backend = _configured_store(tmp_path)
@@ -271,6 +280,7 @@ def test_filtered_backend_duration_and_cost(tmp_path: Path) -> None:
     assert sum(row["value"] for row in json.loads(remote.stdout)["days"]) == 109
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.sql_parity
 def test_daily_activity_query_matches_bigquery_replays() -> None:
     """Aggregate retained observations identically despite repeated raw appends."""
@@ -298,6 +308,7 @@ def test_daily_activity_query_matches_bigquery_replays() -> None:
         remote.close()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("metrics", "expected"),
     [
@@ -333,6 +344,7 @@ def test_metric_component_calculations(
     assert result["status"] == "complete"
 
 
+@pytest.mark.windows_compatible
 def test_inactive_and_shaded_cells() -> None:
     """Leave inactive squares unfilled and distinguish every active shade."""
     from usagebassoon.cli.reports.activity import _cell
@@ -349,6 +361,7 @@ def test_inactive_and_shaded_cells() -> None:
     assert f"on {palette[-1]}" in str(solid.style)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize(
     ("start", "end", "year_month"),
     [
@@ -381,6 +394,7 @@ def test_calendar_year_precedence_and_title_spacing(
     assert "Jun 2026" not in month_line
 
 
+@pytest.mark.windows_compatible
 def test_ascii_option_and_text_save_use_shading(tmp_path: Path) -> None:
     """Force the fallback explicitly and preserve shaded activity in text files."""
     runner = CliRunner()
@@ -391,11 +405,12 @@ def test_ascii_option_and_text_save_use_shading(tmp_path: Path) -> None:
     saved = tmp_path / "activity.txt"
     result = runner.invoke(app, ["report", "activity", "--test", "--save", str(saved)])
     assert result.exit_code == 0, result.output
-    assert saved.read_text() == output
+    assert saved.read_text(encoding="utf-8") == output
     invalid = runner.invoke(app, ["report", "activity", "--test", "--use-asci"])
     assert invalid.exit_code != 0
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("use_256", [False, True])
 def test_solid_and_ascii_mode_selection(
     monkeypatch: pytest.MonkeyPatch, use_256: bool
@@ -451,6 +466,7 @@ def test_solid_and_ascii_mode_selection(
     assert "██" in stream.getvalue()
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("color", ["blue", "bright_cyan", "bright-red"])
 def test_bins_and_color_exports(color: str) -> None:
     """Export the selected ANSI name and bin count in JSON and CSV."""
@@ -477,6 +493,7 @@ def test_bins_and_color_exports(color: str) -> None:
     )
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("name,index", [("red", 1), ("blue", 4), ("bright_cyan", 14)])
 def test_selected_ansi_query_and_character_color(name: str, index: int) -> None:
     """Query the selected theme slot, ignore other slots, and color the fallback."""

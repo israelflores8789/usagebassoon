@@ -91,10 +91,10 @@ STATE_KEYS: dict[str, tuple[str, ...]] = {
 }
 EVENT_KEYS: dict[str, tuple[str, ...]] = {
     "collection_ledger": ("source_id", "run_id", "day", "domain"),
-    "schema_drift_events": ("source_id", "domain", "tokscale_ver", "drift_key"),
+    "payload_drift_events": ("source_id", "domain", "tokscale_ver", "drift_key"),
     "reconciliation_issues": ("source_id", "check_name", "issue_key"),
 }
-DEBUG_TABLES = frozenset({"schema_drift_events", "reconciliation_issues"})
+DEBUG_TABLES = frozenset({"payload_drift_events", "reconciliation_issues"})
 SNAPSHOT_TABLES = tuple(STATE_KEYS) + tuple(EVENT_KEYS)
 
 
@@ -269,6 +269,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("memory_bytes", pa.int64()),
             pa.field("invoke_method", pa.string()),
             pa.field("tokscale_ver", pa.string()),
+            pa.field("usagebassoon_ver", pa.string()),
             pa.field("status", pa.string()),
         ]
     ),
@@ -286,7 +287,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("observation_count", pa.int64(), nullable=False),
         ]
     ),
-    "schema_drift_events": pa.schema(
+    "payload_drift_events": pa.schema(
         [
             pa.field("run_id", pa.string(), nullable=False),
             pa.field("event_id", pa.string(), nullable=False),

@@ -27,8 +27,10 @@ SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 def _write_config(path: Path, database: Path) -> None:
     """Write a local-DuckDB configuration for CLI integration tests."""
     path.write_text(
-        f'source_id = "{SOURCE_ID}"\nbackend.provider = "duckdb"\n'
-        f'backend.duckdb.database = "{database}"\n'
+        f'source_id = "{SOURCE_ID}"\n'
+        'backend.provider = "duckdb"\n'
+        f"backend.duckdb.database = '{database}'\n",
+        encoding="utf-8",
     )
     backend = DuckDBBackend(database)
     try:
@@ -42,6 +44,7 @@ def _command(config: Path, *parts: str) -> list[str]:
     return [*parts, "--config", str(config)]
 
 
+@pytest.mark.windows_compatible
 def test_curation_commands_use_only_the_explicit_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -92,6 +95,7 @@ def test_curation_commands_use_only_the_explicit_config(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_curation_help_documents_the_supported_operations() -> None:
     """Expose each supported tag and note operation in command help."""
     runner = CliRunner()
@@ -106,6 +110,7 @@ def test_curation_help_documents_the_supported_operations() -> None:
             assert operation in output.split()
 
 
+@pytest.mark.windows_compatible
 def test_tag_commands_support_each_scope_rename_and_remove(tmp_path: Path) -> None:
     """Assert tags mutate only at their declared complete target scope."""
     config = tmp_path / "config.toml"
@@ -156,6 +161,7 @@ def test_tag_commands_support_each_scope_rename_and_remove(tmp_path: Path) -> No
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -177,14 +183,15 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
     finally:
         backend.close()
 
-    editor = tmp_path / "editor.py"
+    editor = tmp_path / "editor with spaces.py"
     editor.write_text(
         "from pathlib import Path\nimport sys\n"
         "Path(sys.argv[-1]).write_text(sys.argv[1])\n"
-        "sys.exit(1 if sys.argv[1] == 'failed content' else 0)\n"
+        "sys.exit(1 if sys.argv[1] == 'failed content' else 0)\n",
+        encoding="utf-8",
     )
     monkeypatch.delenv("VISUAL", raising=False)
-    monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} edited")
+    monkeypatch.setenv("EDITOR", f'"{sys.executable}" "{editor}" edited')
     edited = runner.invoke(app, _command(config, "note", "edit", *target))
     assert edited.exit_code == 0
     assert "Updated note" in plain_cli_output(edited.output)
@@ -201,7 +208,7 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
         backend.close()
 
     for content in ("   ", "failed content"):
-        monkeypatch.setenv("EDITOR", f"{sys.executable} {editor} '{content}'")
+        monkeypatch.setenv("EDITOR", f'"{sys.executable}" "{editor}" "{content}"')
         rejected = runner.invoke(app, _command(config, "note", "edit", *target))
         assert rejected.exit_code != 0
         if not content.strip():
@@ -215,6 +222,7 @@ def test_note_edit_uses_editor_and_does_not_write_on_invalid_results(
             backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_note_edit_requires_a_configured_editor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -226,6 +234,7 @@ def test_note_edit_requires_a_configured_editor(
     result = CliRunner().invoke(
         app,
         _command(config, "note", "edit", "--client", "codex", "--session", "ses_123"),
+        env={"COLUMNS": "120"},
     )
     assert result.exit_code != 0
     assert "note set" in plain_cli_output(result.output)
@@ -252,6 +261,7 @@ def _seed_notes(database: Path, count: int) -> list[NoteAssignment]:
     return notes
 
 
+@pytest.mark.windows_compatible
 def test_note_list_defaults_to_16_rows_and_supports_page_selection(
     tmp_path: Path,
 ) -> None:
@@ -287,6 +297,7 @@ def test_note_list_defaults_to_16_rows_and_supports_page_selection(
     assert "No notes found" in plain_cli_output(empty.stdout)
 
 
+@pytest.mark.windows_compatible
 def test_note_list_pages_interactively_and_json_never_prompts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -320,6 +331,7 @@ def test_note_list_pages_interactively_and_json_never_prompts(
     assert "Enter for next" not in plain_cli_output(structured.stdout)
 
 
+@pytest.mark.windows_compatible
 def test_note_list_escapes_terminal_controls(tmp_path: Path) -> None:
     """Keep control sequences inside note previews from affecting the terminal."""
     config = tmp_path / "config.toml"
@@ -340,6 +352,7 @@ def test_note_list_escapes_terminal_controls(tmp_path: Path) -> None:
     assert "\\u001b[31mred [bold]text[/bold]" in plain_cli_output(result.stdout)
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("json_output", [False, True])
 def test_note_describe_serializes_ordered_metadata_for_one_or_multiple_ids(
     tmp_path: Path, json_output: bool
@@ -378,6 +391,7 @@ def test_note_describe_serializes_ordered_metadata_for_one_or_multiple_ids(
             }
 
 
+@pytest.mark.windows_compatible
 def test_note_describe_rejects_missing_and_invalid_ids_without_partial_output(
     tmp_path: Path,
 ) -> None:
@@ -395,6 +409,7 @@ def test_note_describe_rejects_missing_and_invalid_ids_without_partial_output(
         assert plain_cli_output(result.stdout) == ""
 
 
+@pytest.mark.windows_compatible
 def test_note_id_edit_and_remove_resolve_the_notes_own_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -413,7 +428,8 @@ def test_note_id_edit_and_remove_resolve_the_notes_own_source(
     editor = tmp_path / "editor.py"
     editor.write_text(
         "from pathlib import Path\nimport sys\n"
-        "Path(sys.argv[-1]).write_text('edited')\n"
+        "Path(sys.argv[-1]).write_text('edited')\n",
+        encoding="utf-8",
     )
     monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.setenv("EDITOR", f"{sys.executable} {editor}")

@@ -34,7 +34,7 @@ _RELATION_DESCRIPTIONS = {
     "tags": "User tags assigned to workspaces, clients, or sessions.",
     "notes": "User notes attached to source-specific sessions.",
     "collection_ledger": "Collection outcomes, acquisition counts, and host metadata.",
-    "schema_drift_events": "Payload schema changes and their resolution state.",
+    "payload_drift_events": "Payload schema changes and their resolution state.",
     "reconciliation_issues": "Token discrepancies and their resolution state.",
     "daily_cost": "Daily token usage with costs and pricing provenance.",
     "session_model_stats": "All-time token usage and costs per session and model.",

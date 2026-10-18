@@ -6,18 +6,23 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
 import pyarrow as pa
 
 from usagebassoon import ingest, reconcile
 from usagebassoon.backends.base import ActiveTransaction, StorageBackend
-from usagebassoon.drift import SchemaDriftRecord, format_drift
+from usagebassoon.buckets.factory import SnapshotBucketRegistry, bucket_label
+from usagebassoon.drift import PayloadDriftRecord, format_drift
+from usagebassoon.schema_assets import SCHEMA_VERSION, query_sql, schema_hash
+from usagebassoon.snapshot.format import FORMAT_VERSION
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -29,7 +34,7 @@ _LOG = logging.getLogger("usagebassoon")
 
 REQUIRED_RELATIONS: tuple[str, ...] = (
     "collection_runs",
-    "schema_drift_events",
+    "payload_drift_events",
     "sessions",
     "session_model_stats",
     "daily_stats",
@@ -41,6 +46,14 @@ REQUIRED_RELATIONS: tuple[str, ...] = (
     "report_summary",
     "report_models",
 )
+
+
+@runtime_checkable
+class DoctorAuthenticationProvider(Protocol):
+    """Optional capability for a backend or bucket to describe its identity."""
+
+    def doctor_authentication(self) -> tuple[str, str]:
+        """Return its authentication source and effective principal."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,14 +129,89 @@ def maintenance_health(backend: StorageBackend | None) -> DoctorCheck:
     return DoctorCheck("maintenance", "ok" if ready else "warning", message)
 
 
-def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
-    """Report recovery coverage and last creation verification for each archive."""
+def backend_authentication_check(
+    configuration: UsageBassoonConfig | None,
+    backend: StorageBackend | None,
+) -> DoctorCheck:
+    """Report the configured backend authentication source and principal."""
+    authentication = "unavailable"
+    principal = "unavailable"
+    if configuration is not None:
+        if configuration.backend == "duckdb":
+            authentication = "local file permissions"
+            principal = "not applicable"
+        elif configuration.backend == "motherduck":
+            authentication = (
+                "MOTHERDUCK_TOKEN (environment)"
+                if os.environ.get("MOTHERDUCK_TOKEN")
+                else "MOTHERDUCK_TOKEN (not set)"
+            )
+            principal = "unavailable (token identity is not exposed)"
+        elif configuration.bigquery is not None:
+            authentication = _google_auth_source(
+                configuration.bigquery.credentials_file
+            )
+            principal = "unavailable (backend connection failed)"
+
+    if backend is not None and isinstance(backend, DoctorAuthenticationProvider):
+        try:
+            authentication, principal = backend.doctor_authentication()
+        except Exception:
+            _LOG.warning(
+                "doctor backend authentication inspection failed", exc_info=True
+            )
+            principal = "unavailable"
+
+    return DoctorCheck(
+        "backend_authentication",
+        "ok",
+        "configured backend authentication",
+        (f"Auth: {authentication}", f"Principal: {principal}"),
+    )
+
+
+def _google_auth_source(credentials_file: Path | None) -> str:
+    """Describe a Google credential source without exposing its file path."""
+    if credentials_file is not None:
+        return "configured service-account credentials file"
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return "ADC from a credentials file"
+    return "ADC"
+
+
+def snapshot_checks(
+    configuration: UsageBassoonConfig | None,
+) -> tuple[DoctorCheck, DoctorCheck]:
+    """Report snapshot configuration and recovery freshness from one inspection."""
+    snapshot_details = [f"Snapshot Format Version: {FORMAT_VERSION}"]
     if configuration is None:
-        return DoctorCheck("backup_freshness", "warning", "configuration unavailable")
+        return (
+            DoctorCheck(
+                "snapshot",
+                "warning",
+                "configuration unavailable",
+                tuple(snapshot_details),
+            ),
+            DoctorCheck("snapshot_freshness", "warning", "configuration unavailable"),
+        )
     settings = configuration.snapshots
+    registry = SnapshotBucketRegistry.from_settings(settings)
+    snapshot_details.extend(
+        f"{bucket_label(destination.uri)}: {destination.uri}"
+        for destination in registry.destinations
+        if destination.enabled
+    )
     if not settings.enabled:
-        return DoctorCheck(
-            "backup_freshness", "ok", "automatic snapshots are not configured"
+        return (
+            DoctorCheck(
+                "snapshot",
+                "ok",
+                "automatic snapshots are not configured",
+                tuple(snapshot_details),
+            ),
+            DoctorCheck(
+                "snapshot_freshness", "ok", "automatic snapshots are not configured"
+            ),
         )
     from usagebassoon.archiver import SnapshotArchiver
     from usagebassoon.config import parse_interval
@@ -133,9 +221,30 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
 
     details: list[str] = []
     warnings: list[str] = []
+    authentication: dict[str, tuple[str, str]] = {}
+    if settings.local.enable:
+        authentication["Local"] = ("local file permissions", "not applicable")
+    if settings.gcs is not None and settings.gcs.enable:
+        authentication["GCS"] = (
+            _google_auth_source(settings.gcs.credentials_file),
+            "unavailable (bucket not opened)",
+        )
     try:
         archiver = SnapshotArchiver.from_config(configuration)
         reader = SnapshotReader(archiver._archives, archiver._bucket)
+        for bucket in reader.buckets:
+            label = bucket_label(bucket.uri)
+            if isinstance(bucket, DoctorAuthenticationProvider):
+                try:
+                    authentication[label] = bucket.doctor_authentication()
+                except Exception:
+                    _LOG.warning(
+                        "doctor snapshot authentication inspection failed for %s",
+                        label,
+                        exc_info=True,
+                    )
+                    current = authentication.get(label, ("unknown", "unavailable"))
+                    authentication[label] = (current[0], "unavailable")
         rows = reader.listing()
         now = datetime.now(UTC)
         for bucket in reader.buckets:
@@ -234,11 +343,23 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     except Exception as error:
         _LOG.warning("doctor archive inspection failed", exc_info=True)
         warnings.append(f"archive inspection unavailable: {error}")
-    return DoctorCheck(
-        "backup_freshness",
-        "warning" if warnings else "ok",
-        "; ".join(warnings) if warnings else "recovery points are available",
-        tuple(details),
+    for label, (auth_method, principal) in authentication.items():
+        snapshot_details.extend(
+            (
+                f"{label} snapshot Auth: {auth_method}",
+                f"{label} snapshot Principal: {principal}",
+            )
+        )
+    return (
+        DoctorCheck(
+            "snapshot", "ok", "configured snapshot archives", tuple(snapshot_details)
+        ),
+        DoctorCheck(
+            "snapshot_freshness",
+            "warning" if warnings else "ok",
+            "; ".join(warnings) if warnings else "recovery points are available",
+            tuple(details),
+        ),
     )
 
 
@@ -315,15 +436,15 @@ def _read_value[T](result: ReadResult[T]) -> T:
     return cast(T, value)
 
 
-def unresolved_schema_drift(
+def unresolved_payload_drift(
     backend: StorageBackend,
     *,
     limit: int = 20,
-) -> tuple[SchemaDriftRecord, ...]:
-    """Load unresolved current schema-drift events from a backend.
+) -> tuple[PayloadDriftRecord, ...]:
+    """Load unresolved current payload-drift events from a backend.
 
     Args:
-        backend: Backend containing current schema-drift events.
+        backend: Backend containing current payload-drift events.
         limit: Maximum number of newest events to load.
 
     Returns:
@@ -339,11 +460,11 @@ def unresolved_schema_drift(
         backend,
         "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
         "contract_tokscale_ver, created_at, collected_at, "
-        "observation_count FROM open_schema_drift_events "
+        "observation_count FROM open_payload_drift_events "
         f"ORDER BY collected_at DESC LIMIT {limit}",
     )
     return tuple(
-        SchemaDriftRecord(
+        PayloadDriftRecord(
             domain=_as_required_string(_row_value(row, "domain")),
             tokscale_ver=_as_required_string(_row_value(row, "tokscale_ver")),
             drift_key=_as_required_string(_row_value(row, "drift_key")),
@@ -400,28 +521,24 @@ def ingest_issues(
     *,
     limit: int = 20,
 ) -> tuple[ingest.IngestIssue, ...]:
-    """Load recent collection runs with non-success statuses.
+    """Load non-success collection runs without a later success for their source.
 
     Args:
         backend: Backend containing the ingest audit log.
-        limit: Maximum number of runs to load.
+        limit: Maximum number of unresolved runs to load.
 
     Returns:
-        Recent failed, partial, or schema-drift runs first.
+        Unresolved failed, partial, or payload-drift runs, newest first.
 
     Raises:
         ValueError: If ``limit`` is not positive.
     """
     if limit < 1:
         raise ValueError("limit must be positive")
-    rows = _materialized_rows(
-        backend,
-        "SELECT run_id, finished_at, status "
-        "FROM collection_runs "
-        "WHERE status IN ('failed', 'partial', 'schema_drift') "
-        "ORDER BY finished_at DESC NULLS LAST "
-        f"LIMIT {limit}",
+    sql = query_sql(backend.dialect, "doctor_unresolved_collection_runs").format(
+        limit=limit
     )
+    rows = _materialized_rows(backend, sql)
     return tuple(
         ingest.IngestIssue(
             run_id=_as_required_string(_row_value(row, "run_id")),
@@ -430,6 +547,61 @@ def ingest_issues(
         )
         for row in rows
     )
+
+
+def _collection_issues(backend: StorageBackend, *, limit: int = 20) -> tuple[str, ...]:
+    """Return unresolved target statuses and collection-run failures.
+
+    Args:
+        backend: Backend containing the shared collection status views.
+        limit: Maximum number of details to return.
+
+    Returns:
+        Unresolved target details followed by unresolved run details.
+
+    Raises:
+        ValueError: If ``limit`` is not positive.
+    """
+    if limit < 1:
+        raise ValueError("limit must be positive")
+
+    run_issues = ingest_issues(backend, limit=limit)
+    sql = query_sql(backend.dialect, "doctor_unresolved_collection_targets").format(
+        limit=limit
+    )
+    target_rows = _materialized_rows(backend, sql)
+
+    details: list[str] = []
+    target_run_ids: set[str] = set()
+    for row in target_rows:
+        source_id = _as_required_string(_row_value(row, "source_id"))
+        day = _as_required_string(_row_value(row, "day"))
+        domain = _as_required_string(_row_value(row, "domain"))
+        status = _as_required_string(_row_value(row, "status"))
+        run_id = _as_optional_string(_row_value(row, "run_id"))
+        expected_count = _as_optional_int(_row_value(row, "expected_count"))
+        succeeded_count = _as_optional_int(_row_value(row, "succeeded_count"))
+        failure_code = _as_optional_string(_row_value(row, "failure_code"))
+
+        qualifiers: list[str] = []
+        if expected_count is not None and succeeded_count is not None:
+            qualifiers.append(f"{succeeded_count}/{expected_count} succeeded")
+        if failure_code:
+            qualifiers.append(f"failure={failure_code}")
+        if run_id:
+            target_run_ids.add(run_id)
+            qualifiers.append(f"run {run_id}")
+        detail = f"unresolved {domain} target {day} for source {source_id}: {status}"
+        if qualifiers:
+            detail += f" ({'; '.join(qualifiers)})"
+        details.append(detail)
+
+    details.extend(
+        f"{issue.status or 'unknown'} run {issue.run_id}"
+        for issue in run_issues
+        if issue.run_id not in target_run_ids
+    )
+    return tuple(details[:limit])
 
 
 def run_doctor(
@@ -456,7 +628,7 @@ def run_doctor(
         connection_error: Backend construction error, if any.
         snapshot_enabled: Whether optional snapshots are configured.
         snapshot_warnings: Advisories from configured snapshot storage.
-        limit: Maximum number of drift and ingest records to display.
+        limit: Maximum number of unresolved drift and collection records to display.
         logger: Optional logger used for recoverable diagnostic failures.
 
     Returns:
@@ -497,12 +669,25 @@ def run_doctor(
             )
         )
 
+    provider = {
+        "duckdb": "DuckDB",
+        "motherduck": "MotherDuck",
+        "bigquery": "BigQuery",
+    }.get(backend_name, backend_name or "unavailable")
+    target_label = "Dataset" if backend_name == "bigquery" else "Database"
+    backend_details = (
+        f"Backend: {provider}",
+        f"{target_label}: {database or 'unavailable'}",
+        "Remote Schema Version: unavailable",
+        f"Local Schema Version: {SCHEMA_VERSION}",
+    )
     if backend is None:
         checks.append(
             DoctorCheck(
                 "backend",
                 "error",
                 connection_error or "backend could not be opened",
+                backend_details,
             )
         )
         return DoctorReport(tuple(checks))
@@ -513,7 +698,12 @@ def run_doctor(
         except Exception as error:
             active_logger.exception("doctor snapshot initialization failed")
             checks.append(
-                DoctorCheck("backend", "error", f"read snapshot failed: {error}")
+                DoctorCheck(
+                    "backend",
+                    "error",
+                    f"read snapshot failed: {error}",
+                    backend_details,
+                )
             )
             return DoctorReport(tuple(checks))
 
@@ -522,10 +712,38 @@ def run_doctor(
         except Exception as error:
             active_logger.exception("doctor connectivity check failed")
             checks.append(
-                DoctorCheck("backend", "error", f"connectivity failed: {error}")
+                DoctorCheck(
+                    "backend", "error", f"connectivity failed: {error}", backend_details
+                )
             )
             return DoctorReport(tuple(checks))
-        checks.append(DoctorCheck("backend", "ok", "connection and query succeeded"))
+        backend_status: CheckStatus = "ok"
+        backend_message = "connection and query succeeded"
+        try:
+            metadata = backend.schema_metadata()
+            if metadata is None:
+                backend_status = "warning"
+                backend_message = "schema marker is missing; run bassoon init"
+            else:
+                remote_version, remote_hash = metadata
+                backend_details = (
+                    *backend_details[:2],
+                    f"Remote Schema Version: {remote_version}",
+                    backend_details[-1],
+                )
+                if remote_version != SCHEMA_VERSION:
+                    backend_status = "warning"
+                    backend_message = "remote and local schema versions differ"
+                elif remote_hash != schema_hash(backend.dialect):
+                    backend_status = "warning"
+                    backend_message = "remote schema hash differs from this package"
+        except Exception as error:
+            active_logger.exception("doctor schema metadata inspection failed")
+            backend_status = "warning"
+            backend_message = f"schema metadata inspection unavailable: {error}"
+        checks.append(
+            DoctorCheck("backend", backend_status, backend_message, backend_details)
+        )
         workers = backend.max_concurrent_queries
         if workers < 1:
             raise ValueError("backend query concurrency must be positive")
@@ -587,8 +805,8 @@ def run_doctor(
 
         transactions_result: ReadResult[tuple[ActiveTransaction, ...]] | None = None
         backlog_result: ReadResult[pa.Table | None] | None = None
-        drift_result: ReadResult[tuple[SchemaDriftRecord, ...]] | None = None
-        ingest_result: ReadResult[tuple[ingest.IngestIssue, ...]] | None = None
+        drift_result: ReadResult[tuple[PayloadDriftRecord, ...]] | None = None
+        ingest_result: ReadResult[tuple[str, ...]] | None = None
         reconciliation_result: (
             ReadResult[tuple[reconcile.ReconciliationIssueRecord, ...]] | None
         ) = None
@@ -601,10 +819,11 @@ def run_doctor(
                     _capture_read, backend.compaction_backlog
                 )
                 drift_future = executor.submit(
-                    _capture_read, lambda: unresolved_schema_drift(backend, limit=limit)
+                    _capture_read,
+                    lambda: unresolved_payload_drift(backend, limit=limit),
                 )
                 ingest_future = executor.submit(
-                    _capture_read, lambda: ingest_issues(backend, limit=limit)
+                    _capture_read, lambda: _collection_issues(backend, limit=limit)
                 )
                 reconciliation_future = executor.submit(
                     _capture_read, lambda: reconciliation_issues(backend, limit=limit)
@@ -621,9 +840,11 @@ def run_doctor(
             )
             backlog_result = _capture_read(backend.compaction_backlog)
             drift_result = _capture_read(
-                lambda: unresolved_schema_drift(backend, limit=limit)
+                lambda: unresolved_payload_drift(backend, limit=limit)
             )
-            ingest_result = _capture_read(lambda: ingest_issues(backend, limit=limit))
+            ingest_result = _capture_read(
+                lambda: _collection_issues(backend, limit=limit)
+            )
             reconciliation_result = _capture_read(
                 lambda: reconciliation_issues(backend, limit=limit)
             )
@@ -693,10 +914,10 @@ def run_doctor(
         try:
             drift = _read_value(drift_result)
         except Exception as error:
-            active_logger.exception("doctor schema-drift inspection failed")
+            active_logger.exception("doctor payload-drift inspection failed")
             checks.append(
                 DoctorCheck(
-                    "schema_drift",
+                    "payload_drift",
                     "error",
                     f"could not read drift log: {error}",
                 )
@@ -707,7 +928,7 @@ def run_doctor(
                 details += (f"report unexpected drift: {DRIFT_ISSUE_URL}",)
             checks.append(
                 DoctorCheck(
-                    "schema_drift",
+                    "payload_drift",
                     "warning" if drift else "ok",
                     (
                         f"{len(drift)} unresolved event(s)"
@@ -721,28 +942,25 @@ def run_doctor(
         try:
             issues = _read_value(ingest_result)
         except Exception as error:
-            active_logger.exception("doctor ingest-run inspection failed")
+            active_logger.exception("doctor collection health inspection failed")
             checks.append(
                 DoctorCheck(
                     "collection_runs",
                     "error",
-                    f"could not read run log: {error}",
+                    f"could not read collection status: {error}",
                 )
             )
         else:
-            details = tuple(
-                f"{issue.status or 'unknown'} run {issue.run_id}" for issue in issues
-            )
             checks.append(
                 DoctorCheck(
                     "collection_runs",
                     "warning" if issues else "ok",
                     (
-                        f"{len(issues)} recent non-success run(s)"
+                        f"{len(issues)} unresolved collection issue(s)"
                         if issues
-                        else "recent runs are healthy"
+                        else "no unresolved collection issues"
                     ),
-                    details,
+                    issues,
                 )
             )
 

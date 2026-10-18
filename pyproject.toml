@@ -25,6 +25,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "sqlglot>=30.18.0",
     "PyYAML>=6.0",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -72,6 +73,7 @@ dev = [
     "types-grpcio>=1.0",
     "types-protobuf>=5.0",
     "types-PyYAML>=6.0",
+    "rust-just>=1.58.0",
 ]
 
 [tool.hatch.version]
@@ -112,7 +114,7 @@ convention = "google"
 preset = "strict"
 python-version = "3.12"
 project-includes = ["src", "tests"]
-search-path = ["."]
+search-path = ["src", "."]
 min-severity = "warn"
 
 [tool.pytest.ini_options]
@@ -123,6 +125,8 @@ markers = [
     "gcs_live: runs against the dedicated UsageBassoon GCS test bucket.",
     "motherduck_live: runs against the dedicated usagebassoon_it MotherDuck database.",
     "sql_parity: runs hermetic DuckDB and SQLGlot dialect-parity tests.",
+    "windows_smoke: exercises required Windows runtime behavior without cloud services.",
+    "windows_compatible: test has been verified as portable on Windows and POSIX.",
 ]
 
 [tool.coverage.run]

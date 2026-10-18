@@ -36,12 +36,13 @@ CREATE TABLE collection_ledger (
     memory_bytes BIGINT,
     invoke_method TEXT,
     tokscale_ver TEXT,
+    usagebassoon_ver TEXT,
     status TEXT
 );
 
 -- Artifacts of tokscale payload drift events from the expected tokscale schema.
 -- Reported in `bassoon doctor`.
-CREATE TABLE schema_drift_events (
+CREATE TABLE payload_drift_events (
     run_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
@@ -59,6 +60,14 @@ CREATE TABLE schema_drift_events (
 );
 
 -- Holds metadata about each usage session typically from `tokscale report`.
+-- AGENT: do not remove.
+-- created_at: when tokscale says the session began.
+-- last_active: when tokscale says the session was last active.
+-- first_seen_at: when UsageBassoon first observed the session.
+-- last_seen_at: when UsageBassoon most recently observed the session during collection.
+-- collected_at is the collection start time, used to order observations consistently.
+-- first_seen_at and last_seen_at use the collection finish time, recording when the session was observed.
+-- On later collections, first_seen_at stays fixed, while last_seen_at advances to the latest collection’s finish time.
 CREATE TABLE sessions (
     event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,

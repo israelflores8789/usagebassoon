@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, quote_plus
 
 import pyarrow as pa
@@ -33,7 +33,55 @@ _CREDENTIAL_MARKERS = (
     "SECRET",
     "AUTH",
     "CREDENTIAL",
+    "CREDENTIALS",
+    "AUTHORIZATION",
+    "PWD",
 )
+# Exact uppercase names override component detection; the denylist takes priority.
+_CREDENTIAL_NAME_ALLOWLIST = frozenset(
+    {
+        "AUTH_METHOD",
+        "AUTH_SOURCE",
+        "AUTH_TYPE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "CREDENTIAL_FILE",
+        "CREDENTIALS_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "KEYBOARD",
+        "KEYBOARD_LAYOUT",
+        "OLDPWD",
+        "PUBLIC_WORKSPACE",
+        "PWD",
+        "SSH_AUTH_SOCK",
+        "TOKSCALE_CONFIG_DIR",
+        "TOKSCALE_EXTRA_DIRS",
+    }
+)
+_CREDENTIAL_NAME_DENYLIST = frozenset(
+    {
+        "ACCESSKEY",
+        "ACCESSKEYID",
+        "ACCESSTOKEN",
+        "APIKEY",
+        "AUTHORIZATION",
+        "AUTHTOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CLIENTSECRET",
+        "CREDENTIALS",
+        "MOTHERDUCK_TOKEN",
+        "MYSQL_PWD",
+        "PGPASSWORD",
+        "PRIVATEKEY",
+        "REFRESHTOKEN",
+        "SECRETKEY",
+        "SESSIONTOKEN",
+    }
+)
+# Ambient bare values are limited to authentication sources used by UsageBassoon.
+_CREDENTIAL_VALUE_ENVIRONMENT_NAMES = frozenset({"MOTHERDUCK_TOKEN"})
 _URI_CREDENTIAL_PATTERN = re.compile(r"(\w+://)[^\s/@]+@")
 _QUERY_SECRET_PATTERN = re.compile(
     r"[?&;](?P<name>[\w-]+)=[^\s&#;\"']*",
@@ -41,7 +89,10 @@ _QUERY_SECRET_PATTERN = re.compile(
 )
 _ENV_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<prefix>[\"']?\b(?P<name>(?=[\w-]*(?:"
-    + "|".join(_CREDENTIAL_MARKERS)
+    + "|".join(
+        re.escape(name).replace("_", "[_-]")
+        for name in sorted(set(_CREDENTIAL_MARKERS) | _CREDENTIAL_NAME_DENYLIST)
+    )
     + r"))[A-Za-z_][A-Za-z0-9_-]*)[\"']?\s*[=:]\s*)"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;{}\[\]\"']+)",
     re.IGNORECASE,
@@ -50,9 +101,130 @@ _AUTHORIZATION_PATTERN = re.compile(
     r"\b(?:Bearer|Basic)\s+[^\s\"',;}\]]+", re.IGNORECASE
 )
 _WINDOWS_PATH_PATTERN = re.compile(
-    r"(?<![\w:])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\s,:;)]+)[^\s,:;)]*"
+    r"(?<![\w:])(?:"
+    r"(?P<quote>['\"])(?:[A-Za-z]:[\\/]|\\\\[^\\/\r\n]+[\\/])"
+    r"[^\r\n]*?(?P=quote)"
+    r"|"
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])"
+    r"(?:[^\\/:;,)\"'<>|?*\[\]\r\n]+[\\/])*"
+    r"[^\\/:;,)\"'<>|?*\[\]\r\n]*?\.[A-Za-z0-9]{1,16}"
+    r"(?=(?:\[\d+\])?[:;,)'\"\s]|$)"
+    r"|"
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\s,:;)]+)[^\s,:;)]*"
+    r")"
 )
 _POSIX_PATH_PATTERN = re.compile(r"(?<!\w)(?:~|/)[^\s,:;)]*")
+_DOCTOR_POSIX_PATH_PATTERN = re.compile(
+    r"(?<![\w/:])(?:(?P<quote>['\"])(?:~|/[^'\"\r\n]*)(?P=quote)|(?:~|/)[^\s,:;)]*)"
+)
+_GCP_SERVICE_ACCOUNT_PATTERN = re.compile(
+    r"(?P<account>[A-Za-z0-9._+-]+)@[A-Za-z0-9-]+(?P<domain>\.iam\.gserviceaccount\.com)\b",
+    re.IGNORECASE,
+)
+_DOCTOR_EMAIL_PATTERN = re.compile(
+    r"(?P<account>[A-Za-z0-9._%+-]+)@"
+    r"(?P<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63})"
+    r"(?![A-Za-z0-9.-])"
+)
+_PUBLIC_EMAIL_DOMAINS = frozenset(
+    {
+        "aol.com",
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "icloud.com",
+        "live.com",
+        "mac.com",
+        "me.com",
+        "msn.com",
+        "outlook.com",
+        "proton.me",
+        "protonmail.com",
+        "yahoo.com",
+    }
+)
+_DOCTOR_AUTH_METHODS = frozenset(
+    {
+        "ADC",
+        "ADC from a credentials file",
+        "configured service-account credentials file",
+        "explicit credentials",
+        "explicit token",
+        "injected client",
+        "local file permissions",
+        "MOTHERDUCK_TOKEN (environment)",
+        "MOTHERDUCK_TOKEN (not set)",
+        "unavailable",
+    }
+)
+_APPLICATION_PATH_PREFIXES = (
+    ("appdata", "local"),
+    ("appdata", "locallow"),
+    ("appdata", "roaming"),
+    (".config",),
+    (".local", "share"),
+    ("library", "application support"),
+)
+_USER_DIRECTORY_PARENTS = frozenset({"home", "users", "documents and settings"})
+_PUBLIC_USER_DIRECTORIES = frozenset({"all users", "default", "default user", "public"})
+_PROJECT_PARENT_DIRECTORIES = frozenset(
+    {
+        "code",
+        "dev",
+        "documents",
+        "project",
+        "projects",
+        "repo",
+        "repos",
+        "src",
+        "work",
+        "workspace",
+        "workspaces",
+    }
+)
+_COMMON_PATH_DIRECTORIES = frozenset(
+    {
+        ".cache",
+        ".config",
+        ".local",
+        "appdata",
+        "application support",
+        "applications",
+        "bin",
+        "desktop",
+        "dev",
+        "documents",
+        "downloads",
+        "etc",
+        "home",
+        "library",
+        "lib",
+        "lib64",
+        "local",
+        "media",
+        "mnt",
+        "opt",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "public",
+        "run",
+        "sbin",
+        "share",
+        "src",
+        "system32",
+        "temp",
+        "tmp",
+        "usr",
+        "users",
+        "var",
+        "volumes",
+        "windows",
+        "workspace",
+        "workspaces",
+    }
+)
 
 
 def _label(prefix: str, index: int) -> str:
@@ -100,6 +272,14 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
         Original assignment or a redacted value.
     """
     name = match["name"]
+    value = match[0][len(match["prefix"]) :].strip().strip("\"'")
+    if name.casefold() == "auth":
+        line_end = match.string.find("\n", match.end())
+        suffix_end = len(match.string) if line_end < 0 else line_end
+        suffix = match.string[match.end() : suffix_end]
+        complete_value = f"{value}{suffix}".strip().strip("\"'")
+        if complete_value in _DOCTOR_AUTH_METHODS:
+            return match[0]
     if _credential_name(name):
         return f"{match['prefix']}<redacted>"
     return match[0]
@@ -107,7 +287,12 @@ def _redact_environment_secret(match: re.Match[str]) -> str:
 
 def _credential_name(name: str) -> bool:
     """Return whether a field or environment name denotes authentication material."""
-    return any(token in name.upper() for token in _CREDENTIAL_MARKERS)
+    normalized = name.upper().replace("-", "_")
+    if normalized in _CREDENTIAL_NAME_DENYLIST:
+        return True
+    if normalized in _CREDENTIAL_NAME_ALLOWLIST:
+        return False
+    return any(part in _CREDENTIAL_MARKERS for part in normalized.split("_"))
 
 
 def _redact_query_secret(match: re.Match[str]) -> str:
@@ -118,20 +303,22 @@ def _redact_query_secret(match: re.Match[str]) -> str:
 def credential_values(
     environ: Mapping[str, str], *, environment_names: Iterable[str] = ()
 ) -> tuple[str, ...]:
-    """Select active credentials, including explicitly supplied child variables.
+    """Select credential values from supported authentication and child scopes.
 
     Args:
         environ: Active process environment.
-        environment_names: Additional potentially sensitive variable names.
+        environment_names: Explicitly forwarded child variable names to classify.
 
     Returns:
         Nonempty values requiring exact redaction even when echoed without labels.
     """
-    names = set(environment_names)
+    names = _CREDENTIAL_VALUE_ENVIRONMENT_NAMES | {
+        name.upper() for name in environment_names
+    }
     return tuple(
         value
         for name, value in environ.items()
-        if value and (name in names or _credential_name(name))
+        if value and name.upper() in names and _credential_name(name)
     )
 
 
@@ -230,13 +417,96 @@ def sanitize_table(table: pa.Table) -> pa.Table:
     return pa.Table.from_pylist(records, schema=table.schema)
 
 
+def _sanitize_doctor_path(value: str, *, preserve_filename: bool = True) -> str:
+    """Preserve path structure while masking recognizable user and project names.
+
+    Args:
+        value: A Windows, POSIX, or relative filesystem path.
+        preserve_filename: Whether to keep the final path component as a filename.
+
+    Returns:
+        A readable path with known user and project directories replaced.
+    """
+    if value.startswith("//storage.googleapis.com/"):
+        return value
+    windows_path = PureWindowsPath(value)
+    path = windows_path if windows_path.drive or "\\" in value else PurePosixPath(value)
+    parts = list(path.parts[1:] if path.anchor else path.parts)
+    try:
+        home_name = Path.home().name.casefold()
+    except (OSError, RuntimeError):
+        home_name = ""
+    try:
+        project_name = Path.cwd().name.casefold()
+    except OSError:
+        project_name = ""
+
+    sanitized_parts: list[str] = []
+    for index, part in enumerate(parts):
+        normalized = part.casefold()
+        previous = parts[index - 1].casefold() if index else ""
+        is_last = index == len(parts) - 1
+        replacement: str | None = None
+        ancestors = tuple(component.casefold() for component in parts[:index])
+        in_application_data = any(
+            ancestors[start : start + len(prefix)] == prefix
+            for prefix in _APPLICATION_PATH_PREFIXES
+            for start in range(len(ancestors))
+        )
+
+        is_user_directory = bool(home_name and normalized == home_name) or (
+            previous in _USER_DIRECTORY_PARENTS
+            and normalized not in _PUBLIC_USER_DIRECTORIES
+        )
+        is_project_directory = bool(
+            project_name
+            and normalized == project_name
+            and normalized not in _COMMON_PATH_DIRECTORIES
+            and not in_application_data
+        ) or (
+            previous in _PROJECT_PARENT_DIRECTORIES
+            and normalized not in _COMMON_PATH_DIRECTORIES
+            and (not is_last or not preserve_filename)
+        )
+
+        if is_user_directory:
+            replacement = "<user>"
+        elif is_project_directory:
+            replacement = "<project>"
+
+        sanitized_parts.append(replacement or part)
+
+    if isinstance(path, PureWindowsPath) and path.drive.startswith("\\\\"):
+        anchor = "\\\\<host>\\<share>\\"
+        return anchor + "\\".join(sanitized_parts)
+    return str(type(path)(path.anchor, *sanitized_parts))
+
+
+def _sanitize_doctor_path_match(match: re.Match[str]) -> str:
+    """Sanitize one path match while retaining any surrounding quotes."""
+    matched = match[0]
+    if len(matched) >= 2 and matched[0] in "'\"" and matched[-1] == matched[0]:
+        quote = matched[0]
+        path = matched[1:-1]
+        preserve_filename = not path.endswith(("/", "\\"))
+        sanitized_path = _sanitize_doctor_path(
+            path,
+            preserve_filename=preserve_filename,
+        )
+        return f"{quote}{sanitized_path}{quote}"
+    return _sanitize_doctor_path(
+        matched,
+        preserve_filename=not matched.endswith(("/", "\\")),
+    )
+
+
 def sanitize_doctor_text(
     value: str,
     *,
     config_path: str | None,
     database: str | None,
 ) -> str:
-    """Obfuscate configuration directories and redact credentials and other paths.
+    """Keep path context while masking users and projects and redacting secrets.
 
     Args:
         value: One doctor display string.
@@ -248,27 +518,85 @@ def sanitize_doctor_text(
     """
 
     def sanitize_part(part: str) -> str:
-        """Redact a diagnostic fragment while retaining named remote targets."""
-        if database and any(separator in database for separator in ("/", "\\")):
-            part = part.replace(database, "<path>")
-        return _sanitize_text(part, {})
+        """Redact credentials and preserve useful path components."""
+        sanitized = redact_credentials(part)
+        sanitized = _WINDOWS_PATH_PATTERN.sub(_sanitize_doctor_path_match, sanitized)
+        sanitized = _DOCTOR_POSIX_PATH_PATTERN.sub(
+            _sanitize_doctor_path_match, sanitized
+        )
+        sanitized = _GCP_SERVICE_ACCOUNT_PATTERN.sub(
+            r"\g<account>@<project-id>\g<domain>", sanitized
+        )
+        return _DOCTOR_EMAIL_PATTERN.sub(_redact_doctor_email, sanitized)
 
-    if not config_path:
+    database_path = (
+        database
+        if database and any(separator in database for separator in ("/", "\\"))
+        else None
+    )
+    paths = [path for path in (config_path, database_path) if path]
+    if not paths:
         return sanitize_part(value)
-    path = (
-        PureWindowsPath(config_path)
-        if PureWindowsPath(config_path).is_absolute()
-        else PurePosixPath(config_path)
+    pattern = (
+        "("
+        + "|".join(
+            f"(?i:{re.escape(path)})"
+            if PureWindowsPath(path).drive
+            else re.escape(path)
+            for path in sorted(paths, key=len, reverse=True)
+        )
+        + ")"
     )
-    anchor = path.anchor
-    first_index = 1
-    if isinstance(path, PureWindowsPath) and path.drive.startswith("\\\\"):
-        anchor = "\\\\directory-alpha\\directory-bravo\\"
-        first_index = 3
-    directories = tuple(
-        _label("directory", index)
-        for index in range(first_index, first_index + len(path.parts) - 2)
+    return "".join(
+        redact_credentials(_sanitize_doctor_path(part))
+        if index % 2
+        else sanitize_part(part)
+        for index, part in enumerate(re.split(pattern, value))
     )
-    obfuscated = str(type(path)(anchor, *directories, path.name))
-    obfuscated = redact_credentials(obfuscated)
-    return obfuscated.join(sanitize_part(part) for part in value.split(config_path))
+
+
+def google_doctor_principal(credentials: object | None) -> str:
+    """Describe a Google credential principal for sanitized doctor output.
+
+    Args:
+        credentials: Resolved Google Auth credentials, when available.
+
+    Returns:
+        The effective service account, user account, external identity, or an
+        unavailable marker. Email masking is applied when doctor renders output.
+    """
+    if credentials is None:
+        return "unavailable"
+
+    service_account_email = getattr(credentials, "service_account_email", None)
+    if isinstance(service_account_email, str) and "@" in service_account_email:
+        return f"service account {service_account_email}"
+
+    account = getattr(credentials, "account", None)
+    if isinstance(account, str):
+        return (
+            f"user account {account}"
+            if "@" in account
+            else "user account (email unavailable)"
+        )
+
+    module = type(credentials).__module__
+    if any(
+        marker in module for marker in ("external_account", "identity_pool", ".aws")
+    ):
+        return "external identity (email unavailable)"
+    if "compute_engine" in module or "impersonated_credentials" in module:
+        return "service account (email unavailable)"
+    return "principal unavailable"
+
+
+def _redact_doctor_email(match: re.Match[str]) -> str:
+    """Keep only a short handle prefix and allow-listed public email domains."""
+    account = match.group("account")
+    visible_count = 2 if len(account) > 4 else 1 if len(account) > 2 else 0
+    visible = f"{account[:visible_count]}..." if visible_count else "..."
+    domain = match.group("domain")
+    safe_domain = domain.casefold()
+    if safe_domain not in _PUBLIC_EMAIL_DOMAINS:
+        safe_domain = "<domain>"
+    return f"{visible}@{safe_domain}"

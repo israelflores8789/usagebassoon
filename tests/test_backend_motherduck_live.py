@@ -93,7 +93,11 @@ _LOG = logging.getLogger("usagebassoon-motherduck-live")
 @pytest.fixture(autouse=True)
 def _bound_live_test_duration() -> Iterator[None]:
     """Fail a blocked live test within the per-test time limit."""
-    if not hasattr(signal, "SIGALRM"):
+    if (
+        not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "ITIMER_REAL")
+    ):
         yield
         return
 
@@ -719,7 +723,7 @@ def test_live_doctor_keeps_first_query_snapshot(
             stamp = datetime.now(UTC)
             with writer.transaction():
                 writer.append(
-                    "schema_drift_events",
+                    "payload_drift_events",
                     observations(
                         pa.table(
                             {
@@ -754,12 +758,12 @@ def test_live_doctor_keeps_first_query_snapshot(
         assert committed
         assert first_report.status == "ok", first_report.checks
         first_drift = next(
-            check for check in first_report.checks if check.name == "schema_drift"
+            check for check in first_report.checks if check.name == "payload_drift"
         )
         assert first_drift.status == "ok"
         assert first_drift.message == "no unresolved events"
         assert reader.query(
-            "SELECT count(*) AS n FROM open_schema_drift_events "
+            "SELECT count(*) AS n FROM open_payload_drift_events "
             "WHERE source_id = :source_id",
             {"source_id": source_id},
         ).to_pylist() == [{"n": 1}]
@@ -771,7 +775,7 @@ def test_live_doctor_keeps_first_query_snapshot(
         )
         assert not next_report.errors, next_report.checks
         next_drift = next(
-            check for check in next_report.checks if check.name == "schema_drift"
+            check for check in next_report.checks if check.name == "payload_drift"
         )
         assert next_drift.status == "warning"
         assert next_drift.message == "1 unresolved event(s)"
@@ -1044,7 +1048,7 @@ def test_live_portable_snapshots_and_atomic_restore(
             "observation_count": [1],
         }
         debug_payloads: dict[str, dict[str, list[object]]] = {
-            "schema_drift_events": {
+            "payload_drift_events": {
                 "domain": ["models"],
                 "tokscale_ver": [collection_bundle.graph.meta.version],
                 "drift_key": ["unknown_field:entries[].archive"],

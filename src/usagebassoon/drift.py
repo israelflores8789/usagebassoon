@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""drift.py — Persisted schema-drift records and presentation."""
+"""drift.py — Persisted payload-drift records and presentation."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from datetime import datetime
 
 
 @dataclass(frozen=True, slots=True)
-class SchemaDriftRecord:
-    """A current schema-drift event returned by diagnostics.
+class PayloadDriftRecord:
+    """A current payload-drift event returned by diagnostics.
 
     Attributes:
         domain: Tokscale command that produced the payload.
@@ -39,7 +39,7 @@ class SchemaDriftRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class SchemaDriftState:
+class PayloadDriftState:
     """Persisted lifecycle fields needed to resolve a drift event."""
 
     domain: str
@@ -53,15 +53,15 @@ class SchemaDriftState:
     observation_count: int
 
 
-type SchemaDriftIdentity = tuple[str, str, str]
+type PayloadDriftIdentity = tuple[str, str, str]
 
 
-def drift_identity(record: SchemaDriftState) -> SchemaDriftIdentity:
+def drift_identity(record: PayloadDriftState) -> PayloadDriftIdentity:
     """Return the natural key for one persisted event state."""
     return (record.domain, record.tokscale_ver, record.drift_key)
 
 
-def format_drift(record: SchemaDriftRecord) -> str:
+def format_drift(record: PayloadDriftRecord) -> str:
     """Format one persisted drift event for terminal output.
 
     Args:

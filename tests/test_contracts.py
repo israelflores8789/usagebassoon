@@ -20,7 +20,7 @@ from usagebassoon.contracts import (
     load_shipped_contracts,
     validate_payloads,
 )
-from usagebassoon.drift import SchemaDriftState
+from usagebassoon.drift import PayloadDriftState
 from usagebassoon.ingest import (
     IngestEvidence,
     build_collection_bundle,
@@ -66,6 +66,7 @@ def _raw_collection(
     )
 
 
+@pytest.mark.windows_compatible
 def test_shipped_contracts_accept_the_golden_payloads(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -78,6 +79,7 @@ def test_shipped_contracts_accept_the_golden_payloads(
     assert result == type(result)(events=(), fatal=False)
 
 
+@pytest.mark.windows_compatible
 def test_unused_graph_fields_are_optional_in_the_shipped_contract(
     graph_raw: JsonObject,
 ) -> None:
@@ -107,6 +109,7 @@ def test_unused_graph_fields_are_optional_in_the_shipped_contract(
     )
 
 
+@pytest.mark.windows_compatible
 def test_models_performance_can_be_absent_without_losing_token_facts(
     daily_raws: dict[date, JsonObject],
 ) -> None:
@@ -162,6 +165,7 @@ def test_models_performance_can_be_absent_without_losing_token_facts(
     )
 
 
+@pytest.mark.windows_compatible
 def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -201,7 +205,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
         assert backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, "
             "contract_tokscale_ver, resolved, observation_count "
-            "FROM current_schema_drift_events"
+            "FROM current_payload_drift_events"
         ).to_pylist() == [
             {
                 "domain": "models",
@@ -220,6 +224,7 @@ def test_unknown_field_is_non_fatal_and_reaches_the_collection_bundle(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_repeated_drift_observations_upsert_and_are_version_scoped(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -267,7 +272,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
         rows = backend.query(
             "SELECT domain, tokscale_ver, drift_key, contract_tokscale_ver, "
             "created_at, collected_at, resolved, "
-            "observation_count FROM current_schema_drift_events "
+            "observation_count FROM current_payload_drift_events "
             "ORDER BY tokscale_ver"
         ).to_pylist()
         first, second, third = bundles
@@ -301,6 +306,7 @@ def test_repeated_drift_observations_upsert_and_are_version_scoped(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_same_run_payload_sightings_are_counted_in_one_event(
     daily_raws: dict[date, JsonObject], graph_raw: JsonObject
 ) -> None:
@@ -324,13 +330,14 @@ def test_same_run_payload_sightings_are_counted_in_one_event(
         persist_run(backend, normalize(bundle))
         rows = backend.query(
             "SELECT count(*) AS event_count, min(observation_count) AS observations "
-            "FROM current_schema_drift_events"
+            "FROM current_payload_drift_events"
         ).to_pylist()
         assert rows == [{"event_count": 1, "observations": len(daily_raws)}]
     finally:
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_clean_complete_domain_resolves_existing_event(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -361,9 +368,9 @@ def test_clean_complete_domain_resolves_existing_event(
         persisted = backend.query(
             "SELECT domain, tokscale_ver, drift_key, drift_kind, path, detail, "
             "contract_tokscale_ver, created_at, observation_count "
-            "FROM current_schema_drift_events"
+            "FROM current_payload_drift_events"
         ).to_pylist()[0]
-        state = SchemaDriftState(
+        state = PayloadDriftState(
             domain=persisted["domain"],
             tokscale_ver=persisted["tokscale_ver"],
             drift_key=persisted["drift_key"],
@@ -386,7 +393,7 @@ def test_clean_complete_domain_resolves_existing_event(
             pricing_existing_models={},
             pricing_fetch_failures={},
             prior_statuses={},
-            prior_schema_drift=(state,),
+            prior_payload_drift=(state,),
         )
         graph_meta = graph_raw["meta"]
         assert isinstance(graph_meta, dict)
@@ -403,7 +410,7 @@ def test_clean_complete_domain_resolves_existing_event(
             pricing_existing_models={},
             pricing_fetch_failures={},
             prior_statuses={},
-            prior_schema_drift=(state,),
+            prior_payload_drift=(state,),
         )
         version_changed = build_collection_bundle(
             RawCollection(versioned_graph, {day: daily_raws[day]}, {}, {}),
@@ -414,7 +421,7 @@ def test_clean_complete_domain_resolves_existing_event(
             host="pytest",
             evidence=versioned_evidence,
         )
-        assert version_changed.resolved_schema_drift == ()
+        assert version_changed.resolved_payload_drift == ()
         second = build_collection_bundle(
             RawCollection(graph_raw, {day: daily_raws[day]}, {}, {}),
             run_id=str(uuid4()),
@@ -424,11 +431,11 @@ def test_clean_complete_domain_resolves_existing_event(
             host="pytest",
             evidence=evidence,
         )
-        assert second.resolved_schema_drift == (state,)
+        assert second.resolved_payload_drift == (state,)
         persist_run(backend, normalize(second))
         row = backend.query(
             "SELECT created_at, collected_at, "
-            "resolved, observation_count FROM current_schema_drift_events"
+            "resolved, observation_count FROM current_payload_drift_events"
         ).to_pylist()[0]
         assert row == {
             "created_at": first.finished_at,
@@ -440,6 +447,7 @@ def test_clean_complete_domain_resolves_existing_event(
         backend.close()
 
 
+@pytest.mark.windows_compatible
 def test_required_missing_field_blocks_parsing(
     daily_raws: dict[date, JsonObject],
     report_raw: JsonArray,
@@ -470,6 +478,7 @@ def test_required_missing_field_blocks_parsing(
     assert error.value.validation.events[0].drift_kind == "missing_field"
 
 
+@pytest.mark.windows_compatible
 def test_non_nullable_required_field_rejects_null(
     daily_raws: dict[date, JsonObject],
 ) -> None:
@@ -484,6 +493,7 @@ def test_non_nullable_required_field_rejects_null(
     )
 
 
+@pytest.mark.windows_compatible
 def test_mixed_contract_types_are_explicit_not_silently_collapsed() -> None:
     """Assert contracts retain every observed type from array siblings."""
     payload: JsonArray = [{"value": 1}, {"value": "one"}]
@@ -496,6 +506,7 @@ def test_mixed_contract_types_are_explicit_not_silently_collapsed() -> None:
     assert result.events[0].drift_kind == "type_change"
 
 
+@pytest.mark.windows_compatible
 def test_empty_report_is_a_successful_secondary_domain(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,
@@ -534,6 +545,7 @@ def test_empty_report_is_a_successful_secondary_domain(
     ) == ("complete", 1, 1, run_id, None)
 
 
+@pytest.mark.windows_compatible
 def test_secondary_contract_failures_do_not_block_required_collection(
     daily_raws: dict[date, JsonObject],
     graph_raw: JsonObject,
@@ -576,6 +588,7 @@ def test_secondary_contract_failures_do_not_block_required_collection(
     assert "pricing contract validation failed" in caplog.text
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("entries", [[], [{}], None])
 def test_empty_models_do_not_waive_nonempty_member_validation(
     daily_raws: dict[date, JsonObject],

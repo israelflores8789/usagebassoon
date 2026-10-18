@@ -61,7 +61,7 @@ def _collect_locked(
         persisted_models,
         persisted_prices,
         prior_reconciliation_issues,
-        prior_schema_drift,
+        prior_payload_drift,
         report_inventory,
         prior_daily,
     ) = load_ingest_status(config)
@@ -264,7 +264,7 @@ def _collect_locked(
                 pricing_fetch_failures=pricing_failures,
                 prior_statuses=statuses,
                 prior_reconciliation_issues=prior_reconciliation_issues,
-                prior_schema_drift=prior_schema_drift,
+                prior_payload_drift=prior_payload_drift,
                 report_days=frozenset({date.min} if full_report else report_days),
                 report_inventory=full_report,
                 expected_sessions=frozenset(

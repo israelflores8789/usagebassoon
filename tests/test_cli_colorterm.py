@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from itertools import pairwise
 
 import pytest
@@ -14,6 +15,7 @@ from rich.console import Console
 from usagebassoon.cli._colorterm import blend_palette
 
 
+@pytest.mark.windows_compatible
 @pytest.mark.parametrize("ending", ["\x07", "\x1b\\"])
 def test_theme_reply_decoding(ending: str) -> None:
     """Decode light backgrounds with either OSC terminator."""
@@ -24,6 +26,7 @@ def test_theme_reply_decoding(ending: str) -> None:
     assert _decode_colors("\x1b]4;5;rgb:80/40/c0\x07") is None
 
 
+@pytest.mark.windows_compatible
 def test_fragmented_theme_replies_and_timeout() -> None:
     """Collect split replies without requiring a response from unsupported terminals."""
     from usagebassoon.cli._colorterm import _COLOR_QUERY, _probe_colors
@@ -47,45 +50,46 @@ def test_terminal_query_restores_input_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Restore echo and canonical input after an unsupported terminal's timeout."""
-    import importlib
-    import sys
-    import termios
-    from collections.abc import Callable
+    if sys.platform != "win32":
+        import importlib
+        import termios
+        from collections.abc import Callable
 
-    from usagebassoon.cli._colorterm import _posix_colors
+        from usagebassoon.cli._colorterm import _posix_colors
 
-    module = importlib.import_module("usagebassoon.cli._colorterm")
-    master, slave = os.openpty()
-    original = termios.tcgetattr(slave)
-    try:
-        with (
-            os.fdopen(os.dup(slave), "r") as input_stream,
-            os.fdopen(os.dup(slave), "w") as output_stream,
-        ):
-            monkeypatch.setattr(sys, "stdin", input_stream)
-            console = Console(file=output_stream)
+        module = importlib.import_module("usagebassoon.cli._colorterm")
+        master, slave = os.openpty()
+        original = termios.tcgetattr(slave)
+        try:
+            with (
+                os.fdopen(os.dup(slave), "r") as input_stream,
+                os.fdopen(os.dup(slave), "w") as output_stream,
+            ):
+                monkeypatch.setattr(sys, "stdin", input_stream)
+                console = Console(file=output_stream)
 
-            def timeout_probe(
-                write: Callable[[str], object],
-                read: Callable[[float], str],
-                *,
-                ansi_index: int = 5,
-            ) -> None:
-                """Inspect query mode without sending a simulated terminal request."""
-                assert ansi_index == 5
-                assert callable(write) and callable(read)
-                attributes = termios.tcgetattr(slave)
-                assert not attributes[3] & (termios.ICANON | termios.ECHO)
-                return None
+                def timeout_probe(
+                    write: Callable[[str], object],
+                    read: Callable[[float], str],
+                    *,
+                    ansi_index: int = 5,
+                ) -> None:
+                    """Inspect query mode without sending terminal requests."""
+                    assert ansi_index == 5
+                    assert callable(write) and callable(read)
+                    attributes = termios.tcgetattr(slave)
+                    assert not attributes[3] & (termios.ICANON | termios.ECHO)
+                    return None
 
-            monkeypatch.setattr(module, "_probe_colors", timeout_probe)
-            assert _posix_colors(console) is None
-            assert termios.tcgetattr(slave) == original
-    finally:
-        os.close(master)
-        os.close(slave)
+                monkeypatch.setattr(module, "_probe_colors", timeout_probe)
+                assert _posix_colors(console) is None
+                assert termios.tcgetattr(slave) == original
+        finally:
+            os.close(master)
+            os.close(slave)
 
 
+@pytest.mark.windows_compatible
 def test_shared_console_honors_stream_width_and_no_color(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -118,6 +122,7 @@ def test_shared_console_honors_stream_width_and_no_color(
     assert not supports_gradients(redirected)
 
 
+@pytest.mark.windows_compatible
 def test_shared_blending_and_contrast() -> None:
     """Provide bounded blending and foreground contrast without activity policy."""
     from usagebassoon.cli._colorterm import blend_color, contrasting_foreground
@@ -147,6 +152,7 @@ def test_shared_blending_and_contrast() -> None:
         blend_palette(1)
 
 
+@pytest.mark.windows_compatible
 def test_shared_ansi_selection_and_indexed_palette() -> None:
     """Validate theme slots and convert shared RGB styles for 256-color output."""
     import io
@@ -173,42 +179,42 @@ def test_terminal_restore_failure_is_logged_without_aborting_rendering(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A cosmetic probe still reports failure to restore the user's input mode."""
-    import logging
-    import sys
-    import termios
-    from collections.abc import Callable
+    if sys.platform != "win32":
+        import logging
+        import termios
+        from collections.abc import Callable
 
-    from usagebassoon.cli._colorterm import _posix_colors
+        from usagebassoon.cli._colorterm import _posix_colors
 
-    master, slave = os.openpty()
-    calls: list[int] = []
+        master, slave = os.openpty()
+        calls: list[int] = []
 
-    def set_mode(descriptor: int, _when: int, _attributes: object) -> None:
-        """Simulate successful setup followed by failed terminal restoration."""
-        calls.append(descriptor)
-        if len(calls) == 2:
-            raise termios.error("terminal restore unavailable")
+        def set_mode(descriptor: int, _when: int, _attributes: object) -> None:
+            """Simulate successful setup followed by failed terminal restoration."""
+            calls.append(descriptor)
+            if len(calls) == 2:
+                raise termios.error("terminal restore unavailable")
 
-    def no_reply(
-        _write: Callable[[str], object],
-        _read: Callable[[float], str],
-        *,
-        ansi_index: int,
-    ) -> None:
-        """Finish the cosmetic probe without waiting for terminal replies."""
-        assert ansi_index == 5
+        def no_reply(
+            _write: Callable[[str], object],
+            _read: Callable[[float], str],
+            *,
+            ansi_index: int,
+        ) -> None:
+            """Finish the cosmetic probe without waiting for terminal replies."""
+            assert ansi_index == 5
 
-    monkeypatch.setattr(termios, "tcsetattr", set_mode)
-    monkeypatch.setattr("usagebassoon.cli._colorterm._probe_colors", no_reply)
-    monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
-    monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
-    try:
-        with os.fdopen(os.dup(slave), "r") as stream:
-            monkeypatch.setattr(sys, "stdin", stream)
-            assert _posix_colors(Console(file=stream)) is None
-        assert len(calls) == 2
-        assert "could not restore terminal input settings" in caplog.text
-        assert "terminal restore unavailable" in caplog.text
-    finally:
-        os.close(master)
-        os.close(slave)
+        monkeypatch.setattr(termios, "tcsetattr", set_mode)
+        monkeypatch.setattr("usagebassoon.cli._colorterm._probe_colors", no_reply)
+        monkeypatch.setattr(logging.getLogger("usagebassoon"), "propagate", True)
+        monkeypatch.setattr(logging.getLogger("usagebassoon"), "disabled", False)
+        try:
+            with os.fdopen(os.dup(slave), "r") as stream:
+                monkeypatch.setattr(sys, "stdin", stream)
+                assert _posix_colors(Console(file=stream)) is None
+            assert len(calls) == 2
+            assert "could not restore terminal input settings" in caplog.text
+            assert "terminal restore unavailable" in caplog.text
+        finally:
+            os.close(master)
+            os.close(slave)
