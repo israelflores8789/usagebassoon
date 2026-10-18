@@ -296,14 +296,30 @@ def test_doctor_preserves_common_config_path_components(
 
 @pytest.mark.windows_compatible
 @pytest.mark.parametrize(
-    "database", ["usagebassoon_it", "/private/store.duckdb", r"C:\private\store.duckdb"]
+    ("database", "expected"),
+    [
+        ("usagebassoon_it", "usagebassoon_it"),
+        (
+            "/home/alice/projects/private-project/store.duckdb",
+            "/home/<user>/projects/<project>/store.duckdb",
+        ),
+        (
+            r"C:\Users\Alice\projects\private-project\store.duckdb",
+            r"C:\Users\<user>\projects\<project>\store.duckdb",
+        ),
+        (
+            "/home/alice/Library/Application Support/usagebassoon/store.duckdb",
+            "/home/<user>/Library/Application Support/usagebassoon/store.duckdb",
+        ),
+    ],
 )
-def test_doctor_retains_named_targets_and_redacts_database_paths(database: str) -> None:
-    """Remote target names remain actionable while file locations stay private."""
+def test_doctor_retains_named_targets_and_obfuscates_database_paths(
+    database: str, expected: str
+) -> None:
+    """Database paths follow the same user and project masking as other paths."""
     sanitized = sanitize_doctor_text(
         f"database={database}; TOKEN=secret", config_path=None, database=database
     )
-    expected = "<path>" if "store.duckdb" in database else database
     assert sanitized == f"database={expected}; TOKEN=<redacted>"
 
 

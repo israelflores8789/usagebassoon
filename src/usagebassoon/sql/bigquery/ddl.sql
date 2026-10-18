@@ -270,6 +270,7 @@ CREATE TABLE collection_ledger (
     memory_bytes INT64,
     invoke_method STRING,
     tokscale_ver STRING,
+    usagebassoon_ver STRING,
     status STRING
 )
 PARTITION BY day

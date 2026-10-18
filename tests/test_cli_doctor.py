@@ -19,6 +19,8 @@ from tests._observations import observations
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.cli.app import app
 from usagebassoon.diagnostics import DoctorCheck
+from usagebassoon.schema_assets import SCHEMA_VERSION
+from usagebassoon.snapshot.format import FORMAT_VERSION
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -153,6 +155,11 @@ def test_doctor_reports_configured_tokscale_command_and_version(
     backend.close()
     with config.open("a") as stream:
         stream.write('\n[tokscale]\nbin = "npx tokscale@latest"\n')
+        stream.write(
+            "\n[snapshots.local]\nenable = true\n"
+            f"path = '{tmp_path / 'home/alice/projects/private-project/archive'}'\n"
+            '\n[snapshots.gcs]\nenable = false\nuri = "gs://test-bucket/archive"\n'
+        )
     calls: list[list[str]] = []
 
     popen = subprocess.Popen
@@ -198,6 +205,26 @@ def test_doctor_reports_configured_tokscale_command_and_version(
     assert "command: npx tokscale@latest" in plain_cli_output(result.output)
     assert "Auth: local file permissions" in plain_cli_output(result.output)
     assert "Principal: not applicable" in plain_cli_output(result.output)
+    assert "Backend: DuckDB" in output
+    assert f"Remote Schema Version: {SCHEMA_VERSION}" in output
+    assert f"Local Schema Version: {SCHEMA_VERSION}" in output
+    assert output.index("OK snapshot:") < output.index("WARNING snapshot_freshness:")
+    assert f"Snapshot Format Version: {FORMAT_VERSION}" in output
+    assert "GCS: gs://test-bucket/archive" not in output
+    assert "Database: <path>" not in output
+    assert "usagebassoon.duckdb" in output.replace("\n", "")
+    assert (
+        "Local:" in output
+        and "/home/<user>/projects/<project>/archive"
+        in output.replace("\n", "").replace("\\", "/")
+    )
+    assert "alice" not in output and "private-project" not in output
+    snapshot_section = output.split("OK snapshot:")[1].split(
+        "WARNING snapshot_freshness:"
+    )[0]
+    assert "Local snapshot Auth: local file permissions" in snapshot_section
+    assert "Local snapshot Principal: not applicable" in snapshot_section
+    assert "snapshot Auth:" not in output.split("WARNING snapshot_freshness:")[1]
 
 
 @pytest.mark.windows_compatible
@@ -236,7 +263,7 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
         SnapshotsConfig,
         UsageBassoonConfig,
     )
-    from usagebassoon.diagnostics import snapshot_health
+    from usagebassoon.diagnostics import snapshot_checks
     from usagebassoon.snapshot.reader import SnapshotReader
 
     root = str(tmp_path / "archive")
@@ -271,12 +298,14 @@ def test_backup_health_does_not_let_weekly_capture_mask_scheduled_overdue(
         ]
 
     monkeypatch.setattr(SnapshotReader, "listing", listing)
-    check = snapshot_health(config)
+    configuration, check = snapshot_checks(config)
+    assert configuration.name == "snapshot"
+    assert check.name == "snapshot_freshness"
     assert check.status == "warning"
     assert "scheduled recovery capture is overdue" in check.message
     assert "current weekly recovery slot is overdue" not in check.message
     assert any("1 of 4 target slots available" in detail for detail in check.details)
-    assert check.details[:2] == (
+    assert configuration.details[-2:] == (
         "Local snapshot Auth: local file permissions",
         "Local snapshot Principal: not applicable",
     )
@@ -352,7 +381,7 @@ def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
         SnapshotsConfig,
         UsageBassoonConfig,
     )
-    from usagebassoon.diagnostics import snapshot_health
+    from usagebassoon.diagnostics import snapshot_checks
     from usagebassoon.snapshot.reader import SnapshotReader
 
     now = datetime.now(UTC)
@@ -382,7 +411,7 @@ def test_weekly_health_derives_target_slot_gaps_from_available_snapshots(
         return rows
 
     monkeypatch.setattr(SnapshotReader, "listing", listing)
-    report = snapshot_health(config)
+    _, report = snapshot_checks(config)
     assert any("3 of 4 target slots available" in line for line in report.details)
     assert any(
         "Oldest available weekly recovery point" in line for line in report.details
@@ -432,8 +461,9 @@ def test_doctor_displays_remote_target_name(
         encoding="utf-8",
     )
 
-    def fake_open(_configuration: object) -> DuckDBBackend:
+    def fake_open(_configuration: object, *, inspect: bool = False) -> DuckDBBackend:
         """Use a local backend to avoid remote connections in a rendering test."""
+        assert inspect
         return backend
 
     def fake_preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
@@ -447,9 +477,49 @@ def test_doctor_displays_remote_target_name(
         output = plain_cli_output(result.output)
         assert result.exit_code == 0, output
         assert f"backend={provider}, database=usagebassoon_it" in output
+        label = "BigQuery" if provider == "bigquery" else "MotherDuck"
+        target_label = "Dataset" if provider == "bigquery" else "Database"
+        assert f"Backend: {label}" in output
+        assert f"{target_label}: usagebassoon_it" in output
+        assert "Local:" not in output
+        assert "GCS:" not in output
         assert "<database>" not in output
         assert "path:" in output
         assert tmp_path.name in output.replace("\n", "")
         assert "/config.toml" in output.replace("\\", "/")
     finally:
         backend.close()
+
+
+@pytest.mark.windows_compatible
+def test_doctor_warns_about_schema_mismatch_without_changing_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inspect mismatched markers even when ordinary backend opening rejects them."""
+    config, backend = _configured_store(tmp_path)
+    remote_version = SCHEMA_VERSION + 1
+    backend.query(f"UPDATE schema_marker SET version = {remote_version}")
+    backend.close()
+
+    def fake_preflight(_configuration: object) -> tuple[tuple[str, ...], str]:
+        """Keep the version comparison independent of Tokscale availability."""
+        return ("tokscale",), "4.18.0"
+
+    monkeypatch.setattr("usagebassoon.cli.doctor.preflight_tokscale", fake_preflight)
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor", "--config", str(config)])
+    output = plain_cli_output(result.output)
+    assert result.exit_code == 0, output
+    assert "WARNING backend: remote and local schema versions differ" in output
+    assert f"Remote Schema Version: {remote_version}" in output
+    assert f"Local Schema Version: {SCHEMA_VERSION}" in output
+    assert (
+        runner.invoke(app, ["doctor", "--strict", "--config", str(config)]).exit_code
+        == 1
+    )
+    check = DuckDBBackend(tmp_path / "usagebassoon.duckdb")
+    try:
+        metadata = check.schema_metadata()
+        assert metadata is not None and metadata[0] == remote_version
+    finally:
+        check.close()

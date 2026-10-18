@@ -269,6 +269,7 @@ CANONICAL_TABLE_SCHEMAS: dict[str, pa.Schema] = {
             pa.field("memory_bytes", pa.int64()),
             pa.field("invoke_method", pa.string()),
             pa.field("tokscale_ver", pa.string()),
+            pa.field("usagebassoon_ver", pa.string()),
             pa.field("status", pa.string()),
         ]
     ),

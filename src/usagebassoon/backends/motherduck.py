@@ -163,6 +163,13 @@ def _preflight(resource: _NativeResource, _argument: None) -> None:
     resource.backend.preflight()
 
 
+def _schema_metadata(
+    resource: _NativeResource, _argument: None
+) -> tuple[int, str] | None:
+    """Inspect native schema provenance without applying upgrades."""
+    return resource.backend.schema_metadata()
+
+
 def _persist_batch(
     resource: _NativeResource, batch: PersistenceBatch
 ) -> BatchPersistResult:
@@ -294,6 +301,11 @@ class MotherDuckBackend(AbstractStorageBackend):
     def preflight(self) -> None:
         """Inspect schema readiness on the existing child-owned connection."""
         self._call(_preflight, None)
+
+    @override
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Read the native schema marker through the supervised connection."""
+        return self._call(_schema_metadata, None)
 
     @override
     def query(self, sql: str, parameters: Mapping[str, str] | None = None) -> pa.Table:
@@ -620,6 +632,12 @@ class _NativeMotherDuck(_DuckDBStorage):
     def preflight(self) -> None:
         """Share one deadline across the complete preflight operation."""
         return super().preflight()
+
+    @override
+    @_interruptible
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Bound inspection of the persisted MotherDuck schema marker."""
+        return super().schema_metadata()
 
     @override
     def read_snapshot_tables(self, tables: Sequence[str]) -> SnapshotRead:

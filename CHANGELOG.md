@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added repeatable `--exclude-model` options to activity, daily, graph, models, sessions, and summary reports.
 - Doctor output now reports backend and snapshot-bucket authentication sources and available principals for easier debugging. The default output preserves safe authentication labels and obfuscates user email handles and non-public email domains for privacy.
 - Added delayed spinners to `bassoon snapshot list`, `inspect`, `audit`, `repair`, `delete`, and `copy`, plus `bassoon audit runs` and `sources`, for operations taking longer than 200 milliseconds. Spinners stop before prompts and structured output.
+- Collection ledger records now identify the UsageBassoon version that produced each run, including development versions and failed collections.
+- Doctor now reports snapshot format, configured archive locations, backend destination, and installed versus expected backend schema versions, with warnings for schema mismatches.
 
 ### Changed
 
@@ -29,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Development dependencies now include `rust-just>=1.58.0`, and the Just configuration enables the script recipes used for Windows checks.
 - `codex-auto-review` is considered *free* and does not count toward reported costs; however, token usage from `codex-auto-review` is still persisted and user-configured custom pricing in Tokscale is honored. See issue #4.
 - `bassoon init` now includes the config schema URL and a warning above the source ID in newly generated config files, with spacing that clearly associates the warning with the source ID.
+- Doctor groups snapshot authentication under `snapshot` and names the recovery freshness check `snapshot_freshness`.
+- Doctor lists only enabled snapshot destinations and applies its usual path obfuscation to local database paths.
 
 ### Fixed
 

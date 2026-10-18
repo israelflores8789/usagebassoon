@@ -19,8 +19,10 @@ import pyarrow as pa
 
 from usagebassoon import ingest, reconcile
 from usagebassoon.backends.base import ActiveTransaction, StorageBackend
+from usagebassoon.buckets.factory import SnapshotBucketRegistry, bucket_label
 from usagebassoon.drift import SchemaDriftRecord, format_drift
-from usagebassoon.schema_assets import query_sql
+from usagebassoon.schema_assets import SCHEMA_VERSION, query_sql, schema_hash
+from usagebassoon.snapshot.format import FORMAT_VERSION
 
 if TYPE_CHECKING:
     from usagebassoon.config import UsageBassoonConfig
@@ -177,14 +179,39 @@ def _google_auth_source(credentials_file: Path | None) -> str:
     return "ADC"
 
 
-def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
-    """Report recovery coverage and last creation verification for each archive."""
+def snapshot_checks(
+    configuration: UsageBassoonConfig | None,
+) -> tuple[DoctorCheck, DoctorCheck]:
+    """Report snapshot configuration and recovery freshness from one inspection."""
+    snapshot_details = [f"Snapshot Format Version: {FORMAT_VERSION}"]
     if configuration is None:
-        return DoctorCheck("backup_freshness", "warning", "configuration unavailable")
+        return (
+            DoctorCheck(
+                "snapshot",
+                "warning",
+                "configuration unavailable",
+                tuple(snapshot_details),
+            ),
+            DoctorCheck("snapshot_freshness", "warning", "configuration unavailable"),
+        )
     settings = configuration.snapshots
+    registry = SnapshotBucketRegistry.from_settings(settings)
+    snapshot_details.extend(
+        f"{bucket_label(destination.uri)}: {destination.uri}"
+        for destination in registry.destinations
+        if destination.enabled
+    )
     if not settings.enabled:
-        return DoctorCheck(
-            "backup_freshness", "ok", "automatic snapshots are not configured"
+        return (
+            DoctorCheck(
+                "snapshot",
+                "ok",
+                "automatic snapshots are not configured",
+                tuple(snapshot_details),
+            ),
+            DoctorCheck(
+                "snapshot_freshness", "ok", "automatic snapshots are not configured"
+            ),
         )
     from usagebassoon.archiver import SnapshotArchiver
     from usagebassoon.config import parse_interval
@@ -205,8 +232,6 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     try:
         archiver = SnapshotArchiver.from_config(configuration)
         reader = SnapshotReader(archiver._archives, archiver._bucket)
-        from usagebassoon.buckets.factory import bucket_label
-
         for bucket in reader.buckets:
             label = bucket_label(bucket.uri)
             if isinstance(bucket, DoctorAuthenticationProvider):
@@ -318,19 +343,23 @@ def snapshot_health(configuration: UsageBassoonConfig | None) -> DoctorCheck:
     except Exception as error:
         _LOG.warning("doctor archive inspection failed", exc_info=True)
         warnings.append(f"archive inspection unavailable: {error}")
-    authentication_details: list[str] = []
     for label, (auth_method, principal) in authentication.items():
-        authentication_details.extend(
+        snapshot_details.extend(
             (
                 f"{label} snapshot Auth: {auth_method}",
                 f"{label} snapshot Principal: {principal}",
             )
         )
-    return DoctorCheck(
-        "backup_freshness",
-        "warning" if warnings else "ok",
-        "; ".join(warnings) if warnings else "recovery points are available",
-        (*authentication_details, *details),
+    return (
+        DoctorCheck(
+            "snapshot", "ok", "configured snapshot archives", tuple(snapshot_details)
+        ),
+        DoctorCheck(
+            "snapshot_freshness",
+            "warning" if warnings else "ok",
+            "; ".join(warnings) if warnings else "recovery points are available",
+            tuple(details),
+        ),
     )
 
 
@@ -640,12 +669,25 @@ def run_doctor(
             )
         )
 
+    provider = {
+        "duckdb": "DuckDB",
+        "motherduck": "MotherDuck",
+        "bigquery": "BigQuery",
+    }.get(backend_name, backend_name or "unavailable")
+    target_label = "Dataset" if backend_name == "bigquery" else "Database"
+    backend_details = (
+        f"Backend: {provider}",
+        f"{target_label}: {database or 'unavailable'}",
+        "Remote Schema Version: unavailable",
+        f"Local Schema Version: {SCHEMA_VERSION}",
+    )
     if backend is None:
         checks.append(
             DoctorCheck(
                 "backend",
                 "error",
                 connection_error or "backend could not be opened",
+                backend_details,
             )
         )
         return DoctorReport(tuple(checks))
@@ -656,7 +698,12 @@ def run_doctor(
         except Exception as error:
             active_logger.exception("doctor snapshot initialization failed")
             checks.append(
-                DoctorCheck("backend", "error", f"read snapshot failed: {error}")
+                DoctorCheck(
+                    "backend",
+                    "error",
+                    f"read snapshot failed: {error}",
+                    backend_details,
+                )
             )
             return DoctorReport(tuple(checks))
 
@@ -665,10 +712,38 @@ def run_doctor(
         except Exception as error:
             active_logger.exception("doctor connectivity check failed")
             checks.append(
-                DoctorCheck("backend", "error", f"connectivity failed: {error}")
+                DoctorCheck(
+                    "backend", "error", f"connectivity failed: {error}", backend_details
+                )
             )
             return DoctorReport(tuple(checks))
-        checks.append(DoctorCheck("backend", "ok", "connection and query succeeded"))
+        backend_status: CheckStatus = "ok"
+        backend_message = "connection and query succeeded"
+        try:
+            metadata = backend.schema_metadata()
+            if metadata is None:
+                backend_status = "warning"
+                backend_message = "schema marker is missing; run bassoon init"
+            else:
+                remote_version, remote_hash = metadata
+                backend_details = (
+                    *backend_details[:2],
+                    f"Remote Schema Version: {remote_version}",
+                    backend_details[-1],
+                )
+                if remote_version != SCHEMA_VERSION:
+                    backend_status = "warning"
+                    backend_message = "remote and local schema versions differ"
+                elif remote_hash != schema_hash(backend.dialect):
+                    backend_status = "warning"
+                    backend_message = "remote schema hash differs from this package"
+        except Exception as error:
+            active_logger.exception("doctor schema metadata inspection failed")
+            backend_status = "warning"
+            backend_message = f"schema metadata inspection unavailable: {error}"
+        checks.append(
+            DoctorCheck("backend", backend_status, backend_message, backend_details)
+        )
         workers = backend.max_concurrent_queries
         if workers < 1:
             raise ValueError("backend query concurrency must be positive")

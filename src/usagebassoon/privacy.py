@@ -519,9 +519,6 @@ def sanitize_doctor_text(
 
     def sanitize_part(part: str) -> str:
         """Redact credentials and preserve useful path components."""
-        if database and any(separator in database for separator in ("/", "\\")):
-            flags = re.IGNORECASE if PureWindowsPath(database).drive else 0
-            part = re.sub(re.escape(database), "<path>", part, flags=flags)
         sanitized = redact_credentials(part)
         sanitized = _WINDOWS_PATH_PATTERN.sub(_sanitize_doctor_path_match, sanitized)
         sanitized = _DOCTOR_POSIX_PATH_PATTERN.sub(
@@ -532,14 +529,29 @@ def sanitize_doctor_text(
         )
         return _DOCTOR_EMAIL_PATTERN.sub(_redact_doctor_email, sanitized)
 
-    if not config_path:
+    database_path = (
+        database
+        if database and any(separator in database for separator in ("/", "\\"))
+        else None
+    )
+    paths = [path for path in (config_path, database_path) if path]
+    if not paths:
         return sanitize_part(value)
-    windows_config_path = PureWindowsPath(config_path).drive != ""
-    flags = re.IGNORECASE if windows_config_path else 0
-    config_pattern = re.compile(re.escape(config_path), flags)
-    sanitized_config_path = redact_credentials(_sanitize_doctor_path(config_path))
-    return sanitized_config_path.join(
-        sanitize_part(part) for part in config_pattern.split(value)
+    pattern = (
+        "("
+        + "|".join(
+            f"(?i:{re.escape(path)})"
+            if PureWindowsPath(path).drive
+            else re.escape(path)
+            for path in sorted(paths, key=len, reverse=True)
+        )
+        + ")"
+    )
+    return "".join(
+        redact_credentials(_sanitize_doctor_path(part))
+        if index % 2
+        else sanitize_part(part)
+        for index, part in enumerate(re.split(pattern, value))
     )
 
 

@@ -30,7 +30,11 @@ from tests.conftest import (
 from usagebassoon import collection_policy, system_metadata
 from usagebassoon.backends.duckdb_local import DuckDBBackend
 from usagebassoon.ingest import CollectionBundle
-from usagebassoon.normalizer import CANONICAL_TABLE_SCHEMAS, normalize
+from usagebassoon.normalizer import (
+    CANONICAL_TABLE_SCHEMAS,
+    failed_collection,
+    normalize,
+)
 from usagebassoon.persistence import persist_run
 from usagebassoon.system_metadata import InvokeMethod, SystemMetadata
 
@@ -614,6 +618,7 @@ def test_older_same_source_run_cannot_regress_daily_facts(
 def test_persist_run_records_collector_system_metadata(
     collection_bundle: CollectionBundle,
     invoke_method: InvokeMethod,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Record host metadata and the explicit invocation in collection audit views."""
     metadata = SystemMetadata(
@@ -624,6 +629,8 @@ def test_persist_run_records_collector_system_metadata(
         cpu_count=16,
         memory_bytes=68_719_476_736,
     )
+    development_version = "1.2.3.dev4+gabc123.d20261018"
+    monkeypatch.setattr("usagebassoon.normalizer.__version__", development_version)
     backend = DuckDBBackend(":memory:")
     try:
         backend.apply_ddl()
@@ -636,10 +643,14 @@ def test_persist_run_records_collector_system_metadata(
         )
         ledger = normalized.tables["collection_ledger"]
         assert set(ledger.column("invoke_method").to_pylist()) == {invoke_method.value}
+        assert set(ledger.column("usagebassoon_ver").to_pylist()) == {
+            development_version
+        }
         assert "shell" not in ledger.column_names
         persist_run(backend, normalized)
         assert backend.query(
-            "SELECT os_name, architecture, cpu_count, memory_bytes, invoke_method "
+            "SELECT os_name, architecture, cpu_count, memory_bytes, "
+            "invoke_method, usagebassoon_ver "
             "FROM collection_runs"
         ).to_pylist() == [
             {
@@ -648,7 +659,21 @@ def test_persist_run_records_collector_system_metadata(
                 "cpu_count": 16,
                 "memory_bytes": 68_719_476_736,
                 "invoke_method": invoke_method.value,
+                "usagebassoon_ver": development_version,
             }
         ]
+        failure = failed_collection(
+            run_id=str(uuid4()),
+            source_id=collection_bundle.source_id,
+            started_at=collection_bundle.started_at,
+            finished_at=collection_bundle.finished_at,
+            host="collector",
+            error=RuntimeError("acquisition failed"),
+            invoke_method=invoke_method,
+        )
+        persist_run(backend, failure)
+        assert backend.query(
+            "SELECT usagebassoon_ver FROM collection_runs WHERE status = 'failed'"
+        ).to_pylist() == [{"usagebassoon_ver": development_version}]
     finally:
         backend.close()

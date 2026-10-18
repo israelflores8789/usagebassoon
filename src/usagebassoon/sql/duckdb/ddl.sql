@@ -36,6 +36,7 @@ CREATE TABLE collection_ledger (
     memory_bytes BIGINT,
     invoke_method TEXT,
     tokscale_ver TEXT,
+    usagebassoon_ver TEXT,
     status TEXT
 );
 

@@ -29,7 +29,7 @@ from usagebassoon.diagnostics import (
     backend_authentication_check,
     maintenance_health,
     run_doctor,
-    snapshot_health,
+    snapshot_checks,
 )
 from usagebassoon.display import sanitize_display
 from usagebassoon.logger import LOGGER_NAME
@@ -160,7 +160,7 @@ def doctor(
             logger.exception("could not configure doctor logging")
         try:
             with spinner(configuration):
-                opened = open_backend(configuration)
+                opened = open_backend(configuration, inspect=True)
         except Exception as error:
             logger.exception("could not open the configured backend")
             connection_error = str(error)
@@ -202,7 +202,7 @@ def doctor(
                 tokscale_check,
                 *checks,
                 maintenance_health(opened),
-                snapshot_health(configuration),
+                *snapshot_checks(configuration),
                 schedule_doctor_check(configuration),
             )
         )

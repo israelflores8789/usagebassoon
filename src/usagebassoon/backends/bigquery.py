@@ -936,6 +936,28 @@ class BigQueryBackend(AbstractStorageBackend):
                 retry=_request_retry(),
             )
 
+    @override
+    @bounded
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Read persisted schema labels without query jobs or schema upgrades."""
+        try:
+            marker = self.client.get_table(
+                self._table_id("schema_marker"),
+                timeout=remaining_seconds(),
+                retry=_request_retry(),
+            )
+        except NotFound:
+            return None
+        labels = marker.labels or {}
+        if labels.get("usagebassoon_initializing") == "true":
+            raise RuntimeError(
+                "warehouse initialization is incomplete; run bassoon init"
+            )
+        version = labels.get("usagebassoon_schema_version")
+        if version is None:
+            return None
+        return int(version), labels.get("usagebassoon_schema_hash", "")
+
     def _snapshot_stream(self, tables: Sequence[str]) -> SnapshotStream:
         """Pin canonical gold and raw query streams to one warehouse instant."""
         timestamp = next(

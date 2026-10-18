@@ -356,6 +356,10 @@ class StorageBackend(Protocol):
         """Validate initialization and reconcile registered schema upgrades."""
         ...
 
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Read the installed schema version and hash without changing the backend."""
+        ...
+
     def restore_tables(self, tables: Mapping[str, pa.Table]) -> None:
         """Restore into an empty destination while all its writers are stopped."""
         ...
@@ -383,6 +387,10 @@ def close_backend(
 
 class AbstractStorageBackend(ABC):
     """Shared invariant enforcement for concrete storage backends."""
+
+    @abstractmethod
+    def schema_metadata(self) -> tuple[int, str] | None:
+        """Read the installed schema marker, or return None when uninitialized."""
 
     @property
     @abstractmethod

@@ -34,6 +34,7 @@ from usagebassoon.config import MotherDuckConfig, UsageBassoonConfig
 from usagebassoon.deadlines import OperationTimeout, ResourceUnavailable
 from usagebassoon.ingest import CollectionBundle
 from usagebassoon.process import ManagedProcess
+from usagebassoon.schema_assets import SCHEMA_VERSION, schema_hash
 
 # Include native-driver startup in the bounded Windows operation allowance.
 _OPERATION_TIMEOUT = 10.0 if os.name == "nt" else 2.0
@@ -352,6 +353,7 @@ def test_proxy_capture_releases_failed_snapshot_and_streams_next_attempt(
         backend.close()
     backend = MotherDuckBackend("usagebassoon_it", timeout_seconds=_OPERATION_TIMEOUT)
     try:
+        assert backend.schema_metadata() == (SCHEMA_VERSION, schema_hash("duckdb"))
         assert store.write(backend, run_id="next", manual=True) is not None
         assert len(store.list_snapshots()) == 1
     finally:
@@ -527,6 +529,7 @@ def test_native_motherduck_preserves_persistence_snapshot_and_restore(
     backend = _native_motherduck()
     try:
         backend.apply_ddl()
+        assert backend.schema_metadata() == (SCHEMA_VERSION, schema_hash("duckdb"))
         persist_run(backend, bundle)
         assert backend.has_committed_run(bundle.run_id)
         uri = store.write(backend, run_id=bundle.run_id, manual=True)

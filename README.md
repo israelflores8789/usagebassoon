@@ -604,7 +604,7 @@ Each permission notes where it is granted and which identity needs it. **Setup**
   - `bigquery.tables.get / getData`: inspect table metadata and read schema state, reports, diagnostics, and snapshots. Setup, runtime, restore, and scheduled compaction as applicable.
   - `bigquery.tables.updateData`: append collection and curation data, seed compaction control data, and write restored or compacted state. Setup, runtime writes, restore, and scheduled compaction.
   - `bigquery.tables.create / update`: create tables and views, set schema labels and retention settings, replace view definitions, and apply registered schema migrations. Setup.
-  - `bigquery.tables.list`: discover existing relations during init and check destination contents before restore. Setup and restore.
+  - `bigquery.tables.list`: discover relations during init, read `INFORMATION_SCHEMA.VIEWS` for doctor diagnostics, and check destination contents before restore. Setup, doctor, and restore.
   - `bigquery.tables.create`, `bigquery.tables.delete`: create and remove temporary restore staging tables. Restore; table creation is also used during setup as noted above.
 - **Service account scope**
   - `iam.serviceAccounts.actAs`: attach the service account that runs the compaction schedule, granted on that specific service account. Setup when assigning a service account; also relevant to accessing an existing account-backed schedule for query changes.

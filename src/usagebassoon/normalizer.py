@@ -17,6 +17,7 @@ from usagebassoon.drift import SchemaDriftIdentity, drift_identity
 from usagebassoon.parsers.report import SessionRow, make_session_label
 from usagebassoon.storage_model import CANONICAL_TABLE_SCHEMAS
 from usagebassoon.system_metadata import InvokeMethod, capture_system_metadata
+from usagebassoon.version import __version__
 
 if TYPE_CHECKING:
     from usagebassoon.ingest import CollectionBundle
@@ -199,6 +200,7 @@ def _diagnostic_rows(bundle: CollectionBundle, at: datetime) -> dict[str, Column
             ],
             "invoke_method": [bundle.invoke_method.value],
             "tokscale_ver": [bundle.graph.meta.version],
+            "usagebassoon_ver": [__version__],
             "status": [status],
             "day": [bundle.started_at.date()],
             "domain": ["collection"],
@@ -358,6 +360,7 @@ def failed_collection(
     row = {
         **asdict(capture_system_metadata()),
         "invoke_method": InvokeMethod(invoke_method).value,
+        "usagebassoon_ver": __version__,
         "event_id": str(uuid4()),
         "run_id": run_id,
         "source_id": source_id,

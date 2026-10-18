@@ -1435,6 +1435,7 @@ def test_partial_publication_replays_event_ids_and_withholds_coverage(
 @pytest.mark.windows_compatible
 def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
     """Validate an initialized warehouse without schema or data queries."""
+    stored_version = SCHEMA_VERSION
 
     class Client(_BatchClient):
         def get_dataset(self, _: str, **_transport: object) -> bigquery.Dataset:
@@ -1446,7 +1447,7 @@ def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
         def get_table(self, table_id: str, **_transport: object) -> bigquery.Table:
             table = super().get_table(table_id)
             table.labels = {
-                "usagebassoon_schema_version": str(SCHEMA_VERSION),
+                "usagebassoon_schema_version": str(stored_version),
                 "usagebassoon_schema_hash": schema_hash("bigquery"),
             }
             return table
@@ -1458,6 +1459,9 @@ def test_matching_preflight_reads_metadata_without_query_jobs() -> None:
         client=cast(bigquery.Client, client),
     )
     backend.preflight()
+    assert backend.schema_metadata() == (SCHEMA_VERSION, schema_hash("bigquery"))
+    stored_version += 1
+    assert backend.schema_metadata() == (stored_version, schema_hash("bigquery"))
     assert client.queries == []
     assert client.loads == []
 

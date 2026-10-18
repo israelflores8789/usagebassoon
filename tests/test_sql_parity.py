@@ -80,6 +80,7 @@ def test_logical_gold_and_event_schemas_match() -> None:
     for dialect in (duckdb, bigquery):
         ledger_columns = _columns(dialect["collection_ledger"])
         assert "invoke_method" in ledger_columns
+        assert "usagebassoon_ver" in ledger_columns
         assert "shell" not in ledger_columns
     for table in STATE_KEYS | EVENT_KEYS:
         physical = "raw_" + table if table in DEBUG_TABLES else table
