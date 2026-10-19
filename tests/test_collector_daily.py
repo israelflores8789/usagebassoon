@@ -1736,6 +1736,11 @@ def _assert_live_backfill_and_warm_collection(
         assert arguments[:3] == ("report", "--json", "--no-summarize")
         return [row for rows in report_raws.values() for row in rows]
 
+    def uses_utc(_configuration: UsageBassoonConfig, _environment: object) -> bool:
+        """Keep fixture-backed backend tests independent of a Tokscale install."""
+        return True
+
+    monkeypatch.setattr(subprocess_collector, "_tokscale_uses_utc", uses_utc)
     monkeypatch.setattr(collector, "_json_command", command)
     monkeypatch.setattr(subprocess_collector, "_json_command", command)
     _, summary = collector.collect(configuration)
