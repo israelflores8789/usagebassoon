@@ -117,7 +117,7 @@ jobs:
         fi
 
     - name: Setup uv
-      uses: astral-sh/setup-uv@v10.1.0
+      uses: astral-sh/setup-uv@v10.3.0
       with:
         enable-cache: false # keep release builds independent of PR caches
 
@@ -164,14 +164,14 @@ jobs:
         fi
 
     - name: Upload distributions
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: dist
         path: dist/
         if-no-files-found: error
 
     - name: Upload release notes
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: release-notes
         path: release-notes.md
@@ -191,7 +191,7 @@ jobs:
       id-token: write # OIDC trusted publishing — no API token
     steps:
     - name: Download distributions
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: dist
         path: dist/
@@ -219,13 +219,13 @@ jobs:
       attestations: write
     steps:
     - name: Download distributions
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: dist
         path: dist/
 
     - name: Download release notes
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: release-notes
         path: .
